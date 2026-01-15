@@ -48,7 +48,7 @@ pip install strainphase[full]
 
 **System requirements:**
 - Operating System: Linux, macOS, or Windows (WSL2 recommended)
-- Python 3.9, 3.10, 3.11, or 3.12
+- Python 3.11+ (recommended: 3.13)
 - 4 GB RAM minimum (8+ GB recommended for large datasets)
 - 1 GB disk space
 
@@ -92,7 +92,7 @@ pip install strainphase[full]
 **Option B: Install from source (latest development version)**
 ```bash
 # Clone repository
-git clone https://github.com/roles/strainphase.git
+git clone https://github.com/rolesucsd/strainphase.git
 cd strainphase
 
 # Install in development mode
@@ -104,7 +104,7 @@ pre-commit install
 
 **Option C: Install from GitHub release**
 ```bash
-pip install https://github.com/roles/strainphase/archive/v0.1.0.tar.gz
+pip install https://github.com/rolesucsd/strainphase/archive/v0.1.0.tar.gz
 ```
 
 #### 3. Verify Installation
@@ -507,14 +507,12 @@ sudo apt-get install -y libz-dev libbz2-dev liblzma-dev
 
 If you encounter issues not covered here:
 
-1. **Check existing issues**: https://github.com/roles/strainphase/issues
-2. **Search discussions**: https://github.com/roles/strainphase/discussions
-3. **Create new issue**: Include:
-   - Operating system and version
-   - Python version (`python --version`)
-   - Strainphase version (`strainphase version`)
-   - Full error message
-   - Steps to reproduce
+Email `roles@ucsd.edu` with:
+- Operating system and version
+- Python version (`python --version`)
+- Strainphase version (`strainphase version`)
+- Full error message
+- Steps to reproduce
 
 ## Updating
 
@@ -581,8 +579,4 @@ After installation:
 1. Read the [Tutorial](tutorials/TUTORIAL.md) for usage examples
 2. Check out [Quick Start](../README.md#quick-start) in README
 3. Run the test suite to verify everything works
-4. Try the parameter sweep to understand algorithm behavior
-
----
-
-For questions, see our [GitHub Discussions](https://github.com/roles/strainphase/discussions)
+4. (Optional) If you are tuning parameters, run the developer sweep tool (`strainphase sweep --quick`)

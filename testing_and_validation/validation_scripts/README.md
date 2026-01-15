@@ -259,4 +259,4 @@ See:
 - Main README: `../README.md`
 - Tutorial: `../docs/tutorials/TUTORIAL.md`
 - Publication guide: `../QUICK_START_PUBLICATION.md`
-- GitHub issues: https://github.com/roles/strainphase/issues
+- Contact: `roles@ucsd.edu`

@@ -32,18 +32,16 @@ Example:
 
 import argparse
 import logging
-import sys
 import os
+import sys
 from collections import defaultdict
 from typing import Dict, List, Tuple, Optional, Set
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
 try:
     import pysam  # noqa: F401
+    HAS_PYSAM = True
 except ImportError:
-    print("ERROR: pysam required", file=sys.stderr)
-    sys.exit(1)
+    HAS_PYSAM = False
 
 try:
     import pandas as pd
@@ -155,7 +153,7 @@ def parse_reference_contigs(
 # -----------------------------------------------------------------------------#
 
 def process_mag_longitudinal(
-    mag_name: str,
+    mag_name: Optional[str],
     mag_contigs: Dict[str, int],
     samples: List[str],
     bam_paths: Dict[str, str],
@@ -170,7 +168,8 @@ def process_mag_longitudinal(
     Returns:
         {sample_id: {contig_id: [WindowResult, ...]}}
     """
-    logging.info(f"Processing MAG {mag_name} across {len(samples)} samples "
+    mag_label = mag_name or "<unknown>"
+    logging.info(f"Processing MAG {mag_label} across {len(samples)} samples "
                  f"({len(mag_contigs)} contigs)")
 
     # ------------------ First pass: per-sample EM haplotyping ------------------
@@ -516,6 +515,9 @@ def write_longitudinal_outputs(
 # -----------------------------------------------------------------------------#
 
 def main():
+    if not HAS_PYSAM:
+        print("ERROR: pysam required (install with: pip install pysam)", file=sys.stderr)
+        sys.exit(1)
     parser = argparse.ArgumentParser(
         description="Longitudinal haplotype integration across samples",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,

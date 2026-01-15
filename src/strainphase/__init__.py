@@ -37,10 +37,12 @@ from strainphase.core import (
     LogProbCache,
     # Main functions
     process_contig,
-    process_mag_longitudinal,
     link_windows,
     results_to_dataframe,
 )
+
+# Canonical longitudinal pipeline entry point
+from strainphase.longitudinal import process_mag_longitudinal
 
 __all__ = [
     # Version info

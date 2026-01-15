@@ -566,7 +566,7 @@ EOF
 - Read the [Algorithm Details](ALGORITHM.md) for technical background
 - Check out [Benchmarks](BENCHMARKS.md) for performance comparisons
 - See [Installation Guide](INSTALLATION.md) for advanced setup
-- Join [GitHub Discussions](https://github.com/roles/strainphase/discussions) for Q&A
+- For questions, email `roles@ucsd.edu`
 
 ## Citation
 
@@ -577,6 +577,6 @@ If you use Strainphase in your research, please cite:
   author = {Oles, Renee},
   title = {Strainphase: Hybrid graph-probabilistic haplotype reconstruction},
   year = {2025},
-  url = {https://github.com/roles/strainphase}
+  url = {https://github.com/rolesucsd/strainphase}
 }
 ```

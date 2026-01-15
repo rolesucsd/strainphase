@@ -14,7 +14,7 @@
 
 **Results:** We present Strainphase, a novel method for reconstructing bacterial haplotypes from PacBio HiFi metagenomic data across multiple timepoints. Strainphase employs a hybrid approach combining graph-based initialization via Louvain community detection with expectation-maximization (EM) refinement using quality-weighted soft read assignments. A key innovation is the longitudinal rescue mechanism, which detects low-abundance strains in one timepoint by leveraging their presence as high-abundance strains in other timepoints. On synthetic data, Strainphase achieves [mean F1 score of X.XX], with particular strength in detecting rare strains (>X% improvement over single-timepoint analysis). Analysis of [real longitudinal gut microbiome dataset] revealed [N] distinct strain lineages with [key biological finding].
 
-**Availability and Implementation:** Strainphase is implemented in Python 3.9+ and distributed via PyPI (`pip install strainphase`). Source code, documentation, and tutorials are available at https://github.com/roles/strainphase under the MIT license.
+**Availability and Implementation:** Strainphase is implemented in Python 3.11+ and distributed via PyPI (`pip install strainphase`). Source code, documentation, and tutorials are available at https://github.com/rolesucsd/strainphase under the BSD 3-Clause license.
 
 **Contact:** roles@ucsd.edu
 
@@ -169,7 +169,7 @@ This enables tracking strain persistence and detecting phylogenetic relationship
 
 ### 2.9 Implementation
 
-Strainphase is implemented in Python 3.9+ using numpy, scipy, and networkx. Key optimizations include:
+Strainphase is implemented in Python 3.11+ using numpy, scipy, and networkx. Key optimizations include:
 - Precomputed position sets for O(1) membership testing
 - Early-exit mismatch counting in graph construction
 - Cached log-probability computations
@@ -359,7 +359,7 @@ Truong, D.T. et al. (2017) MetaPhlAn2 for enhanced metagenomic taxonomic profili
 
 - **Synthetic data:** Available via `strainphase.simulation` module
 - **Real data:** [Accession numbers for sequencing data]
-- **Code:** https://github.com/roles/strainphase (v0.1.0)
+- **Code:** https://github.com/rolesucsd/strainphase (v0.1.0)
 - **Benchmarks:** Reproducible via scripts in `scripts/` directory
 - **Figures:** Source code in `notebooks/` directory
 

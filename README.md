@@ -3,8 +3,8 @@
 **Hybrid graph-probabilistic haplotype reconstruction for PacBio HiFi metagenomic data**
 
 [![PyPI version](https://badge.fury.io/py/strainphase.svg)](https://badge.fury.io/py/strainphase)
-[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
+[![License: BSD 3-Clause](https://img.shields.io/badge/License-BSD%203--Clause-yellow.svg)](https://opensource.org/license/bsd-3-clause/)
 
 ## Overview
 
@@ -36,7 +36,7 @@ pip install strainphase[all]
 
 ### From source
 ```bash
-git clone https://github.com/roles/strainphase.git
+git clone https://github.com/rolesucsd/strainphase.git
 cd strainphase
 pip install -e .
 ```
@@ -148,7 +148,7 @@ Options:
   --rescued-min-weight Minimum weight after rescue [default: 0.02]
 ```
 
-### `strainphase sweep`
+### `strainphase sweep` (developer tool)
 
 ```
 strainphase sweep [OPTIONS]
@@ -216,10 +216,10 @@ strainphase test
 # Run with verbose output
 strainphase test -v
 
-# Parameter sensitivity (quick)
+# Parameter sensitivity (quick; developer tool)
 strainphase sweep --quick
 
-# Full parameter sweep (324 configs × 4 scenarios)
+# Full parameter sweep (324 configs × 4 scenarios; developer tool)
 strainphase sweep --output-dir full_sweep_results/
 ```
 
@@ -241,14 +241,10 @@ If you use Strainphase in your research, please cite:
   author = {Oles, Renee},
   title = {Strainphase: Hybrid graph-probabilistic haplotype reconstruction},
   year = {2025},
-  url = {https://github.com/roles/strainphase}
+  url = {https://github.com/rolesucsd/strainphase}
 }
 ```
 
 ## License
 
-MIT License - see [LICENSE](LICENSE) for details.
-
-## Contributing
-
-Contributions welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+BSD 3-Clause License - see [LICENSE](LICENSE) for details.

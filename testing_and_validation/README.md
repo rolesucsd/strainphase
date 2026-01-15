@@ -225,7 +225,7 @@ Before publication or major release:
 3. See main StrainPhase documentation in `docs/`
 4. Check validation results in `results/`
 
-## Contributing
+## Notes for maintainers
 
 When adding new tests or validation tools:
 

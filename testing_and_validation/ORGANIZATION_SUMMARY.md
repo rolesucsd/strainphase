@@ -93,7 +93,7 @@ All testing and validation tools are in one place, making it clear what's for de
 - Publication: `manuscript/`
 
 ### 3. **Easy Navigation**
-New contributors and users can quickly find testing tools without searching through the root directory.
+Users can quickly find testing tools without searching through the root directory.
 
 ### 4. **Scalability**
 Easy to add new testing tools, validation scripts, or test datasets without cluttering the root.

@@ -670,9 +670,12 @@ class GraphInitializer:
                 return [Haplotype(consensus=consensus, supporting_reads=len(window.reads))], [len(window.reads)]
             return [], []
         
-        # Partition
+        # Partition reads into clusters.
+        #
+        # Prefer Louvain community detection when available; otherwise fall back to
+        # connected components on the thresholded overlap graph.
         if HAS_LOUVAIN:
-            partition = community_louvain.best_partition(G, weight='weight')
+            partition = community_louvain.best_partition(G, weight="weight")
         else:
             partition = {}
             for idx, component in enumerate(nx.connected_components(G)):
@@ -1541,102 +1544,40 @@ def process_contig(
     return results
 
 
-def process_mag_longitudinal(
-    samples: Dict[str, Tuple[str, str]],
-    mag_contigs: Dict[str, int],
-    config: HaplotyperConfig = DEFAULT_CONFIG
-) -> Dict[str, Dict[str, List[WindowResult]]]:
+def process_mag_longitudinal(*args, **kwargs):
     """
-    Process MAG across timepoints with longitudinal rescue.
-    
-    Haplotypes are linked across windows after initial processing,
-    after rescue, and after 1-SNP validation merge.
+    Backwards-compatible wrapper.
+
+    Canonical implementation lives in `strainphase.longitudinal.process_mag_longitudinal`.
+    This wrapper exists so older code that imported `process_mag_longitudinal` from
+    `strainphase.core` / `strainphase` keeps working.
     """
-    # First pass: process all samples (includes initial linking)
-    all_results: Dict[str, Dict[str, List[WindowResult]]] = {}
-    
-    for sample_id, (bam_path, vcf_path) in samples.items():
-        logging.info(f"Processing sample {sample_id}")
-        all_results[sample_id] = {}
-        
-        for contig_id, contig_length in mag_contigs.items():
-            results = process_contig(
-                bam_path, vcf_path, contig_id, contig_length, config, sample_id
-            )
-            all_results[sample_id][contig_id] = results
-    
-    # Second pass: longitudinal rescue with proper timepoint counting
-    integrator = LongitudinalIntegrator(config)
-    
-    for contig_id in mag_contigs.keys():
-        # Collect results for this contig
-        results_by_timepoint: Dict[str, List[WindowResult]] = {}
-        for sample_id in samples.keys():
-            if contig_id in all_results[sample_id]:
-                results_by_timepoint[sample_id] = all_results[sample_id][contig_id]
-        
-        if len(results_by_timepoint) >= 2:
-            # Apply rescue
-            rescued = integrator.rescue_low_abundance(results_by_timepoint)
-            
-            for sample_id, window_results in rescued.items():
-                # Re-link after rescue (may have new haplotypes)
-                window_results = link_windows(window_results, config)
-                all_results[sample_id][contig_id] = window_results
-    
-    # Third pass: re-run merge with correct n_timepoints for 1-SNP validation
-    if config.validate_1snp_differences and len(samples) >= config.min_timepoints_for_1snp:
-        for contig_id in mag_contigs.keys():
-            # Group windows by position
-            windows_by_pos: Dict[Tuple, Dict[str, WindowResult]] = defaultdict(dict)
-            
-            for sample_id in samples.keys():
-                for wr in all_results[sample_id].get(contig_id, []):
-                    key = (wr.window.start, wr.window.end)
-                    windows_by_pos[key][sample_id] = wr
-            
-            # Count timepoints for each haplotype and re-merge if needed
-            post = PostProcessor(config)
-            
-            for window_key, sample_wrs in windows_by_pos.items():
-                n_timepoints = len(sample_wrs)
-                
-                for sample_id, wr in sample_wrs.items():
-                    if len(wr.haplotypes) > 1:
-                        # Re-run merge with correct timepoint count
-                        merged_haps, final_gamma, final_pi = post.merge_similar_haplotypes(
-                            wr.haplotypes, wr.gamma, wr.pi, wr.window, n_timepoints
-                        )
-                        
-                        if len(merged_haps) != len(wr.haplotypes):
-                            # Update result
-                            assignments = post.assign_reads(wr.window.reads, final_gamma, final_pi)
-                            new_wr = WindowResult(
-                                window=wr.window,
-                                haplotypes=merged_haps,
-                                gamma=final_gamma,
-                                pi=final_pi,
-                                log_likelihood=wr.log_likelihood,
-                                assignments=assignments,
-                                converged=wr.converged,
-                                iterations=wr.iterations
-                            )
-                            
-                            # Find and replace in results
-                            for i, old_wr in enumerate(all_results[sample_id][contig_id]):
-                                if old_wr.window.start == wr.window.start:
-                                    all_results[sample_id][contig_id][i] = new_wr
-                                    break
-        
-        # Re-link after merge (haplotypes may have been merged)
-        for sample_id in samples.keys():
-            for contig_id in mag_contigs.keys():
-                if contig_id in all_results[sample_id]:
-                    all_results[sample_id][contig_id] = link_windows(
-                        all_results[sample_id][contig_id], config
-                    )
-    
-    return all_results
+    # Import lazily to avoid circular imports (`strainphase.longitudinal` imports `core`).
+    from strainphase.longitudinal import process_mag_longitudinal as _impl
+
+    # Legacy signature:
+    #   process_mag_longitudinal(samples: Dict[str, Tuple[bam, vcf]],
+    #                            mag_contigs: Dict[str, int],
+    #                            config: HaplotyperConfig = DEFAULT_CONFIG)
+    #
+    # New canonical signature:
+    #   process_mag_longitudinal(mag_name: Optional[str],
+    #                            mag_contigs: Dict[str, int],
+    #                            samples: List[str],
+    #                            bam_paths: Dict[str, str],
+    #                            vcf_paths: Dict[str, str],
+    #                            config: HaplotyperConfig)
+    if len(args) >= 2 and isinstance(args[0], dict) and isinstance(args[1], dict) and "samples" not in kwargs:
+        samples_dict: Dict[str, Tuple[str, str]] = args[0]
+        mag_contigs: Dict[str, int] = args[1]
+        config: HaplotyperConfig = args[2] if len(args) >= 3 else kwargs.get("config", DEFAULT_CONFIG)
+
+        sample_ids = list(samples_dict.keys())
+        bam_paths = {sid: samples_dict[sid][0] for sid in sample_ids}
+        vcf_paths = {sid: samples_dict[sid][1] for sid in sample_ids}
+        return _impl(None, mag_contigs, sample_ids, bam_paths, vcf_paths, config)
+
+    return _impl(*args, **kwargs)
 
 
 # =============================================================================
