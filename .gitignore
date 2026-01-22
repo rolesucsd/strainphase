@@ -28,3 +28,6 @@ dist/
 .idea/
 .vscode/
 
+# Hide manuscript and tutorials from GitHub
+docs/manuscript/
+docs/tutorials/

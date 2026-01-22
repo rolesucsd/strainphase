@@ -5,22 +5,17 @@ Performance benchmarking script for Strainphase.
 Measures runtime, memory usage, and scalability across different parameters.
 
 Usage:
-    python scripts/benchmark_performance.py --output benchmarks/
-    python scripts/benchmark_performance.py --quick  # Fast benchmarks
+    python benchmarks/benchmark_performance.py --output results/
+    python benchmarks/benchmark_performance.py --quick  # Fast benchmarks
 """
 
 import argparse
 import logging
-import sys
-import os
 import time
 import tracemalloc
 from pathlib import Path
 from typing import Dict, List, Tuple
 import json
-
-# Add parent directory to path
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from strainphase import HaplotyperConfig, process_window, link_windows
 from strainphase.simulation import SyntheticDataGenerator, SimulationScenario

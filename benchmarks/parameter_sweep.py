@@ -13,19 +13,18 @@ Evaluates:
 - Number of lineages inferred
 - Major lineage frequency trajectories
 - Sweep detection stability
+
+Run with: python benchmarks/parameter_sweep.py
 """
 
-import sys
-import os
 import itertools
 import json
 import time
+import os
 from dataclasses import dataclass, asdict
 from typing import Dict, List, Tuple, Optional, Any
 from collections import defaultdict
 import numpy as np
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from strainphase.core import (
     HaplotyperConfig, 
