@@ -79,13 +79,11 @@ test = "strainphase.cli:cmd_test"
 sweep = "strainphase.cli:cmd_sweep"
 
 [tool.setuptools.packages.find]
-where = ["src"]
-
-[tool.setuptools.package-data]
-strainphase = ["py.typed"]
+where = ["."]
+exclude = ["tests*", "benchmarks*", "validation*", "docs*"]
 
 [tool.pytest.ini_options]
-testpaths = ["src/strainphase/tests"]
+testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_functions = ["test_*"]
 addopts = "-v --tb=short"

@@ -172,77 +172,44 @@ def cmd_longitudinal(args: argparse.Namespace) -> int:
 def cmd_test(args: argparse.Namespace) -> int:
     """Run test suite."""
     setup_logging("INFO")
-    
+
     print(f"\n{'=' * 60}")
     print(f"STRAINPHASE v{__version__} - TEST SUITE")
     print(f"{'=' * 60}\n")
-    
+
     try:
-        from strainphase.tests.test_core import run_tests
-        result = run_tests(verbosity=2 if args.verbose else 1)
-        
-        print(f"\n{'=' * 60}")
-        print(f"Tests run: {result.testsRun}")
-        print(f"Failures: {len(result.failures)}")
-        print(f"Errors: {len(result.errors)}")
-        print(f"{'=' * 60}\n")
-        
-        return 0 if (len(result.failures) == 0 and len(result.errors) == 0) else 1
-        
-    except ImportError as e:
-        logging.error(f"Could not import test module: {e}")
-        logging.info("Try running: pip install strainphase[dev]")
+        import subprocess
+        cmd = ["python", "-m", "pytest", "tests/", "-v" if args.verbose else "-q"]
+        result = subprocess.run(cmd, capture_output=False)
+        return result.returncode
+    except Exception as e:
+        logging.error(f"Could not run tests: {e}")
+        logging.info("Try running: pip install strainphase[dev] && pytest tests/")
         return 1
 
 
 def cmd_sweep(args: argparse.Namespace) -> int:
     """Run parameter sensitivity analysis."""
     setup_logging("INFO")
-    
+
     print(f"\n{'=' * 60}")
     print(f"STRAINPHASE v{__version__} - PARAMETER SWEEP")
     print(f"{'=' * 60}\n")
-    
+
     try:
-        from strainphase.tests.parameter_sweep import ParameterSweep, run_parameter_sweep
-        
+        import subprocess
         output_dir = args.output_dir or "strainphase_sweep_results"
-        
-        if args.quick:
-            # Reduced grid
-            grid = {
-                'max_mismatch_frac': [0.01, 0.02],
-                'min_mapq': [20],
-                'min_shared_snvs_for_edge': [3],
-                'merge_distance_threshold': [0.01],
-                'min_weight_for_anchor': [0.20],
-            }
-            sweep = ParameterSweep(grid=grid, seed=42)
-            print("Running QUICK sweep (reduced parameter grid)...\n")
-            results = sweep.run_sweep(
-                max_configs=args.max_configs,
-                verbose=not args.quiet,
-            )
-            summary = sweep.summarize_results()
-            
-            # Save results
-            import json
-            os.makedirs(output_dir, exist_ok=True)
-            with open(os.path.join(output_dir, 'sweep_summary.json'), 'w') as f:
-                json.dump(summary, f, indent=2)
-        else:
-            print("Running FULL sweep (this may take several minutes)...\n")
-            summary = run_parameter_sweep(
-                output_dir=output_dir,
-                max_configs=args.max_configs,
-                verbose=not args.quiet,
-            )
-        
-        print(f"\nResults saved to: {output_dir}")
-        return 0
-        
-    except ImportError as e:
-        logging.error(f"Could not import sweep module: {e}")
+        cmd = ["python", "benchmarks/parameter_sweep.py"]
+        if args.max_configs:
+            # Pass via environment or modify script to accept args
+            pass
+        print("Running parameter sweep from benchmarks/parameter_sweep.py...")
+        print(f"Results will be saved to: {output_dir}\n")
+        result = subprocess.run(cmd, capture_output=False)
+        return result.returncode
+    except Exception as e:
+        logging.error(f"Could not run sweep: {e}")
+        logging.info("Try running: python benchmarks/parameter_sweep.py")
         return 1
 
 

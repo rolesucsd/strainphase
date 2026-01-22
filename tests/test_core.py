@@ -6,14 +6,12 @@ Includes:
 - Unit tests for individual components
 - Integration tests for full pipeline
 - Regression tests for known behaviors
+
+Run with: pytest tests/ or python -m pytest tests/
 """
 
 import unittest
 import numpy as np
-import sys
-import os
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from strainphase.core import (
     HaplotyperConfig,

@@ -3,11 +3,10 @@
 Quick synthetic validation with figure generation.
 
 Tests Strainphase on synthetic data and creates publication-quality figure.
-"""
 
-import sys
-from pathlib import Path
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+Usage:
+    python validation/test_and_figure.py
+"""
 
 import numpy as np
 import matplotlib.pyplot as plt

@@ -6,20 +6,15 @@ Generates synthetic scenarios, runs Strainphase, and compares results
 to ground truth to compute accuracy metrics.
 
 Usage:
-    python scripts/validate_synthetic.py --output results/validation/
-    python scripts/validate_synthetic.py --quick  # Fast validation
+    python validation/validate_synthetic.py --output results/
+    python validation/validate_synthetic.py --quick  # Fast validation
 """
 
 import argparse
 import logging
-import sys
-import os
 from pathlib import Path
 from typing import Dict, List, Tuple
 import json
-
-# Add parent directory to path
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from strainphase import HaplotyperConfig, process_window, link_windows
 from strainphase.simulation import (

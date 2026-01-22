@@ -1,7 +1,0 @@
-{
-  "mean_f1": 0.9523809523809524,
-  "mean_precision": 1.0,
-  "mean_recall": 0.9166666666666666,
-  "mean_mae": 0.006915066974263587,
-  "scenarios_tested": 3
-}
