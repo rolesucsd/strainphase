@@ -31,3 +31,6 @@ dist/
 # Hide manuscript and tutorials from GitHub
 docs/manuscript/
 docs/tutorials/
+
+# Generated data (simulations, benchmarks)
+data/
