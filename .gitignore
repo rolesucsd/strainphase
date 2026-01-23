@@ -35,3 +35,7 @@ docs/tutorials/
 # Generated data (simulations, benchmarks)
 data/
 tmp/
+results/
+
+# Local instructions
+agents.md
