@@ -59,8 +59,9 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     if records:
         import csv
-        with open(args.output, 'w', newline='') as f:
-            writer = csv.DictWriter(f, fieldnames=records[0].keys(), delimiter='\t')
+
+        with open(args.output, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=records[0].keys(), delimiter="\t")
             writer.writeheader()
             writer.writerows(records)
         logging.info(f"Wrote {len(records)} haplotypes to {args.output}")
@@ -78,7 +79,9 @@ def cmd_longitudinal(args: argparse.Namespace) -> int:
     import importlib.util
 
     if importlib.util.find_spec("pysam") is None:
-        logging.error("pysam is required for longitudinal analysis. Install with: pip install pysam")
+        logging.error(
+            "pysam is required for longitudinal analysis. Install with: pip install pysam"
+        )
         return 1
 
     from strainphase import HaplotyperConfig
@@ -90,7 +93,7 @@ def cmd_longitudinal(args: argparse.Namespace) -> int:
     )
 
     # Parse samples
-    samples = [s.strip() for s in args.samples.split(',')]
+    samples = [s.strip() for s in args.samples.split(",")]
     logging.info(f"Processing {len(samples)} samples: {samples}")
 
     # Build path mappings
@@ -116,7 +119,7 @@ def cmd_longitudinal(args: argparse.Namespace) -> int:
 
     # Filter to requested MAGs
     if args.mags:
-        requested = set(args.mags.split(','))
+        requested = set(args.mags.split(","))
         mags = {k: v for k, v in mags.items() if k in requested}
 
     if not mags:
@@ -158,9 +161,10 @@ def cmd_longitudinal(args: argparse.Namespace) -> int:
     # Write outputs
     if lineage_records:
         import csv
+
         output_path = os.path.join(args.output_dir, "lineages.tsv")
-        with open(output_path, 'w', newline='') as f:
-            writer = csv.DictWriter(f, fieldnames=lineage_records[0].keys(), delimiter='\t')
+        with open(output_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=lineage_records[0].keys(), delimiter="\t")
             writer.writeheader()
             writer.writerows(lineage_records)
         logging.info(f"Wrote {len(lineage_records)} lineage records to {output_path}")
@@ -178,6 +182,7 @@ def cmd_test(args: argparse.Namespace) -> int:
 
     try:
         import subprocess
+
         cmd = ["python", "-m", "pytest", "tests/", "-v" if args.verbose else "-q"]
         result = subprocess.run(cmd, capture_output=False)
         return result.returncode
@@ -197,6 +202,7 @@ def cmd_sweep(args: argparse.Namespace) -> int:
 
     try:
         import subprocess
+
         output_dir = args.output_dir or "strainphase_sweep_results"
         cmd = ["python", "benchmarks/parameter_sweep.py"]
         if args.max_configs:
@@ -242,7 +248,8 @@ Examples:
         """,
     )
     parser.add_argument(
-        "-V", "--version",
+        "-V",
+        "--version",
         action="version",
         version=f"%(prog)s {__version__}",
     )
@@ -265,10 +272,14 @@ Examples:
     run_parser.add_argument("--window-size", type=int, default=3000, help="Window size (bp)")
     run_parser.add_argument("--max-reads", type=int, default=300, help="Max reads per window")
     run_parser.add_argument("--min-mapq", type=int, default=20, help="Minimum MAPQ")
-    run_parser.add_argument("--max-mismatch", type=float, default=0.02, help="Max mismatch fraction")
+    run_parser.add_argument(
+        "--max-mismatch", type=float, default=0.02, help="Max mismatch fraction"
+    )
     run_parser.add_argument("--seed", type=int, help="Random seed")
     run_parser.add_argument("--no-validate", action="store_true", help="Skip result validation")
-    run_parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    run_parser.add_argument(
+        "--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"]
+    )
     run_parser.set_defaults(func=cmd_run)
 
     # =========== LONGITUDINAL subcommand ===========
@@ -286,9 +297,15 @@ Examples:
     long_parser.add_argument("--contig-filter", help="File with allowed contig names")
     long_parser.add_argument("--window-size", type=int, default=3000, help="Window size (bp)")
     long_parser.add_argument("--max-reads", type=int, default=300, help="Max reads per window")
-    long_parser.add_argument("--min-anchor-weight", type=float, default=0.15, help="Min weight for anchor")
-    long_parser.add_argument("--rescued-min-weight", type=float, default=0.02, help="Min weight after rescue")
-    long_parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    long_parser.add_argument(
+        "--min-anchor-weight", type=float, default=0.15, help="Min weight for anchor"
+    )
+    long_parser.add_argument(
+        "--rescued-min-weight", type=float, default=0.02, help="Min weight after rescue"
+    )
+    long_parser.add_argument(
+        "--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"]
+    )
     long_parser.set_defaults(func=cmd_longitudinal)
 
     # =========== TEST subcommand ===========

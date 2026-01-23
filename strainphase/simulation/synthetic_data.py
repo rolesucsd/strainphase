@@ -25,6 +25,7 @@ from strainphase.core import HaplotyperConfig, Read, Window
 @dataclass
 class TrueHaplotype:
     """Ground truth haplotype for simulation."""
+
     id: str
     consensus: dict[int, str]  # pos -> base
     abundance_by_timepoint: dict[str, float] = field(default_factory=dict)
@@ -36,6 +37,7 @@ class TrueHaplotype:
 @dataclass
 class SimulationScenario:
     """Complete simulation scenario with ground truth."""
+
     name: str
     contig_id: str
     contig_length: int
@@ -64,7 +66,7 @@ class SyntheticDataGenerator:
 
     def __init__(self, seed: int = 42):
         self.rng = np.random.default_rng(seed)
-        self.bases = ['A', 'C', 'G', 'T']
+        self.bases = ["A", "C", "G", "T"]
 
     def create_scenario(
         self,
@@ -74,7 +76,7 @@ class SyntheticDataGenerator:
         n_haplotypes: int = 3,
         n_timepoints: int = 4,
         include_sweep: bool = True,
-        snv_density_per_kb: float = 2.0
+        snv_density_per_kb: float = 2.0,
     ) -> SimulationScenario:
         """
         Create a complete simulation scenario with ground truth haplotypes.
@@ -105,13 +107,15 @@ class SyntheticDataGenerator:
         # Record sweep events if any
         sweep_events = []
         if include_sweep and n_haplotypes >= 2:
-            sweep_events.append({
-                'type': 'selective_sweep',
-                'winner': true_haplotypes[0].id,
-                'loser': true_haplotypes[1].id,
-                'start_timepoint': timepoints[1],
-                'end_timepoint': timepoints[-1],
-            })
+            sweep_events.append(
+                {
+                    "type": "selective_sweep",
+                    "winner": true_haplotypes[0].id,
+                    "loser": true_haplotypes[1].id,
+                    "start_timepoint": timepoints[1],
+                    "end_timepoint": timepoints[-1],
+                }
+            )
 
         return SimulationScenario(
             name=name,
@@ -121,7 +125,7 @@ class SyntheticDataGenerator:
             ref_alleles=ref_alleles,
             true_haplotypes=true_haplotypes,
             timepoints=timepoints,
-            sweep_events=sweep_events
+            sweep_events=sweep_events,
         )
 
     def _generate_snv_positions(self, contig_length: int, n_snvs: int) -> list[int]:
@@ -147,7 +151,7 @@ class SyntheticDataGenerator:
         ref_alleles: dict[int, str],
         n_haplotypes: int,
         timepoints: list[str],
-        include_sweep: bool
+        include_sweep: bool,
     ) -> list[TrueHaplotype]:
         """
         Generate true haplotypes with defined relationships and temporal dynamics.
@@ -185,11 +189,11 @@ class SyntheticDataGenerator:
                 h_idx, n_haplotypes, timepoints, include_sweep
             )
 
-            haplotypes.append(TrueHaplotype(
-                id=hap_id,
-                consensus=consensus,
-                abundance_by_timepoint=abundance_by_timepoint
-            ))
+            haplotypes.append(
+                TrueHaplotype(
+                    id=hap_id, consensus=consensus, abundance_by_timepoint=abundance_by_timepoint
+                )
+            )
 
         # Normalize abundances so they sum to 1.0 for each timepoint
         for tp in timepoints:
@@ -201,11 +205,7 @@ class SyntheticDataGenerator:
         return haplotypes
 
     def _generate_abundance_trajectory(
-        self,
-        hap_idx: int,
-        n_haplotypes: int,
-        timepoints: list[str],
-        include_sweep: bool
+        self, hap_idx: int, n_haplotypes: int, timepoints: list[str], include_sweep: bool
     ) -> dict[str, float]:
         """
         Generate realistic abundance trajectory for a haplotype.
@@ -253,7 +253,7 @@ class SyntheticDataGenerator:
         n_reads: int = 100,
         error_rate: float = 0.001,
         base_quality: int = 30,
-        mapq: int = 60
+        mapq: int = 60,
     ) -> tuple[Window, dict[str, str]]:
         """
         Generate synthetic reads for a window.
@@ -262,8 +262,7 @@ class SyntheticDataGenerator:
             (Window object with reads, dict mapping read_id to true haplotype)
         """
         # Get SNVs in this window
-        window_snvs = [p for p in scenario.snv_positions
-                       if window_start <= p < window_end]
+        window_snvs = [p for p in scenario.snv_positions if window_start <= p < window_end]
 
         if not window_snvs:
             return None, {}
@@ -297,9 +296,7 @@ class SyntheticDataGenerator:
             # Read covers ~60-90% of SNVs in window
             coverage_frac = self.rng.uniform(0.6, 0.9)
             covered_snvs = self.rng.choice(
-                window_snvs,
-                size=max(1, int(len(window_snvs) * coverage_frac)),
-                replace=False
+                window_snvs, size=max(1, int(len(window_snvs) * coverage_frac)), replace=False
             )
 
             for pos in covered_snvs:
@@ -315,14 +312,16 @@ class SyntheticDataGenerator:
                     alleles[pos] = true_base
                     quals[pos] = base_quality + self.rng.integers(-3, 4)
 
-            reads.append(Read(
-                id=read_id,
-                contig=scenario.contig_id,
-                mapq=mapq,
-                alleles=alleles,
-                quals=quals,
-                sample=timepoint
-            ))
+            reads.append(
+                Read(
+                    id=read_id,
+                    contig=scenario.contig_id,
+                    mapq=mapq,
+                    alleles=alleles,
+                    quals=quals,
+                    sample=timepoint,
+                )
+            )
 
         window = Window(
             contig=scenario.contig_id,
@@ -331,7 +330,7 @@ class SyntheticDataGenerator:
             snv_pos=window_snvs,
             ref_alleles=ref_alleles,
             reads=reads,
-            sample=timepoint
+            sample=timepoint,
         )
 
         return window, read_true_haplotypes
@@ -341,7 +340,7 @@ class SyntheticDataGenerator:
         scenario: SimulationScenario,
         config: HaplotyperConfig,
         n_reads_per_window: int = 100,
-        error_rate: float = 0.001
+        error_rate: float = 0.001,
     ) -> dict[str, list[tuple[Window, dict[str, str]]]]:
         """
         Generate all windows for all timepoints.
@@ -368,7 +367,7 @@ class SyntheticDataGenerator:
                     window_start=start,
                     window_end=end,
                     n_reads=n_reads_per_window,
-                    error_rate=error_rate
+                    error_rate=error_rate,
                 )
 
                 if window is not None and len(window.snv_pos) >= config.min_snvs_per_window:
@@ -394,99 +393,99 @@ def create_test_scenarios() -> dict[str, SimulationScenario]:
     scenarios = {}
 
     # Simple: 2 haplotypes, clear separation
-    scenarios['simple_2hap'] = gen.create_scenario(
-        name='simple_2hap',
+    scenarios["simple_2hap"] = gen.create_scenario(
+        name="simple_2hap",
         contig_length=30000,
         n_snvs=60,
         n_haplotypes=2,
         n_timepoints=3,
-        include_sweep=False
+        include_sweep=False,
     )
 
     # Sweep: 2 haplotypes with selective sweep
-    scenarios['sweep_2hap'] = gen.create_scenario(
-        name='sweep_2hap',
+    scenarios["sweep_2hap"] = gen.create_scenario(
+        name="sweep_2hap",
         contig_length=30000,
         n_snvs=60,
         n_haplotypes=2,
         n_timepoints=4,
-        include_sweep=True
+        include_sweep=True,
     )
 
     # Complex: 4 haplotypes, some closely related
-    scenarios['complex_4hap'] = gen.create_scenario(
-        name='complex_4hap',
+    scenarios["complex_4hap"] = gen.create_scenario(
+        name="complex_4hap",
         contig_length=50000,
         n_snvs=100,
         n_haplotypes=4,
         n_timepoints=5,
-        include_sweep=True
+        include_sweep=True,
     )
 
     # Low abundance: includes a rare strain
-    scenarios['low_abundance'] = gen.create_scenario(
-        name='low_abundance',
+    scenarios["low_abundance"] = gen.create_scenario(
+        name="low_abundance",
         contig_length=30000,
         n_snvs=50,
         n_haplotypes=3,
         n_timepoints=4,
-        include_sweep=False
+        include_sweep=False,
     )
     # Manually adjust abundance for one haplotype to be very low
     # Then renormalize so abundances sum to 1.0
-    for tp in scenarios['low_abundance'].timepoints:
-        scenarios['low_abundance'].true_haplotypes[2].abundance_by_timepoint[tp] = 0.03
+    for tp in scenarios["low_abundance"].timepoints:
+        scenarios["low_abundance"].true_haplotypes[2].abundance_by_timepoint[tp] = 0.03
         # Renormalize
-        total = sum(h.get_abundance(tp) for h in scenarios['low_abundance'].true_haplotypes)
+        total = sum(h.get_abundance(tp) for h in scenarios["low_abundance"].true_haplotypes)
         if total > 0:
-            for hap in scenarios['low_abundance'].true_haplotypes:
+            for hap in scenarios["low_abundance"].true_haplotypes:
                 hap.abundance_by_timepoint[tp] = hap.get_abundance(tp) / total
 
     # Ultra-complex: more haplotypes, longer contig, more timepoints
-    scenarios['ultra_complex_6hap'] = gen.create_scenario(
-        name='ultra_complex_6hap',
+    scenarios["ultra_complex_6hap"] = gen.create_scenario(
+        name="ultra_complex_6hap",
         contig_length=80000,
         n_snvs=160,
         n_haplotypes=6,
         n_timepoints=6,
-        include_sweep=True
+        include_sweep=True,
     )
 
     # Benchmark matrix scenarios (agents.md)
-    scenarios['simple-easy'] = gen.create_scenario(
-        name='simple-easy',
+    scenarios["simple-easy"] = gen.create_scenario(
+        name="simple-easy",
         contig_length=30000,
         n_snvs=50,
         n_haplotypes=2,
         n_timepoints=4,
-        include_sweep=False
+        include_sweep=False,
     )
 
-    scenarios['simple-hard'] = gen.create_scenario(
-        name='simple-hard',
+    scenarios["simple-hard"] = gen.create_scenario(
+        name="simple-hard",
         contig_length=30000,
         n_snvs=60,
         n_haplotypes=2,
         n_timepoints=4,
-        include_sweep=True
+        include_sweep=True,
     )
 
-    scenarios['complex-easy'] = gen.create_scenario(
-        name='complex-easy',
+    scenarios["complex-easy"] = gen.create_scenario(
+        name="complex-easy",
         contig_length=50000,
         n_snvs=120,
         n_haplotypes=6,
         n_timepoints=5,
-        include_sweep=False
+        include_sweep=False,
     )
 
-    scenarios['complex-hard'] = gen.create_scenario(
-        name='complex-hard',
+    scenarios["complex-hard"] = gen.create_scenario(
+        name="complex-hard",
         contig_length=80000,
         n_snvs=180,
         n_haplotypes=8,
         n_timepoints=6,
-        include_sweep=True
+        include_sweep=True,
     )
 
     return scenarios
@@ -497,7 +496,7 @@ def _fasta_total_length(path: Path) -> int:
     total = 0
     with open(path) as handle:
         for line in handle:
-            if line.startswith('>'):
+            if line.startswith(">"):
                 continue
             total += len(line.strip())
     return total
@@ -510,7 +509,7 @@ def create_reference_scenarios(
     min_lineages: int = 2,
     max_lineages: int = 20,
     snv_density_per_kb: float = 2.0,
-    n_timepoints: int = 5
+    n_timepoints: int = 5,
 ) -> dict[str, SimulationScenario]:
     """
     Create synthetic scenarios from reference genomes on disk.
@@ -520,9 +519,7 @@ def create_reference_scenarios(
     rng = np.random.default_rng(seed)
     ref_path = Path(reference_dir)
     fasta_files = sorted(
-        list(ref_path.glob("*.fa")) +
-        list(ref_path.glob("*.fasta")) +
-        list(ref_path.glob("*.fna"))
+        list(ref_path.glob("*.fa")) + list(ref_path.glob("*.fasta")) + list(ref_path.glob("*.fna"))
     )
     if not fasta_files:
         raise ValueError(f"No FASTA files found in {reference_dir}")
@@ -546,7 +543,7 @@ def create_reference_scenarios(
             n_snvs=n_snvs,
             n_haplotypes=n_haplotypes,
             n_timepoints=n_timepoints,
-            include_sweep=include_sweep
+            include_sweep=include_sweep,
         )
 
     return scenarios
@@ -568,6 +565,5 @@ if __name__ == "__main__":
 
         print("  Abundance trajectories:")
         for hap in scenario.true_haplotypes:
-            abunds = [f"{tp}={hap.get_abundance(tp):.2f}"
-                      for tp in scenario.timepoints]
+            abunds = [f"{tp}={hap.get_abundance(tp):.2f}" for tp in scenario.timepoints]
             print(f"    {hap.id}: {', '.join(abunds)}")

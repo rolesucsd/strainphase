@@ -38,12 +38,14 @@ from collections import defaultdict
 
 try:
     import pysam  # noqa: F401
+
     HAS_PYSAM = True
 except ImportError:
     HAS_PYSAM = False
 
 try:
     import pandas as pd
+
     HAS_PANDAS = True
 except ImportError:
     HAS_PANDAS = False
@@ -63,6 +65,7 @@ from strainphase.core import (
 # Reference parsing and contig filtering
 # -----------------------------------------------------------------------------#
 
+
 def load_allowed_contigs(path: str) -> set[str]:
     """
     Load an optional contig filter file.
@@ -79,7 +82,7 @@ def load_allowed_contigs(path: str) -> set[str]:
         if not first:
             return allowed
 
-        cols = first.split('\t')
+        cols = first.split("\t")
         if len(cols) == 1:
             # No header, first line is a contig name
             allowed.add(cols[0])
@@ -99,7 +102,7 @@ def load_allowed_contigs(path: str) -> set[str]:
                 line = line.strip()
                 if not line:
                     continue
-                parts = line.split('\t')
+                parts = line.split("\t")
                 if len(parts) <= idx:
                     continue
                 allowed.add(parts[idx])
@@ -109,8 +112,7 @@ def load_allowed_contigs(path: str) -> set[str]:
 
 
 def parse_reference_contigs(
-    fasta_path: str,
-    allowed_contigs: set[str] | None = None
+    fasta_path: str, allowed_contigs: set[str] | None = None
 ) -> dict[str, dict[str, int]]:
     """
     Parse reference .fai to get contig info grouped by MAG.
@@ -127,7 +129,7 @@ def parse_reference_contigs(
 
     with open(fai_path) as f:
         for line in f:
-            parts = line.strip().split('\t')
+            parts = line.strip().split("\t")
             if not parts:
                 continue
             contig_name = parts[0]
@@ -150,13 +152,14 @@ def parse_reference_contigs(
 # Core longitudinal logic
 # -----------------------------------------------------------------------------#
 
+
 def process_mag_longitudinal(
     mag_name: str | None,
     mag_contigs: dict[str, int],
     samples: list[str],
     bam_paths: dict[str, str],
     vcf_paths: dict[str, str],
-    config: HaplotyperConfig
+    config: HaplotyperConfig,
 ) -> dict[str, dict[str, list[WindowResult]]]:
     """
     Process a single MAG across all samples with longitudinal rescue.
@@ -167,8 +170,9 @@ def process_mag_longitudinal(
         {sample_id: {contig_id: [WindowResult, ...]}}
     """
     mag_label = mag_name or "<unknown>"
-    logging.info(f"Processing MAG {mag_label} across {len(samples)} samples "
-                 f"({len(mag_contigs)} contigs)")
+    logging.info(
+        f"Processing MAG {mag_label} across {len(samples)} samples " f"({len(mag_contigs)} contigs)"
+    )
 
     # ------------------ First pass: per-sample EM haplotyping ------------------
     # (process_contig now includes window linking)
@@ -228,8 +232,7 @@ def process_mag_longitudinal(
 
 
 def build_lineage_table(
-    all_results: dict[str, dict[str, dict[str, list[WindowResult]]]],
-    config: HaplotyperConfig
+    all_results: dict[str, dict[str, dict[str, list[WindowResult]]]], config: HaplotyperConfig
 ) -> list[dict]:
     """
     Build lineage tracking table across samples using TRACKS.
@@ -279,7 +282,9 @@ def build_lineage_table(
                     n_windows = len(members)
 
                     # Merge consensus across all windows in track
-                    position_votes: dict[int, dict[str, float]] = defaultdict(lambda: defaultdict(float))
+                    position_votes: dict[int, dict[str, float]] = defaultdict(
+                        lambda: defaultdict(float)
+                    )
                     total_weight = 0.0
                     total_reads = 0
 
@@ -293,16 +298,18 @@ def build_lineage_table(
                     for pos, votes in position_votes.items():
                         merged_consensus[pos] = max(votes.keys(), key=lambda b: votes[b])
 
-                    tracks_by_contig[contig_id].append((
-                        sample_id,
-                        track_id,
-                        span_start,
-                        span_end,
-                        n_windows,
-                        merged_consensus,
-                        total_weight / n_windows,  # mean_weight
-                        total_reads
-                    ))
+                    tracks_by_contig[contig_id].append(
+                        (
+                            sample_id,
+                            track_id,
+                            span_start,
+                            span_end,
+                            n_windows,
+                            merged_consensus,
+                            total_weight / n_windows,  # mean_weight
+                            total_reads,
+                        )
+                    )
 
         # Cluster tracks across samples by consensus similarity
         # FIXED: Compare each track to ALL existing clusters (not just unassigned tracks)
@@ -323,7 +330,7 @@ def build_lineage_table(
 
                 # Try to find an existing cluster to join
                 best_cluster = -1
-                best_dist = float('inf')
+                best_dist = float("inf")
 
                 for c_idx in range(len(clusters)):
                     c_span_start, c_span_end = cluster_spans[c_idx]
@@ -340,8 +347,7 @@ def build_lineage_table(
                         continue
 
                     mismatches = sum(
-                        1 for p in shared_pos
-                        if consensus_i.get(p) != c_consensus.get(p)
+                        1 for p in shared_pos if consensus_i.get(p) != c_consensus.get(p)
                     )
                     dist = mismatches / len(shared_pos)
 
@@ -360,7 +366,7 @@ def build_lineage_table(
                     old_start, old_end = cluster_spans[best_cluster]
                     cluster_spans[best_cluster] = (
                         min(old_start, span_start_i),
-                        max(old_end, span_end_i)
+                        max(old_end, span_end_i),
                     )
                 else:
                     # Create new cluster
@@ -375,30 +381,39 @@ def build_lineage_table(
                 n_timepoints = len({tracks[idx][0] for idx in cluster})
 
                 for idx in cluster:
-                    (sample_id, track_id, span_start, span_end,
-                     n_windows, consensus, mean_weight, total_reads) = tracks[idx]
+                    (
+                        sample_id,
+                        track_id,
+                        span_start,
+                        span_end,
+                        n_windows,
+                        consensus,
+                        mean_weight,
+                        total_reads,
+                    ) = tracks[idx]
 
                     consensus_str = "|".join(
-                        f"{pos}:{base}"
-                        for pos, base in sorted(consensus.items())
+                        f"{pos}:{base}" for pos, base in sorted(consensus.items())
                     )
 
-                    records.append({
-                        "lineage_id": lineage_id,
-                        "mag": mag_name,
-                        "contig": contig_id,
-                        "sample": sample_id,
-                        "track_id": track_id,
-                        "span_start": span_start,
-                        "span_end": span_end,
-                        "span_bp": span_end - span_start,
-                        "n_windows": n_windows,
-                        "mean_weight": mean_weight,
-                        "total_supporting_reads": total_reads,
-                        "n_snvs": len(consensus),
-                        "consensus": consensus_str,
-                        "n_timepoints": n_timepoints,
-                    })
+                    records.append(
+                        {
+                            "lineage_id": lineage_id,
+                            "mag": mag_name,
+                            "contig": contig_id,
+                            "sample": sample_id,
+                            "track_id": track_id,
+                            "span_start": span_start,
+                            "span_end": span_end,
+                            "span_bp": span_end - span_start,
+                            "n_windows": n_windows,
+                            "mean_weight": mean_weight,
+                            "total_supporting_reads": total_reads,
+                            "n_snvs": len(consensus),
+                            "consensus": consensus_str,
+                            "n_timepoints": n_timepoints,
+                        }
+                    )
 
     return records
 
@@ -406,7 +421,7 @@ def build_lineage_table(
 def write_longitudinal_outputs(
     all_results: dict[str, dict[str, dict[str, list[WindowResult]]]],
     lineage_records: list[dict],
-    output_dir: str
+    output_dir: str,
 ) -> str:
     """
     Write longitudinal analysis outputs into output_dir.
@@ -428,10 +443,9 @@ def write_longitudinal_outputs(
         df.to_csv(lineage_path, sep="\t", index=False)
     elif lineage_records:
         import csv
+
         with open(lineage_path, "w", newline="") as f:
-            writer = csv.DictWriter(
-                f, fieldnames=lineage_records[0].keys(), delimiter="\t"
-            )
+            writer = csv.DictWriter(f, fieldnames=lineage_records[0].keys(), delimiter="\t")
             writer.writeheader()
             writer.writerows(lineage_records)
     else:
@@ -454,9 +468,7 @@ def write_longitudinal_outputs(
         for sample_id, contig_results in mag_results.items():
             contig_records = []
             for contig_id, window_results in contig_results.items():
-                contig_records.extend(
-                    results_to_dataframe({contig_id: window_results})
-                )
+                contig_records.extend(results_to_dataframe({contig_id: window_results}))
 
             for rec in contig_records:
                 rec["mag"] = mag_name
@@ -473,10 +485,9 @@ def write_longitudinal_outputs(
             df.to_csv(sample_path, sep="\t", index=False)
         else:
             import csv
+
             with open(sample_path, "w", newline="") as f:
-                writer = csv.DictWriter(
-                    f, fieldnames=records[0].keys(), delimiter="\t"
-                )
+                writer = csv.DictWriter(f, fieldnames=records[0].keys(), delimiter="\t")
                 writer.writeheader()
                 writer.writerows(records)
 
@@ -500,9 +511,7 @@ def write_longitudinal_outputs(
                 mean_tp = lineages["n_timepoints"].mean()
                 n_samples = mag_df["sample"].nunique()
 
-                f.write(
-                    f"{mag_name}\t{n_lineages}\t{n_multi}\t{mean_tp:.2f}\t{n_samples}\n"
-                )
+                f.write(f"{mag_name}\t{n_lineages}\t{n_multi}\t{mean_tp:.2f}\t{n_samples}\n")
 
     logging.info(f"Wrote summary to {summary_path}")
     return lineage_path
@@ -511,6 +520,7 @@ def write_longitudinal_outputs(
 # -----------------------------------------------------------------------------#
 # CLI
 # -----------------------------------------------------------------------------#
+
 
 def main():
     if not HAS_PYSAM:
@@ -521,62 +531,31 @@ def main():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    parser.add_argument(
-        "--samples",
-        required=True,
-        help="Comma-separated list of sample names"
-    )
-    parser.add_argument(
-        "--bams",
-        required=True,
-        help="BAM path template with {sample} placeholder"
-    )
-    parser.add_argument(
-        "--vcfs",
-        required=True,
-        help="VCF path template with {sample} placeholder"
-    )
-    parser.add_argument(
-        "--reference",
-        required=True,
-        help="Combined reference FASTA"
-    )
-    parser.add_argument(
-        "--output-dir",
-        required=True,
-        help="Output directory"
-    )
+    parser.add_argument("--samples", required=True, help="Comma-separated list of sample names")
+    parser.add_argument("--bams", required=True, help="BAM path template with {sample} placeholder")
+    parser.add_argument("--vcfs", required=True, help="VCF path template with {sample} placeholder")
+    parser.add_argument("--reference", required=True, help="Combined reference FASTA")
+    parser.add_argument("--output-dir", required=True, help="Output directory")
 
     # Optional / efficiency-related
     parser.add_argument(
-        "--mags",
-        help="Comma-separated list of MAGs to process (default: all MAGs in reference)"
+        "--mags", help="Comma-separated list of MAGs to process (default: all MAGs in reference)"
     )
     parser.add_argument(
-        "--contig-filter",
-        help="TSV or text file listing contigs to include (see docstring)"
+        "--contig-filter", help="TSV or text file listing contigs to include (see docstring)"
     )
-    parser.add_argument(
-        "--window-size",
-        type=int,
-        default=6000,
-        help="Window size for haplotyping"
-    )
+    parser.add_argument("--window-size", type=int, default=6000, help="Window size for haplotyping")
     parser.add_argument(
         "--max-reads",
         type=int,
         default=1000,
-        help="Max reads per window (subsampling for performance)"
+        help="Max reads per window (subsampling for performance)",
     )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        help="Random seed"
-    )
+    parser.add_argument("--seed", type=int, help="Random seed")
     parser.add_argument(
         "--validate-results",
         action="store_true",
-        help="Enable internal consistency checks on WindowResult (slower)"
+        help="Enable internal consistency checks on WindowResult (slower)",
     )
 
     # Longitudinal hyperparameters exposed for transparency
@@ -584,13 +563,13 @@ def main():
         "--min-anchor-weight",
         type=float,
         default=0.15,
-        help="Min mixture weight for a haplotype to serve as an anchor"
+        help="Min mixture weight for a haplotype to serve as an anchor",
     )
     parser.add_argument(
         "--rescued-min-weight",
         type=float,
         default=0.02,
-        help="Min mixture weight to assign to rescued haplotypes"
+        help="Min mixture weight to assign to rescued haplotypes",
     )
 
     # Lineage clustering parameters
@@ -598,26 +577,26 @@ def main():
         "--lineage-merge-distance",
         type=float,
         default=0.02,
-        help="Max distance to merge tracks into same lineage (default: 0.02 = 2%%)"
+        help="Max distance to merge tracks into same lineage (default: 0.02 = 2%%)",
     )
     parser.add_argument(
         "--min-shared-for-lineage",
         type=int,
         default=3,
-        help="Min shared SNVs to consider merging tracks into lineage"
+        help="Min shared SNVs to consider merging tracks into lineage",
     )
     parser.add_argument(
         "--max-span-gap",
         type=int,
         default=10000,
-        help="Max bp gap between track spans to consider same locus"
+        help="Max bp gap between track spans to consider same locus",
     )
 
     parser.add_argument(
         "--log-level",
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-        help="Logging level"
+        help="Logging level",
     )
 
     args = parser.parse_args()
@@ -705,9 +684,7 @@ def main():
 
     # Summary in logs
     n_lineages = len({r["lineage_id"] for r in lineage_records}) if lineage_records else 0
-    logging.info(
-        f"DONE: {len(mags_to_process)} MAGs processed, {n_lineages} lineages identified"
-    )
+    logging.info(f"DONE: {len(mags_to_process)} MAGs processed, {n_lineages} lineages identified")
 
 
 if __name__ == "__main__":
