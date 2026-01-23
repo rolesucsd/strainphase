@@ -349,6 +349,7 @@ def run_full_benchmark(
     max_configs: Optional[int] = None,
     max_contigs: Optional[int] = None,
     include_performance: bool = False,
+    resume: bool = False,
     verbose: bool = True
 ) -> Dict[str, Any]:
     """
@@ -396,16 +397,20 @@ def run_full_benchmark(
 
     # Step 1: Simulate reads
     step_start = time.time()
-    success = simulate_reads(
-        genomes_dir=genomes_dir,
-        output_dir=str(sim_dir),
-        n_timepoints=n_timepoints,
-        coverage=coverage,
-        snv_density=snv_density,
-        error_rate=error_rate,
-        seed=seed,
-        max_strains=max_strains,
-    )
+    if resume and sim_dir.exists():
+        logger.info("Resume enabled: skipping read simulation")
+        success = True
+    else:
+        success = simulate_reads(
+            genomes_dir=genomes_dir,
+            output_dir=str(sim_dir),
+            n_timepoints=n_timepoints,
+            coverage=coverage,
+            snv_density=snv_density,
+            error_rate=error_rate,
+            seed=seed,
+            max_strains=max_strains,
+        )
     results["steps"]["simulate_reads"] = {
         "success": success,
         "duration_seconds": time.time() - step_start
@@ -416,7 +421,12 @@ def run_full_benchmark(
 
     # Step 2: Convert SAM to BAM
     step_start = time.time()
-    success = convert_sam_to_bam(str(sim_dir))
+    bam_files = list(sim_dir.glob("*.bam")) if sim_dir.exists() else []
+    if resume and bam_files:
+        logger.info("Resume enabled: skipping SAM->BAM conversion")
+        success = True
+    else:
+        success = convert_sam_to_bam(str(sim_dir))
     results["steps"]["sam_to_bam"] = {
         "success": success,
         "duration_seconds": time.time() - step_start
@@ -427,7 +437,13 @@ def run_full_benchmark(
 
     # Step 3: Prepare VCF
     step_start = time.time()
-    success = create_vcf_from_truth(str(sim_dir))
+    vcf_candidates = [sim_dir / "variants.vcf.gz", sim_dir / "variants.vcf"]
+    vcf_exists = any(p.exists() for p in vcf_candidates)
+    if resume and vcf_exists:
+        logger.info("Resume enabled: skipping VCF preparation")
+        success = True
+    else:
+        success = create_vcf_from_truth(str(sim_dir))
     results["steps"]["prepare_vcf"] = {
         "success": success,
         "duration_seconds": time.time() - step_start
@@ -549,6 +565,8 @@ def main():
     # Optional steps
     parser.add_argument("--include-performance", action="store_true",
                         help="Include performance profiling benchmark")
+    parser.add_argument("--resume", action="store_true",
+                        help="Skip completed simulation/BAM/VCF steps if outputs exist")
 
     # Verbosity
     parser.add_argument("--quiet", "-q", action="store_true",
@@ -571,6 +589,7 @@ def main():
         max_configs=args.max_configs,
         max_contigs=args.max_contigs,
         include_performance=args.include_performance,
+        resume=args.resume,
         verbose=not args.quiet
     )
 
