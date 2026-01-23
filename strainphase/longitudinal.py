@@ -35,7 +35,6 @@ import logging
 import os
 import sys
 from collections import defaultdict
-from typing import Dict, List, Tuple, Optional, Set
 
 try:
     import pysam  # noqa: F401
@@ -51,21 +50,20 @@ except ImportError:
     print("WARNING: pandas not installed, some features limited", file=sys.stderr)
 
 from strainphase.core import (
+    Haplotype,
     HaplotyperConfig,
     LongitudinalIntegrator,
-    process_contig,
-    link_windows,
-    results_to_dataframe,
     WindowResult,
-    Haplotype,
+    link_windows,
+    process_contig,
+    results_to_dataframe,
 )
-
 
 # -----------------------------------------------------------------------------#
 # Reference parsing and contig filtering
 # -----------------------------------------------------------------------------#
 
-def load_allowed_contigs(path: str) -> Set[str]:
+def load_allowed_contigs(path: str) -> set[str]:
     """
     Load an optional contig filter file.
 
@@ -75,7 +73,7 @@ def load_allowed_contigs(path: str) -> Set[str]:
 
     Returns a set of contig IDs to keep.
     """
-    allowed: Set[str] = set()
+    allowed: set[str] = set()
     with open(path) as f:
         first = f.readline().strip()
         if not first:
@@ -112,8 +110,8 @@ def load_allowed_contigs(path: str) -> Set[str]:
 
 def parse_reference_contigs(
     fasta_path: str,
-    allowed_contigs: Optional[Set[str]] = None
-) -> Dict[str, Dict[str, int]]:
+    allowed_contigs: set[str] | None = None
+) -> dict[str, dict[str, int]]:
     """
     Parse reference .fai to get contig info grouped by MAG.
 
@@ -125,7 +123,7 @@ def parse_reference_contigs(
     If allowed_contigs is provided, only those contigs are kept.
     """
     fai_path = fasta_path + ".fai"
-    mags: Dict[str, Dict[str, int]] = defaultdict(dict)
+    mags: dict[str, dict[str, int]] = defaultdict(dict)
 
     with open(fai_path) as f:
         for line in f:
@@ -153,13 +151,13 @@ def parse_reference_contigs(
 # -----------------------------------------------------------------------------#
 
 def process_mag_longitudinal(
-    mag_name: Optional[str],
-    mag_contigs: Dict[str, int],
-    samples: List[str],
-    bam_paths: Dict[str, str],
-    vcf_paths: Dict[str, str],
+    mag_name: str | None,
+    mag_contigs: dict[str, int],
+    samples: list[str],
+    bam_paths: dict[str, str],
+    vcf_paths: dict[str, str],
     config: HaplotyperConfig
-) -> Dict[str, Dict[str, List[WindowResult]]]:
+) -> dict[str, dict[str, list[WindowResult]]]:
     """
     Process a single MAG across all samples with longitudinal rescue.
 
@@ -174,7 +172,7 @@ def process_mag_longitudinal(
 
     # ------------------ First pass: per-sample EM haplotyping ------------------
     # (process_contig now includes window linking)
-    all_results: Dict[str, Dict[str, List[WindowResult]]] = {}
+    all_results: dict[str, dict[str, list[WindowResult]]] = {}
 
     for sample_id in samples:
         logging.info(f"  Sample {sample_id}: initial contig processing")
@@ -211,7 +209,7 @@ def process_mag_longitudinal(
 
         for contig_id in mag_contigs.keys():
             # Collect results for this contig across samples
-            results_by_timepoint: Dict[str, List[WindowResult]] = {}
+            results_by_timepoint: dict[str, list[WindowResult]] = {}
             for sample_id in samples:
                 sample_contigs = all_results.get(sample_id, {})
                 if contig_id in sample_contigs:
@@ -230,23 +228,23 @@ def process_mag_longitudinal(
 
 
 def build_lineage_table(
-    all_results: Dict[str, Dict[str, Dict[str, List[WindowResult]]]],
+    all_results: dict[str, dict[str, dict[str, list[WindowResult]]]],
     config: HaplotyperConfig
-) -> List[Dict]:
+) -> list[dict]:
     """
     Build lineage tracking table across samples using TRACKS.
 
     Clusters similar tracks (linked haplotypes) across samples by
     consensus similarity. Each track spans multiple windows within
     a sample, and similar tracks across samples get the same lineage_id.
-    
+
     Clustering logic:
     1. Group tracks by contig
     2. For each pair of tracks:
        - Check span overlap (must be at same locus, within max_span_gap_for_lineage)
        - Compute consensus distance on shared SNV positions
        - Merge into same lineage if dist <= lineage_merge_distance and n_shared >= min_shared_for_lineage
-    
+
     Key parameters (from config):
     - lineage_merge_distance: Max distance to merge (default 0.02 = 2%)
     - min_shared_for_lineage: Min shared SNVs to consider (default 3)
@@ -255,46 +253,46 @@ def build_lineage_table(
     Returns:
         List of dicts suitable for pd.DataFrame() or TSV writing.
     """
-    records: List[Dict] = []
+    records: list[dict] = []
     lineage_counter = 0
 
     # Process each MAG
     for mag_name, mag_results in all_results.items():
         # Collect all tracks by contig
         # Structure: {contig_id: [(sample_id, track_id, span_start, span_end, merged_consensus, stats), ...]}
-        tracks_by_contig: Dict[str, List[Tuple]] = defaultdict(list)
+        tracks_by_contig: dict[str, list[tuple]] = defaultdict(list)
 
         for sample_id, contig_results in mag_results.items():
             for contig_id, window_results in contig_results.items():
                 # Group haplotypes by track_id within this sample/contig
-                track_haps: Dict[str, List[Tuple[WindowResult, Haplotype]]] = defaultdict(list)
-                
+                track_haps: dict[str, list[tuple[WindowResult, Haplotype]]] = defaultdict(list)
+
                 for wr in window_results:
                     for hap in wr.haplotypes:
                         tid = hap.track_id or f"unlinked_{wr.window.start}"
                         track_haps[tid].append((wr, hap))
-                
+
                 # Build track info
                 for track_id, members in track_haps.items():
                     span_start = min(wr.window.start for wr, _ in members)
                     span_end = max(wr.window.end for wr, _ in members)
                     n_windows = len(members)
-                    
+
                     # Merge consensus across all windows in track
-                    position_votes: Dict[int, Dict[str, float]] = defaultdict(lambda: defaultdict(float))
+                    position_votes: dict[int, dict[str, float]] = defaultdict(lambda: defaultdict(float))
                     total_weight = 0.0
                     total_reads = 0
-                    
-                    for wr, hap in members:
+
+                    for _wr, hap in members:
                         total_weight += hap.weight
                         total_reads += hap.supporting_reads
                         for pos, base in hap.consensus.items():
                             position_votes[pos][base] += hap.weight
-                    
+
                     merged_consensus = {}
                     for pos, votes in position_votes.items():
                         merged_consensus[pos] = max(votes.keys(), key=lambda b: votes[b])
-                    
+
                     tracks_by_contig[contig_id].append((
                         sample_id,
                         track_id,
@@ -311,46 +309,46 @@ def build_lineage_table(
         for contig_id, tracks in tracks_by_contig.items():
             if not tracks:
                 continue
-            
+
             # clusters[i] = list of track indices in cluster i
             # cluster_consensus[i] = merged consensus for cluster i
             # cluster_spans[i] = (min_start, max_end) for cluster i
-            clusters: List[List[int]] = []
-            cluster_consensus: List[Dict[int, str]] = []
-            cluster_spans: List[Tuple[int, int]] = []
-            
+            clusters: list[list[int]] = []
+            cluster_consensus: list[dict[int, str]] = []
+            cluster_spans: list[tuple[int, int]] = []
+
             for i in range(len(tracks)):
                 _, _, span_start_i, span_end_i, _, consensus_i, _, _ = tracks[i]
                 positions_i = set(consensus_i.keys())
-                
+
                 # Try to find an existing cluster to join
                 best_cluster = -1
                 best_dist = float('inf')
-                
+
                 for c_idx in range(len(clusters)):
                     c_span_start, c_span_end = cluster_spans[c_idx]
                     c_consensus = cluster_consensus[c_idx]
-                    
+
                     # Check span overlap
                     span_gap = max(0, max(span_start_i, c_span_start) - min(span_end_i, c_span_end))
                     if span_gap > config.max_span_gap_for_lineage:
                         continue
-                    
+
                     # Compute distance on shared positions
                     shared_pos = positions_i & set(c_consensus.keys())
                     if len(shared_pos) < config.min_shared_for_lineage:
                         continue
-                    
+
                     mismatches = sum(
-                        1 for p in shared_pos 
+                        1 for p in shared_pos
                         if consensus_i.get(p) != c_consensus.get(p)
                     )
                     dist = mismatches / len(shared_pos)
-                    
+
                     if dist <= config.lineage_merge_distance and dist < best_dist:
                         best_cluster = c_idx
                         best_dist = dist
-                
+
                 if best_cluster >= 0:
                     # Join existing cluster
                     clusters[best_cluster].append(i)
@@ -369,22 +367,22 @@ def build_lineage_table(
                     clusters.append([i])
                     cluster_consensus.append(dict(consensus_i))
                     cluster_spans.append((span_start_i, span_end_i))
-            
+
             # Emit lineage records
             for cluster in clusters:
                 lineage_counter += 1
                 lineage_id = f"L{lineage_counter:06d}"
                 n_timepoints = len({tracks[idx][0] for idx in cluster})
-                
+
                 for idx in cluster:
-                    (sample_id, track_id, span_start, span_end, 
+                    (sample_id, track_id, span_start, span_end,
                      n_windows, consensus, mean_weight, total_reads) = tracks[idx]
-                    
+
                     consensus_str = "|".join(
                         f"{pos}:{base}"
                         for pos, base in sorted(consensus.items())
                     )
-                    
+
                     records.append({
                         "lineage_id": lineage_id,
                         "mag": mag_name,
@@ -406,8 +404,8 @@ def build_lineage_table(
 
 
 def write_longitudinal_outputs(
-    all_results: Dict[str, Dict[str, Dict[str, List[WindowResult]]]],
-    lineage_records: List[Dict],
+    all_results: dict[str, dict[str, dict[str, list[WindowResult]]]],
+    lineage_records: list[dict],
     output_dir: str
 ) -> str:
     """
@@ -450,7 +448,7 @@ def write_longitudinal_outputs(
     # 2. Per-sample haplotypes (post-rescue)
     #    Note: if multiple MAGs are processed, each sample file will contain
     #    rows for multiple MAGs (with 'mag' column distinguishing them).
-    per_sample_records: Dict[str, List[Dict]] = defaultdict(list)
+    per_sample_records: dict[str, list[dict]] = defaultdict(list)
 
     for mag_name, mag_results in all_results.items():
         for sample_id, contig_results in mag_results.items():
@@ -648,7 +646,7 @@ def main():
                 sys.exit(1)
 
     # Load optional contig filter
-    allowed_contigs: Optional[Set[str]] = None
+    allowed_contigs: set[str] | None = None
     if args.contig_filter:
         allowed_contigs = load_allowed_contigs(args.contig_filter)
 
@@ -685,7 +683,7 @@ def main():
     logging.info(f"Processing {len(mags_to_process)} MAGs: {sorted(mags_to_process)}")
 
     # Process each MAG with longitudinal integration
-    all_results: Dict[str, Dict[str, Dict[str, List[WindowResult]]]] = {}
+    all_results: dict[str, dict[str, dict[str, list[WindowResult]]]] = {}
 
     for mag_name, mag_contigs in mags_to_process.items():
         mag_results = process_mag_longitudinal(
