@@ -21,28 +21,24 @@ __author__ = "Renee Oles"
 __email__ = "roles@ucsd.edu"
 
 from strainphase.core import (
-    # Configuration
-    HaplotyperConfig,
     DEFAULT_CONFIG,
-    # Data structures
+    EMHaplotyper,
+    GraphInitializer,
+    Haplotype,
+    HaplotyperConfig,
+    LogProbCache,
+    LongitudinalIntegrator,
+    PostProcessor,
     Read,
     Window,
-    Haplotype,
     WindowResult,
-    # Core algorithms
-    GraphInitializer,
-    EMHaplotyper,
-    PostProcessor,
-    LongitudinalIntegrator,
-    LogProbCache,
-    # Main functions
-    process_contig,
     link_windows,
+    process_contig,
     results_to_dataframe,
 )
-
-# Canonical longitudinal pipeline entry point
 from strainphase.longitudinal import process_mag_longitudinal
+
+# Core algorithms and pipeline entry points.
 
 __all__ = [
     # Version info
