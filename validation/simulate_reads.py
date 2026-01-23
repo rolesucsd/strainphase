@@ -423,7 +423,7 @@ def write_vcf(snv_positions: Dict[str, List[int]], strains: List[Strain], refere
 
                 if alt_alleles:
                     alt_str = ','.join(sorted(alt_alleles.keys()))
-                    strain_info = ';'.join(f"{alt}:{','.join(sids)}" for alt, sids in alt_alleles.items())
+                    strain_info = '|'.join(f"{alt}:{','.join(sids)}" for alt, sids in alt_alleles.items())
                     # Add fake depth and AF for strainphase compatibility
                     info = f"DP=50;AF=0.5;STRAINS={strain_info}"
                     # Add sample genotype (0/1 = heterozygous indicating mixed population)

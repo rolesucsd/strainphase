@@ -214,7 +214,7 @@ def load_ground_truth_snvs(truth_dir: str) -> Dict[str, Dict[int, Dict[str, str]
             # Parse STRAINS info field
             if 'STRAINS=' in info:
                 strains_info = info.split('STRAINS=')[1].split(';')[0]
-                for allele_info in strains_info.split(';'):
+                for allele_info in strains_info.split('|'):
                     if ':' in allele_info:
                         allele, strain_list = allele_info.split(':')
                         for strain_id in strain_list.split(','):

@@ -163,7 +163,7 @@ def load_ground_truth(truth_dir: str) -> Tuple[List[TrueHaplotype], Dict[str, Li
                 # Parse STRAINS info field
                 if 'STRAINS=' in info:
                     strains_info = info.split('STRAINS=')[1].split(';')[0]
-                    for allele_info in strains_info.split(';'):
+                    for allele_info in strains_info.split('|'):
                         if ':' in allele_info:
                             allele, strain_list = allele_info.split(':')
                             for strain_id in strain_list.split(','):
