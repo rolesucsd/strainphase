@@ -34,3 +34,4 @@ docs/tutorials/
 
 # Generated data (simulations, benchmarks)
 data/
+tmp/
