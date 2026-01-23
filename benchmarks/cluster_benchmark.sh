@@ -141,6 +141,7 @@ python benchmarks/run_full_benchmark.py \
     --output "$OUTPUT_DIR" \
     --timepoints "$TIMEPOINTS" \
     --coverage "$COVERAGE" \
+    --resume \
     --seed "$SEED" \
     2>&1 | tee "${OUTPUT_DIR}/benchmark.log"
 
