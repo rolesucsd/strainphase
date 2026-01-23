@@ -34,17 +34,17 @@ jobs:
 
     - name: Run linting (ruff)
       run: |
-        ruff check src/strainphase
+        ruff check strainphase
       continue-on-error: true
 
     - name: Check formatting (black)
       run: |
-        black --check src/strainphase
+        black --check strainphase
       continue-on-error: true
 
     - name: Run tests
       run: |
-        pytest src/strainphase/tests/ -v --cov=strainphase --cov-report=xml --cov-report=term
+        pytest tests -v --cov=strainphase --cov-report=xml --cov-report=term
 
     - name: Upload coverage to Codecov
       uses: codecov/codecov-action@v4
@@ -75,11 +75,11 @@ jobs:
 
     - name: Run ruff
       run: |
-        ruff check src/strainphase --output-format=github
+        ruff check strainphase --output-format=github
 
     - name: Run black
       run: |
-        black --check --diff src/strainphase
+        black --check --diff strainphase
 
   docs:
     name: Documentation Build
