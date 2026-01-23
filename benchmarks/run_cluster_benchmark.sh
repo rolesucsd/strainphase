@@ -22,8 +22,9 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+PROJECT_ROOT="${SLURM_SUBMIT_DIR:-$(dirname "$SCRIPT_DIR")}"
 OUTPUT_BASE="${OUTPUT_BASE:-$PROJECT_ROOT/results/cluster_benchmark}"
+LOG_DIR="${LOG_DIR:-$PROJECT_ROOT/logs}"
 
 # Parse arguments
 LOCAL_MODE=false
@@ -52,7 +53,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 # Create directories
-mkdir -p "$OUTPUT_BASE" "${PROJECT_ROOT}/logs"
+mkdir -p "$OUTPUT_BASE" "$LOG_DIR"
 
 consolidate_results() {
     echo ""

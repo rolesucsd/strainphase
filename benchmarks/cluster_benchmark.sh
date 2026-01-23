@@ -32,9 +32,10 @@ set -euo pipefail
 
 # Configuration
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+PROJECT_ROOT="${SLURM_SUBMIT_DIR:-$(dirname "$SCRIPT_DIR")}"
 GENOME_SOURCE="${GENOME_SOURCE:-$PROJECT_ROOT/tmp}"  # Directory with source genomes
 OUTPUT_BASE="${OUTPUT_BASE:-$PROJECT_ROOT/results/cluster_benchmark}"
+LOG_DIR="${LOG_DIR:-$PROJECT_ROOT/logs}"
 TIMEPOINTS="${TIMEPOINTS:-4}"
 COVERAGE="${COVERAGE:-30}"
 SEED="${SEED:-42}"
@@ -87,7 +88,7 @@ echo "============================================================"
 # Create output directories
 OUTPUT_DIR="${OUTPUT_BASE}/${COMPLEXITY_NAME}"
 GENOME_DIR="${OUTPUT_DIR}/genomes"
-mkdir -p "$OUTPUT_DIR" "$GENOME_DIR" "${PROJECT_ROOT}/logs"
+mkdir -p "$OUTPUT_DIR" "$GENOME_DIR" "$LOG_DIR"
 
 # Select genomes for this complexity level
 echo ""
