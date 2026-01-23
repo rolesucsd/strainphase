@@ -5,9 +5,12 @@ Parameter sweep framework for haplotyper pipeline.
 Tests pipeline stability across a grid of parameters:
 - mismatch thresholds: 0.5%, 1%, 2%, 4%
 - MAPQ: 10, 20, 30
-- shared SNVs: 2, 3, 4
+- base quality: 20, 30
+- shared SNVs: 2, 3, 4, 5
 - merge distance: 0.5%, 1%, 2%
-- anchor weight: 10%, 20%, 30%
+- anchor weight: 5%, 10%, 15%, 20%
+- rescued min weight: 1%, 2%, 5%
+- window size: 3000, 5000, 7000, 10000
 
 Evaluates:
 - Number of lineages inferred
@@ -70,6 +73,7 @@ class ParameterSet:
     merge_distance_threshold: float
     min_weight_for_anchor: float
     rescued_min_weight: float
+    window_size: int
 
     def to_config(self, base_config: Optional[HaplotyperConfig] = None) -> HaplotyperConfig:
         """Convert to HaplotyperConfig."""
@@ -85,6 +89,7 @@ class ParameterSet:
             merge_distance_threshold=self.merge_distance_threshold,
             min_weight_for_anchor=self.min_weight_for_anchor,
             rescued_min_weight=self.rescued_min_weight,
+            window_size=self.window_size,
 
             # Related parameters (keep consistent)
             max_link_distance=self.max_mismatch_frac,
@@ -96,7 +101,6 @@ class ParameterSet:
             min_shared_for_lineage=self.min_shared_snvs_for_edge,
 
             # Fixed parameters
-            window_size=base_config.window_size,
             min_snvs_per_window=base_config.min_snvs_per_window,
             min_reads_per_window=base_config.min_reads_per_window,
             em_max_iter=base_config.em_max_iter,
@@ -113,7 +117,8 @@ class ParameterSet:
                 f"snv{self.min_shared_snvs_for_edge}_"
                 f"md{self.merge_distance_threshold:.3f}_"
                 f"aw{self.min_weight_for_anchor:.2f}_"
-                f"rw{self.rescued_min_weight:.2f}")
+                f"rw{self.rescued_min_weight:.2f}_"
+                f"ws{self.window_size}")
 
 
 @dataclass
@@ -274,7 +279,6 @@ def process_contig_with_params(
     from strainphase.core import process_contig
 
     config = params.to_config()
-    config.window_size = 10000  # Fixed window size for sweep
 
     try:
         results = process_contig(
@@ -302,8 +306,8 @@ class ParameterSweep:
     Requires file-based input (BAM/VCF files).
     """
 
-    # Default parameter grid
-    DEFAULT_GRID = {
+    # Required parameter grid (agents.md)
+    REQUIRED_GRID = {
         'max_mismatch_frac': [0.005, 0.01, 0.02, 0.04],
         'min_mapq': [10, 20, 30],
         'min_base_quality': [20, 30],
@@ -311,6 +315,7 @@ class ParameterSweep:
         'merge_distance_threshold': [0.005, 0.01, 0.02],
         'min_weight_for_anchor': [0.05, 0.10, 0.15, 0.20],
         'rescued_min_weight': [0.01, 0.02, 0.05],
+        'window_size': [3000, 5000, 7000, 10000],
     }
 
     def __init__(
@@ -318,7 +323,11 @@ class ParameterSweep:
         grid: Optional[Dict[str, List]] = None,
         seed: int = 42,
     ):
-        self.grid = grid or self.DEFAULT_GRID
+        if grid is None:
+            self.grid = {k: list(v) for k, v in self.REQUIRED_GRID.items()}
+        else:
+            self._validate_grid(grid)
+            self.grid = grid
         self.seed = seed
         self.results: List[SweepResult] = []
 
@@ -328,6 +337,23 @@ class ParameterSweep:
         self.truth_dir: Optional[str] = None
         self.truth_snvs: Optional[Dict] = None
         self.truth_abundances: Optional[Dict] = None
+
+    def _validate_grid(self, grid: Dict[str, List]) -> None:
+        """Enforce that the parameter grid matches agents.md."""
+        required_keys = set(self.REQUIRED_GRID.keys())
+        provided_keys = set(grid.keys())
+        if required_keys != provided_keys:
+            missing = sorted(required_keys - provided_keys)
+            extra = sorted(provided_keys - required_keys)
+            raise ValueError(f"Parameter grid mismatch: missing={missing}, extra={extra}")
+
+        for key, required_values in self.REQUIRED_GRID.items():
+            provided_values = grid.get(key, [])
+            if sorted(required_values) != sorted(provided_values):
+                raise ValueError(
+                    f"Parameter grid mismatch for {key}: "
+                    f"expected {required_values}, got {provided_values}"
+                )
 
     def generate_parameter_sets(self) -> List[ParameterSet]:
         """Generate all parameter combinations."""
