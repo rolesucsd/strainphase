@@ -36,20 +36,8 @@ import os
 import sys
 from collections import defaultdict
 
-try:
-    import pysam  # noqa: F401
-
-    HAS_PYSAM = True
-except ImportError:
-    HAS_PYSAM = False
-
-try:
-    import pandas as pd
-
-    HAS_PANDAS = True
-except ImportError:
-    HAS_PANDAS = False
-    print("WARNING: pandas not installed, some features limited", file=sys.stderr)
+import pandas as pd
+import pysam  # noqa: F401
 
 from strainphase.core import (
     Haplotype,
@@ -438,16 +426,9 @@ def write_longitudinal_outputs(
     # 1. Lineage table
     lineage_path = os.path.join(output_dir, "lineages.tsv")
 
-    if lineage_records and HAS_PANDAS:
+    if lineage_records:
         df = pd.DataFrame(lineage_records)
         df.to_csv(lineage_path, sep="\t", index=False)
-    elif lineage_records:
-        import csv
-
-        with open(lineage_path, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=lineage_records[0].keys(), delimiter="\t")
-            writer.writeheader()
-            writer.writerows(lineage_records)
     else:
         with open(lineage_path, "w") as f:
             f.write(
@@ -480,16 +461,8 @@ def write_longitudinal_outputs(
 
         sample_path = os.path.join(output_dir, f"{sample_id}.rescued.tsv")
 
-        if HAS_PANDAS:
-            df = pd.DataFrame(records)
-            df.to_csv(sample_path, sep="\t", index=False)
-        else:
-            import csv
-
-            with open(sample_path, "w", newline="") as f:
-                writer = csv.DictWriter(f, fieldnames=records[0].keys(), delimiter="\t")
-                writer.writeheader()
-                writer.writerows(records)
+        df = pd.DataFrame(records)
+        df.to_csv(sample_path, sep="\t", index=False)
 
     # 3. Summary statistics
     summary_path = os.path.join(output_dir, "longitudinal_summary.tsv")
@@ -500,7 +473,7 @@ def write_longitudinal_outputs(
             "mean_timepoints_per_lineage\tn_samples\n"
         )
 
-        if HAS_PANDAS and lineage_records:
+        if lineage_records:
             df = pd.DataFrame(lineage_records)
             for mag_name in df["mag"].unique():
                 mag_df = df[df["mag"] == mag_name]
@@ -523,9 +496,6 @@ def write_longitudinal_outputs(
 
 
 def main():
-    if not HAS_PYSAM:
-        print("ERROR: pysam required (install with: pip install pysam)", file=sys.stderr)
-        sys.exit(1)
     parser = argparse.ArgumentParser(
         description="Longitudinal haplotype integration across samples",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,

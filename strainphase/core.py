@@ -28,19 +28,11 @@ import warnings
 from collections import defaultdict
 from dataclasses import dataclass, field
 
+import community as community_louvain
 import networkx as nx
 import numpy as np
 from scipy.special import logsumexp
 from scipy.stats import binom
-
-# Optional imports
-try:
-    import community as community_louvain
-
-    HAS_LOUVAIN = True
-except ImportError:
-    HAS_LOUVAIN = False
-    logging.warning("python-louvain not installed; falling back to connected components")
 
 try:
     import pysam
@@ -681,15 +673,8 @@ class GraphInitializer:
 
         # Partition reads into clusters.
         #
-        # Prefer Louvain community detection when available; otherwise fall back to
-        # connected components on the thresholded overlap graph.
-        if HAS_LOUVAIN:
-            partition = community_louvain.best_partition(graph, weight="weight")
-        else:
-            partition = {}
-            for idx, component in enumerate(nx.connected_components(graph)):
-                for node in component:
-                    partition[node] = idx
+        # Louvain community detection for read clustering.
+        partition = community_louvain.best_partition(graph, weight="weight")
 
         # Group by cluster
         clusters = defaultdict(list)
