@@ -36,6 +36,7 @@ from scipy.stats import binom
 # Optional imports
 try:
     import community as community_louvain
+
     HAS_LOUVAIN = True
 except ImportError:
     HAS_LOUVAIN = False
@@ -43,6 +44,7 @@ except ImportError:
 
 try:
     import pysam
+
     HAS_PYSAM = True
 except ImportError:
     HAS_PYSAM = False
@@ -53,8 +55,10 @@ except ImportError:
 # WARNING THROTTLING
 # =============================================================================
 
+
 class WarningThrottler:
     """Throttle repeated warnings to avoid spam."""
+
     _warned: set[str] = set()
 
     @classmethod
@@ -71,6 +75,7 @@ class WarningThrottler:
 # =============================================================================
 # CONFIGURATION WITH VALIDATION
 # =============================================================================
+
 
 @dataclass
 class HaplotyperConfig:
@@ -143,7 +148,9 @@ class HaplotyperConfig:
     # Haplotypes in adjacent overlapping windows are linked if their
     # consensus agrees on shared SNVs (Hamming distance <= max_link_distance)
     max_link_distance: float = 0.02  # Max mismatch fraction to link
-    min_shared_snvs_for_link: int = 3  # Min shared SNVs with ACTUAL CALLS to link (not just window overlap)
+    min_shared_snvs_for_link: int = (
+        3  # Min shared SNVs with ACTUAL CALLS to link (not just window overlap)
+    )
 
     # =========== RUNTIME PARAMETERS ===========
     random_seed: int | None = None
@@ -201,9 +208,11 @@ DEFAULT_CONFIG = HaplotyperConfig()
 # DATA STRUCTURES
 # =============================================================================
 
+
 @dataclass
 class Read:
     """Lightweight container for read data. All positions are 1-based (VCF convention)."""
+
     id: str
     contig: str
     mapq: int
@@ -215,9 +224,10 @@ class Read:
 @dataclass
 class Window:
     """Represents a genomic window with associated SNVs and reads."""
+
     contig: str
     start: int  # 1-based, inclusive
-    end: int    # 1-based, exclusive
+    end: int  # 1-based, exclusive
     snv_pos: list[int] = field(default_factory=list)
     ref_alleles: dict[int, str] = field(default_factory=dict)
     reads: list[Read] = field(default_factory=list)
@@ -231,8 +241,7 @@ class Window:
         """Get precomputed position sets for each read (cached)."""
         if self._pos_sets is None:
             self._pos_sets = [
-                {p for p in r.alleles if self.start <= p < self.end}
-                for r in self.reads
+                {p for p in r.alleles if self.start <= p < self.end} for r in self.reads
             ]
         return self._pos_sets
 
@@ -248,14 +257,16 @@ class Window:
 @dataclass
 class Haplotype:
     """A resolved haplotype within a window."""
+
     consensus: dict[int, str]
     weight: float = 0.0
     supporting_reads: int = 0
     confidence: float = 0.0
     track_id: str | None = None  # Assigned after window linking
 
-    def distance_to(self, other: 'Haplotype', positions: list[int],
-                    max_mismatches: int | None = None) -> tuple[float, int, int]:
+    def distance_to(
+        self, other: "Haplotype", positions: list[int], max_mismatches: int | None = None
+    ) -> tuple[float, int, int]:
         """
         Compute normalized Hamming distance with optional early exit.
 
@@ -285,10 +296,11 @@ class Haplotype:
             return 1.0, 0, 0
         return mismatches / total, mismatches, total
 
-    def get_differing_positions(self, other: 'Haplotype', positions: list[int]) -> list[int]:
+    def get_differing_positions(self, other: "Haplotype", positions: list[int]) -> list[int]:
         """Return list of positions where haplotypes differ."""
         return [
-            pos for pos in positions
+            pos
+            for pos in positions
             if (b1 := self.consensus.get(pos)) is not None
             and (b2 := other.consensus.get(pos)) is not None
             and b1 != b2
@@ -298,6 +310,7 @@ class Haplotype:
 @dataclass
 class WindowResult:
     """Complete results from processing a single window."""
+
     window: Window
     haplotypes: list[Haplotype]
     gamma: np.ndarray
@@ -313,18 +326,19 @@ class WindowResult:
         n_haps = len(self.haplotypes)
         k_eff = n_haps + 1
 
-        assert self.gamma.shape == (n_reads, k_eff), \
-            f"gamma shape {self.gamma.shape} != expected ({n_reads}, {k_eff})"
+        assert self.gamma.shape == (
+            n_reads,
+            k_eff,
+        ), f"gamma shape {self.gamma.shape} != expected ({n_reads}, {k_eff})"
 
         row_sums = self.gamma.sum(axis=1)
-        assert np.allclose(row_sums, 1.0, atol=1e-6), \
-            f"gamma rows don't sum to 1: min={row_sums.min()}, max={row_sums.max()}"
+        assert np.allclose(
+            row_sums, 1.0, atol=1e-6
+        ), f"gamma rows don't sum to 1: min={row_sums.min()}, max={row_sums.max()}"
 
-        assert np.isclose(self.pi.sum(), 1.0, atol=1e-6), \
-            f"pi doesn't sum to 1: {self.pi.sum()}"
+        assert np.isclose(self.pi.sum(), 1.0, atol=1e-6), f"pi doesn't sum to 1: {self.pi.sum()}"
 
-        assert len(self.pi) == k_eff, \
-            f"pi length {len(self.pi)} != k_eff {k_eff}"
+        assert len(self.pi) == k_eff, f"pi length {len(self.pi)} != k_eff {k_eff}"
 
         return True
 
@@ -332,6 +346,7 @@ class WindowResult:
 # =============================================================================
 # LOG-PROBABILITY CACHE
 # =============================================================================
+
 
 class LogProbCache:
     """
@@ -366,11 +381,12 @@ _LOG_PROB_CACHE = LogProbCache()
 # I/O FUNCTIONS - LAZY LOADING
 # =============================================================================
 
+
 def load_snvs_from_clair3(
     vcf_path: str,
     contig_id: str | None = None,
     sample_name: str | None = None,
-    config: HaplotyperConfig = DEFAULT_CONFIG
+    config: HaplotyperConfig = DEFAULT_CONFIG,
 ) -> tuple[list[int], dict[int, str], dict[int, int], dict[int, float | None]]:
     """Load SNVs from Clair3 VCF."""
     if not HAS_PYSAM:
@@ -393,7 +409,7 @@ def load_snvs_from_clair3(
 
     for record in vcf.fetch(contig=contig_id) if contig_id else vcf.fetch():
         # Filter check
-        if record.filter.keys() and 'PASS' not in record.filter.keys():
+        if record.filter.keys() and "PASS" not in record.filter.keys():
             continue
 
         # SNP only
@@ -422,22 +438,22 @@ def load_snvs_from_clair3(
 
         # Extract depth
         site_depth = None
-        if 'DP' in record.info:
-            site_depth = record.info['DP']
-        elif sample is not None and 'DP' in sample:
-            site_depth = sample['DP']
+        if "DP" in record.info:
+            site_depth = record.info["DP"]
+        elif sample is not None and "DP" in sample:
+            site_depth = sample["DP"]
 
         if site_depth is None or site_depth < config.min_depth_site:
             continue
 
         # Extract AF
         site_af = None
-        if 'AF' in record.info:
-            site_af = record.info['AF']
+        if "AF" in record.info:
+            site_af = record.info["AF"]
             if isinstance(site_af, tuple):
                 site_af = site_af[0]
-        elif sample is not None and 'AD' in sample:
-            ad = sample['AD']
+        elif sample is not None and "AD" in sample:
+            ad = sample["AD"]
             if ad and len(ad) >= 2 and sum(ad) > 0:
                 site_af = ad[1] / sum(ad)
 
@@ -465,7 +481,7 @@ def make_windows_lazy(
     snv_positions: list[int],
     ref_alleles: dict[int, str],
     config: HaplotyperConfig = DEFAULT_CONFIG,
-    sample_id: str | None = None
+    sample_id: str | None = None,
 ) -> list[Window]:
     """
     Create overlapping windows with lazy per-window read loading.
@@ -518,10 +534,7 @@ def make_windows_lazy(
 
             # Parse alleles at SNV sites
             r = Read(
-                id=aln.query_name,
-                contig=contig_id,
-                mapq=aln.mapping_quality,
-                sample=sample_id
+                id=aln.query_name, contig=contig_id, mapq=aln.mapping_quality, sample=sample_id
             )
 
             query_seq = aln.query_sequence
@@ -534,7 +547,7 @@ def make_windows_lazy(
             if query_qual is None:
                 WarningThrottler.warn_once(
                     "no_qual",
-                    f"Some reads lack quality scores. Using default Q{config.default_base_quality}."
+                    f"Some reads lack quality scores. Using default Q{config.default_base_quality}.",
                 )
 
             # Extract alleles at SNV positions
@@ -560,19 +573,13 @@ def make_windows_lazy(
 
         # Subsample if needed (reproducible)
         if config.max_reads_per_window and len(reads) > config.max_reads_per_window:
-            indices = rng.permutation(len(reads))[:config.max_reads_per_window]
+            indices = rng.permutation(len(reads))[: config.max_reads_per_window]
             reads = [reads[i] for i in indices]
 
         if len(reads) < config.min_reads_per_window:
             continue
 
-        w = Window(
-            contig=contig_id,
-            start=start,
-            end=end,
-            sample=sample_id,
-            window_idx=window_idx
-        )
+        w = Window(contig=contig_id, start=start, end=end, sample=sample_id, window_idx=window_idx)
         w.snv_pos = window_snvs
         w.ref_alleles = {p: ref_alleles[p] for p in window_snvs}
         w.reads = reads
@@ -586,6 +593,7 @@ def make_windows_lazy(
 # =============================================================================
 # OPTIMIZED GRAPH INITIALIZER
 # =============================================================================
+
 
 class GraphInitializer:
     """
@@ -666,7 +674,9 @@ class GraphInitializer:
         if graph.number_of_edges() == 0:
             consensus = self.derive_consensus(window.reads, window)
             if consensus:
-                return [Haplotype(consensus=consensus, supporting_reads=len(window.reads))], [len(window.reads)]
+                return [Haplotype(consensus=consensus, supporting_reads=len(window.reads))], [
+                    len(window.reads)
+                ]
             return [], []
 
         # Partition reads into clusters.
@@ -707,6 +717,7 @@ class GraphInitializer:
 # OPTIMIZED EM ENGINE
 # =============================================================================
 
+
 class EMHaplotyper:
     """
     EM engine with cached log-probability computations.
@@ -719,7 +730,7 @@ class EMHaplotyper:
         window: Window,
         initial_haplotypes: list[Haplotype],
         cluster_sizes: list[int] | None = None,
-        config: HaplotyperConfig = DEFAULT_CONFIG
+        config: HaplotyperConfig = DEFAULT_CONFIG,
     ):
         self.window = window
         self.haplotypes = initial_haplotypes
@@ -920,6 +931,7 @@ class EMHaplotyper:
 # POST-PROCESSOR (with 1-SNP validation)
 # =============================================================================
 
+
 class PostProcessor:
     """Post-processing with optimized merging and 1-SNP validation."""
 
@@ -934,7 +946,7 @@ class PostProcessor:
         k2: int,
         window: Window,
         gamma: np.ndarray,
-        n_timepoints_seen: int = 1
+        n_timepoints_seen: int = 1,
     ) -> bool:
         """Determine if 1-SNP pair should be merged."""
         if not self.config.validate_1snp_differences:
@@ -957,9 +969,7 @@ class PostProcessor:
             return True
 
         # Check supporting reads
-        minor_supporting = int(
-            (gamma[:, minor_k] >= self.config.assign_confidence_threshold).sum()
-        )
+        minor_supporting = int((gamma[:, minor_k] >= self.config.assign_confidence_threshold).sum())
         if minor_supporting < self.config.min_minor_supporting_reads_1snp:
             return True
 
@@ -996,7 +1006,7 @@ class PostProcessor:
         gamma: np.ndarray,
         pi: np.ndarray,
         window: Window,
-        n_timepoints_seen: int = 1
+        n_timepoints_seen: int = 1,
     ) -> tuple[list[Haplotype], np.ndarray, np.ndarray]:
         """Merge similar haplotypes with optimized distance computation."""
         n_haps = len(haplotypes)
@@ -1031,8 +1041,7 @@ class PostProcessor:
                 if dist <= self.config.merge_distance_threshold:
                     if n_diff == 1:
                         should_merge = self.should_merge_1snp_pair(
-                            haplotypes[i], haplotypes[j],
-                            i, j, window, gamma, n_timepoints_seen
+                            haplotypes[i], haplotypes[j], i, j, window, gamma, n_timepoints_seen
                         )
                         if not should_merge:
                             continue
@@ -1088,12 +1097,7 @@ class PostProcessor:
 
         return new_haplotypes, new_gamma, new_pi
 
-    def assign_reads(
-        self,
-        reads: list[Read],
-        gamma: np.ndarray,
-        pi: np.ndarray
-    ) -> list[dict]:
+    def assign_reads(self, reads: list[Read], gamma: np.ndarray, pi: np.ndarray) -> list[dict]:
         """Hard assignment of reads."""
         assignments = []
         n_reads, k_eff = gamma.shape
@@ -1104,7 +1108,7 @@ class PostProcessor:
             best_k = int(np.argmax(probs))
             best_prob = float(probs[best_k])
 
-            is_junk = (best_k == junk_idx)
+            is_junk = best_k == junk_idx
 
             if is_junk:
                 hap_id = None
@@ -1116,13 +1120,15 @@ class PostProcessor:
                 hap_id = None
                 is_ambiguous = True
 
-            assignments.append({
-                'read_id': reads[i].id,
-                'hap_id': hap_id,
-                'prob': best_prob,
-                'is_junk': is_junk,
-                'is_ambiguous': is_ambiguous
-            })
+            assignments.append(
+                {
+                    "read_id": reads[i].id,
+                    "hap_id": hap_id,
+                    "prob": best_prob,
+                    "is_junk": is_junk,
+                    "is_ambiguous": is_ambiguous,
+                }
+            )
 
         return assignments
 
@@ -1131,6 +1137,7 @@ class PostProcessor:
 # OPTIMIZED LONGITUDINAL INTEGRATOR
 # =============================================================================
 
+
 class LongitudinalIntegrator:
     """Cross-timepoint integration with optimized anchor panel construction."""
 
@@ -1138,8 +1145,7 @@ class LongitudinalIntegrator:
         self.config = config
 
     def build_anchor_panel_for_key(
-        self,
-        sample_results: dict[str, WindowResult]
+        self, sample_results: dict[str, WindowResult]
     ) -> tuple[list[Haplotype], list[str]]:
         """
         Build anchor panel directly from sample_results dict.
@@ -1159,10 +1165,7 @@ class LongitudinalIntegrator:
         return anchor_haps, anchor_samples
 
     def count_timepoints_for_haplotype(
-        self,
-        hap: Haplotype,
-        sample_results: dict[str, WindowResult],
-        positions: list[int]
+        self, hap: Haplotype, sample_results: dict[str, WindowResult], positions: list[int]
     ) -> int:
         """Count timepoints where this haplotype appears."""
         count = 0
@@ -1180,7 +1183,7 @@ class LongitudinalIntegrator:
         self,
         window_result: WindowResult,
         anchor_haps: list[Haplotype],
-        sample_results: dict[str, WindowResult]
+        sample_results: dict[str, WindowResult],
     ) -> WindowResult:
         """Rescue low-confidence haplotypes using anchors."""
         if not anchor_haps:
@@ -1198,7 +1201,7 @@ class LongitudinalIntegrator:
                 continue
 
             # Check for anchor match - only consider anchors with sufficient shared positions
-            best_dist = float('inf')
+            best_dist = float("inf")
             best_n_shared = 0
             for anchor in anchor_haps:
                 dist, _, n_shared = hap.distance_to(anchor, window.snv_pos)
@@ -1206,7 +1209,10 @@ class LongitudinalIntegrator:
                     best_dist = dist
                     best_n_shared = n_shared
 
-            if best_n_shared >= self.config.min_shared_for_rescue and best_dist <= self.config.rescue_match_distance:
+            if (
+                best_n_shared >= self.config.min_shared_for_rescue
+                and best_dist <= self.config.rescue_match_distance
+            ):
                 old_weight = pi[k]
                 new_weight = max(old_weight, self.config.rescued_min_weight)
 
@@ -1247,16 +1253,13 @@ class LongitudinalIntegrator:
                 log_likelihood=window_result.log_likelihood,
                 assignments=assignments,
                 converged=window_result.converged,
-                iterations=window_result.iterations
+                iterations=window_result.iterations,
             )
 
         return window_result
 
     def _recompute_gamma(
-        self,
-        window: Window,
-        haplotypes: list[Haplotype],
-        pi: np.ndarray
+        self, window: Window, haplotypes: list[Haplotype], pi: np.ndarray
     ) -> np.ndarray:
         """Recompute gamma with fixed pi (E-step only)."""
         reads = window.reads
@@ -1310,8 +1313,7 @@ class LongitudinalIntegrator:
         return gamma
 
     def rescue_low_abundance(
-        self,
-        results_by_timepoint: dict[str, list[WindowResult]]
+        self, results_by_timepoint: dict[str, list[WindowResult]]
     ) -> dict[str, list[WindowResult]]:
         """Rescue low-abundance haplotypes across timepoints."""
         if len(results_by_timepoint) < 2:
@@ -1343,10 +1345,9 @@ class LongitudinalIntegrator:
 # MAIN PIPELINE
 # =============================================================================
 
+
 def process_window(
-    window: Window,
-    config: HaplotyperConfig = DEFAULT_CONFIG,
-    n_timepoints_seen: int = 1
+    window: Window, config: HaplotyperConfig = DEFAULT_CONFIG, n_timepoints_seen: int = 1
 ) -> WindowResult:
     """Process a single window through the full pipeline."""
     post = PostProcessor(config)
@@ -1370,7 +1371,7 @@ def process_window(
             log_likelihood=-np.inf,
             assignments=assignments,
             converged=True,
-            iterations=0
+            iterations=0,
         )
 
     # EM
@@ -1387,7 +1388,7 @@ def process_window(
             log_likelihood=log_lik,
             assignments=assignments,
             converged=converged,
-            iterations=iterations
+            iterations=iterations,
         )
 
     # Post-processing with 1-SNP validation
@@ -1404,7 +1405,7 @@ def process_window(
         log_likelihood=log_lik,
         assignments=assignments,
         converged=converged,
-        iterations=iterations
+        iterations=iterations,
     )
 
     # Optional validation
@@ -1415,8 +1416,7 @@ def process_window(
 
 
 def link_windows(
-    results: list[WindowResult],
-    config: HaplotyperConfig = DEFAULT_CONFIG
+    results: list[WindowResult], config: HaplotyperConfig = DEFAULT_CONFIG
 ) -> list[WindowResult]:
     """
     Link haplotypes across overlapping windows based on consensus similarity.
@@ -1478,7 +1478,10 @@ def link_windows(
                     # CRITICAL: Only link if haplotypes actually share called positions
                     # This prevents chaining unrelated haplotypes that happen to lack
                     # calls in the window overlap region
-                    if n_shared >= config.min_shared_snvs_for_link and dist <= config.max_link_distance:
+                    if (
+                        n_shared >= config.min_shared_snvs_for_link
+                        and dist <= config.max_link_distance
+                    ):
                         graph.add_edge((i, hi), (k, hj))
 
     # Find connected components - each is a track
@@ -1487,7 +1490,7 @@ def link_windows(
     # Assign track_ids
     for track_idx, component in enumerate(components):
         track_id = f"T{track_idx + 1:04d}"
-        for (w_idx, h_idx) in component:
+        for w_idx, h_idx in component:
             sorted_results[w_idx].haplotypes[h_idx].track_id = track_id
 
     logging.debug(
@@ -1505,7 +1508,7 @@ def process_contig(
     contig_length: int,
     config: HaplotyperConfig = DEFAULT_CONFIG,
     sample_id: str | None = None,
-    vcf_sample_name: str | None = None
+    vcf_sample_name: str | None = None,
 ) -> list[WindowResult]:
     """
     Process all windows in a contig and link haplotypes across windows.
@@ -1566,10 +1569,17 @@ def process_mag_longitudinal(*args, **kwargs):
     #                            bam_paths: Dict[str, str],
     #                            vcf_paths: Dict[str, str],
     #                            config: HaplotyperConfig)
-    if len(args) >= 2 and isinstance(args[0], dict) and isinstance(args[1], dict) and "samples" not in kwargs:
+    if (
+        len(args) >= 2
+        and isinstance(args[0], dict)
+        and isinstance(args[1], dict)
+        and "samples" not in kwargs
+    ):
         samples_dict: dict[str, tuple[str, str]] = args[0]
         mag_contigs: dict[str, int] = args[1]
-        config: HaplotyperConfig = args[2] if len(args) >= 3 else kwargs.get("config", DEFAULT_CONFIG)
+        config: HaplotyperConfig = (
+            args[2] if len(args) >= 3 else kwargs.get("config", DEFAULT_CONFIG)
+        )
 
         sample_ids = list(samples_dict.keys())
         bam_paths = {sid: samples_dict[sid][0] for sid in sample_ids}
@@ -1582,6 +1592,7 @@ def process_mag_longitudinal(*args, **kwargs):
 # =============================================================================
 # RESULTS EXPORT
 # =============================================================================
+
 
 def results_to_dataframe(results: dict[str, list[WindowResult]]) -> list[dict]:
     """
@@ -1632,26 +1643,27 @@ def results_to_dataframe(results: dict[str, list[WindowResult]]) -> list[dict]:
             # Get sample from first window (all should be same)
             sample = members[0][0].window.sample
 
-            records.append({
-                'contig': contig_id,
-                'sample': sample,
-                'track_id': track_id,
-                'span_start': span_start,
-                'span_end': span_end,
-                'span_bp': span_end - span_start,
-                'n_windows': n_windows,
-                'n_snvs': len(merged_consensus),
-                'mean_weight': total_weight / n_windows if n_windows > 0 else 0.0,
-                'total_supporting_reads': total_reads,
-                'mean_confidence': np.mean(confidences) if confidences else 0.0,
-                'consensus': '|'.join(
-                    f"{pos}:{base}"
-                    for pos, base in sorted(merged_consensus.items())
-                ),
-            })
+            records.append(
+                {
+                    "contig": contig_id,
+                    "sample": sample,
+                    "track_id": track_id,
+                    "span_start": span_start,
+                    "span_end": span_end,
+                    "span_bp": span_end - span_start,
+                    "n_windows": n_windows,
+                    "n_snvs": len(merged_consensus),
+                    "mean_weight": total_weight / n_windows if n_windows > 0 else 0.0,
+                    "total_supporting_reads": total_reads,
+                    "mean_confidence": np.mean(confidences) if confidences else 0.0,
+                    "consensus": "|".join(
+                        f"{pos}:{base}" for pos, base in sorted(merged_consensus.items())
+                    ),
+                }
+            )
 
     # Sort by contig, then by span_start
-    records.sort(key=lambda r: (r['contig'], r['span_start']))
+    records.sort(key=lambda r: (r["contig"], r["span_start"]))
 
     return records
 
@@ -1663,7 +1675,9 @@ def results_to_dataframe(results: dict[str, list[WindowResult]]) -> list[dict]:
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Haplotype reconstruction for PacBio HiFi metagenomics")
+    parser = argparse.ArgumentParser(
+        description="Haplotype reconstruction for PacBio HiFi metagenomics"
+    )
     parser.add_argument("--bam", required=True)
     parser.add_argument("--vcf", required=True)
     parser.add_argument("--contig", required=True)
@@ -1682,22 +1696,22 @@ if __name__ == "__main__":
         window_size=args.window_size,
         max_reads_per_window=args.max_reads,
         random_seed=args.seed,
-        validate_results=not args.no_validate
+        validate_results=not args.no_validate,
     )
 
     logging.basicConfig(level=logging.INFO)
 
     results = process_contig(
-        args.bam, args.vcf, args.contig, args.length,
-        config, args.sample, args.vcf_sample
+        args.bam, args.vcf, args.contig, args.length, config, args.sample, args.vcf_sample
     )
 
     records = results_to_dataframe({args.contig: results})
 
     if records:
         import csv
-        with open(args.output, 'w', newline='') as f:
-            writer = csv.DictWriter(f, fieldnames=records[0].keys(), delimiter='\t')
+
+        with open(args.output, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=records[0].keys(), delimiter="\t")
             writer.writeheader()
             writer.writerows(records)
         print(f"Wrote {len(records)} haplotypes to {args.output}")
