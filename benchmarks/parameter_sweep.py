@@ -527,7 +527,8 @@ class ParameterSweep:
         'merge_distance_threshold': [0.005, 0.01, 0.02],
         'min_weight_for_anchor': [0.05, 0.10, 0.15, 0.20],
         'rescued_min_weight': [0.01, 0.02, 0.05],
-        'window_size': [3000, 5000, 7000, 10000],
+        # Minimum 10000 to ensure sufficient shared SNVs in overlap region for reliable linking
+        'window_size': [10000, 20000, 50000, 100000],
     }
 
     # Parameter order for sequential optimization (most impactful first)
@@ -544,7 +545,7 @@ class ParameterSweep:
 
     # Default/intermediate starting values for sequential optimization
     DEFAULT_START_VALUES = {
-        'window_size': 5000,
+        'window_size': 10000,
         'max_mismatch_frac': 0.01,
         'min_shared_snvs_for_edge': 3,
         'merge_distance_threshold': 0.01,

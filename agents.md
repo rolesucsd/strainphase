@@ -175,6 +175,8 @@ Because Strainphase outputs **linked tracks** (not just per-window haplotypes), 
 | **Missed link rate** | Fraction of true adjacent-window links not recovered (splitting) |
 | **Track consensus error** | Mismatch fraction between inferred track consensus and truth at shared SNV sites |
 
+**Linking rule (required):** For adjacent windows, evaluate all candidate haplotype pairs first, then select only the smallest-distance match. If a haplotype has more than one perfect match (or any distance tie for the minimum), do not link it to any option.
+
 ### 3.5 Longitudinal Lineage Validation (Strainphase-specific)
 
 | Metric | Definition |
@@ -194,8 +196,9 @@ Supports benchmarking on **simulated data** (with ground truth) and **real data*
 ```python
 PARAMETER_GRID = {
     # Windowing / subsampling
-    # (Publication expansion: include at least a small sweep here)
-    'window_size': [3000, 5000, 7000, 10000],
+    # Minimum window_size is 10000 to ensure sufficient shared SNVs for reliable linking.
+    # With ~1-2 SNVs/kb, smaller windows have too few SNVs in the 50% overlap region.
+    'window_size': [10000, 20000, 50000, 100000],
     'max_reads_per_window': [100, 300, 600],
 
     # Clustering parameters
