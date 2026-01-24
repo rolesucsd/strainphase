@@ -49,6 +49,8 @@ MAX_CONFIGS="${MAX_CONFIGS:-}"
 PASSES="${PASSES:-1}"
 # CHECKPOINT_INTERVAL: Save checkpoint every N configs
 CHECKPOINT_INTERVAL="${CHECKPOINT_INTERVAL:-10}"
+# WORKERS: Number of parallel workers for window processing (use SLURM cpus if available)
+WORKERS="${WORKERS:-${SLURM_CPUS_PER_TASK:-8}}"
 
 # Complexity levels: number of strains
 declare -A COMPLEXITY_STRAINS=(
@@ -99,6 +101,7 @@ if [[ "$MODE" == "sequential" ]]; then
 elif [[ -n "$MAX_CONFIGS" ]]; then
     echo "Max configs: $MAX_CONFIGS"
 fi
+echo "Parallel workers: $WORKERS"
 echo "============================================================"
 
 # Create output directories
@@ -170,6 +173,7 @@ elif [[ -n "$MAX_CONFIGS" ]]; then
 fi
 
 PYTHON_CMD="$PYTHON_CMD --checkpoint-interval $CHECKPOINT_INTERVAL"
+PYTHON_CMD="$PYTHON_CMD --workers $WORKERS"
 
 # Run the benchmark
 eval "$PYTHON_CMD" 2>&1 | tee "${OUTPUT_DIR}/benchmark.log"

@@ -27,6 +27,8 @@ import logging
 import warnings
 from collections import defaultdict
 from dataclasses import dataclass, field
+from multiprocessing import Pool
+from functools import partial
 
 import community as community_louvain
 import networkx as nx
@@ -147,6 +149,7 @@ class HaplotyperConfig:
     # =========== RUNTIME PARAMETERS ===========
     random_seed: int | None = None
     validate_results: bool = False  # Set False for production runs
+    n_workers: int = 1  # Number of parallel workers for window processing (1=sequential)
 
     def __post_init__(self):
         """Validate configuration parameters."""
@@ -1453,21 +1456,44 @@ def link_windows(
             if len(shared_snvs) < config.min_shared_snvs_for_link:
                 continue
 
-            # Try to link each pair of haplotypes
+            # Evaluate candidate pairings before linking (avoid cross-links).
+            candidates: list[tuple[int, int, float]] = []
             for hi, hap_i in enumerate(curr_wr.haplotypes):
                 for hj, hap_j in enumerate(next_wr.haplotypes):
-                    # Compute distance on shared positions
-                    # n_shared is the count of positions where BOTH haplotypes have calls
                     dist, _, n_shared = hap_i.distance_to(hap_j, shared_snvs)
+                    # Only consider pairs with real shared calls
+                    if n_shared < config.min_shared_snvs_for_link:
+                        continue
+                    if dist <= config.max_link_distance:
+                        candidates.append((hi, hj, dist))
 
-                    # CRITICAL: Only link if haplotypes actually share called positions
-                    # This prevents chaining unrelated haplotypes that happen to lack
-                    # calls in the window overlap region
-                    if (
-                        n_shared >= config.min_shared_snvs_for_link
-                        and dist <= config.max_link_distance
-                    ):
-                        graph.add_edge((i, hi), (k, hj))
+            if not candidates:
+                continue
+
+            # Track unique best matches for each haplotype on both sides.
+            best_for_i: dict[int, list[tuple[float, int]]] = {}
+            best_for_j: dict[int, list[tuple[float, int]]] = {}
+            for hi, hj, dist in candidates:
+                best_for_i.setdefault(hi, []).append((dist, hj))
+                best_for_j.setdefault(hj, []).append((dist, hi))
+
+            def unique_best(matches: dict[int, list[tuple[float, int]]]) -> dict[int, tuple[int, float]]:
+                unique: dict[int, tuple[int, float]] = {}
+                for idx, options in matches.items():
+                    options.sort(key=lambda x: x[0])
+                    best_dist = options[0][0]
+                    bests = [opt for opt in options if opt[0] == best_dist]
+                    # Skip ambiguous ties (including multiple perfect matches).
+                    if len(bests) == 1:
+                        unique[idx] = (bests[0][1], best_dist)
+                return unique
+
+            unique_i = unique_best(best_for_i)
+            unique_j = unique_best(best_for_j)
+
+            for hi, (hj, dist) in unique_i.items():
+                if hj in unique_j and unique_j[hj][0] == hi:
+                    graph.add_edge((i, hi), (k, hj))
 
     # Find connected components - each is a track
     components = list(nx.connected_components(graph))
@@ -1519,16 +1545,34 @@ def process_contig(
         logging.warning(f"No valid windows for contig {contig_id}")
         return []
 
-    # Process each window
-    results = []
-    for window in windows:
-        result = process_window(window, config)
-        results.append(result)
+    # Process windows (parallel if n_workers > 1)
+    n_workers = config.n_workers
+    if n_workers > 1 and len(windows) > 1:
+        # Parallel processing using multiprocessing Pool
+        n_workers = min(n_workers, len(windows))
+        logging.info(f"Processing {len(windows)} windows with {n_workers} workers")
+
+        # Use partial to bind config to process_window
+        process_func = partial(_process_window_wrapper, config=config)
+
+        with Pool(n_workers) as pool:
+            results = pool.map(process_func, windows)
+    else:
+        # Sequential processing
+        results = []
+        for window in windows:
+            result = process_window(window, config)
+            results.append(result)
 
     # Link haplotypes across overlapping windows
     results = link_windows(results, config)
 
     return results
+
+
+def _process_window_wrapper(window: Window, config: HaplotyperConfig) -> WindowResult:
+    """Wrapper for process_window that can be pickled for multiprocessing."""
+    return process_window(window, config)
 
 
 def process_mag_longitudinal(*args, **kwargs):

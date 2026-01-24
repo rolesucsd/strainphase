@@ -227,6 +227,7 @@ def run_parameter_sweep(
     resume: bool = False,
     checkpoint_interval: int = 10,
     passes: int = 1,
+    n_workers: int = 1,
 ) -> Dict[str, Any]:
     """
     Run parameter sweep on simulated data.
@@ -241,11 +242,14 @@ def run_parameter_sweep(
         resume: Resume from checkpoint if available
         checkpoint_interval: Save checkpoint every N configs
         passes: Number of optimization passes (sequential mode only)
+        n_workers: Number of parallel workers for window processing
     """
     logger.info("=" * 60)
     logger.info("STEP 4: Running parameter sweep")
     logger.info("=" * 60)
     logger.info(f"Mode: {mode}")
+    if n_workers > 1:
+        logger.info(f"Parallel workers: {n_workers}")
 
     from parameter_sweep import run_parameter_sweep as sweep_func
 
@@ -285,6 +289,7 @@ def run_parameter_sweep(
         resume=resume,
         checkpoint_interval=checkpoint_interval,
         passes=passes,
+        n_workers=n_workers,
     )
 
     return summary
@@ -374,6 +379,7 @@ def run_full_benchmark(
     mode: str = "grid",
     passes: int = 1,
     checkpoint_interval: int = 10,
+    n_workers: int = 1,
 ) -> Dict[str, Any]:
     """
     Run the complete benchmark pipeline.
@@ -395,6 +401,7 @@ def run_full_benchmark(
         mode: "grid" for full sweep, "sequential" for coordinate descent
         passes: Number of optimization passes (sequential mode)
         checkpoint_interval: Save checkpoint every N configs
+        n_workers: Number of parallel workers for window processing
 
     Returns summary dict with all results.
     """
@@ -412,6 +419,8 @@ def run_full_benchmark(
         logger.info(f"Optimization passes: {passes}")
     else:
         logger.info(f"Max parameter configs: {max_configs or 'all'}")
+    if n_workers > 1:
+        logger.info(f"Parallel workers: {n_workers}")
     logger.info("=" * 60)
 
     # Check dependencies
@@ -509,6 +518,7 @@ def run_full_benchmark(
         resume=resume,
         checkpoint_interval=checkpoint_interval,
         passes=passes,
+        n_workers=n_workers,
     )
     results["steps"]["parameter_sweep"] = {
         "success": bool(sweep_summary),
@@ -624,6 +634,10 @@ def main():
     parser.add_argument("--passes", type=int, default=1,
                         help="Number of optimization passes (sequential mode only)")
 
+    # Parallelization
+    parser.add_argument("-j", "--workers", type=int, default=1,
+                        help="Number of parallel workers for window processing (default: 1)")
+
     # Optional steps
     parser.add_argument("--include-performance", action="store_true",
                         help="Include performance profiling benchmark")
@@ -656,6 +670,7 @@ def main():
         mode=args.mode,
         passes=args.passes,
         checkpoint_interval=args.checkpoint_interval,
+        n_workers=args.workers,
     )
 
     # Exit with error if any critical step failed
