@@ -40,6 +40,16 @@ TIMEPOINTS="${TIMEPOINTS:-4}"
 COVERAGE="${COVERAGE:-30}"
 SEED="${SEED:-42}"
 
+# Parameter sweep configuration
+# MODE: "grid" for full sweep (13,824 configs), "sequential" for coordinate descent (~27 configs)
+MODE="${MODE:-sequential}"
+# MAX_CONFIGS: Limit configs for grid mode (empty = all)
+MAX_CONFIGS="${MAX_CONFIGS:-}"
+# PASSES: Number of optimization passes for sequential mode
+PASSES="${PASSES:-1}"
+# CHECKPOINT_INTERVAL: Save checkpoint every N configs
+CHECKPOINT_INTERVAL="${CHECKPOINT_INTERVAL:-10}"
+
 # Complexity levels: number of strains
 declare -A COMPLEXITY_STRAINS=(
     [1]=2    # Simple
@@ -83,6 +93,12 @@ echo "Number of strains: $N_STRAINS"
 echo "Timepoints: $TIMEPOINTS"
 echo "Coverage: ${COVERAGE}x"
 echo "Genome source: $GENOME_SOURCE"
+echo "Sweep mode: $MODE"
+if [[ "$MODE" == "sequential" ]]; then
+    echo "Optimization passes: $PASSES"
+elif [[ -n "$MAX_CONFIGS" ]]; then
+    echo "Max configs: $MAX_CONFIGS"
+fi
 echo "============================================================"
 
 # Create output directories
@@ -136,14 +152,27 @@ echo "Starting benchmark..."
 echo "Output: $OUTPUT_DIR"
 echo ""
 
-python benchmarks/run_full_benchmark.py \
-    --genomes "$GENOME_DIR" \
-    --output "$OUTPUT_DIR" \
-    --timepoints "$TIMEPOINTS" \
-    --coverage "$COVERAGE" \
+# Build python command with optional arguments
+PYTHON_CMD="python benchmarks/run_full_benchmark.py \
+    --genomes $GENOME_DIR \
+    --output $OUTPUT_DIR \
+    --timepoints $TIMEPOINTS \
+    --coverage $COVERAGE \
     --resume \
-    --seed "$SEED" \
-    2>&1 | tee "${OUTPUT_DIR}/benchmark.log"
+    --seed $SEED \
+    --mode $MODE"
+
+# Add mode-specific options
+if [[ "$MODE" == "sequential" ]]; then
+    PYTHON_CMD="$PYTHON_CMD --passes $PASSES"
+elif [[ -n "$MAX_CONFIGS" ]]; then
+    PYTHON_CMD="$PYTHON_CMD --max-configs $MAX_CONFIGS"
+fi
+
+PYTHON_CMD="$PYTHON_CMD --checkpoint-interval $CHECKPOINT_INTERVAL"
+
+# Run the benchmark
+eval "$PYTHON_CMD" 2>&1 | tee "${OUTPUT_DIR}/benchmark.log"
 
 # Check exit status
 if [[ $? -eq 0 ]]; then

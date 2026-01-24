@@ -222,14 +222,30 @@ def run_parameter_sweep(
     output_dir: str,
     max_configs: Optional[int] = None,
     max_contigs: Optional[int] = None,
-    verbose: bool = True
+    verbose: bool = True,
+    mode: str = "grid",
+    resume: bool = False,
+    checkpoint_interval: int = 10,
+    passes: int = 1,
 ) -> Dict[str, Any]:
     """
     Run parameter sweep on simulated data.
+
+    Args:
+        sim_dir: Directory with simulated data (BAM, VCF files)
+        output_dir: Output directory for results
+        max_configs: Limit number of configs (grid mode only)
+        max_contigs: Limit number of contigs to process
+        verbose: Print progress
+        mode: "grid" for full sweep, "sequential" for coordinate descent
+        resume: Resume from checkpoint if available
+        checkpoint_interval: Save checkpoint every N configs
+        passes: Number of optimization passes (sequential mode only)
     """
     logger.info("=" * 60)
     logger.info("STEP 4: Running parameter sweep")
     logger.info("=" * 60)
+    logger.info(f"Mode: {mode}")
 
     from parameter_sweep import run_parameter_sweep as sweep_func
 
@@ -264,7 +280,11 @@ def run_parameter_sweep(
         truth_dir=sim_dir,
         max_configs=max_configs,
         max_contigs=max_contigs,
-        verbose=verbose
+        verbose=verbose,
+        mode=mode,
+        resume=resume,
+        checkpoint_interval=checkpoint_interval,
+        passes=passes,
     )
 
     return summary
@@ -350,10 +370,31 @@ def run_full_benchmark(
     max_contigs: Optional[int] = None,
     include_performance: bool = False,
     resume: bool = False,
-    verbose: bool = True
+    verbose: bool = True,
+    mode: str = "grid",
+    passes: int = 1,
+    checkpoint_interval: int = 10,
 ) -> Dict[str, Any]:
     """
     Run the complete benchmark pipeline.
+
+    Args:
+        genomes_dir: Directory containing strain FASTA files
+        output_dir: Output directory for all results
+        n_timepoints: Number of timepoints to simulate
+        coverage: Read coverage per timepoint
+        snv_density: SNVs per 10kb to introduce
+        error_rate: Sequencing error rate
+        seed: Random seed
+        max_strains: Limit number of strains
+        max_configs: Limit number of configs (grid mode only)
+        max_contigs: Limit number of contigs
+        include_performance: Include performance profiling
+        resume: Resume from checkpoint
+        verbose: Print progress
+        mode: "grid" for full sweep, "sequential" for coordinate descent
+        passes: Number of optimization passes (sequential mode)
+        checkpoint_interval: Save checkpoint every N configs
 
     Returns summary dict with all results.
     """
@@ -366,7 +407,11 @@ def run_full_benchmark(
     logger.info(f"Output directory: {output_dir}")
     logger.info(f"Timepoints: {n_timepoints}")
     logger.info(f"Coverage: {coverage}x")
-    logger.info(f"Max parameter configs: {max_configs or 'all'}")
+    logger.info(f"Sweep mode: {mode}")
+    if mode == "sequential":
+        logger.info(f"Optimization passes: {passes}")
+    else:
+        logger.info(f"Max parameter configs: {max_configs or 'all'}")
     logger.info("=" * 60)
 
     # Check dependencies
@@ -459,7 +504,11 @@ def run_full_benchmark(
         output_dir=output_dir,
         max_configs=max_configs,
         max_contigs=max_contigs,
-        verbose=verbose
+        verbose=verbose,
+        mode=mode,
+        resume=resume,
+        checkpoint_interval=checkpoint_interval,
+        passes=passes,
     )
     results["steps"]["parameter_sweep"] = {
         "success": bool(sweep_summary),
@@ -558,15 +607,28 @@ def main():
 
     # Sweep parameters
     parser.add_argument("--max-configs", type=int,
-                        help="Limit number of parameter configs to test")
+                        help="Limit number of parameter configs to test (grid mode only)")
     parser.add_argument("--max-contigs", type=int,
                         help="Limit number of contigs to process")
+
+    # Mode selection
+    parser.add_argument("--mode", choices=["grid", "sequential"], default="grid",
+                        help="Optimization mode: 'grid' for full sweep (13,824 configs), "
+                             "'sequential' for coordinate descent (~27 configs)")
+
+    # Checkpointing
+    parser.add_argument("--checkpoint-interval", type=int, default=10,
+                        help="Save checkpoint every N configs")
+
+    # Sequential mode options
+    parser.add_argument("--passes", type=int, default=1,
+                        help="Number of optimization passes (sequential mode only)")
 
     # Optional steps
     parser.add_argument("--include-performance", action="store_true",
                         help="Include performance profiling benchmark")
     parser.add_argument("--resume", action="store_true",
-                        help="Skip completed simulation/BAM/VCF steps if outputs exist")
+                        help="Resume from checkpoint if available")
 
     # Verbosity
     parser.add_argument("--quiet", "-q", action="store_true",
@@ -590,7 +652,10 @@ def main():
         max_contigs=args.max_contigs,
         include_performance=args.include_performance,
         resume=args.resume,
-        verbose=not args.quiet
+        verbose=not args.quiet,
+        mode=args.mode,
+        passes=args.passes,
+        checkpoint_interval=args.checkpoint_interval,
     )
 
     # Exit with error if any critical step failed
