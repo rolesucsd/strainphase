@@ -75,7 +75,7 @@ class ParameterSet:
     rescued_min_weight: float
     window_size: int
 
-    def to_config(self, base_config: Optional[HaplotyperConfig] = None) -> HaplotyperConfig:
+    def to_config(self, base_config: Optional[HaplotyperConfig] = None, n_workers: int = 1) -> HaplotyperConfig:
         """Convert to HaplotyperConfig."""
         if base_config is None:
             base_config = HaplotyperConfig()
@@ -105,6 +105,7 @@ class ParameterSet:
             min_reads_per_window=base_config.min_reads_per_window,
             em_max_iter=base_config.em_max_iter,
             validate_results=False,  # Faster for sweep
+            n_workers=n_workers,  # Parallel window processing
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -479,7 +480,8 @@ def process_contig_with_params(
     contig_id: str,
     contig_length: int,
     params: ParameterSet,
-    sample_id: str = "sample"
+    sample_id: str = "sample",
+    n_workers: int = 1,
 ) -> List[WindowResult]:
     """
     Process a single contig with given parameter set.
@@ -488,7 +490,7 @@ def process_contig_with_params(
     """
     from strainphase.core import process_contig
 
-    config = params.to_config()
+    config = params.to_config(n_workers=n_workers)
 
     try:
         results = process_contig(
@@ -612,6 +614,7 @@ class ParameterSweep:
         resume: bool = False,
         checkpoint_interval: int = 10,
         output_dir: Optional[str] = None,
+        n_workers: int = 1,
     ) -> List[SweepResult]:
         """
         Run parameter sweep on BAM/VCF data with checkpointing.
@@ -626,6 +629,7 @@ class ParameterSweep:
             resume: If True, resume from last checkpoint
             checkpoint_interval: How often to save progress (in configs)
             output_dir: Output directory for checkpoints (required if resume=True)
+            n_workers: Number of parallel workers for window processing
         """
         if not HAS_PYSAM:
             raise ImportError("pysam required for BAM/VCF processing")
@@ -708,7 +712,7 @@ class ParameterSweep:
                 for contig_idx, (contig_id, contig_length) in enumerate(contigs.items(), 1):
                     results = process_contig_with_params(
                         bam_path, vcf_path, contig_id, contig_length,
-                        params, sample_id="sample"
+                        params, sample_id="sample", n_workers=n_workers
                     )
                     all_window_results.extend(results)
 
@@ -846,6 +850,7 @@ class ParameterSweep:
         contigs: Dict[str, int],
         progress_logger: ProgressLogger,
         config_idx: int,
+        n_workers: int = 1,
     ) -> SweepResult:
         """Run a single parameter configuration and return the result."""
         start_time = time.time()
@@ -854,7 +859,7 @@ class ParameterSweep:
         for contig_idx, (contig_id, contig_length) in enumerate(contigs.items(), 1):
             results = process_contig_with_params(
                 self.bam_path, self.vcf_path, contig_id, contig_length,
-                params, sample_id="sample"
+                params, sample_id="sample", n_workers=n_workers
             )
             all_window_results.extend(results)
             progress_logger.log_contig_progress(config_idx, contig_idx, contig_id, len(results))
@@ -911,6 +916,7 @@ class ParameterSweep:
         max_passes: int = 1,
         param_order: Optional[List[str]] = None,
         start_values: Optional[Dict[str, Any]] = None,
+        n_workers: int = 1,
     ) -> tuple:
         """
         Run sequential/coordinate descent parameter optimization.
@@ -933,6 +939,7 @@ class ParameterSweep:
             max_passes: Number of passes through all parameters (default: 1)
             param_order: Order to optimize parameters (default: most impactful first)
             start_values: Initial parameter values (default: intermediate values)
+            n_workers: Number of parallel workers for window processing
 
         Returns:
             (all_results, best_params_dict)
@@ -1037,7 +1044,7 @@ class ParameterSweep:
                         progress_logger.log_config_start(config_count, params)
 
                         try:
-                            result = self._run_single_config(params, contigs, progress_logger, config_count)
+                            result = self._run_single_config(params, contigs, progress_logger, config_count, n_workers)
                             progress_logger.log_config_complete(config_count, result)
 
                             self.results.append(result)
@@ -1245,6 +1252,7 @@ def run_parameter_sweep(
     resume: bool = False,
     checkpoint_interval: int = 10,
     passes: int = 1,
+    n_workers: int = 1,
 ) -> Dict[str, Any]:
     """
     Run complete parameter sweep and save results.
@@ -1262,6 +1270,7 @@ def run_parameter_sweep(
         resume: If True, resume from last checkpoint
         checkpoint_interval: How often to save progress (in configs)
         passes: Number of optimization passes (sequential mode only)
+        n_workers: Number of parallel workers for window processing
     """
     os.makedirs(output_dir, exist_ok=True)
 
@@ -1285,6 +1294,7 @@ def run_parameter_sweep(
             resume=resume,
             checkpoint_interval=checkpoint_interval,
             max_passes=passes,
+            n_workers=n_workers,
         )
     else:
         logger.info(f"Starting parameter sweep on: {bam_path}")
@@ -1298,6 +1308,7 @@ def run_parameter_sweep(
             resume=resume,
             checkpoint_interval=checkpoint_interval,
             output_dir=output_dir,
+            n_workers=n_workers,
         )
 
     # Save raw results
@@ -1402,6 +1413,10 @@ def main():
     parser.add_argument("--passes", type=int, default=1,
                         help="Number of optimization passes (sequential mode only)")
 
+    # Parallelization
+    parser.add_argument("-j", "--workers", type=int, default=1,
+                        help="Number of parallel workers for window processing (default: 1)")
+
     # Verbosity
     parser.add_argument("--quiet", "-q", action="store_true",
                         help="Reduce output verbosity")
@@ -1421,6 +1436,7 @@ def main():
         resume=args.resume,
         checkpoint_interval=args.checkpoint_interval,
         passes=args.passes,
+        n_workers=args.workers,
     )
 
 
