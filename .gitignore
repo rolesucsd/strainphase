@@ -35,7 +35,11 @@ docs/tutorials/
 # Generated data (simulations, benchmarks)
 data/
 tmp/
+tmp2/
 results/
+
+# Conda environments
+.conda/
 
 # Local instructions
 agents.md
