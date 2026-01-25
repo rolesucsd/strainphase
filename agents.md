@@ -20,15 +20,25 @@ The benchmarking and validation pipeline requires these Python packages at runti
 
 ### 1.1 Input Requirements
 
-**User provides**: A folder containing individual bacterial genome FASTA files (one per strain).
+**User provides**: A folder containing individual bacterial genome FASTA files (one per genome).
 
 ```
 user_genomes/
-├── species_A_strain_1.fasta
-├── species_A_strain_2.fasta
-├── species_B_strain_1.fasta
+├── species_A_genome_1.fasta
+├── species_B_genome_1.fasta
 └── ...
 ```
+
+**Important**: The simulation creates **multiple strains from each genome file provided**. For every single genome file:
+- **Randomly chooses** a number between **2 and `max_strains`** strains per genome file
+- Each genome file creates: 1 reference strain (no SNVs) + (N-1) variant strains (with SNVs), where N is randomly chosen between 2 and `max_strains`
+- If `max_strains` is not specified or < 2, defaults to exactly 2 strains per genome file
+
+**Example**: If you provide 3 genome files and `max_strains=5`:
+- Genome file 1 → randomly creates 3 strains (1 reference + 2 variants)
+- Genome file 2 → randomly creates 5 strains (1 reference + 4 variants)  
+- Genome file 3 → randomly creates 2 strains (1 reference + 1 variant)
+- **Total: 10 strains** (3 references + 7 variants, with varying numbers per genome)
 
 **Tool generates**: Synthetic HiFi reads with known ground truth.
 

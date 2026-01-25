@@ -4,12 +4,21 @@ Performance benchmarking script for Strainphase.
 
 Measures runtime, memory usage, and scalability across different parameters.
 
+**NOTE**: This script uses in-memory synthetic data (SyntheticDataGenerator) which is
+different from the file-based simulation used by the main benchmarking pipeline.
+This is useful for quick performance profiling but results may differ from
+file-based benchmarks due to different data characteristics.
+
+This script is automatically called by run_full_benchmark.py (always included),
+but can also be run standalone.
+
 Usage:
     python benchmarks/benchmark_performance.py --output results/
     python benchmarks/benchmark_performance.py --quick  # Fast benchmarks
 """
 
 import argparse
+import sys
 import logging
 import time
 import tracemalloc
@@ -17,7 +26,8 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 import json
 
-from strainphase import HaplotyperConfig, process_window, link_windows
+from strainphase import HaplotyperConfig, link_windows
+from strainphase.core import process_window
 from strainphase.simulation import SyntheticDataGenerator, SimulationScenario
 
 import numpy as np
@@ -49,16 +59,16 @@ class PerformanceBenchmark:
 
         # Generate window
         logging.info("  Generating synthetic data...")
-        window = generator.generate_window(
+        window, _ = generator.generate_reads_for_window(
             scenario=scenario,
             timepoint=scenario.timepoints[0],
             window_start=1,
             window_end=scenario.contig_length,
             n_reads=n_reads,
-            coverage=coverage,
-            read_length=10000,
             error_rate=0.001,
         )
+        if window is None:
+            raise ValueError("Synthetic window generation returned no SNVs for benchmarking.")
 
         logging.info(f"  Window: {len(window.reads)} reads, {len(window.snv_pos)} SNVs")
 

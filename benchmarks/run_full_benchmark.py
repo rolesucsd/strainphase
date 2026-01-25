@@ -5,9 +5,12 @@ Unified benchmark pipeline for Strainphase.
 Orchestrates the complete benchmark workflow:
 1. Simulate HiFi reads from user-provided bacterial genomes
 2. Convert SAM to BAM and index
-3. Run parameter sweep across configurations
+3. Run parameter sweep across configurations (with automatic validation)
 4. Generate HTML report with figures
-5. Run performance profiling (optional)
+5. Run performance profiling (uses in-memory synthetic data for scalability testing)
+
+This is the PRIMARY entry point for all benchmarking. All validation and
+reporting modules are automatically called by this script.
 
 Usage:
     # Full benchmark with 1 genome (test run)
@@ -21,8 +24,10 @@ Usage:
         --genomes data/genomes/ \
         --output results/benchmark/ \
         --timepoints 4 \
-        --coverage 30 \
-        --include-performance
+        --coverage 30
+
+Note: Performance profiling automatically runs and uses in-memory synthetic data
+for scalability testing (results may differ from file-based benchmarks).
 """
 
 import argparse
@@ -255,31 +260,90 @@ def run_parameter_sweep(
 
     sim_path = Path(sim_dir)
 
-    # Find BAM file (use first timepoint)
+    # Find all BAM files (all timepoints)
     bam_files = sorted(sim_path.glob("*.bam"))
     if not bam_files:
         logger.error(f"No BAM files found in {sim_dir}")
         return {}
 
-    bam_path = str(bam_files[0])
-
-    # Find VCF file
-    vcf_path = sim_path / "variants.vcf.gz"
-    if not vcf_path.exists():
-        vcf_path = sim_path / "variants.vcf"
-    if not vcf_path.exists():
-        vcf_path = sim_path / "truth_snvs.vcf"
-    if not vcf_path.exists():
-        vcf_path = sim_path / "truth_variants.vcf"
-
-    vcf_path = str(vcf_path)
+    # Extract timepoint IDs from BAM filenames (e.g., T1.bam -> T1)
+    timepoints = []
+    bam_paths = {}
+    vcf_paths = {}
+    
+    for bam_file in bam_files:
+        timepoint = bam_file.stem  # e.g., "T1"
+        timepoints.append(timepoint)
+        bam_paths[timepoint] = str(bam_file)
+        
+        # Find corresponding VCF file for this timepoint
+        vcf_path = sim_path / f"{timepoint}.vcf.gz"
+        if not vcf_path.exists():
+            vcf_path = sim_path / f"{timepoint}.vcf"
+        if not vcf_path.exists():
+            # Fallback to shared variants.vcf
+            vcf_path = sim_path / "variants.vcf.gz"
+            if not vcf_path.exists():
+                vcf_path = sim_path / "variants.vcf"
+                if not vcf_path.exists():
+                    vcf_path = sim_path / "truth_snvs.vcf"
+                    if not vcf_path.exists():
+                        vcf_path = sim_path / "truth_variants.vcf"
+        
+        if vcf_path.exists():
+            vcf_paths[timepoint] = str(vcf_path)
+        else:
+            logger.warning(f"No VCF found for timepoint {timepoint}, skipping")
+    
+    if not timepoints:
+        logger.error("No valid timepoints found")
+        return {}
+    
+    logger.info(f"Found {len(timepoints)} timepoints: {timepoints}")
+    
+    # Find reference FASTA (needed for longitudinal processing)
+    reference_path = sim_path / "combined_reference.fasta"
+    if not reference_path.exists():
+        # Try alternative names
+        ref_files = list(sim_path.glob("*.fasta")) + list(sim_path.glob("*.fa"))
+        if ref_files:
+            reference_path = ref_files[0]
+        else:
+            logger.error(f"No reference FASTA found in {sim_dir}")
+            return {}
+    
+    # Create .fai index if it doesn't exist (required by parse_reference_contigs)
+    fai_path = Path(str(reference_path) + ".fai")
+    if not fai_path.exists():
+        logger.info(f"Creating FASTA index: {fai_path.name}")
+        try:
+            # Use pysam.faidx to create the index (no external samtools needed)
+            import pysam
+            pysam.faidx(str(reference_path))
+            if not fai_path.exists():
+                raise RuntimeError(f"Index file {fai_path.name} was not created")
+            logger.info(f"Created FASTA index: {fai_path.name}")
+        except ImportError:
+            logger.error("pysam is required to create FASTA index")
+            logger.error("Install with: pip install pysam")
+            return {}
+        except Exception as e:
+            logger.error(f"Failed to create FASTA index: {e}")
+            logger.error("You can create it manually with:")
+            logger.error(f"  samtools faidx {reference_path}")
+            logger.error("  or: python -c 'import pysam; pysam.faidx(\"{}\")'".format(reference_path))
+            return {}
+    
+    reference_path = str(reference_path)
 
     sweep_output = Path(output_dir) / "sweep_results"
     sweep_output.mkdir(parents=True, exist_ok=True)
 
     summary = sweep_func(
-        bam_path=bam_path,
-        vcf_path=vcf_path,
+        bam_paths=bam_paths if len(timepoints) > 1 else {timepoints[0]: bam_paths[timepoints[0]]},
+        vcf_paths=vcf_paths if len(timepoints) > 1 else {timepoints[0]: vcf_paths[timepoints[0]]},
+        reference_path=reference_path if len(timepoints) > 1 else None,
+        timepoints=timepoints,
         output_dir=str(sweep_output),
         truth_dir=sim_dir,
         max_configs=max_configs,
@@ -333,10 +397,14 @@ def run_performance_benchmark(
 ) -> bool:
     """
     Run performance profiling benchmark.
+    
+    NOTE: This uses in-memory synthetic data (different from file-based pipeline)
+    for quick performance profiling. Results may differ from file-based benchmarks.
     """
     logger.info("=" * 60)
     logger.info("STEP 6: Running performance benchmark")
     logger.info("=" * 60)
+    logger.info("NOTE: Using in-memory synthetic data for performance profiling")
 
     script_path = Path(__file__).parent / "benchmark_performance.py"
 
@@ -373,7 +441,6 @@ def run_full_benchmark(
     max_strains: Optional[int] = None,
     max_configs: Optional[int] = None,
     max_contigs: Optional[int] = None,
-    include_performance: bool = False,
     resume: bool = False,
     verbose: bool = True,
     mode: str = "grid",
@@ -395,7 +462,6 @@ def run_full_benchmark(
         max_strains: Limit number of strains
         max_configs: Limit number of configs (grid mode only)
         max_contigs: Limit number of contigs
-        include_performance: Include performance profiling
         resume: Resume from checkpoint
         verbose: Print progress
         mode: "grid" for full sweep, "sequential" for coordinate descent
@@ -539,18 +605,17 @@ def run_full_benchmark(
         "duration_seconds": time.time() - step_start
     }
 
-    # Step 6: Performance benchmark (optional)
-    if include_performance:
-        step_start = time.time()
-        success = run_performance_benchmark(
-            sim_dir=str(sim_dir),
-            output_dir=output_dir,
-            quick=True
-        )
-        results["steps"]["performance_benchmark"] = {
-            "success": success,
-            "duration_seconds": time.time() - step_start
-        }
+    # Step 6: Performance benchmark (always run)
+    step_start = time.time()
+    success = run_performance_benchmark(
+        sim_dir=str(sim_dir),
+        output_dir=output_dir,
+        quick=True
+    )
+    results["steps"]["performance_benchmark"] = {
+        "success": success,
+        "duration_seconds": time.time() - step_start
+    }
 
     # Total time
     total_time = time.time() - start_time
@@ -639,8 +704,6 @@ def main():
                         help="Number of parallel workers for window processing (default: 1)")
 
     # Optional steps
-    parser.add_argument("--include-performance", action="store_true",
-                        help="Include performance profiling benchmark")
     parser.add_argument("--resume", action="store_true",
                         help="Resume from checkpoint if available")
 
@@ -664,7 +727,6 @@ def main():
         max_strains=args.max_strains,
         max_configs=args.max_configs,
         max_contigs=args.max_contigs,
-        include_performance=args.include_performance,
         resume=args.resume,
         verbose=not args.quiet,
         mode=args.mode,

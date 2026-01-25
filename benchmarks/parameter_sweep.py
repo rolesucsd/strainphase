@@ -2,30 +2,26 @@
 """
 Parameter sweep framework for haplotyper pipeline.
 
-Tests pipeline stability across a grid of parameters:
-- mismatch thresholds: 0.5%, 1%, 2%, 4%
-- MAPQ: 10, 20, 30
-- base quality: 20, 30
-- shared SNVs: 2, 3, 4, 5
-- merge distance: 0.5%, 1%, 2%
-- anchor weight: 5%, 10%, 15%, 20%
-- rescued min weight: 1%, 2%, 5%
-- window size: 3000, 5000, 7000, 10000
+This module is used by run_full_benchmark.py to test parameter configurations.
+It can also be run standalone for custom parameter sweeps.
+
+Tests pipeline stability across a grid of parameters (see REQUIRED_GRID for full list).
+Automatically runs validation for each configuration when truth_dir is provided.
 
 Evaluates:
 - Number of lineages inferred
 - Major lineage frequency trajectories
 - Sweep detection stability
+- Validation metrics (precision, recall, F1, track/linking, lineage metrics)
 
-Requires file-based input (BAM/VCF). Use run_full_benchmark.py to generate
-simulated data from real genomes and run the complete benchmark pipeline.
-
-Usage:
+Usage (standalone):
     python benchmarks/parameter_sweep.py \
         --bam data/simulated/T1.bam \
         --vcf data/simulated/T1.vcf.gz \
         --truth data/simulated/ \
         --output benchmarks/sweep_results/
+
+Note: For full benchmarking pipeline, use run_full_benchmark.py instead.
 """
 
 import argparse
@@ -74,11 +70,26 @@ class ParameterSet:
     min_weight_for_anchor: float
     rescued_min_weight: float
     window_size: int
+    # New parameters (optional, with defaults)
+    max_reads_per_window: Optional[int] = None
+    junk_divergence_rate: Optional[float] = None
+    max_link_distance: Optional[float] = None
+    min_shared_snvs_for_link: Optional[int] = None
+    rescue_match_distance: Optional[float] = None
+    lineage_merge_distance: Optional[float] = None
 
     def to_config(self, base_config: Optional[HaplotyperConfig] = None, n_workers: int = 1) -> HaplotyperConfig:
         """Convert to HaplotyperConfig."""
         if base_config is None:
             base_config = HaplotyperConfig()
+
+        # Get values for new parameters (with defaults if not in ParameterSet)
+        max_reads_per_window = self.max_reads_per_window if self.max_reads_per_window is not None else base_config.max_reads_per_window
+        junk_divergence_rate = self.junk_divergence_rate if self.junk_divergence_rate is not None else base_config.junk_divergence_rate
+        max_link_distance = self.max_link_distance if self.max_link_distance is not None else self.max_mismatch_frac
+        min_shared_snvs_for_link = self.min_shared_snvs_for_link if self.min_shared_snvs_for_link is not None else self.min_shared_snvs_for_edge
+        rescue_match_distance = self.rescue_match_distance if self.rescue_match_distance is not None else base_config.rescue_match_distance
+        lineage_merge_distance = self.lineage_merge_distance if self.lineage_merge_distance is not None else base_config.lineage_merge_distance
 
         return HaplotyperConfig(
             # Parameters we're varying
@@ -90,14 +101,16 @@ class ParameterSet:
             min_weight_for_anchor=self.min_weight_for_anchor,
             rescued_min_weight=self.rescued_min_weight,
             window_size=self.window_size,
+            max_reads_per_window=max_reads_per_window,
+            junk_divergence_rate=junk_divergence_rate,
 
             # Related parameters (keep consistent)
-            max_link_distance=self.max_mismatch_frac,
-            min_shared_snvs_for_link=self.min_shared_snvs_for_edge,
+            max_link_distance=max_link_distance,
+            min_shared_snvs_for_link=min_shared_snvs_for_link,
             min_shared_for_merge=self.min_shared_snvs_for_edge,
             min_shared_for_rescue=self.min_shared_snvs_for_edge,
-            rescue_match_distance=self.merge_distance_threshold,
-            lineage_merge_distance=self.max_mismatch_frac,
+            rescue_match_distance=rescue_match_distance,
+            lineage_merge_distance=lineage_merge_distance,
             min_shared_for_lineage=self.min_shared_snvs_for_edge,
 
             # Fixed parameters
@@ -156,7 +169,28 @@ class SweepResult:
     snv_precision: Optional[float] = None
     snv_recall: Optional[float] = None
     snv_f1: Optional[float] = None
+    
+    # Track/linking metrics (when ground truth available)
+    track_fragmentation_mean: Optional[float] = None
+    track_fragmentation_median: Optional[float] = None
+    false_link_rate: Optional[float] = None
+    missed_link_rate: Optional[float] = None
+    track_consensus_error: Optional[float] = None
+    
+    # Lineage metrics (when ground truth available)
+    lineage_precision: Optional[float] = None
+    lineage_recall: Optional[float] = None
+    lineage_f1: Optional[float] = None
+    rescue_delta_recall_rare: Optional[float] = None
+    abundance_trajectory_error: Optional[float] = None
+    
+    # Performance metrics
     memory_peak_mb: Optional[float] = None
+    
+    # Metadata
+    ablation: Optional[str] = None  # e.g., "full", "no_linking", "no_rescue", "no_junk", "no_1snp_guard"
+    config_full: Optional[Dict] = None  # Full HaplotyperConfig fields
+    environment: Optional[Dict] = None  # Software versions, platform, CPU, threads
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -179,7 +213,23 @@ class SweepResult:
             'snv_precision': self.snv_precision,
             'snv_recall': self.snv_recall,
             'snv_f1': self.snv_f1,
+            # Track/linking metrics
+            'track_fragmentation_mean': self.track_fragmentation_mean,
+            'track_fragmentation_median': self.track_fragmentation_median,
+            'false_link_rate': self.false_link_rate,
+            'missed_link_rate': self.missed_link_rate,
+            'track_consensus_error': self.track_consensus_error,
+            # Lineage metrics
+            'lineage_precision': self.lineage_precision,
+            'lineage_recall': self.lineage_recall,
+            'lineage_f1': self.lineage_f1,
+            'rescue_delta_recall_rare': self.rescue_delta_recall_rare,
+            'abundance_trajectory_error': self.abundance_trajectory_error,
+            # Performance and metadata
             'memory_peak_mb': self.memory_peak_mb,
+            'ablation': self.ablation,
+            'config_full': self.config_full,
+            'environment': self.environment,
         }
 
 
@@ -350,6 +400,22 @@ class CheckpointManager:
                 snv_precision=data.get('snv_precision'),
                 snv_recall=data.get('snv_recall'),
                 snv_f1=data.get('snv_f1'),
+                # Track/linking metrics
+                track_fragmentation_mean=data.get('track_fragmentation_mean'),
+                track_fragmentation_median=data.get('track_fragmentation_median'),
+                false_link_rate=data.get('false_link_rate'),
+                missed_link_rate=data.get('missed_link_rate'),
+                track_consensus_error=data.get('track_consensus_error'),
+                # Lineage metrics
+                lineage_precision=data.get('lineage_precision'),
+                lineage_recall=data.get('lineage_recall'),
+                lineage_f1=data.get('lineage_f1'),
+                rescue_delta_recall_rare=data.get('rescue_delta_recall_rare'),
+                abundance_trajectory_error=data.get('abundance_trajectory_error'),
+                # Metadata
+                ablation=data.get('ablation'),
+                config_full=data.get('config_full'),
+                environment=data.get('environment'),
                 memory_peak_mb=data.get('memory_peak_mb'),
             )
             results.append(result)
@@ -389,78 +455,31 @@ class CheckpointManager:
             snv_precision=data.get('snv_precision'),
             snv_recall=data.get('snv_recall'),
             snv_f1=data.get('snv_f1'),
+            # Track/linking metrics
+            track_fragmentation_mean=data.get('track_fragmentation_mean'),
+            track_fragmentation_median=data.get('track_fragmentation_median'),
+            false_link_rate=data.get('false_link_rate'),
+            missed_link_rate=data.get('missed_link_rate'),
+            track_consensus_error=data.get('track_consensus_error'),
+            # Lineage metrics
+            lineage_precision=data.get('lineage_precision'),
+            lineage_recall=data.get('lineage_recall'),
+            lineage_f1=data.get('lineage_f1'),
+            rescue_delta_recall_rare=data.get('rescue_delta_recall_rare'),
+            abundance_trajectory_error=data.get('abundance_trajectory_error'),
+            # Metadata
+            ablation=data.get('ablation'),
+            config_full=data.get('config_full'),
+            environment=data.get('environment'),
             memory_peak_mb=data.get('memory_peak_mb'),
         )
 
 
 # =============================================================================
-# Ground truth loading
-# =============================================================================
-
-def load_ground_truth_snvs(truth_dir: str) -> Dict[str, Dict[int, Dict[str, str]]]:
-    """
-    Load ground truth SNVs from simulation output.
-
-    Returns: {contig: {pos: {strain_id: allele}}}
-    """
-    truth_path = Path(truth_dir)
-
-    vcf_file = truth_path / "truth_snvs.vcf"
-    if not vcf_file.exists():
-        vcf_file = truth_path / "truth_variants.vcf"
-    snvs: Dict[str, Dict[int, Dict[str, str]]] = defaultdict(lambda: defaultdict(dict))
-
-    if not vcf_file.exists():
-        return {}
-
-    with open(vcf_file) as f:
-        for line in f:
-            if line.startswith('#'):
-                continue
-            parts = line.strip().split('\t')
-            contig = parts[0]
-            pos = int(parts[1]) - 1  # Convert to 0-indexed
-            info = parts[7]
-
-            # Parse STRAINS info field
-            if 'STRAINS=' in info:
-                strains_info = info.split('STRAINS=')[1].split(';')[0]
-                for allele_info in strains_info.split('|'):
-                    if ':' in allele_info:
-                        allele, strain_list = allele_info.split(':')
-                        for strain_id in strain_list.split(','):
-                            snvs[contig][pos][strain_id] = allele
-
-    return dict(snvs)
-
-
-def load_ground_truth_abundances(truth_dir: str) -> Dict[str, Dict[str, float]]:
-    """
-    Load ground truth abundances from simulation output.
-
-    Returns: {strain_id: {timepoint: abundance}}
-    """
-    abundances: Dict[str, Dict[str, float]] = defaultdict(dict)
-
-    abundances_file = Path(truth_dir) / "truth_abundances.tsv"
-    if not abundances_file.exists():
-        return {}
-
-    with open(abundances_file) as f:
-        header = f.readline().strip().split('\t')
-        timepoints = header[1:]  # First column is strain_id
-        for line in f:
-            parts = line.strip().split('\t')
-            strain_id = parts[0]
-            for i, tp in enumerate(timepoints):
-                abundances[strain_id][tp] = float(parts[i + 1])
-
-    return dict(abundances)
-
-
-# =============================================================================
 # BAM/VCF processing
 # =============================================================================
+# Note: Ground truth loading is handled by validation modules (validate_haplotypes.py)
+# which loads truth data directly from truth_dir when needed.
 
 def get_contigs_from_bam(bam_path: str) -> Dict[str, int]:
     """Get contig names and lengths from BAM header."""
@@ -507,6 +526,69 @@ def process_contig_with_params(
         return []
 
 
+def window_results_to_lineages_tsv(
+    all_window_results: List[WindowResult],
+    output_path: str,
+    sample_id: str = "sample"
+) -> str:
+    """
+    Convert WindowResults to lineages.tsv format for validation.
+    
+    Creates a simplified lineages.tsv that aggregates haplotypes by track_id
+    across all windows and contigs.
+    
+    If no haplotypes are detected, creates an empty file with headers.
+    """
+    import csv
+    
+    # Aggregate haplotypes by track_id
+    track_data = defaultdict(lambda: {
+        'abundances': {},
+        'snvs': defaultdict(dict),  # contig -> {pos -> allele}
+        'contigs': set(),
+    })
+    
+    for wr in all_window_results:
+        contig_id = wr.window.contig  # Window uses 'contig', not 'contig_id'
+        for hap in wr.haplotypes:
+            track_id = hap.track_id or f"unlinked_{wr.window.start}"
+            
+            track_data[track_id]['contigs'].add(contig_id)
+            track_data[track_id]['abundances'][sample_id] = hap.weight
+            
+            # Aggregate SNV alleles from consensus
+            for pos, allele in hap.consensus.items():
+                track_data[track_id]['snvs'][contig_id][pos] = allele
+    
+    # Write lineages.tsv (create even if empty)
+    records = []
+    for track_id, data in track_data.items():
+        for contig_id in data['contigs']:
+            snv_alleles_str = ','.join(
+                f"{pos}:{allele}" 
+                for pos, allele in sorted(data['snvs'][contig_id].items())
+            )
+            
+            records.append({
+                'lineage_id': track_id,
+                'sample': sample_id,
+                'contig': contig_id,
+                'track_id': track_id,
+                'abundance': data['abundances'].get(sample_id, 0.0),
+                'snv_alleles': snv_alleles_str if snv_alleles_str else '.',
+            })
+    
+    # Always create the file, even if empty (for validation)
+    fieldnames = ['lineage_id', 'sample', 'contig', 'track_id', 'abundance', 'snv_alleles']
+    with open(output_path, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, delimiter='\t')
+        writer.writeheader()
+        if records:
+            writer.writerows(records)
+    
+    return output_path
+
+
 # =============================================================================
 # Parameter sweep class
 # =============================================================================
@@ -520,15 +602,37 @@ class ParameterSweep:
 
     # Required parameter grid (agents.md)
     REQUIRED_GRID = {
+        # Windowing / subsampling
+        # Minimum window_size is 10000 to ensure sufficient shared SNVs for reliable linking.
+        # With ~1-2 SNVs/kb, smaller windows have too few SNVs in the 50% overlap region.
+        'window_size': [10000, 20000, 50000, 100000],
+        'max_reads_per_window': [100, 300, 600],
+        
+        # Clustering parameters
         'max_mismatch_frac': [0.005, 0.01, 0.02, 0.04],
+        'min_shared_snvs_for_edge': [2, 3, 4, 5],
+        
+        # Quality filters
         'min_mapq': [10, 20, 30],
         'min_base_quality': [20, 30],
-        'min_shared_snvs_for_edge': [2, 3, 4, 5],
+        
+        # Junk model sensitivity (publication expansion)
+        'junk_divergence_rate': [0.05, 0.10, 0.20],
+        
+        # Merging thresholds
         'merge_distance_threshold': [0.005, 0.01, 0.02],
+        
+        # Linking thresholds (publication expansion)
+        'max_link_distance': [0.01, 0.02, 0.04],
+        'min_shared_snvs_for_link': [2, 3, 5],
+        
+        # Abundance thresholds
         'min_weight_for_anchor': [0.05, 0.10, 0.15, 0.20],
         'rescued_min_weight': [0.01, 0.02, 0.05],
-        # Minimum 10000 to ensure sufficient shared SNVs in overlap region for reliable linking
-        'window_size': [10000, 20000, 50000, 100000],
+        
+        # Rescue/lineage thresholds (publication expansion)
+        'rescue_match_distance': [0.005, 0.01, 0.02],
+        'lineage_merge_distance': [0.01, 0.02, 0.04],
     }
 
     # Parameter order for sequential optimization (most impactful first)
@@ -544,12 +648,13 @@ class ParameterSweep:
     ]
 
     # Default/intermediate starting values for sequential optimization
+    # These match the best parameters found in benchmarking
     DEFAULT_START_VALUES = {
-        'window_size': 10000,
+        'window_size': 20000,
         'max_mismatch_frac': 0.01,
-        'min_shared_snvs_for_edge': 3,
-        'merge_distance_threshold': 0.01,
-        'min_mapq': 20,
+        'min_shared_snvs_for_edge': 4,  # Increased from 2 for better cluster purity
+        'merge_distance_threshold': 0.02,  # Increased from 0.005 for better merging
+        'min_mapq': 20,  # Increased from 10 for higher quality reads
         'min_base_quality': 20,
         'min_weight_for_anchor': 0.10,
         'rescued_min_weight': 0.02,
@@ -572,8 +677,6 @@ class ParameterSweep:
         self.bam_path: Optional[str] = None
         self.vcf_path: Optional[str] = None
         self.truth_dir: Optional[str] = None
-        self.truth_snvs: Optional[Dict] = None
-        self.truth_abundances: Optional[Dict] = None
 
     def _validate_grid(self, grid: Dict[str, List]) -> None:
         """Enforce that the parameter grid matches agents.md."""
@@ -606,8 +709,10 @@ class ParameterSweep:
 
     def run_sweep(
         self,
-        bam_path: str,
-        vcf_path: str,
+        bam_paths: Dict[str, str],  # {timepoint -> bam_path}
+        vcf_paths: Dict[str, str],  # {timepoint -> vcf_path}
+        reference_path: Optional[str] = None,  # Required for longitudinal
+        timepoints: Optional[List[str]] = None,  # List of timepoint IDs
         truth_dir: Optional[str] = None,
         max_configs: Optional[int] = None,
         max_contigs: Optional[int] = None,
@@ -619,10 +724,14 @@ class ParameterSweep:
     ) -> List[SweepResult]:
         """
         Run parameter sweep on BAM/VCF data with checkpointing.
+        
+        Supports both single-timepoint and longitudinal (multi-timepoint) modes.
 
         Args:
-            bam_path: Path to BAM file
-            vcf_path: Path to VCF file
+            bam_paths: Dict mapping timepoint IDs to BAM file paths
+            vcf_paths: Dict mapping timepoint IDs to VCF file paths
+            reference_path: Reference FASTA path (required for longitudinal mode)
+            timepoints: List of timepoint IDs (e.g., ["T1", "T2"])
             truth_dir: Optional path to ground truth directory (from simulation)
             max_configs: Limit number of parameter configs to test
             max_contigs: Limit number of contigs to process
@@ -635,8 +744,22 @@ class ParameterSweep:
         if not HAS_PYSAM:
             raise ImportError("pysam required for BAM/VCF processing")
 
-        self.bam_path = bam_path
-        self.vcf_path = vcf_path
+        # Determine if longitudinal mode (multiple timepoints)
+        use_longitudinal = (reference_path is not None and 
+                           timepoints is not None and 
+                           len(timepoints) > 1)
+        
+        # Store paths as instance variables for use in processing
+        self.bam_paths = bam_paths
+        self.vcf_paths = vcf_paths
+        self.reference_path = reference_path
+        self.timepoints = timepoints
+        self.use_longitudinal = use_longitudinal
+        
+        # Store paths for backward compatibility and validation
+        first_timepoint = timepoints[0] if timepoints else list(bam_paths.keys())[0]
+        self.bam_path = bam_paths[first_timepoint]  # For backward compatibility
+        self.vcf_path = vcf_paths[first_timepoint]   # For backward compatibility
         self.truth_dir = truth_dir
 
         # Setup checkpointing if output_dir provided
@@ -645,19 +768,28 @@ class ParameterSweep:
             checkpoint_mgr = CheckpointManager(output_dir, checkpoint_interval)
             checkpoint_mgr.setup()
 
-        # Load ground truth if provided
+        # Store truth_dir for validation (validation loads its own ground truth)
+        self.truth_dir = truth_dir
         if truth_dir:
-            logger.info(f"Loading ground truth from {truth_dir}")
-            self.truth_snvs = load_ground_truth_snvs(truth_dir)
-            self.truth_abundances = load_ground_truth_abundances(truth_dir)
+            logger.info(f"Ground truth directory: {truth_dir}")
 
-        # Get contigs from BAM
-        contigs = get_contigs_from_bam(bam_path)
+        # Get contigs from first BAM (or reference for longitudinal)
+        if use_longitudinal and reference_path:
+            from strainphase.longitudinal import parse_reference_contigs
+            mags = parse_reference_contigs(reference_path, allowed_contigs=None)
+            # Flatten MAG structure to get all contigs
+            contigs = {}
+            for mag_contigs in mags.values():
+                contigs.update(mag_contigs)
+        else:
+            contigs = get_contigs_from_bam(bam_paths[first_timepoint])
         if max_contigs:
             contig_list = list(contigs.items())[:max_contigs]
             contigs = dict(contig_list)
 
         logger.info(f"Processing {len(contigs)} contigs")
+        if use_longitudinal:
+            logger.info(f"Using longitudinal mode with {len(timepoints)} timepoints")
 
         param_sets = self.generate_parameter_sets()
         if max_configs:
@@ -709,16 +841,47 @@ class ParameterSweep:
             try:
                 # Process all contigs with this parameter set
                 all_window_results: List[WindowResult] = []
-
-                for contig_idx, (contig_id, contig_length) in enumerate(contigs.items(), 1):
-                    results = process_contig_with_params(
-                        bam_path, vcf_path, contig_id, contig_length,
-                        params, sample_id="sample", n_workers=n_workers
+                
+                if use_longitudinal:
+                    # Longitudinal mode: use process_mag_longitudinal
+                    from strainphase.longitudinal import process_mag_longitudinal
+                    from strainphase.core import HaplotyperConfig
+                    
+                    config = params.to_config(n_workers=n_workers)
+                    
+                    # Process MAG with longitudinal integration
+                    # mag_contigs should be {contig_id: length}, not nested
+                    mag_results = process_mag_longitudinal(
+                        mag_name="MAG_01",
+                        mag_contigs=contigs,  # Pass contigs directly, not nested dict
+                        samples=timepoints,
+                        bam_paths=bam_paths,
+                        vcf_paths=vcf_paths,
+                        config=config,
                     )
-                    all_window_results.extend(results)
-
+                    
+                    # Flatten results: {sample -> {contig -> [WindowResult]}} -> List[WindowResult]
+                    for sample_results in mag_results.values():
+                        for contig_results in sample_results.values():
+                            all_window_results.extend(contig_results)
+                    
                     # Per-contig logging
-                    progress_logger.log_contig_progress(run_idx, contig_idx, contig_id, len(results))
+                    for contig_idx, (contig_id, contig_length) in enumerate(contigs.items(), 1):
+                        n_windows = sum(len(mag_results.get(sample, {}).get(contig_id, [])) 
+                                      for sample in timepoints)
+                        progress_logger.log_contig_progress(run_idx, contig_idx, contig_id, n_windows)
+                else:
+                    # Single-timepoint mode: process each contig individually
+                    for contig_idx, (contig_id, contig_length) in enumerate(contigs.items(), 1):
+                        results = process_contig_with_params(
+                            bam_paths[first_timepoint], vcf_paths[first_timepoint], 
+                            contig_id, contig_length,
+                            params, sample_id=first_timepoint, n_workers=n_workers
+                        )
+                        all_window_results.extend(results)
+
+                        # Per-contig logging
+                        progress_logger.log_contig_progress(run_idx, contig_idx, contig_id, len(results))
 
                 runtime = time.time() - start_time
 
@@ -728,10 +891,112 @@ class ParameterSweep:
 
                 # Compute accuracy if truth available
                 accuracy_metrics = {}
-                if self.truth_snvs:
-                    accuracy_metrics = self._compute_accuracy_vs_truth(
-                        all_window_results, self.truth_snvs
-                    )
+                validation_result = None
+                if self.truth_dir:
+                    # Create temporary lineages.tsv for validation
+                    # Use output_dir if provided, otherwise create temp directory
+                    if output_dir:
+                        config_output_dir = Path(output_dir) / "configs" / params.short_name()
+                    else:
+                        # Create temp directory if output_dir not provided
+                        import tempfile
+                        temp_base = Path(tempfile.gettempdir()) / "strainphase_benchmark" / params.short_name()
+                        config_output_dir = temp_base
+                    
+                    config_output_dir.mkdir(parents=True, exist_ok=True)
+                    lineages_path = str(config_output_dir / "lineages.tsv")
+                    
+                    # Convert WindowResults to lineages.tsv
+                    try:
+                        if use_longitudinal:
+                            # For longitudinal mode, use build_lineage_table to create proper lineages.tsv
+                            from strainphase.longitudinal import build_lineage_table
+                            
+                            # Reconstruct the structure expected by build_lineage_table
+                            # {mag_name -> {sample -> {contig -> [WindowResult]}}}
+                            structured_results = {"MAG_01": mag_results}
+                            
+                            # Build lineage table (creates records with lineage_id, sample, contig, etc.)
+                            lineage_records = build_lineage_table(structured_results, config)
+                            
+                            # Write lineages.tsv from lineage records
+                            import csv
+                            fieldnames = ['lineage_id', 'sample', 'contig', 'track_id', 'abundance', 'snv_alleles']
+                            with open(lineages_path, 'w', newline='') as f:
+                                writer = csv.DictWriter(f, fieldnames=fieldnames, delimiter='\t')
+                                writer.writeheader()
+                                if lineage_records:
+                                    writer.writerows(lineage_records)
+                        else:
+                            # Single-timepoint mode: use simple conversion
+                            window_results_to_lineages_tsv(
+                                all_window_results, lineages_path, sample_id=first_timepoint
+                            )
+                        
+                        # Check if file was created
+                        if not Path(lineages_path).exists():
+                            logger.warning(f"Failed to create lineages.tsv at {lineages_path}")
+                            raise FileNotFoundError(f"lineages.tsv not created")
+                        
+                        # Skip validation if no haplotypes detected (no point validating empty results)
+                        if len(all_window_results) == 0 or sum(len(wr.haplotypes) for wr in all_window_results) == 0:
+                            logger.info(f"    No haplotypes detected - skipping validation")
+                            accuracy_metrics = {}
+                        else:
+                            # Run detailed validation (handles empty files gracefully)
+                            from validation.validate_haplotypes import run_validation
+                            validation_output = str(config_output_dir / "validation")
+                            
+                            if verbose:
+                                mode_str = "longitudinal" if use_longitudinal else "single-timepoint"
+                                logger.info(f"    Running validation ({mode_str} mode)...")
+                            
+                            validation_result = run_validation(
+                                detected_file=lineages_path,
+                                truth_dir=self.truth_dir,
+                                output_dir=validation_output,
+                                window_results=all_window_results,  # For track validation
+                                window_size=params.window_size  # For track validation
+                            )
+                            
+                            # Extract metrics from validation (including track/linking and lineage metrics)
+                            accuracy_metrics = {
+                                "snv_precision": validation_result.snv_precision,
+                                "snv_recall": validation_result.snv_recall,
+                                "snv_f1": 2 * validation_result.snv_precision * validation_result.snv_recall / 
+                                         (validation_result.snv_precision + validation_result.snv_recall) 
+                                         if (validation_result.snv_precision + validation_result.snv_recall) > 0 else 0.0,
+                                "haplotype_precision": validation_result.precision,
+                                "haplotype_recall": validation_result.recall,
+                                "haplotype_f1": validation_result.f1,
+                                "abundance_pearson_r": validation_result.abundance_pearson_r,
+                                "abundance_mae": validation_result.abundance_mae,
+                                # Track/linking metrics
+                                "track_fragmentation_mean": validation_result.track_fragmentation_mean,
+                                "track_fragmentation_median": validation_result.track_fragmentation_median,
+                                "false_link_rate": validation_result.false_link_rate,
+                                "missed_link_rate": validation_result.missed_link_rate,
+                                "track_consensus_error": validation_result.track_consensus_error,
+                                # Lineage metrics
+                                "lineage_precision": validation_result.lineage_precision,
+                                "lineage_recall": validation_result.lineage_recall,
+                                "lineage_f1": validation_result.lineage_f1,
+                                "rescue_delta_recall_rare": validation_result.rescue_delta_recall_rare,
+                                "abundance_trajectory_error": validation_result.abundance_trajectory_error,
+                            }
+                            if verbose:
+                                logger.info(f"    Validation complete: F1={accuracy_metrics['haplotype_f1']:.3f}, "
+                                          f"Precision={accuracy_metrics['haplotype_precision']:.3f}, "
+                                          f"Recall={accuracy_metrics['haplotype_recall']:.3f}")
+                                if use_longitudinal:
+                                    logger.info(f"      Lineage F1={accuracy_metrics.get('lineage_f1', 0):.3f}, "
+                                              f"Rescue ΔRecall={accuracy_metrics.get('rescue_delta_recall_rare', 0):.3f}")
+                                logger.info(f"    Validation outputs saved to: {validation_output}")
+                    except Exception as e:
+                        logger.warning(f"Validation failed for {params.short_name()}: {e}")
+                        logger.exception("Validation exception details:")
+                        # No fallback - validation must succeed for metrics
+                        accuracy_metrics = {}
 
                 # Build trajectories for single timepoint
                 trajectories = {}
@@ -742,6 +1007,23 @@ class ParameterSweep:
                             trajectories[tid] = {}
                         trajectories[tid]["T1"] = hap.weight
 
+                # Get full config and environment info
+                config_obj = params.to_config()
+                try:
+                    from dataclasses import asdict as dataclass_asdict
+                    config_full = dataclass_asdict(config_obj)
+                except:
+                    # Fallback if not a dataclass
+                    config_full = {k: getattr(config_obj, k, None) for k in dir(config_obj) if not k.startswith('_')}
+                
+                import platform
+                environment = {
+                    'python': f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+                    'platform': platform.system().lower(),
+                    'cpu': platform.processor() or platform.machine(),
+                    'threads': os.cpu_count() or 1,
+                }
+                
                 result = SweepResult(
                     params=params,
                     scenario_name="file_based",
@@ -757,6 +1039,27 @@ class ParameterSweep:
                     snv_precision=accuracy_metrics.get("snv_precision"),
                     snv_recall=accuracy_metrics.get("snv_recall"),
                     snv_f1=accuracy_metrics.get("snv_f1"),
+                    haplotype_precision=accuracy_metrics.get("haplotype_precision"),
+                    haplotype_recall=accuracy_metrics.get("haplotype_recall"),
+                    haplotype_f1=accuracy_metrics.get("haplotype_f1"),
+                    abundance_pearson_r=accuracy_metrics.get("abundance_pearson_r"),
+                    abundance_mae=accuracy_metrics.get("abundance_mae"),
+                    # Track/linking metrics
+                    track_fragmentation_mean=accuracy_metrics.get("track_fragmentation_mean"),
+                    track_fragmentation_median=accuracy_metrics.get("track_fragmentation_median"),
+                    false_link_rate=accuracy_metrics.get("false_link_rate"),
+                    missed_link_rate=accuracy_metrics.get("missed_link_rate"),
+                    track_consensus_error=accuracy_metrics.get("track_consensus_error"),
+                    # Lineage metrics
+                    lineage_precision=accuracy_metrics.get("lineage_precision"),
+                    lineage_recall=accuracy_metrics.get("lineage_recall"),
+                    lineage_f1=accuracy_metrics.get("lineage_f1"),
+                    rescue_delta_recall_rare=accuracy_metrics.get("rescue_delta_recall_rare"),
+                    abundance_trajectory_error=accuracy_metrics.get("abundance_trajectory_error"),
+                    # Metadata
+                    ablation=None,  # Can be set by caller for ablation studies
+                    config_full=config_full,
+                    environment=environment,
                 )
 
                 # Log completion
@@ -788,45 +1091,6 @@ class ParameterSweep:
 
         return self.results
 
-    def _compute_accuracy_vs_truth(
-        self,
-        window_results: List[WindowResult],
-        truth_snvs: Dict[str, Dict[int, Dict[str, str]]]
-    ) -> Dict[str, float]:
-        """
-        Compute accuracy metrics against ground truth SNVs.
-        """
-        total_correct = 0
-        total_detected = 0
-        total_true = 0
-
-        for wr in window_results:
-            contig = wr.window.contig if hasattr(wr.window, 'contig') else "unknown"
-            true_snvs_for_contig = truth_snvs.get(contig, {})
-
-            for hap in wr.haplotypes:
-                for pos, allele in hap.consensus.items():
-                    total_detected += 1
-                    if pos in true_snvs_for_contig:
-                        # Check if any strain has this allele
-                        for strain_allele in true_snvs_for_contig[pos].values():
-                            if strain_allele == allele:
-                                total_correct += 1
-                                break
-
-        for contig_snvs in truth_snvs.values():
-            total_true += len(contig_snvs)
-
-        precision = total_correct / total_detected if total_detected > 0 else 0.0
-        recall = total_correct / total_true if total_true > 0 else 0.0
-        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
-
-        return {
-            "snv_precision": precision,
-            "snv_recall": recall,
-            "snv_f1": f1,
-        }
-
     def _score_result(self, res: SweepResult) -> float:
         """
         Score a result for optimization comparison.
@@ -852,18 +1116,52 @@ class ParameterSweep:
         progress_logger: ProgressLogger,
         config_idx: int,
         n_workers: int = 1,
+        output_dir: Optional[str] = None,
+        verbose: bool = True,
     ) -> SweepResult:
         """Run a single parameter configuration and return the result."""
         start_time = time.time()
 
         all_window_results: List[WindowResult] = []
-        for contig_idx, (contig_id, contig_length) in enumerate(contigs.items(), 1):
-            results = process_contig_with_params(
-                self.bam_path, self.vcf_path, contig_id, contig_length,
-                params, sample_id="sample", n_workers=n_workers
+        
+        if hasattr(self, 'use_longitudinal') and self.use_longitudinal:
+            # Longitudinal mode: use process_mag_longitudinal
+            from strainphase.longitudinal import process_mag_longitudinal
+            from strainphase.core import HaplotyperConfig
+            
+            config = params.to_config(n_workers=n_workers)
+
+            # Process MAG with longitudinal integration
+            # mag_contigs should be {contig_id: length}, not nested
+            mag_results = process_mag_longitudinal(
+                mag_name="MAG_01",
+                mag_contigs=contigs,  # Pass contigs directly, not nested dict
+                samples=self.timepoints,
+                bam_paths=self.bam_paths,
+                vcf_paths=self.vcf_paths,
+                config=config,
             )
-            all_window_results.extend(results)
-            progress_logger.log_contig_progress(config_idx, contig_idx, contig_id, len(results))
+            
+            # Flatten results: {sample -> {contig -> [WindowResult]}} -> List[WindowResult]
+            for sample_results in mag_results.values():
+                for contig_results in sample_results.values():
+                    all_window_results.extend(contig_results)
+            
+            # Per-contig logging
+            for contig_idx, (contig_id, contig_length) in enumerate(contigs.items(), 1):
+                n_windows = sum(len(mag_results.get(sample, {}).get(contig_id, [])) 
+                              for sample in self.timepoints)
+                progress_logger.log_contig_progress(config_idx, contig_idx, contig_id, n_windows)
+        else:
+            # Single-timepoint mode: process each contig individually
+            first_timepoint = self.timepoints[0] if hasattr(self, 'timepoints') and self.timepoints else list(self.bam_paths.keys())[0] if hasattr(self, 'bam_paths') else "sample"
+            for contig_idx, (contig_id, contig_length) in enumerate(contigs.items(), 1):
+                results = process_contig_with_params(
+                    self.bam_path, self.vcf_path, contig_id, contig_length,
+                    params, sample_id=first_timepoint, n_workers=n_workers
+                )
+                all_window_results.extend(results)
+                progress_logger.log_contig_progress(config_idx, contig_idx, contig_id, len(results))
 
         runtime = time.time() - start_time
 
@@ -873,10 +1171,123 @@ class ParameterSweep:
 
         # Compute accuracy if truth available
         accuracy_metrics = {}
-        if self.truth_snvs:
-            accuracy_metrics = self._compute_accuracy_vs_truth(
-                all_window_results, self.truth_snvs
-            )
+        validation_result = None
+        if self.truth_dir:
+            # Create temporary lineages.tsv for validation
+            # Use output_dir if provided, otherwise create temp directory
+            if output_dir:
+                config_output_dir = Path(output_dir) / "configs" / params.short_name()
+            else:
+                # Create temp directory if output_dir not provided
+                import tempfile
+                temp_base = Path(tempfile.gettempdir()) / "strainphase_benchmark" / params.short_name()
+                config_output_dir = temp_base
+            
+            config_output_dir.mkdir(parents=True, exist_ok=True)
+            lineages_path = str(config_output_dir / "lineages.tsv")
+            
+            # Convert WindowResults to lineages.tsv
+            try:
+                if hasattr(self, 'use_longitudinal') and self.use_longitudinal:
+                    # For longitudinal mode, use build_lineage_table to create proper lineages.tsv
+                    from strainphase.longitudinal import build_lineage_table
+                    from strainphase.core import HaplotyperConfig
+                    
+                    config = params.to_config(n_workers=n_workers)
+                    
+                    # Reconstruct the structure expected by build_lineage_table
+                    # {mag_name -> {sample -> {contig -> [WindowResult]}}}
+                    # We need to reconstruct this from all_window_results
+                    # Group by sample and contig
+                    structured_results = {"MAG_01": {}}
+                    for wr in all_window_results:
+                        sample = wr.window.sample or self.timepoints[0]
+                        contig = wr.window.contig
+                        if sample not in structured_results["MAG_01"]:
+                            structured_results["MAG_01"][sample] = {}
+                        if contig not in structured_results["MAG_01"][sample]:
+                            structured_results["MAG_01"][sample][contig] = []
+                        structured_results["MAG_01"][sample][contig].append(wr)
+                    
+                    # Build lineage table (creates records with lineage_id, sample, contig, etc.)
+                    lineage_records = build_lineage_table(structured_results, config)
+                    
+                    # Write lineages.tsv from lineage records
+                    import csv
+                    fieldnames = ['lineage_id', 'sample', 'contig', 'track_id', 'abundance', 'snv_alleles']
+                    with open(lineages_path, 'w', newline='') as f:
+                        writer = csv.DictWriter(f, fieldnames=fieldnames, delimiter='\t')
+                        writer.writeheader()
+                        if lineage_records:
+                            writer.writerows(lineage_records)
+                else:
+                    # Single-timepoint mode: use simple conversion
+                    first_timepoint = self.timepoints[0] if hasattr(self, 'timepoints') and self.timepoints else list(self.bam_paths.keys())[0] if hasattr(self, 'bam_paths') else "T1"
+                    window_results_to_lineages_tsv(
+                        all_window_results, lineages_path, sample_id=first_timepoint
+                    )
+                
+                # Skip validation if no haplotypes detected
+                if len(all_window_results) == 0 or sum(len(wr.haplotypes) for wr in all_window_results) == 0:
+                    if verbose:
+                        logger.info(f"    No haplotypes detected - skipping validation")
+                    accuracy_metrics = {}
+                else:
+                    # Run detailed validation (with track/linking support)
+                    from validation.validate_haplotypes import run_validation
+                    validation_output = str(config_output_dir / "validation")
+                    
+                    if verbose:
+                        mode_str = "longitudinal" if hasattr(self, 'use_longitudinal') and self.use_longitudinal else "single-timepoint"
+                        logger.info(f"    Running validation ({mode_str} mode)...")
+                    
+                    validation_result = run_validation(
+                        detected_file=lineages_path,
+                        truth_dir=self.truth_dir,
+                        output_dir=validation_output,
+                        window_results=all_window_results,  # For track validation
+                        window_size=params.window_size  # For track validation
+                    )
+                    
+                    # Extract metrics from validation (including track/linking and lineage metrics)
+                    accuracy_metrics = {
+                        "snv_precision": validation_result.snv_precision,
+                        "snv_recall": validation_result.snv_recall,
+                        "snv_f1": 2 * validation_result.snv_precision * validation_result.snv_recall / 
+                                 (validation_result.snv_precision + validation_result.snv_recall) 
+                                 if (validation_result.snv_precision + validation_result.snv_recall) > 0 else 0.0,
+                        "haplotype_precision": validation_result.precision,
+                        "haplotype_recall": validation_result.recall,
+                        "haplotype_f1": validation_result.f1,
+                        "abundance_pearson_r": validation_result.abundance_pearson_r,
+                        "abundance_mae": validation_result.abundance_mae,
+                        # Track/linking metrics
+                        "track_fragmentation_mean": validation_result.track_fragmentation_mean,
+                        "track_fragmentation_median": validation_result.track_fragmentation_median,
+                        "false_link_rate": validation_result.false_link_rate,
+                        "missed_link_rate": validation_result.missed_link_rate,
+                        "track_consensus_error": validation_result.track_consensus_error,
+                        # Lineage metrics
+                        "lineage_precision": validation_result.lineage_precision,
+                        "lineage_recall": validation_result.lineage_recall,
+                        "lineage_f1": validation_result.lineage_f1,
+                        "rescue_delta_recall_rare": validation_result.rescue_delta_recall_rare,
+                        "abundance_trajectory_error": validation_result.abundance_trajectory_error,
+                    }
+                    if verbose:
+                        logger.info(f"    Validation complete: F1={accuracy_metrics['haplotype_f1']:.3f}, "
+                                  f"Precision={accuracy_metrics['haplotype_precision']:.3f}, "
+                                  f"Recall={accuracy_metrics['haplotype_recall']:.3f}")
+                        if hasattr(self, 'use_longitudinal') and self.use_longitudinal:
+                            logger.info(f"      Lineage F1={accuracy_metrics.get('lineage_f1', 0):.3f}, "
+                                      f"Rescue ΔRecall={accuracy_metrics.get('rescue_delta_recall_rare', 0):.3f}")
+                        logger.info(f"    Validation outputs saved to: {validation_output}")
+            except Exception as e:
+                logger.warning(f"Validation failed for {params.short_name()}: {e}")
+                if verbose:
+                    logger.exception("Validation exception details:")
+                # No fallback - validation must succeed for metrics
+                accuracy_metrics = {}
 
         # Build trajectories for single timepoint
         trajectories = {}
@@ -887,6 +1298,23 @@ class ParameterSweep:
                     trajectories[tid] = {}
                 trajectories[tid]["T1"] = hap.weight
 
+        # Get full config and environment info
+        config_obj = params.to_config()
+        try:
+            from dataclasses import asdict as dataclass_asdict
+            config_full = dataclass_asdict(config_obj)
+        except:
+            # Fallback if not a dataclass
+            config_full = {k: getattr(config_obj, k, None) for k in dir(config_obj) if not k.startswith('_')}
+        
+        import platform
+        environment = {
+            'python': f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+            'platform': platform.system().lower(),
+            'cpu': platform.processor() or platform.machine(),
+            'threads': os.cpu_count() or 1,
+        }
+        
         return SweepResult(
             params=params,
             scenario_name="file_based",
@@ -902,13 +1330,36 @@ class ParameterSweep:
             snv_precision=accuracy_metrics.get("snv_precision"),
             snv_recall=accuracy_metrics.get("snv_recall"),
             snv_f1=accuracy_metrics.get("snv_f1"),
+            haplotype_precision=accuracy_metrics.get("haplotype_precision"),
+            haplotype_recall=accuracy_metrics.get("haplotype_recall"),
+            haplotype_f1=accuracy_metrics.get("haplotype_f1"),
+            abundance_pearson_r=accuracy_metrics.get("abundance_pearson_r"),
+            abundance_mae=accuracy_metrics.get("abundance_mae"),
+            # Track/linking metrics
+            track_fragmentation_mean=accuracy_metrics.get("track_fragmentation_mean"),
+            track_fragmentation_median=accuracy_metrics.get("track_fragmentation_median"),
+            false_link_rate=accuracy_metrics.get("false_link_rate"),
+            missed_link_rate=accuracy_metrics.get("missed_link_rate"),
+            track_consensus_error=accuracy_metrics.get("track_consensus_error"),
+            # Lineage metrics
+            lineage_precision=accuracy_metrics.get("lineage_precision"),
+            lineage_recall=accuracy_metrics.get("lineage_recall"),
+            lineage_f1=accuracy_metrics.get("lineage_f1"),
+            rescue_delta_recall_rare=accuracy_metrics.get("rescue_delta_recall_rare"),
+            abundance_trajectory_error=accuracy_metrics.get("abundance_trajectory_error"),
+            # Metadata
+            ablation=None,  # Can be set by caller for ablation studies
+            config_full=config_full,
+            environment=environment,
         )
 
     def run_sequential_sweep(
         self,
-        bam_path: str,
-        vcf_path: str,
-        output_dir: str,
+        bam_paths: Dict[str, str],  # {timepoint -> bam_path}
+        vcf_paths: Dict[str, str],  # {timepoint -> vcf_path}
+        reference_path: Optional[str] = None,  # Required for longitudinal
+        timepoints: Optional[List[str]] = None,  # List of timepoint IDs
+        output_dir: str = "benchmarks/results",
         truth_dir: Optional[str] = None,
         max_contigs: Optional[int] = None,
         verbose: bool = True,
@@ -922,6 +1373,8 @@ class ParameterSweep:
         """
         Run sequential/coordinate descent parameter optimization.
 
+        Supports both single-timepoint and longitudinal (multi-timepoint) modes.
+        
         Instead of testing all 13,824 combinations, tests parameters one at a time:
         1. Start with intermediate default values for all parameters
         2. Test all values for parameter 1, pick the best
@@ -953,22 +1406,36 @@ class ParameterSweep:
         if start_values is None:
             start_values = dict(self.DEFAULT_START_VALUES)
 
-        self.bam_path = bam_path
-        self.vcf_path = vcf_path
+        # Determine if longitudinal mode (multiple timepoints)
+        use_longitudinal = (reference_path is not None and 
+                           timepoints is not None and 
+                           len(timepoints) > 1)
+        
+        # Store paths for backward compatibility and validation
+        first_timepoint = timepoints[0] if timepoints else list(bam_paths.keys())[0]
+        self.bam_path = bam_paths[first_timepoint]  # For backward compatibility
+        self.vcf_path = vcf_paths[first_timepoint]   # For backward compatibility
         self.truth_dir = truth_dir
 
         # Setup checkpointing
         checkpoint_mgr = CheckpointManager(output_dir, checkpoint_interval)
         checkpoint_mgr.setup()
 
-        # Load ground truth if provided
+        # Store truth_dir for validation (validation loads its own ground truth)
+        self.truth_dir = truth_dir
         if truth_dir:
-            logger.info(f"Loading ground truth from {truth_dir}")
-            self.truth_snvs = load_ground_truth_snvs(truth_dir)
-            self.truth_abundances = load_ground_truth_abundances(truth_dir)
+            logger.info(f"Ground truth directory: {truth_dir}")
 
-        # Get contigs from BAM
-        contigs = get_contigs_from_bam(bam_path)
+        # Get contigs from first BAM (or reference for longitudinal)
+        if use_longitudinal and reference_path:
+            from strainphase.longitudinal import parse_reference_contigs
+            mags = parse_reference_contigs(reference_path, allowed_contigs=None)
+            # Flatten MAG structure to get all contigs
+            contigs = {}
+            for mag_contigs in mags.values():
+                contigs.update(mag_contigs)
+        else:
+            contigs = get_contigs_from_bam(bam_paths[first_timepoint])
         if max_contigs:
             contig_list = list(contigs.items())[:max_contigs]
             contigs = dict(contig_list)
@@ -1045,7 +1512,10 @@ class ParameterSweep:
                         progress_logger.log_config_start(config_count, params)
 
                         try:
-                            result = self._run_single_config(params, contigs, progress_logger, config_count, n_workers)
+                            result = self._run_single_config(
+                                params, contigs, progress_logger, config_count, n_workers,
+                                output_dir=output_dir, verbose=verbose
+                            )
                             progress_logger.log_config_complete(config_count, result)
 
                             self.results.append(result)
@@ -1241,8 +1711,12 @@ class ParameterSweep:
 
 
 def run_parameter_sweep(
-    bam_path: str,
-    vcf_path: str,
+    bam_path: Optional[str] = None,
+    vcf_path: Optional[str] = None,
+    bam_paths: Optional[Dict[str, str]] = None,  # For longitudinal: {timepoint -> bam_path}
+    vcf_paths: Optional[Dict[str, str]] = None,  # For longitudinal: {timepoint -> vcf_path}
+    reference_path: Optional[str] = None,  # Required for longitudinal mode
+    timepoints: Optional[List[str]] = None,  # List of timepoint IDs
     output_dir: str = "benchmarks/results",
     truth_dir: Optional[str] = None,
     params_file: Optional[str] = None,
@@ -1259,8 +1733,12 @@ def run_parameter_sweep(
     Run complete parameter sweep and save results.
 
     Args:
-        bam_path: BAM file path
-        vcf_path: VCF file path
+        bam_path: Single BAM file path (for single-timepoint mode)
+        vcf_path: Single VCF file path (for single-timepoint mode)
+        bam_paths: Dict of {timepoint -> bam_path} (for longitudinal mode)
+        vcf_paths: Dict of {timepoint -> vcf_path} (for longitudinal mode)
+        reference_path: Reference FASTA path (required for longitudinal mode)
+        timepoints: List of timepoint IDs (e.g., ["T1", "T2"])
         output_dir: Output directory for results
         truth_dir: Ground truth directory (optional, for accuracy metrics)
         params_file: Custom parameter grid JSON file (optional)
@@ -1272,8 +1750,29 @@ def run_parameter_sweep(
         checkpoint_interval: How often to save progress (in configs)
         passes: Number of optimization passes (sequential mode only)
         n_workers: Number of parallel workers for window processing
+    
+    Note: Either provide (bam_path, vcf_path) for single-timepoint mode,
+          or (bam_paths, vcf_paths, reference_path, timepoints) for longitudinal mode.
     """
     os.makedirs(output_dir, exist_ok=True)
+
+    # Determine mode: longitudinal (multiple timepoints) or single-timepoint
+    use_longitudinal = (bam_paths is not None and vcf_paths is not None and 
+                       reference_path is not None and timepoints is not None)
+    
+    if not use_longitudinal:
+        # Single-timepoint mode: require bam_path and vcf_path
+        if not bam_path or not vcf_path:
+            raise ValueError("Either provide (bam_path, vcf_path) for single-timepoint mode, "
+                           "or (bam_paths, vcf_paths, reference_path, timepoints) for longitudinal mode")
+        # Convert to dict format for consistency
+        bam_paths = {"T1": bam_path}
+        vcf_paths = {"T1": vcf_path}
+        timepoints = ["T1"]
+        reference_path = None
+        logger.info(f"Single-timepoint mode: using {bam_path}")
+    else:
+        logger.info(f"Longitudinal mode: {len(timepoints)} timepoints ({', '.join(timepoints)})")
 
     # Load custom parameter grid if provided
     grid = None
@@ -1284,10 +1783,12 @@ def run_parameter_sweep(
     sweep = ParameterSweep(seed=42, grid=grid)
 
     if mode == "sequential":
-        logger.info(f"Starting sequential parameter optimization on: {bam_path}")
+        logger.info(f"Starting sequential parameter optimization")
         results, best_params = sweep.run_sequential_sweep(
-            bam_path=bam_path,
-            vcf_path=vcf_path,
+            bam_paths=bam_paths,
+            vcf_paths=vcf_paths,
+            reference_path=reference_path,
+            timepoints=timepoints,
             output_dir=output_dir,
             truth_dir=truth_dir,
             max_contigs=max_contigs,
@@ -1298,10 +1799,12 @@ def run_parameter_sweep(
             n_workers=n_workers,
         )
     else:
-        logger.info(f"Starting parameter sweep on: {bam_path}")
+        logger.info(f"Starting parameter sweep")
         results = sweep.run_sweep(
-            bam_path=bam_path,
-            vcf_path=vcf_path,
+            bam_paths=bam_paths,
+            vcf_paths=vcf_paths,
+            reference_path=reference_path,
+            timepoints=timepoints,
             truth_dir=truth_dir,
             max_configs=max_configs,
             max_contigs=max_contigs,
@@ -1317,12 +1820,17 @@ def run_parameter_sweep(
     with open(os.path.join(output_dir, 'sweep_results.json'), 'w') as f:
         json.dump(results_data, f, indent=2, default=str)
 
-    # Save metrics in documented schema
+    # Save metrics in documented schema (agents.md Section 4.3)
     metrics_payload = []
-    for r in results:
+    for idx, r in enumerate(results):
         metrics_payload.append({
             "params": r.params.to_dict(),
+            "config_full": r.config_full or {},
             "community": r.scenario_name,
+            "seed": r.params.random_seed if hasattr(r.params, 'random_seed') else None,
+            "replicate": idx + 1,  # Sequential index as replicate number
+            "environment": r.environment or {},
+            "ablation": r.ablation,  # e.g., "full", "no_linking", "no_rescue", etc.
             "metrics": {
                 "haplotype_precision": r.haplotype_precision,
                 "haplotype_recall": r.haplotype_recall,
@@ -1331,6 +1839,18 @@ def run_parameter_sweep(
                 "abundance_mae": r.abundance_mae,
                 "snv_precision": r.snv_precision,
                 "snv_recall": r.snv_recall,
+                "snv_f1": r.snv_f1,
+                # Track/linking metrics
+                "track_fragmentation": r.track_fragmentation_mean,
+                "false_link_rate": r.false_link_rate,
+                "missed_link_rate": r.missed_link_rate,
+                "track_consensus_error": r.track_consensus_error,
+                # Lineage metrics
+                "lineage_precision": r.lineage_precision,
+                "lineage_recall": r.lineage_recall,
+                "rescue_delta_recall_rare": r.rescue_delta_recall_rare,
+                "abundance_trajectory_error": r.abundance_trajectory_error,
+                # Performance
                 "runtime_seconds": r.runtime_seconds,
                 "memory_peak_mb": r.memory_peak_mb,
             }
@@ -1394,9 +1914,9 @@ def main():
                         help="Output directory for results")
 
     # Mode selection
-    parser.add_argument("--mode", choices=["grid", "sequential"], default="grid",
-                        help="Optimization mode: 'grid' for full sweep (13,824 configs), "
-                             "'sequential' for coordinate descent (~27 configs)")
+    parser.add_argument("--mode", choices=["grid", "sequential"], default="sequential",
+                        help="Optimization mode: 'sequential' for coordinate descent (~27 configs), "
+                             "'grid' for full sweep (many configs)")
 
     # Limits
     parser.add_argument("--max-configs", type=int,
@@ -1405,8 +1925,10 @@ def main():
                         help="Limit number of contigs to process")
 
     # Checkpointing
-    parser.add_argument("--resume", action="store_true",
-                        help="Resume from last checkpoint if available")
+    parser.add_argument("--resume", action="store_true", default=True,
+                        help="Resume from last checkpoint if available (default: True)")
+    parser.add_argument("--no-resume", action="store_false", dest="resume",
+                        help="Start fresh, ignoring any existing checkpoint")
     parser.add_argument("--checkpoint-interval", type=int, default=10,
                         help="Save checkpoint every N configs")
 
@@ -1415,8 +1937,8 @@ def main():
                         help="Number of optimization passes (sequential mode only)")
 
     # Parallelization
-    parser.add_argument("-j", "--workers", type=int, default=1,
-                        help="Number of parallel workers for window processing (default: 1)")
+    parser.add_argument("-j", "--workers", type=int, default=8,
+                        help="Number of parallel workers for window processing")
 
     # Verbosity
     parser.add_argument("--quiet", "-q", action="store_true",

@@ -4,41 +4,51 @@ Tools for validating strainphase against simulated data.
 
 ## Overview
 
-This folder contains scripts for:
-1. **Downloading** real bacterial genomes from NCBI RefSeq
-2. **Validating** strainphase results against ground truth
-3. **Generating** publication-quality figures
+This folder contains the validation modules used by the benchmarking pipeline.
+All validation is orchestrated through `benchmarks/run_full_benchmark.py`.
 
-## Files
+## Core Validation Modules
 
-- `download_real_genomes.py` - Downloads bacterial genomes from NCBI for testing
-- `validate_synthetic.py` - Validates strainphase against synthetic scenarios
-- `test_and_figure.py` - Quick validation with figure generation
-- `slurm_array.sh` - Example SLURM job script for HPC clusters
+- `simulate_reads.py` - Generates file-based synthetic HiFi reads from real genomes
+- `validate_haplotypes.py` - Main validation entry point (precision, recall, F1, etc.)
+- `validate_tracks.py` - Track/linking validation metrics (library module)
+- `validate_lineages.py` - Lineage validation metrics (library module)
 
 ## Usage
 
-### 1. Download Reference Genomes
+### Full Benchmarking Pipeline (Recommended)
 
 ```bash
-python validation/download_real_genomes.py --output data/genomes/
+python benchmarks/run_full_benchmark.py \
+    --genomes data/genomes/ \
+    --output results/benchmark/
 ```
 
-### 2. Run Validation
+This automatically:
+1. Simulates reads from genomes
+2. Runs parameter sweeps
+3. Validates results
+4. Generates reports
+
+### Standalone Validation
+
+If you already have results and want to validate them:
 
 ```bash
-python validation/validate_synthetic.py --output results/
-python validation/validate_synthetic.py --quick  # Fast validation
+python validation/validate_haplotypes.py \
+    --detected results/lineages.tsv \
+    --truth data/simulated/ \
+    --output results/validation/
 ```
 
-### 3. Generate Figures
+## Simulation Systems
 
-```bash
-python validation/test_and_figure.py
-```
+This directory contains **file-based simulation** (`simulate_reads.py`) which generates
+real BAM/VCF/FASTQ files from user-provided genomes. This is used by the main
+benchmarking pipeline for validation.
 
-## Note
-
-The synthetic data generator in `strainphase.simulation` creates in-memory test
-scenarios. For file-based validation with realistic data, use `download_real_genomes.py`
-to obtain real bacterial genomes from NCBI.
+**Note:** There is also an **in-memory simulation system** (`strainphase.simulation.SyntheticDataGenerator`)
+which generates synthetic data without file I/O. This is used by `benchmark_performance.py`
+for quick performance profiling. The two systems serve different purposes:
+- **File-based** (`validation/simulate_reads.py`): Full pipeline testing with real file formats
+- **In-memory** (`strainphase/simulation/`): Fast performance profiling without I/O overhead

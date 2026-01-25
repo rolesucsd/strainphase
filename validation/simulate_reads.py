@@ -70,6 +70,13 @@ class SimulationConfig:
     # Abundance dynamics
     sweep_fraction: float = 0.3  # Fraction of strains with sweeping dynamics
 
+    # VCF realism (optional)
+    vcf_realism: bool = False  # If True, inject FP/FN sites and missing AF/DP
+    vcf_fp_rate: float = 0.01  # False positive rate (fraction of sites to add)
+    vcf_fn_rate: float = 0.01  # False negative rate (fraction of sites to drop)
+    vcf_missing_af_rate: float = 0.05  # Fraction of sites with missing AF
+    vcf_missing_dp_rate: float = 0.05  # Fraction of sites with missing DP
+
     # Random seed
     seed: int = 42
 
@@ -389,8 +396,26 @@ def write_sam(reads: List[Dict], reference_contigs: Dict[str, str], output_path:
             f.write(f"{read['id']}\t{flag}\t{read['contig']}\t{read['start']+1}\t{read['mapq']}\t{read['cigar']}\t*\t0\t0\t{read['seq']}\t{''.join(chr(q+33) for q in read['quals'])}\n")
 
 
-def write_vcf(snv_positions: Dict[str, List[int]], strains: List[Strain], reference: Strain, output_path: str):
-    """Write ground truth VCF with all SNV positions in proper VCF format with sample column."""
+def write_vcf(
+    snv_positions: Dict[str, List[int]], 
+    strains: List[Strain], 
+    reference: Strain, 
+    output_path: str,
+    config: Optional[SimulationConfig] = None,
+    rng: Optional[np.random.Generator] = None
+):
+    """
+    Write ground truth VCF with all SNV positions in proper VCF format with sample column.
+    
+    If config.vcf_realism is True, injects FP/FN sites and missing AF/DP fields.
+    """
+    perturbations = {
+        'fp_sites': [],  # (contig, pos) added
+        'fn_sites': [],  # (contig, pos) dropped
+        'missing_af_sites': [],  # (contig, pos) with missing AF
+        'missing_dp_sites': [],  # (contig, pos) with missing DP
+    }
+    
     with open(output_path, 'w') as f:
         # Header
         f.write("##fileformat=VCFv4.2\n")
@@ -406,12 +431,56 @@ def write_vcf(snv_positions: Dict[str, List[int]], strains: List[Strain], refere
         f.write("#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE\n")
 
         # Variants
-        for contig_id, positions in sorted(snv_positions.items()):
+        all_positions = list(snv_positions.items())
+        
+        # Apply VCF realism if enabled
+        if config and config.vcf_realism and rng:
+            # Drop some sites (false negatives)
+            n_fn = int(len(all_positions) * config.vcf_fn_rate)
+            fn_indices = set(rng.choice(len(all_positions), size=n_fn, replace=False))
+            filtered_positions = [(c, p) for i, (c, ps) in enumerate(all_positions) 
+                                 for p in ps if i not in fn_indices]
+            
+            # Add false positive sites (random positions not in truth)
+            n_fp = int(len(filtered_positions) * config.vcf_fp_rate)
+            fp_sites = []
+            for contig_id, ref_seq in reference.contigs.items():
+                valid_positions = [p for p in range(100, len(ref_seq) - 100) 
+                                 if (contig_id, p) not in filtered_positions]
+                if valid_positions:
+                    fp_positions = rng.choice(valid_positions, 
+                                            size=min(n_fp, len(valid_positions)), 
+                                            replace=False)
+                    fp_sites.extend([(contig_id, int(p)) for p in fp_positions])
+                    perturbations['fp_sites'] = fp_sites
+            
+            # Mark sites for missing AF/DP
+            all_sites = filtered_positions + fp_sites
+            n_missing_af = int(len(all_sites) * config.vcf_missing_af_rate)
+            n_missing_dp = int(len(all_sites) * config.vcf_missing_dp_rate)
+            missing_af_indices = set(rng.choice(len(all_sites), size=n_missing_af, replace=False))
+            missing_dp_indices = set(rng.choice(len(all_sites), size=n_missing_dp, replace=False))
+        else:
+            filtered_positions = [(c, p) for c, ps in all_positions for p in ps]
+            fp_sites = []
+            missing_af_indices = set()
+            missing_dp_indices = set()
+        
+        # Write variants
+        all_sites_to_write = filtered_positions + fp_sites
+        for site_idx, (contig_id, pos) in enumerate(all_sites_to_write):
             ref_seq = reference.contigs.get(contig_id, "")
-
-            for pos in positions:
-                ref_base = ref_seq[pos] if pos < len(ref_seq) else 'N'
-
+            ref_base = ref_seq[pos] if pos < len(ref_seq) else 'N'
+            
+            # Check if this is a false positive (not in truth)
+            is_fp = (contig_id, pos) in fp_sites
+            
+            if is_fp:
+                # Generate random alt allele for FP
+                bases = ['A', 'C', 'G', 'T']
+                alt_base = rng.choice([b for b in bases if b != ref_base]) if rng else 'A'
+                strain_info = f"{alt_base}:fake_strain"  # Fake strain assignment
+            else:
                 # Find all alt alleles and which strains have them
                 alt_alleles = {}
                 for strain in strains[1:]:
@@ -420,16 +489,62 @@ def write_vcf(snv_positions: Dict[str, List[int]], strains: List[Strain], refere
                         if alt not in alt_alleles:
                             alt_alleles[alt] = []
                         alt_alleles[alt].append(strain.id)
-
-                if alt_alleles:
-                    alt_str = ','.join(sorted(alt_alleles.keys()))
-                    strain_info = '|'.join(f"{alt}:{','.join(sids)}" for alt, sids in alt_alleles.items())
-                    # Add fake depth and AF for strainphase compatibility
-                    info = f"DP=50;AF=0.5;STRAINS={strain_info}"
-                    # Add sample genotype (0/1 = heterozygous indicating mixed population)
-                    gt_format = "GT:DP:AD"
-                    gt_sample = "0/1:50:25,25"
-                    f.write(f"{contig_id}\t{pos+1}\t.\t{ref_base}\t{alt_str}\t30\tPASS\t{info}\t{gt_format}\t{gt_sample}\n")
+                
+                if not alt_alleles:
+                    continue  # Skip if no alt alleles (shouldn't happen for truth sites)
+                
+                alt_base = sorted(alt_alleles.keys())[0]
+                strain_info = '|'.join(f"{alt}:{','.join(sids)}" for alt, sids in alt_alleles.items())
+            
+            # Build INFO field
+            info_parts = []
+            if site_idx not in missing_dp_indices:
+                info_parts.append("DP=50")
+            if site_idx not in missing_af_indices:
+                info_parts.append("AF=0.5")
+            info_parts.append(f"STRAINS={strain_info}")
+            info = ';'.join(info_parts)
+            
+            # Build FORMAT/SAMPLE fields
+            gt_format = "GT:DP:AD"
+            if site_idx in missing_dp_indices:
+                gt_sample = "0/1:.:25,25"  # Missing DP
+            else:
+                gt_sample = "0/1:50:25,25"
+            
+            f.write(f"{contig_id}\t{pos+1}\t.\t{ref_base}\t{alt_base}\t30\tPASS\t{info}\t{gt_format}\t{gt_sample}\n")
+            
+            # Track perturbations
+            if is_fp:
+                perturbations['fp_sites'].append((contig_id, pos))
+            if site_idx in missing_af_indices:
+                perturbations['missing_af_sites'].append((contig_id, pos))
+            if site_idx in missing_dp_indices:
+                perturbations['missing_dp_sites'].append((contig_id, pos))
+        
+        # Track false negatives
+        if config and config.vcf_realism and rng:
+            fn_sites = [(c, p) for i, (c, ps) in enumerate(all_positions) 
+                       for p in ps if i in fn_indices]
+            perturbations['fn_sites'] = fn_sites
+    
+    # Save perturbations JSON if realism enabled
+    if config and config.vcf_realism:
+        perturbations_path = output_path.replace('.vcf', '_perturbations.json').replace('truth_', 'truth_vcf_')
+        import json
+        import os
+        # Convert tuples to lists for JSON serialization
+        perturbations_json = {
+            'fp_sites': [{'contig': c, 'pos': p} for c, p in perturbations['fp_sites']],
+            'fn_sites': [{'contig': c, 'pos': p} for c, p in perturbations['fn_sites']],
+            'missing_af_sites': [{'contig': c, 'pos': p} for c, p in perturbations['missing_af_sites']],
+            'missing_dp_sites': [{'contig': c, 'pos': p} for c, p in perturbations['missing_dp_sites']],
+        }
+        # Write to same directory as VCF
+        perturbations_path = os.path.join(os.path.dirname(output_path), 'truth_vcf_perturbations.json')
+        with open(perturbations_path, 'w') as f:
+            json.dump(perturbations_json, f, indent=2)
+        logger.info(f"Wrote VCF perturbations to {perturbations_path}")
 
 
 def write_reference_fasta(reference: Strain, output_path: str):
@@ -500,6 +615,41 @@ def write_ground_truth(ground_truth: GroundTruth, output_dir: str):
                 allele_str = ",".join(alleles) if alleles else "."
                 f.write(f"{strain.id}\t{contig}\t{allele_str}\n")
 
+    # Track spans per strain (per contig) - for track/linking validation
+    # Each strain should have one continuous track per contig (including reference strain)
+    tracks_path = os.path.join(output_dir, "truth_tracks.tsv")
+    with open(tracks_path, 'w') as f:
+        f.write("strain_id\tcontig\tstart\tend\twindow_chain\n")
+        for strain in ground_truth.strains:
+            for contig, positions in sorted(ground_truth.snv_positions.items()):
+                # Include all strains that have this contig (including reference strain)
+                # Reference strain has reference alleles at all SNV positions, which is informative
+                if contig in strain.contigs:
+                    # Track spans the entire contig (or at least where SNVs exist)
+                    contig_length = len(strain.contigs[contig])
+                    # Window chain is just a placeholder - actual windows depend on window_size
+                    # Format: "w0,w1,w2" where windows overlap by 50%
+                    # For now, we'll mark it as "full" and validation will compute actual windows
+                    f.write(f"{strain.id}\t{contig}\t1\t{contig_length}\tfull\n")
+    
+    logger.info(f"Wrote truth_tracks.tsv to {tracks_path}")
+
+    # Lineage mapping (strain IDs ↔ cross-timepoint lineage IDs)
+    # For simulation: each strain gets a unique lineage ID (since strains persist across timepoints)
+    lineages_path = os.path.join(output_dir, "truth_lineages.tsv")
+    with open(lineages_path, 'w') as f:
+        f.write("strain_id\tlineage_id\tcontig\n")
+        for strain in ground_truth.strains:
+            # Create a unique lineage ID per strain (can be same as strain_id or derived)
+            # For simulation, lineage_id = strain_id since each strain is a distinct lineage
+            lineage_id = strain.id
+            # Each strain appears in all contigs where it has SNVs
+            for contig in sorted(set(ground_truth.snv_positions.keys())):
+                if contig in strain.contigs:
+                    f.write(f"{strain.id}\t{lineage_id}\t{contig}\n")
+    
+    logger.info(f"Wrote truth_lineages.tsv to {lineages_path}")
+
     logger.info(f"Wrote ground truth files to {output_dir}")
 
 
@@ -520,13 +670,43 @@ def run_simulation(
 
     # Load genomes
     logger.info(f"Loading genomes from {genome_dir}")
-    strains = load_genomes(genome_dir)
-    logger.info(f"Loaded {len(strains)} strains")
+    genome_strains = load_genomes(genome_dir)
+    logger.info(f"Loaded {len(genome_strains)} genome file(s)")
 
-    # Limit strains if requested
-    if max_strains and len(strains) > max_strains:
-        strains = strains[:max_strains]
-        logger.info(f"Limited to {max_strains} strains")
+    # CRITICAL RULE: For EVERY SINGLE genome file provided, randomly create between 2 and max_strains strains
+    # This ensures SNVs can be introduced (introduce_snvs only processes strains[1:], so we need >= 2 strains)
+    max_strains_per_genome = max_strains if max_strains and max_strains >= 2 else 2
+    min_strains_per_genome = 2
+    
+    logger.info(f"Creating between {min_strains_per_genome} and {max_strains_per_genome} strains per genome file (randomly chosen)")
+
+    # Expand each genome file into multiple strains
+    strains = []
+    for genome_strain in genome_strains:
+        # Randomly choose number of strains for this genome file (between 2 and max_strains)
+        n_strains_for_this_genome = rng.integers(min_strains_per_genome, max_strains_per_genome + 1)
+        logger.info(f"  {genome_strain.id}: creating {n_strains_for_this_genome} strains")
+        
+        # First strain is the reference (no SNVs introduced)
+        reference_strain = Strain(
+            id=f"{genome_strain.id}_ref",
+            genome_file=genome_strain.genome_file,
+            contigs=dict(genome_strain.contigs),  # Deep copy
+            total_length=genome_strain.total_length
+        )
+        strains.append(reference_strain)
+        
+        # Create additional variant strains from this genome (strains[1:] will get SNVs)
+        for i in range(1, n_strains_for_this_genome):
+            variant_strain = Strain(
+                id=f"{genome_strain.id}_var_{i}",
+                genome_file=genome_strain.genome_file,
+                contigs=dict(genome_strain.contigs),  # Deep copy
+                total_length=genome_strain.total_length
+            )
+            strains.append(variant_strain)
+    
+    logger.info(f"Created {len(strains)} total strains ({len(genome_strains)} references + {len(strains) - len(genome_strains)} variants)")
 
     # Introduce SNVs
     logger.info("Introducing SNVs between strains")
@@ -546,11 +726,17 @@ def run_simulation(
 
     # Write ground truth VCF (primary + legacy name)
     vcf_path = os.path.join(output_dir, "truth_snvs.vcf")
-    write_vcf(snv_positions, strains, reference, vcf_path)
+    write_vcf(snv_positions, strains, reference, vcf_path, config=config, rng=rng)
     logger.info(f"Wrote truth VCF to {vcf_path}")
+    
+    # If VCF realism enabled, also write perturbations JSON
+    if config.vcf_realism:
+        perturbations_path = os.path.join(output_dir, "truth_vcf_perturbations.json")
+        # This is written inside write_vcf, but we log it here too
+        logger.info(f"VCF realism enabled - perturbations logged")
 
     legacy_vcf_path = os.path.join(output_dir, "truth_variants.vcf")
-    write_vcf(snv_positions, strains, reference, legacy_vcf_path)
+    write_vcf(snv_positions, strains, reference, legacy_vcf_path, config=config, rng=rng)
     logger.info(f"Wrote legacy truth VCF to {legacy_vcf_path}")
 
     # Simulate reads for each timepoint
