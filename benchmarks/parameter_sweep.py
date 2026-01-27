@@ -868,7 +868,8 @@ class ParameterSweep:
                         config=config,
                     )
                     
-                    # Log per-timepoint results
+                    # Log per-timepoint results from process_mag_longitudinal
+                    logger.info(f"    process_mag_longitudinal returned results for {len(mag_results)} timepoints")
                     for sample_id in timepoints:
                         sample_contigs = mag_results.get(sample_id, {})
                         total_windows = sum(len(contig_results) for contig_results in sample_contigs.values())
@@ -878,6 +879,11 @@ class ParameterSweep:
                             for wr in contig_results
                         )
                         logger.info(f"    {sample_id}: {len(sample_contigs)} contigs, {total_windows} windows, {total_haplotypes} haplotypes")
+                    
+                    # Check if any timepoints are missing
+                    missing_samples = set(timepoints) - set(mag_results.keys())
+                    if missing_samples:
+                        logger.warning(f"    WARNING: process_mag_longitudinal did not return results for: {sorted(missing_samples)}")
                     
                     # Flatten results: {sample -> {contig -> [WindowResult]}} -> List[WindowResult]
                     for sample_results in mag_results.values():
@@ -938,10 +944,20 @@ class ParameterSweep:
                             # Build lineage table (creates records with lineage_id, sample, contig, etc.)
                             lineage_records = build_lineage_table(structured_results, config)
                             
-                            # Log which timepoints have records
+                            # Log which timepoints have records BEFORE conversion
                             samples_in_records = set(rec.get('sample', '') for rec in lineage_records)
                             logger.info(f"    Lineage records include timepoints: {sorted(samples_in_records)}")
                             logger.info(f"    Total lineage records: {len(lineage_records)}")
+                            
+                            # Log per-timepoint record counts BEFORE conversion
+                            from collections import Counter
+                            sample_counts_raw = Counter(rec.get('sample', '') for rec in lineage_records)
+                            logger.info(f"    Raw records per timepoint: {dict(sample_counts_raw)}")
+                            
+                            # Verify all expected timepoints are present
+                            missing_timepoints = set(timepoints) - samples_in_records
+                            if missing_timepoints:
+                                logger.warning(f"    WARNING: Missing timepoints in lineage records: {sorted(missing_timepoints)}")
                             
                             # Convert records to format expected by validation
                             # build_lineage_table returns: mean_weight, consensus (pipe-separated)
@@ -964,10 +980,13 @@ class ParameterSweep:
                                     'snv_alleles': snv_alleles,
                                 })
                             
-                            # Log per-timepoint counts
-                            from collections import Counter
+                            # Log per-timepoint counts AFTER conversion
                             sample_counts = Counter(rec['sample'] for rec in converted_records)
-                            logger.info(f"    Records per timepoint: {dict(sample_counts)}")
+                            logger.info(f"    Converted records per timepoint: {dict(sample_counts)}")
+                            
+                            # Log per-contig breakdown
+                            contig_counts = Counter(rec['contig'] for rec in converted_records)
+                            logger.info(f"    Records per contig: {dict(contig_counts)}")
                             
                             # Write lineages.tsv from converted records
                             import csv
@@ -1189,7 +1208,8 @@ class ParameterSweep:
                 config=config,
             )
             
-            # Log per-timepoint results
+            # Log per-timepoint results from process_mag_longitudinal
+            logger.info(f"    process_mag_longitudinal returned results for {len(mag_results)} timepoints")
             for sample_id in self.timepoints:
                 sample_contigs = mag_results.get(sample_id, {})
                 total_windows = sum(len(contig_results) for contig_results in sample_contigs.values())
@@ -1199,6 +1219,11 @@ class ParameterSweep:
                     for wr in contig_results
                 )
                 logger.info(f"    {sample_id}: {len(sample_contigs)} contigs, {total_windows} windows, {total_haplotypes} haplotypes")
+            
+            # Check if any timepoints are missing
+            missing_samples = set(self.timepoints) - set(mag_results.keys())
+            if missing_samples:
+                logger.warning(f"    WARNING: process_mag_longitudinal did not return results for: {sorted(missing_samples)}")
             
             # Flatten results: {sample -> {contig -> [WindowResult]}} -> List[WindowResult]
             for sample_results in mag_results.values():
@@ -1270,10 +1295,20 @@ class ParameterSweep:
                     # Build lineage table (creates records with lineage_id, sample, contig, etc.)
                     lineage_records = build_lineage_table(structured_results, config)
                     
-                    # Log which timepoints have records
+                    # Log which timepoints have records BEFORE conversion
                     samples_in_records = set(rec.get('sample', '') for rec in lineage_records)
                     logger.info(f"    Lineage records include timepoints: {sorted(samples_in_records)}")
                     logger.info(f"    Total lineage records: {len(lineage_records)}")
+                    
+                    # Log per-timepoint record counts BEFORE conversion
+                    from collections import Counter
+                    sample_counts_raw = Counter(rec.get('sample', '') for rec in lineage_records)
+                    logger.info(f"    Raw records per timepoint: {dict(sample_counts_raw)}")
+                    
+                    # Verify all expected timepoints are present
+                    missing_timepoints = set(self.timepoints) - samples_in_records
+                    if missing_timepoints:
+                        logger.warning(f"    WARNING: Missing timepoints in lineage records: {sorted(missing_timepoints)}")
                     
                     # Convert records to format expected by validation
                     # build_lineage_table returns: mean_weight, consensus (pipe-separated)
@@ -1296,10 +1331,13 @@ class ParameterSweep:
                             'snv_alleles': snv_alleles,
                         })
                     
-                    # Log per-timepoint counts
-                    from collections import Counter
+                    # Log per-timepoint counts AFTER conversion
                     sample_counts = Counter(rec['sample'] for rec in converted_records)
-                    logger.info(f"    Records per timepoint: {dict(sample_counts)}")
+                    logger.info(f"    Converted records per timepoint: {dict(sample_counts)}")
+                    
+                    # Log per-contig breakdown
+                    contig_counts = Counter(rec['contig'] for rec in converted_records)
+                    logger.info(f"    Records per contig: {dict(contig_counts)}")
                     
                     # Write lineages.tsv from converted records
                     import csv
@@ -1492,10 +1530,17 @@ class ParameterSweep:
             start_values = dict(self.DEFAULT_START_VALUES)
 
         # Determine if longitudinal mode (multiple timepoints)
-        use_longitudinal = (reference_path is not None and 
-                           timepoints is not None and 
+        use_longitudinal = (reference_path is not None and
+                           timepoints is not None and
                            len(timepoints) > 1)
-        
+
+        # Store paths as instance variables for use in processing
+        self.bam_paths = bam_paths
+        self.vcf_paths = vcf_paths
+        self.reference_path = reference_path
+        self.timepoints = timepoints
+        self.use_longitudinal = use_longitudinal
+
         # Store paths for backward compatibility and validation
         first_timepoint = timepoints[0] if timepoints else list(bam_paths.keys())[0]
         self.bam_path = bam_paths[first_timepoint]  # For backward compatibility
