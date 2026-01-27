@@ -37,6 +37,7 @@ data/
 tmp/
 tmp2/
 results/
+strains/
 
 # Conda environments
 .conda/
