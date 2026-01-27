@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=strainphase_bench
-#SBATCH --array=1-5
+#SBATCH --array=1-3
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
 #SBATCH --time=24:00:00
@@ -10,22 +10,20 @@
 ###############################################################################
 # Strainphase Full Benchmark Suite
 #
-# Runs parameter sweep at 5 different complexity levels:
+# Runs parameter sweep at 3 different complexity levels:
 #   1: Simple     (2 strains)
-#   2: Low        (4 strains)
-#   3: Medium     (8 strains)
-#   4: High       (16 strains)
-#   5: Complex    (32 strains)
+#   2: Medium     (4 strains)
+#   3: Complex    (8 strains)
 #
 # Usage:
 #   # On SLURM cluster:
 #   sbatch benchmarks/cluster_benchmark.sh
 #
 #   # Locally (run specific complexity level):
-#   bash benchmarks/cluster_benchmark.sh 3   # Run medium complexity
+#   bash benchmarks/cluster_benchmark.sh 2   # Run medium complexity
 #
 #   # Locally (run all sequentially):
-#   for i in 1 2 3 4 5; do bash benchmarks/cluster_benchmark.sh $i; done
+#   for i in 1 2 3; do bash benchmarks/cluster_benchmark.sh $i; done
 ###############################################################################
 
 set -euo pipefail
@@ -55,18 +53,14 @@ WORKERS="${WORKERS:-${SLURM_CPUS_PER_TASK:-8}}"
 # Complexity levels: number of strains
 declare -A COMPLEXITY_STRAINS=(
     [1]=2    # Simple
-    [2]=4    # Low
-    [3]=8    # Medium
-    [4]=16   # High
-    [5]=32   # Complex
+    [2]=4    # Medium
+    [3]=8    # Complex
 )
 
 declare -A COMPLEXITY_NAMES=(
     [1]="simple"
-    [2]="low"
-    [3]="medium"
-    [4]="high"
-    [5]="complex"
+    [2]="medium"
+    [3]="complex"
 )
 
 # Get complexity level (from SLURM array or command line)
@@ -75,23 +69,39 @@ if [[ -n "${SLURM_ARRAY_TASK_ID:-}" ]]; then
 elif [[ -n "${1:-}" ]]; then
     COMPLEXITY_LEVEL=$1
 else
-    echo "Usage: $0 <complexity_level 1-5>"
+    echo "Usage: $0 <complexity_level 1-3>"
     echo "  1: Simple  (2 strains)"
-    echo "  2: Low     (4 strains)"
-    echo "  3: Medium  (8 strains)"
-    echo "  4: High    (16 strains)"
-    echo "  5: Complex (32 strains)"
+    echo "  2: Medium  (4 strains)"
+    echo "  3: Complex (8 strains)"
     exit 1
 fi
 
 N_STRAINS=${COMPLEXITY_STRAINS[$COMPLEXITY_LEVEL]}
 COMPLEXITY_NAME=${COMPLEXITY_NAMES[$COMPLEXITY_LEVEL]}
+SNV_COUNTS=""
+
+case "$COMPLEXITY_LEVEL" in
+    1)
+        SNV_COUNTS="10000"
+        ;;
+    2)
+        SNV_COUNTS="2500,5000,10000"
+        ;;
+    3)
+        SNV_COUNTS="500,1000,2000,5000,6000,7000,10000"
+        ;;
+    *)
+        echo "Invalid complexity level: $COMPLEXITY_LEVEL"
+        exit 1
+        ;;
+esac
 
 echo "============================================================"
 echo "STRAINPHASE BENCHMARK - ${COMPLEXITY_NAME^^} COMPLEXITY"
 echo "============================================================"
 echo "Complexity level: $COMPLEXITY_LEVEL"
 echo "Number of strains: $N_STRAINS"
+echo "SNV counts (strains[1:]): $SNV_COUNTS"
 echo "Timepoints: $TIMEPOINTS"
 echo "Coverage: ${COVERAGE}x"
 echo "Genome source: $GENOME_SOURCE"
@@ -111,7 +121,7 @@ mkdir -p "$OUTPUT_DIR" "$GENOME_DIR" "$LOG_DIR"
 
 # Select genomes for this complexity level
 echo ""
-echo "Selecting $N_STRAINS genomes..."
+echo "Selecting base genome..."
 
 # Get list of available genomes
 AVAILABLE_GENOMES=($(find "$GENOME_SOURCE" -name "*.fa" -o -name "*.fasta" -o -name "*.fna" 2>/dev/null | head -100))
@@ -127,17 +137,12 @@ BASE_GENOME="${AVAILABLE_GENOMES[0]}"
 BASE_NAME=$(basename "$BASE_GENOME" | sed 's/\.\(fa\|fasta\|fna\)$//')
 
 echo "Using base genome: $BASE_NAME"
-echo "Creating $N_STRAINS strain variants..."
+echo "Simulation will generate $N_STRAINS strains from base genome..."
 
-# Copy base genome as strain_1 (reference)
-cp "$BASE_GENOME" "${GENOME_DIR}/${BASE_NAME}_strain_1.fa"
+# Copy base genome (single reference input)
+cp "$BASE_GENOME" "${GENOME_DIR}/${BASE_NAME}.fa"
 
-# Create additional strain copies (simulation will introduce SNVs)
-for i in $(seq 2 $N_STRAINS); do
-    cp "$BASE_GENOME" "${GENOME_DIR}/${BASE_NAME}_strain_${i}.fa"
-done
-
-echo "Created $(ls -1 "$GENOME_DIR"/*.fa 2>/dev/null | wc -l) strain files"
+echo "Created $(ls -1 "$GENOME_DIR"/*.fa 2>/dev/null | wc -l) genome file"
 
 # Activate conda environment if available
 if command -v conda &> /dev/null; then
@@ -163,7 +168,9 @@ PYTHON_CMD="python benchmarks/run_full_benchmark.py \
     --coverage $COVERAGE \
     --resume \
     --seed $SEED \
-    --mode $MODE"
+    --mode $MODE \
+    --snv-counts $SNV_COUNTS \
+    --fixed-strains-per-genome $N_STRAINS"
 
 # Add mode-specific options
 if [[ "$MODE" == "sequential" ]]; then

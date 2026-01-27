@@ -69,8 +69,8 @@ import os
 from pathlib import Path
 
 output_base = "${OUTPUT_BASE}"
-complexities = ["simple", "low", "medium", "high", "complex"]
-n_strains = [2, 4, 8, 16, 32]
+    complexities = ["simple", "medium", "complex"]
+    n_strains = [2, 4, 8]
 
 consolidated = {
     "benchmark_suite": "strainphase_parameter_sweep",
@@ -168,7 +168,7 @@ if $LOCAL_MODE; then
     # Run locally
     PIDS=()
 
-    for level in 1 2 3 4 5; do
+    for level in 1 2 3; do
         echo ""
         echo "Starting complexity level $level..."
 

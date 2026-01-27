@@ -356,20 +356,27 @@ def load_detected_haplotypes(lineages_file: str) -> List[DetectedHaplotype]:
                 
             sample = row.get('sample', row.get('timepoint', ''))
             contig = row.get('contig', '')
-            abundance = float(row.get('abundance', row.get('weight', 0)))
+            # Try multiple field names for abundance (mean_weight from build_lineage_table, abundance/weight from other formats)
+            abundance = float(row.get('abundance', row.get('mean_weight', row.get('weight', 0))))
 
             # Store abundance
             lineage_data[lineage_id]['abundances'][sample] = abundance
 
             # Parse SNV alleles if present
-            # Format might be: "pos1:A,pos2:G,pos3:T" or separate columns
+            # Format might be: "pos1:A,pos2:G,pos3:T" (comma-separated) or "pos1:A|pos2:G" (pipe-separated)
             snv_col = row.get('snv_alleles', row.get('consensus', ''))
             if snv_col and snv_col != '.':
-                for snv in snv_col.split(','):
+                # Handle both comma and pipe separators
+                snv_list = snv_col.replace('|', ',').split(',')
+                for snv in snv_list:
+                    snv = snv.strip()
                     if ':' in snv:
-                        pos_str, allele = snv.split(':')
-                        pos = int(pos_str)
-                        lineage_data[lineage_id]['snvs'][contig][pos] = allele
+                        pos_str, allele = snv.split(':', 1)
+                        try:
+                            pos = int(pos_str)
+                            lineage_data[lineage_id]['snvs'][contig][pos] = allele
+                        except ValueError:
+                            continue  # Skip invalid positions
 
     # Convert to DetectedHaplotype objects
     for lineage_id, data in lineage_data.items():
@@ -932,56 +939,6 @@ def generate_figures(
         plt.savefig(os.path.join(output_dir, 'detection_sensitivity.png'), dpi=300, bbox_inches='tight')
         plt.close()
 
-    # Figure 4: Enhanced confusion matrix with all haplotypes
-    if true_haps and detected_haps:
-        # Use all haplotypes, not just subset
-        matrix = np.zeros((len(true_haps), len(detected_haps)))
-        match_matrix = np.zeros((len(true_haps), len(detected_haps)), dtype=bool)
-        
-        # Mark actual matches
-        matched_true_idx = {h.strain_id: i for i, h in enumerate(true_haps)}
-        matched_det_idx = {h.lineage_id: i for i, h in enumerate(detected_haps)}
-        
-        for true_hap, det_hap, dist in matches:
-            i = matched_true_idx[true_hap.strain_id]
-            j = matched_det_idx[det_hap.lineage_id]
-            match_matrix[i, j] = True
-        
-        # Fill distance matrix
-        for i, true_hap in enumerate(true_haps):
-            for j, det_hap in enumerate(detected_haps):
-                _, _, _, match_fraction = compute_haplotype_distance(true_hap, det_hap)
-                matrix[i, j] = match_fraction
-
-        fig, ax = plt.subplots(figsize=(max(12, len(detected_haps) * 0.5), max(8, len(true_haps) * 0.4)))
-        im = ax.imshow(matrix, cmap='RdYlGn', vmin=0, vmax=1, aspect='auto')
-        
-        # Highlight matches with boxes
-        for i in range(len(true_haps)):
-            for j in range(len(detected_haps)):
-                if match_matrix[i, j]:
-                    rect = plt.Rectangle((j-0.5, i-0.5), 1, 1, fill=False, 
-                                        edgecolor=COLOR_PALETTE['primary'], linewidth=2.5)
-                    ax.add_patch(rect)
-        
-        ax.set_title('Haplotype Match Matrix (Green=Good match, Red=Poor match, Box=Actual match)',
-                    fontweight='bold', color=COLOR_PALETTE['primary'])
-        ax.set_xlabel('Detected Lineage', fontweight='bold', color=COLOR_PALETTE['primary'])
-        ax.set_ylabel('True Strain', fontweight='bold', color=COLOR_PALETTE['primary'])
-        ax.set_xticks(range(len(detected_haps)))
-        ax.set_xticklabels([d.lineage_id[:15] + '...' if len(d.lineage_id) > 15 else d.lineage_id 
-                           for d in detected_haps], rotation=45, ha='right', fontsize=8,
-                           color=COLOR_PALETTE['primary'])
-        ax.set_yticks(range(len(true_haps)))
-        ax.set_yticklabels([t.strain_id[:15] + '...' if len(t.strain_id) > 15 else t.strain_id 
-                           for t in true_haps], fontsize=8, color=COLOR_PALETTE['primary'])
-        cbar = plt.colorbar(im, ax=ax)
-        cbar.set_label('Match Fraction', fontweight='bold', color=COLOR_PALETTE['primary'])
-        cbar.ax.tick_params(labelsize=9, colors=COLOR_PALETTE['primary'])
-        plt.tight_layout()
-        plt.savefig(os.path.join(output_dir, 'confusion_matrix.png'), dpi=150, bbox_inches='tight')
-        plt.close()
-
     # Figure 5: Per-haplotype matching details
     if result.match_details_full:
         fig, axes = plt.subplots(2, 2, figsize=(14, 10))
@@ -993,8 +950,8 @@ def generate_figures(
         axes[0, 0].axvline(0.9, color=COLOR_PALETTE['error'], linestyle='--', 
                           linewidth=2.0, label='90% threshold', alpha=0.8)
         axes[0, 0].set_xlabel('SNV Match Fraction', fontweight='bold', color=COLOR_PALETTE['primary'])
-        axes[0, 0].set_ylabel('Number of Matches', fontweight='bold', color=COLOR_PALETTE['primary'])
-        axes[0, 0].set_title('Distribution of SNV Match Fractions', 
+        axes[0, 0].set_ylabel('Matched haplotype pairs', fontweight='bold', color=COLOR_PALETTE['primary'])
+        axes[0, 0].set_title('SNV match fraction per matched haplotype pair', 
                             fontweight='bold', color=COLOR_PALETTE['primary'])
         axes[0, 0].legend(frameon=True, framealpha=0.95, edgecolor=COLOR_PALETTE['neutral'])
         
@@ -1005,9 +962,9 @@ def generate_figures(
                           alpha=0.8, color=COLOR_PALETTE['warning'], linewidth=1.2)
             axes[0, 1].set_xlabel('Mean Absolute Abundance Error', 
                                 fontweight='bold', color=COLOR_PALETTE['primary'])
-            axes[0, 1].set_ylabel('Number of Matches', 
+            axes[0, 1].set_ylabel('Matched haplotype pairs', 
                                 fontweight='bold', color=COLOR_PALETTE['primary'])
-            axes[0, 1].set_title('Distribution of Abundance Errors',
+            axes[0, 1].set_title('Abundance MAE per matched haplotype pair',
                                fontweight='bold', color=COLOR_PALETTE['primary'])
         
         # SNV counts comparison
@@ -1022,7 +979,7 @@ def generate_figures(
                        label='Perfect match', alpha=0.8)
         axes[1, 0].set_xlabel('True SNV Count', fontweight='bold', color=COLOR_PALETTE['primary'])
         axes[1, 0].set_ylabel('Detected SNV Count', fontweight='bold', color=COLOR_PALETTE['primary'])
-        axes[1, 0].set_title('SNV Count Comparison', 
+        axes[1, 0].set_title('SNV counts: true vs detected (matched pairs)', 
                            fontweight='bold', color=COLOR_PALETTE['primary'])
         axes[1, 0].legend(frameon=True, framealpha=0.95, edgecolor=COLOR_PALETTE['neutral'])
         
@@ -1052,35 +1009,47 @@ def generate_figures(
         plt.savefig(os.path.join(output_dir, 'detailed_matching.png'), dpi=300, bbox_inches='tight')
         plt.close()
 
-    # Figure 6: Abundance trajectories for matched haplotypes
+    # Figure 6: Abundance trajectories (single panel, color by timepoint, shape by true/detected)
     if matches:
-        n_plots = min(len(matches), 12)  # Show up to 12 trajectories
-        n_cols = 3
-        n_rows = (n_plots + n_cols - 1) // n_cols
-        
-        fig, axes = plt.subplots(n_rows, n_cols, figsize=(15, 5 * n_rows))
-        if n_rows == 1:
-            axes = axes.reshape(1, -1)
-        axes = axes.flatten()
-        
-        for idx, (true_hap, det_hap, _) in enumerate(matches[:n_plots]):
-            ax = axes[idx]
-            tps = sorted(set(true_hap.abundances.keys()) & set(det_hap.abundances.keys()))
-            true_abunds = [true_hap.abundances[tp] for tp in tps]
-            det_abunds = [det_hap.abundances[tp] for tp in tps]
-            
-            ax.plot(tps, true_abunds, 'o-', label='True', linewidth=2, markersize=8)
-            ax.plot(tps, det_abunds, 's--', label='Detected', linewidth=2, markersize=8)
-            ax.set_xlabel('Timepoint')
-            ax.set_ylabel('Abundance')
-            ax.set_title(f'{true_hap.strain_id} → {det_hap.lineage_id[:15]}')
-            ax.legend()
-            # No grid - clean professional look
-        
-        # Hide unused subplots
-        for idx in range(n_plots, len(axes)):
-            axes[idx].axis('off')
-        
+        fig, ax = plt.subplots(figsize=(10, 6))
+
+        # Collect timepoints across matches
+        all_tps = sorted({tp for m in matches for tp in m[0].abundances.keys()})
+        tp_to_x = {tp: i for i, tp in enumerate(all_tps)}
+        cmap = plt.get_cmap('viridis')
+        colors = {tp: cmap(i / max(1, len(all_tps) - 1)) for i, tp in enumerate(all_tps)}
+
+        # Plot points for each match
+        for true_hap, det_hap, _ in matches:
+            common_tps = sorted(set(true_hap.abundances.keys()) & set(det_hap.abundances.keys()))
+            for tp in common_tps:
+                x = tp_to_x[tp]
+                ax.scatter(x, true_hap.abundances[tp], marker='o',
+                           color=colors[tp], edgecolor=COLOR_PALETTE['primary'], s=40)
+                ax.scatter(x, det_hap.abundances[tp], marker='s',
+                           color=colors[tp], edgecolor=COLOR_PALETTE['primary'], s=40)
+
+        ax.set_xlabel('Timepoint')
+        ax.set_ylabel('Abundance')
+        ax.set_xticks(range(len(all_tps)))
+        ax.set_xticklabels(all_tps)
+        ax.set_ylim(0, 1.0)
+        ax.set_title('Abundance trajectories (true vs detected)')
+
+        # Combined legend: marker shape for true/detected, color for timepoint
+        handles = [
+            plt.Line2D([0], [0], marker='o', color='w',
+                       markerfacecolor=COLOR_PALETTE['primary'], label='True', markersize=8),
+            plt.Line2D([0], [0], marker='s', color='w',
+                       markerfacecolor=COLOR_PALETTE['primary'], label='Detected', markersize=8),
+        ]
+        for tp in all_tps:
+            handles.append(
+                plt.Line2D([0], [0], marker='o', color='w',
+                           markerfacecolor=colors[tp], label=f"{tp}", markersize=7)
+            )
+        ax.legend(handles=handles, frameon=True, loc="upper right", title="Legend")
+
         plt.tight_layout()
         plt.savefig(os.path.join(output_dir, 'abundance_trajectories.png'), dpi=300, bbox_inches='tight')
         plt.close()
@@ -1331,6 +1300,414 @@ def generate_figures(
                     plt.close()
         except Exception as e:
             logger.warning(f"Track visualization failed: {e}")
+
+    # Figure 11: Per-abundance-bin performance (publication standard)
+    _generate_per_abundance_performance(true_haps, detected_haps, matches, output_dir)
+    
+    # Figure 12: Strain divergence vs performance
+    _generate_divergence_performance(true_haps, detected_haps, matches, output_dir)
+    
+    # Figure 13: ROC-like detection curve
+    _generate_detection_roc_curve(true_haps, detected_haps, matches, output_dir)
+    
+    # Figure 14: Reference coverage (completeness)
+    _generate_reference_coverage(true_haps, detected_haps, matches, output_dir)
+    
+    # Figure 15: Error type breakdown
+    _generate_error_breakdown(true_haps, detected_haps, matches, output_dir)
+    
+    # Figure 16: Performance vs strain count (scalability)
+    _generate_scalability_analysis(true_haps, detected_haps, matches, output_dir)
+
+
+def _generate_per_abundance_performance(
+    true_haps: List[TrueHaplotype],
+    detected_haps: List[DetectedHaplotype],
+    matches: List[Tuple[TrueHaplotype, DetectedHaplotype, float]],
+    output_dir: str
+):
+    """Generate per-abundance-bin performance plot (publication standard)."""
+    if not HAS_MATPLOTLIB or not true_haps:
+        return
+    
+    # Define abundance bins (standard ranges from literature)
+    bins = [(0, 0.01), (0.01, 0.05), (0.05, 0.10), (0.10, 0.50), (0.50, 1.0)]
+    bin_labels = ['0-1%', '1-5%', '5-10%', '10-50%', '50-100%']
+    
+    matched_strain_ids = {m[0].strain_id for m in matches}
+    
+    # Compute metrics per bin
+    bin_precision = []
+    bin_recall = []
+    bin_f1 = []
+    bin_counts = []
+    
+    for low, high in bins:
+        # Get strains in this abundance range (check all timepoints)
+        strains_in_bin = []
+        for true_hap in true_haps:
+            max_abund = max(true_hap.abundances.values()) if true_hap.abundances else 0.0
+            if low <= max_abund < high:
+                strains_in_bin.append(true_hap)
+        
+        if not strains_in_bin:
+            bin_precision.append(0.0)
+            bin_recall.append(0.0)
+            bin_f1.append(0.0)
+            bin_counts.append(0)
+            continue
+        
+        # Count detected strains in this bin
+        detected_in_bin = sum(1 for h in strains_in_bin if h.strain_id in matched_strain_ids)
+        
+        # For precision: count detected lineages that match strains in this bin
+        detected_lineages_in_bin = set()
+        for true_hap, det_hap, _ in matches:
+            if true_hap.strain_id in {h.strain_id for h in strains_in_bin}:
+                detected_lineages_in_bin.add(det_hap.lineage_id)
+        
+        # Count all detected lineages (for precision denominator)
+        total_detected_in_bin = len([h for h in detected_haps if h.lineage_id in detected_lineages_in_bin])
+        
+        precision = detected_in_bin / total_detected_in_bin if total_detected_in_bin > 0 else 0.0
+        recall = detected_in_bin / len(strains_in_bin) if len(strains_in_bin) > 0 else 0.0
+        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+        
+        bin_precision.append(precision)
+        bin_recall.append(recall)
+        bin_f1.append(f1)
+        bin_counts.append(len(strains_in_bin))
+    
+    # Plot
+    fig, ax = plt.subplots(figsize=(10, 6))
+    x = np.arange(len(bin_labels))
+    width = 0.25
+    
+    bars1 = ax.bar(x - width, bin_precision, width, label='Precision', 
+                   color=COLOR_PALETTE['success'], edgecolor=COLOR_PALETTE['primary'],
+                   linewidth=1.2, alpha=0.85)
+    bars2 = ax.bar(x, bin_recall, width, label='Recall',
+                   color=COLOR_PALETTE['accent'], edgecolor=COLOR_PALETTE['primary'],
+                   linewidth=1.2, alpha=0.85)
+    bars3 = ax.bar(x + width, bin_f1, width, label='F1',
+                   color=COLOR_PALETTE['info'], edgecolor=COLOR_PALETTE['primary'],
+                   linewidth=1.2, alpha=0.85)
+    
+    # Add count annotations
+    for i, (bar, count) in enumerate(zip(bars2, bin_counts)):
+        if count > 0:
+            ax.text(bar.get_x() + bar.get_width()/2, -0.05,
+                   f'n={count}', ha='center', va='top', fontsize=9,
+                   color=COLOR_PALETTE['secondary'], style='italic')
+    
+    ax.set_xlabel('Abundance Range', fontweight='bold', color=COLOR_PALETTE['primary'])
+    ax.set_ylabel('Score', fontweight='bold', color=COLOR_PALETTE['primary'])
+    ax.set_title('Performance by Abundance Range', fontweight='bold', color=COLOR_PALETTE['primary'])
+    ax.set_xticks(x)
+    ax.set_xticklabels(bin_labels, color=COLOR_PALETTE['primary'])
+    ax.set_ylim(0, 1.1)
+    ax.legend(frameon=True, framealpha=0.95, edgecolor=COLOR_PALETTE['neutral'])
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'per_abundance_performance.png'), dpi=300, bbox_inches='tight')
+    plt.close()
+
+
+def _generate_divergence_performance(
+    true_haps: List[TrueHaplotype],
+    detected_haps: List[DetectedHaplotype],
+    matches: List[Tuple[TrueHaplotype, DetectedHaplotype, float]],
+    output_dir: str
+):
+    """Generate performance vs strain divergence (SNV density) plot."""
+    if not HAS_MATPLOTLIB or not true_haps:
+        return
+    
+    matched_strain_ids = {m[0].strain_id for m in matches}
+    
+    # Compute SNV density per strain (SNVs per 10kb)
+    strain_divergences = []
+    strain_detected = []
+    
+    for true_hap in true_haps:
+        total_snvs = sum(len(snvs) for snvs in true_hap.snv_positions.values())
+        total_length = sum(
+            max(snvs.keys()) - min(snvs.keys()) if snvs else 10000
+            for snvs in true_hap.snv_positions.values()
+        ) if true_hap.snv_positions else 10000
+        
+        # SNVs per 10kb
+        snv_density = (total_snvs / max(total_length, 1)) * 10000 if total_length > 0 else 0.0
+        strain_divergences.append(snv_density)
+        strain_detected.append(1 if true_hap.strain_id in matched_strain_ids else 0)
+    
+    if not strain_divergences:
+        return
+    
+    # Bin by divergence
+    max_div = max(strain_divergences) if strain_divergences else 50
+    bins = np.linspace(0, max_div, 6)
+    bin_labels = [f'{bins[i]:.1f}-{bins[i+1]:.1f}' for i in range(len(bins)-1)]
+    
+    bin_recall = []
+    bin_counts = []
+    
+    for i in range(len(bins) - 1):
+        low, high = bins[i], bins[i+1]
+        in_bin = [j for j, div in enumerate(strain_divergences) if low <= div < high]
+        if not in_bin:
+            bin_recall.append(0.0)
+            bin_counts.append(0)
+            continue
+        
+        detected_count = sum(strain_detected[j] for j in in_bin)
+        recall = detected_count / len(in_bin) if len(in_bin) > 0 else 0.0
+        bin_recall.append(recall)
+        bin_counts.append(len(in_bin))
+    
+    # Plot
+    fig, ax = plt.subplots(figsize=(10, 6))
+    x = np.arange(len(bin_labels))
+    
+    bars = ax.bar(x, bin_recall, color=COLOR_PALETTE['accent'], 
+                 edgecolor=COLOR_PALETTE['primary'], linewidth=1.5, alpha=0.85)
+    
+    # Add count annotations
+    for bar, count in zip(bars, bin_counts):
+        if count > 0:
+            ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.02,
+                   f'n={count}', ha='center', fontsize=9,
+                   color=COLOR_PALETTE['secondary'], style='italic')
+    
+    ax.set_xlabel('SNV Density (SNVs per 10kb)', fontweight='bold', color=COLOR_PALETTE['primary'])
+    ax.set_ylabel('Recall', fontweight='bold', color=COLOR_PALETTE['primary'])
+    ax.set_title('Detection Performance vs Strain Divergence', 
+                fontweight='bold', color=COLOR_PALETTE['primary'])
+    ax.set_xticks(x)
+    ax.set_xticklabels(bin_labels, rotation=45, ha='right', color=COLOR_PALETTE['primary'])
+    ax.set_ylim(0, 1.1)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'divergence_performance.png'), dpi=300, bbox_inches='tight')
+    plt.close()
+
+
+def _generate_detection_roc_curve(
+    true_haps: List[TrueHaplotype],
+    detected_haps: List[DetectedHaplotype],
+    matches: List[Tuple[TrueHaplotype, DetectedHaplotype, float]],
+    output_dir: str
+):
+    """Generate ROC-like detection curve (detection rate vs false positive rate)."""
+    if not HAS_MATPLOTLIB or not true_haps:
+        return
+    
+    matched_strain_ids = {m[0].strain_id for m in matches}
+    matched_lineage_ids = {m[1].lineage_id for m in matches}
+    
+    # Compute true positives, false positives, false negatives
+    tp = len(matched_strain_ids)
+    fp = len(detected_haps) - len(matched_lineage_ids)
+    fn = len(true_haps) - len(matched_strain_ids)
+    tn = 0  # Not applicable for this context
+    
+    # Detection rate (recall/TPR)
+    tpr = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    
+    # False positive rate
+    fpr = fp / (fp + tn) if (fp + tn) > 0 else fp / len(detected_haps) if detected_haps else 0.0
+    
+    # For a full ROC curve, we'd vary thresholds, but here we show the operating point
+    # and add a diagonal reference line
+    fig, ax = plt.subplots(figsize=(8, 8))
+    
+    # Plot diagonal (random classifier)
+    ax.plot([0, 1], [0, 1], '--', color=COLOR_PALETTE['neutral'], 
+           linewidth=2.0, alpha=0.7, label='Random classifier')
+    
+    # Plot operating point
+    ax.scatter([fpr], [tpr], s=200, color=COLOR_PALETTE['success'],
+              edgecolors=COLOR_PALETTE['primary'], linewidths=2.5, zorder=5,
+              label=f'Strainphase (TPR={tpr:.3f}, FPR={fpr:.3f})')
+    
+    ax.set_xlabel('False Positive Rate', fontweight='bold', color=COLOR_PALETTE['primary'])
+    ax.set_ylabel('True Positive Rate (Recall)', fontweight='bold', color=COLOR_PALETTE['primary'])
+    ax.set_title('Detection Performance (ROC-like)', fontweight='bold', color=COLOR_PALETTE['primary'])
+    ax.set_xlim(-0.05, 1.05)
+    ax.set_ylim(-0.05, 1.05)
+    ax.legend(frameon=True, framealpha=0.95, edgecolor=COLOR_PALETTE['neutral'])
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'detection_roc.png'), dpi=300, bbox_inches='tight')
+    plt.close()
+
+
+def _generate_reference_coverage(
+    true_haps: List[TrueHaplotype],
+    detected_haps: List[DetectedHaplotype],
+    matches: List[Tuple[TrueHaplotype, DetectedHaplotype, float]],
+    output_dir: str
+):
+    """Generate reference coverage (completeness) plot."""
+    if not HAS_MATPLOTLIB or not matches:
+        return
+    
+    # Compute coverage per matched strain (fraction of true SNVs recovered)
+    coverages = []
+    strain_ids = []
+    
+    for true_hap, det_hap, _ in matches:
+        total_true_snvs = sum(len(snvs) for snvs in true_hap.snv_positions.values())
+        if total_true_snvs == 0:
+            continue
+        
+        recovered_snvs = 0
+        for contig, true_snvs in true_hap.snv_positions.items():
+            det_snvs = det_hap.snv_alleles.get(contig, {})
+            for pos, true_allele in true_snvs.items():
+                if pos in det_snvs and det_snvs[pos] == true_allele:
+                    recovered_snvs += 1
+        
+        coverage = recovered_snvs / total_true_snvs if total_true_snvs > 0 else 0.0
+        coverages.append(coverage)
+        strain_ids.append(true_hap.strain_id[:15])
+    
+    if not coverages:
+        return
+    
+    # Plot histogram
+    fig, ax = plt.subplots(figsize=(10, 6))
+    bins = np.linspace(0, 1.0, 21)
+    
+    ax.hist(coverages, bins=bins, color=COLOR_PALETTE['accent'],
+           edgecolor=COLOR_PALETTE['primary'], linewidth=1.2, alpha=0.85)
+    
+    # Add mean line
+    mean_cov = np.mean(coverages)
+    ax.axvline(mean_cov, color=COLOR_PALETTE['error'], linestyle='--',
+              linewidth=2.5, label=f'Mean: {mean_cov:.3f}', alpha=0.8)
+    
+    ax.set_xlabel('Reference Coverage (Fraction of SNVs Recovered)', 
+                 fontweight='bold', color=COLOR_PALETTE['primary'])
+    ax.set_ylabel('Number of Strains', fontweight='bold', color=COLOR_PALETTE['primary'])
+    ax.set_title('Haplotype Reference Coverage Distribution',
+                fontweight='bold', color=COLOR_PALETTE['primary'])
+    ax.set_xlim(0, 1.05)
+    ax.legend(frameon=True, framealpha=0.95, edgecolor=COLOR_PALETTE['neutral'])
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'reference_coverage.png'), dpi=300, bbox_inches='tight')
+    plt.close()
+
+
+def _generate_error_breakdown(
+    true_haps: List[TrueHaplotype],
+    detected_haps: List[DetectedHaplotype],
+    matches: List[Tuple[TrueHaplotype, DetectedHaplotype, float]],
+    output_dir: str
+):
+    """Generate error type breakdown (false positives/negatives by category)."""
+    if not HAS_MATPLOTLIB:
+        return
+    
+    matched_strain_ids = {m[0].strain_id for m in matches}
+    matched_lineage_ids = {m[1].lineage_id for m in matches}
+    
+    # False negatives: true strains not detected
+    fn_strains = [h for h in true_haps if h.strain_id not in matched_strain_ids]
+    
+    # False positives: detected lineages not matching truth
+    fp_lineages = [h for h in detected_haps if h.lineage_id not in matched_lineage_ids]
+    
+    # Categorize false negatives by abundance
+    fn_low_abund = 0
+    fn_med_abund = 0
+    fn_high_abund = 0
+    
+    for h in fn_strains:
+        if h.abundances:
+            max_abund = max(h.abundances.values())
+            if max_abund < 0.01:
+                fn_low_abund += 1
+            elif 0.01 <= max_abund < 0.10:
+                fn_med_abund += 1
+            else:
+                fn_high_abund += 1
+        else:
+            fn_low_abund += 1  # No abundance data = treat as low
+    
+    # Plot
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+    
+    # False negatives breakdown
+    fn_categories = ['Low (<1%)', 'Medium (1-10%)', 'High (≥10%)']
+    fn_counts = [fn_low_abund, fn_med_abund, fn_high_abund]
+    colors_fn = [COLOR_PALETTE['error'], COLOR_PALETTE['warning'], COLOR_PALETTE['success']]
+    
+    bars1 = ax1.bar(fn_categories, fn_counts, color=colors_fn,
+                   edgecolor=COLOR_PALETTE['primary'], linewidth=1.5, alpha=0.85)
+    ax1.set_ylabel('Count', fontweight='bold', color=COLOR_PALETTE['primary'])
+    ax1.set_title('False Negatives by Abundance', fontweight='bold', color=COLOR_PALETTE['primary'])
+    ax1.set_xticklabels(fn_categories, color=COLOR_PALETTE['primary'])
+    
+    for bar, count in zip(bars1, fn_counts):
+        if count > 0:
+            ax1.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.1,
+                    str(count), ha='center', fontsize=11, fontweight='bold',
+                    color=COLOR_PALETTE['primary'])
+    
+    # False positives count
+    fp_total = len(fp_lineages)
+    ax2.bar(['False Positives'], [fp_total], color=COLOR_PALETTE['error'],
+           edgecolor=COLOR_PALETTE['primary'], linewidth=1.5, alpha=0.85)
+    ax2.set_ylabel('Count', fontweight='bold', color=COLOR_PALETTE['primary'])
+    ax2.set_title('False Positives', fontweight='bold', color=COLOR_PALETTE['primary'])
+    
+    if fp_total > 0:
+        ax2.text(0, fp_total + 0.1, str(fp_total), ha='center', fontsize=11,
+                fontweight='bold', color=COLOR_PALETTE['primary'])
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'error_breakdown.png'), dpi=300, bbox_inches='tight')
+    plt.close()
+
+
+def _generate_scalability_analysis(
+    true_haps: List[TrueHaplotype],
+    detected_haps: List[DetectedHaplotype],
+    matches: List[Tuple[TrueHaplotype, DetectedHaplotype, float]],
+    output_dir: str
+):
+    """Generate performance vs strain count (scalability analysis)."""
+    if not HAS_MATPLOTLIB:
+        return
+    
+    # This is a placeholder - in real benchmarking, we'd have multiple scenarios
+    # with different strain counts. For now, we show the current scenario.
+    n_strains = len(true_haps)
+    n_detected = len(detected_haps)
+    precision = len({m[1].lineage_id for m in matches}) / n_detected if n_detected > 0 else 0.0
+    recall = len({m[0].strain_id for m in matches}) / n_strains if n_strains > 0 else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+    
+    # Plot single point (in full benchmark, this would show multiple scenarios)
+    fig, ax = plt.subplots(figsize=(8, 6))
+    
+    ax.scatter([n_strains], [f1], s=300, color=COLOR_PALETTE['success'],
+              edgecolors=COLOR_PALETTE['primary'], linewidths=2.5, zorder=5,
+              label=f'Current (n={n_strains}, F1={f1:.3f})')
+    
+    ax.set_xlabel('Number of True Strains', fontweight='bold', color=COLOR_PALETTE['primary'])
+    ax.set_ylabel('F1 Score', fontweight='bold', color=COLOR_PALETTE['primary'])
+    ax.set_title('Scalability: Performance vs Strain Count',
+                fontweight='bold', color=COLOR_PALETTE['primary'])
+    ax.set_xlim(0, max(n_strains * 1.2, 10))
+    ax.set_ylim(0, 1.1)
+    ax.legend(frameon=True, framealpha=0.95, edgecolor=COLOR_PALETTE['neutral'])
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'scalability_analysis.png'), dpi=300, bbox_inches='tight')
+    plt.close()
 
 
 # =============================================================================

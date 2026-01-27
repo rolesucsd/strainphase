@@ -13,16 +13,19 @@ This is the PRIMARY entry point for all benchmarking. All validation and
 reporting modules are automatically called by this script.
 
 Usage:
-    # Full benchmark with 1 genome (test run)
-    python benchmarks/run_full_benchmark.py \
-        --genomes data/test_genomes/ \
-        --output results/benchmark/ \
-        --max-configs 5
-
-    # Full benchmark with all options
+    # Full benchmark with synthetic strains (default)
     python benchmarks/run_full_benchmark.py \
         --genomes data/genomes/ \
         --output results/benchmark/ \
+        --timepoints 4 \
+        --coverage 30 \
+        --max-strains 5
+
+    # Full benchmark with real strains (each FASTA = distinct strain)
+    python benchmarks/run_full_benchmark.py \
+        --genomes data/real_strains/ \
+        --output results/benchmark/ \
+        --use-real-strains \
         --timepoints 4 \
         --coverage 30
 
@@ -94,14 +97,25 @@ def simulate_reads(
     error_rate: float = 0.001,
     seed: int = 42,
     max_strains: Optional[int] = None,
+    use_real_strains: bool = False,
+    snv_counts: Optional[str] = None,
+    fixed_strains_per_genome: Optional[int] = None,
 ) -> bool:
     """
     Run read simulation from bacterial genomes.
 
     Uses validation/simulate_reads.py to generate synthetic data.
+    
+    Args:
+        use_real_strains: If True, use FASTA files directly as distinct strains
+                         (detect real SNVs instead of introducing synthetic ones)
     """
     logger.info("=" * 60)
     logger.info("STEP 1: Simulating reads from genomes")
+    if use_real_strains:
+        logger.info("Mode: Using real strains (each FASTA = distinct strain)")
+    else:
+        logger.info("Mode: Creating synthetic strains from genomes")
     logger.info("=" * 60)
 
     # Build command
@@ -120,6 +134,13 @@ def simulate_reads(
 
     if max_strains:
         cmd.extend(["--max-strains", str(max_strains)])
+    
+    if use_real_strains:
+        cmd.append("--use-real-strains")
+    if snv_counts:
+        cmd.extend(["--snv-counts", snv_counts])
+    if fixed_strains_per_genome:
+        cmd.extend(["--fixed-strains-per-genome", str(fixed_strains_per_genome)])
 
     result = subprocess.run(cmd, capture_output=True, text=True)
 
@@ -439,6 +460,9 @@ def run_full_benchmark(
     error_rate: float = 0.001,
     seed: int = 42,
     max_strains: Optional[int] = None,
+    use_real_strains: bool = False,
+    snv_counts: Optional[str] = None,
+    fixed_strains_per_genome: Optional[int] = None,
     max_configs: Optional[int] = None,
     max_contigs: Optional[int] = None,
     resume: bool = False,
@@ -456,10 +480,14 @@ def run_full_benchmark(
         output_dir: Output directory for all results
         n_timepoints: Number of timepoints to simulate
         coverage: Read coverage per timepoint
-        snv_density: SNVs per 10kb to introduce
+        snv_density: SNVs per 10kb to introduce (only for synthetic mode)
         error_rate: Sequencing error rate
         seed: Random seed
-        max_strains: Limit number of strains
+        max_strains: Limit number of strains (only for synthetic mode)
+        use_real_strains: If True, use FASTA files directly as distinct strains
+                         (detect real SNVs instead of introducing synthetic ones)
+        snv_counts: Comma-separated SNV counts for strains[1:] (exact overrides density)
+        fixed_strains_per_genome: Exact number of strains per genome (synthetic mode)
         max_configs: Limit number of configs (grid mode only)
         max_contigs: Limit number of contigs
         resume: Resume from checkpoint
@@ -480,6 +508,10 @@ def run_full_benchmark(
     logger.info(f"Output directory: {output_dir}")
     logger.info(f"Timepoints: {n_timepoints}")
     logger.info(f"Coverage: {coverage}x")
+    if use_real_strains:
+        logger.info("Strain mode: Using real strains (each FASTA = distinct strain)")
+    else:
+        logger.info("Strain mode: Creating synthetic strains from genomes")
     logger.info(f"Sweep mode: {mode}")
     if mode == "sequential":
         logger.info(f"Optimization passes: {passes}")
@@ -507,6 +539,8 @@ def run_full_benchmark(
             "n_timepoints": n_timepoints,
             "coverage": coverage,
             "snv_density": snv_density,
+            "snv_counts": snv_counts,
+            "fixed_strains_per_genome": fixed_strains_per_genome,
             "error_rate": error_rate,
             "seed": seed,
             "max_strains": max_strains,
@@ -530,6 +564,9 @@ def run_full_benchmark(
             error_rate=error_rate,
             seed=seed,
             max_strains=max_strains,
+            use_real_strains=use_real_strains,
+            snv_counts=snv_counts,
+            fixed_strains_per_genome=fixed_strains_per_genome,
         )
     results["steps"]["simulate_reads"] = {
         "success": success,
@@ -598,7 +635,7 @@ def run_full_benchmark(
     success = generate_report(
         sweep_dir=sweep_dir,
         output_dir=output_dir,
-        validation_dir=str(sim_dir)
+        validation_dir=sweep_dir
     )
     results["steps"]["generate_report"] = {
         "success": success,
@@ -673,12 +710,18 @@ def main():
                         help="Read coverage per timepoint")
     parser.add_argument("--snv-density", type=int, default=10,
                         help="SNVs per 10kb to introduce")
+    parser.add_argument("--snv-counts", type=str, default=None,
+                        help="Comma-separated SNV counts for strains[1:] (exact overrides density)")
     parser.add_argument("--error-rate", type=float, default=0.001,
                         help="Sequencing error rate")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed")
     parser.add_argument("--max-strains", type=int,
-                        help="Limit number of strains to use")
+                        help="Limit number of strains to use (only for synthetic mode)")
+    parser.add_argument("--use-real-strains", action="store_true",
+                        help="Use FASTA files directly as distinct strains (detect real SNVs instead of introducing synthetic ones)")
+    parser.add_argument("--fixed-strains-per-genome", type=int, default=None,
+                        help="Use an exact number of strains per genome (synthetic mode only)")
 
     # Sweep parameters
     parser.add_argument("--max-configs", type=int,
@@ -725,6 +768,9 @@ def main():
         error_rate=args.error_rate,
         seed=args.seed,
         max_strains=args.max_strains,
+        use_real_strains=args.use_real_strains,
+        snv_counts=args.snv_counts,
+        fixed_strains_per_genome=args.fixed_strains_per_genome,
         max_configs=args.max_configs,
         max_contigs=args.max_contigs,
         resume=args.resume,

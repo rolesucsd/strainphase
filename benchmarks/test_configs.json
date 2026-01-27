@@ -1,0 +1,77 @@
+{
+  "description": "Focused test configurations for real strains benchmarking",
+  "configs": [
+    {
+      "name": "baseline",
+      "description": "Default recommended parameters",
+      "window_size": 20000,
+      "max_mismatch_frac": 0.01,
+      "min_shared_snvs_for_edge": 4,
+      "merge_distance_threshold": 0.02,
+      "min_mapq": 20,
+      "min_base_quality": 20,
+      "min_weight_for_anchor": 0.10,
+      "rescued_min_weight": 0.02
+    },
+    {
+      "name": "sensitive",
+      "description": "More sensitive clustering (lower thresholds)",
+      "window_size": 20000,
+      "max_mismatch_frac": 0.02,
+      "min_shared_snvs_for_edge": 3,
+      "merge_distance_threshold": 0.01,
+      "min_mapq": 20,
+      "min_base_quality": 20,
+      "min_weight_for_anchor": 0.10,
+      "rescued_min_weight": 0.02
+    },
+    {
+      "name": "strict",
+      "description": "Stricter clustering (higher thresholds)",
+      "window_size": 20000,
+      "max_mismatch_frac": 0.005,
+      "min_shared_snvs_for_edge": 5,
+      "merge_distance_threshold": 0.02,
+      "min_mapq": 20,
+      "min_base_quality": 20,
+      "min_weight_for_anchor": 0.10,
+      "rescued_min_weight": 0.02
+    },
+    {
+      "name": "large_windows",
+      "description": "Larger windows for better linking",
+      "window_size": 50000,
+      "max_mismatch_frac": 0.01,
+      "min_shared_snvs_for_edge": 4,
+      "merge_distance_threshold": 0.02,
+      "min_mapq": 20,
+      "min_base_quality": 20,
+      "min_weight_for_anchor": 0.10,
+      "rescued_min_weight": 0.02
+    },
+    {
+      "name": "small_windows",
+      "description": "Smaller windows for fine-grained resolution",
+      "window_size": 10000,
+      "max_mismatch_frac": 0.01,
+      "min_shared_snvs_for_edge": 4,
+      "merge_distance_threshold": 0.02,
+      "min_mapq": 20,
+      "min_base_quality": 20,
+      "min_weight_for_anchor": 0.10,
+      "rescued_min_weight": 0.02
+    },
+    {
+      "name": "high_quality",
+      "description": "Stricter quality filters",
+      "window_size": 20000,
+      "max_mismatch_frac": 0.01,
+      "min_shared_snvs_for_edge": 4,
+      "merge_distance_threshold": 0.02,
+      "min_mapq": 30,
+      "min_base_quality": 30,
+      "min_weight_for_anchor": 0.10,
+      "rescued_min_weight": 0.02
+    }
+  ]
+}
