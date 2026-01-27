@@ -29,6 +29,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from multiprocessing import Pool
 from functools import partial
+from typing import Optional, List, Dict, Tuple, Set
 
 import community as community_louvain
 import networkx as nx
@@ -147,7 +148,7 @@ class HaplotyperConfig:
     )
 
     # =========== RUNTIME PARAMETERS ===========
-    random_seed: int | None = None
+    random_seed: Optional[int] = None
     validate_results: bool = False  # Set False for production runs
     n_workers: int = 1  # Number of parallel workers for window processing (1=sequential)
 
@@ -213,7 +214,7 @@ class Read:
     mapq: int
     alleles: dict[int, str] = field(default_factory=dict)
     quals: dict[int, int] = field(default_factory=dict)
-    sample: str | None = None
+    sample: Optional[str] = None
 
 
 @dataclass
@@ -226,11 +227,11 @@ class Window:
     snv_pos: list[int] = field(default_factory=list)
     ref_alleles: dict[int, str] = field(default_factory=dict)
     reads: list[Read] = field(default_factory=list)
-    sample: str | None = None
+    sample: Optional[str] = None
     window_idx: int = 0  # Position in contig's window sequence
 
     # Cached position sets for graph building (optimization)
-    _pos_sets: list[set[int]] | None = field(default=None, repr=False)
+    _pos_sets: Optional[List[Set[int]]] = field(default=None, repr=False)
 
     def get_read_position_sets(self) -> list[set[int]]:
         """Get precomputed position sets for each read (cached)."""
@@ -257,10 +258,10 @@ class Haplotype:
     weight: float = 0.0
     supporting_reads: int = 0
     confidence: float = 0.0
-    track_id: str | None = None  # Assigned after window linking
+    track_id: Optional[str] = None  # Assigned after window linking
 
     def distance_to(
-        self, other: "Haplotype", positions: list[int], max_mismatches: int | None = None
+        self, other: "Haplotype", positions: list[int], max_mismatches: Optional[int] = None
     ) -> tuple[float, int, int]:
         """
         Compute normalized Hamming distance with optional early exit.
@@ -379,10 +380,10 @@ _LOG_PROB_CACHE = LogProbCache()
 
 def load_snvs_from_clair3(
     vcf_path: str,
-    contig_id: str | None = None,
-    sample_name: str | None = None,
+    contig_id: Optional[str] = None,
+    sample_name: Optional[str] = None,
     config: HaplotyperConfig = DEFAULT_CONFIG,
-) -> tuple[list[int], dict[int, str], dict[int, int], dict[int, float | None]]:
+) -> Tuple[List[int], Dict[int, str], Dict[int, int], Dict[int, Optional[float]]]:
     """Load SNVs from Clair3 VCF."""
     if not HAS_PYSAM:
         raise ImportError("pysam required for VCF parsing")
@@ -476,7 +477,7 @@ def make_windows_lazy(
     snv_positions: list[int],
     ref_alleles: dict[int, str],
     config: HaplotyperConfig = DEFAULT_CONFIG,
-    sample_id: str | None = None,
+    sample_id: Optional[str] = None,
 ) -> list[Window]:
     """
     Create overlapping windows with lazy per-window read loading.
@@ -717,7 +718,7 @@ class EMHaplotyper:
         self,
         window: Window,
         initial_haplotypes: list[Haplotype],
-        cluster_sizes: list[int] | None = None,
+        cluster_sizes: Optional[List[int]] = None,
         config: HaplotyperConfig = DEFAULT_CONFIG,
     ):
         self.window = window
@@ -729,7 +730,7 @@ class EMHaplotyper:
         # Use global log probability cache
         self._cache = _LOG_PROB_CACHE
 
-    def _compute_log_prob_read_hap(self, read: Read, haplotype: Haplotype) -> float | None:
+    def _compute_log_prob_read_hap(self, read: Read, haplotype: Haplotype) -> Optional[float]:
         """Compute log P(read | haplotype) using cached base probs."""
         log_prob = 0.0
         overlap = 0
@@ -1526,8 +1527,8 @@ def process_contig(
     contig_id: str,
     contig_length: int,
     config: HaplotyperConfig = DEFAULT_CONFIG,
-    sample_id: str | None = None,
-    vcf_sample_name: str | None = None,
+    sample_id: Optional[str] = None,
+    vcf_sample_name: Optional[str] = None,
 ) -> list[WindowResult]:
     """
     Process all windows in a contig and link haplotypes across windows.

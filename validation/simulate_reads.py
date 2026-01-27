@@ -5,11 +5,26 @@ Simulate HiFi reads from user-provided bacterial genomes.
 Creates synthetic metagenomic data with known ground truth for validating
 strainphase haplotype reconstruction.
 
-Usage:
+Two modes:
+1. Synthetic mode (default): Creates multiple strains from each genome file by
+   introducing SNVs. Each genome file generates 2-max_strains synthetic strains.
+   
+2. Real strains mode (--use-real-strains): Uses FASTA files directly as distinct
+   strains. SNVs are detected from real differences between strains.
+
+Usage (synthetic mode):
+    python validation/simulate_reads.py \
+        --genomes /path/to/genome_fastas/ \
+        --output data/simulated/ \
+        --timepoints 4 \
+        --coverage 30 \
+        --max-strains 5
+
+Usage (real strains mode):
     python validation/simulate_reads.py \
         --genomes /path/to/strain_fastas/ \
         --output data/simulated/ \
-        --complexity medium \
+        --use-real-strains \
         --timepoints 4 \
         --coverage 30
 """
@@ -62,6 +77,7 @@ class SimulationConfig:
 
     # SNV parameters
     snv_density: int = 10  # SNVs per 10kb
+    snv_counts_per_strain: Optional[List[int]] = None  # Exact SNV counts for strains[1:]
 
     # Coverage and timepoints
     coverage: int = 30
@@ -69,6 +85,14 @@ class SimulationConfig:
 
     # Abundance dynamics
     sweep_fraction: float = 0.3  # Fraction of strains with sweeping dynamics
+
+    # Strain handling mode
+    use_real_strains: bool = False  # If True, use FASTA files directly as strains (no SNV introduction)
+    fixed_strains_per_genome: Optional[int] = None  # If set, use exact count per genome in synthetic mode
+    # When use_real_strains=True:
+    # - Each FASTA file is treated as a distinct strain
+    # - SNVs are detected from real differences between strains
+    # - No synthetic strain duplication or SNV introduction
 
     # VCF realism (optional)
     vcf_realism: bool = False  # If True, inject FP/FN sites and missing AF/DP
@@ -138,8 +162,70 @@ def load_genomes(genome_dir: str) -> List[Strain]:
 
 
 # =============================================================================
-# SNV introduction
+# SNV detection/introduction
 # =============================================================================
+
+def detect_snvs_from_real_strains(strains: List[Strain], reference: Strain) -> Dict[str, List[int]]:
+    """
+    Detect SNVs from real differences between strains and a reference.
+    
+    Compares each strain to the reference and identifies variant positions.
+    Returns dict of contig -> [snv_positions] for ground truth.
+    """
+    all_snv_positions = defaultdict(set)
+    
+    logger.info(f"Detecting SNVs from real strain differences (reference: {reference.id})")
+    
+    # Get all contigs present in any strain
+    all_contigs = set(reference.contigs.keys())
+    for strain in strains:
+        all_contigs.update(strain.contigs.keys())
+    
+    for strain in strains:
+        if strain.id == reference.id:
+            continue  # Skip reference itself
+        
+        # Initialize snvs dict for this strain if needed
+        if not hasattr(strain, 'snvs') or strain.snvs is None:
+            strain.snvs = {}
+        
+        for contig_id in all_contigs:
+            ref_seq = reference.contigs.get(contig_id, "")
+            strain_seq = strain.contigs.get(contig_id, "")
+            
+            if not ref_seq or not strain_seq:
+                continue
+            
+            # Initialize contig dict if needed
+            if contig_id not in strain.snvs:
+                strain.snvs[contig_id] = {}
+            
+            # Align sequences (simple position-by-position comparison)
+            # For real genomes, we assume they're already aligned or use the shorter length
+            min_len = min(len(ref_seq), len(strain_seq))
+            
+            for pos in range(min_len):
+                ref_base = ref_seq[pos].upper()
+                strain_base = strain_seq[pos].upper()
+                
+                # Skip Ns and gaps
+                if ref_base in 'N-.' or strain_base in 'N-.':
+                    continue
+                
+                # Record SNV if bases differ
+                if ref_base != strain_base and ref_base in 'ACGT' and strain_base in 'ACGT':
+                    # Store with 0-indexed position for consistency with introduce_snvs
+                    # (VCF writing will convert to 1-indexed when writing)
+                    strain.snvs[contig_id][pos] = strain_base
+                    all_snv_positions[contig_id].add(pos)
+    
+    # Convert to sorted lists
+    result = {contig: sorted(positions) for contig, positions in all_snv_positions.items()}
+    total_snvs = sum(len(positions) for positions in result.values())
+    logger.info(f"Detected {total_snvs:,} SNV positions from real strain differences")
+    
+    return result
+
 
 def introduce_snvs(strains: List[Strain], config: SimulationConfig, rng: np.random.Generator) -> Dict[str, List[int]]:
     """
@@ -161,18 +247,29 @@ def introduce_snvs(strains: List[Strain], config: SimulationConfig, rng: np.rand
     for i, strain in enumerate(strains[1:], 1):
         strain.is_sweeping = i in sweeping_indices
 
-        # Determine SNV density for this strain
-        if strain.is_sweeping:
-            # Sweeping strains: moderate SNV count
-            density = config.snv_density * rng.uniform(0.5, 1.5)
+        if config.snv_counts_per_strain is not None:
+            if len(config.snv_counts_per_strain) < len(strains) - 1:
+                raise ValueError(
+                    f"snv_counts_per_strain has {len(config.snv_counts_per_strain)} entries "
+                    f"but {len(strains) - 1} strains require counts"
+                )
+            snvs_to_add = int(config.snv_counts_per_strain[i - 1])
         else:
-            # Fixed strains: variable density
-            density = config.snv_density * rng.uniform(0.2, 2.0)
+            # Determine SNV density for this strain
+            if strain.is_sweeping:
+                # Sweeping strains: moderate SNV count
+                density = config.snv_density * rng.uniform(0.5, 1.5)
+            else:
+                # Fixed strains: variable density
+                density = config.snv_density * rng.uniform(0.2, 2.0)
 
-        snvs_to_add = int(strain.total_length * density / 10000)
+            snvs_to_add = int(strain.total_length * density / 10000)
+
         logger.debug(f"{strain.id}: adding ~{snvs_to_add} SNVs (sweeping={strain.is_sweeping})")
 
         # Introduce SNVs based on reference contigs
+        chosen_by_contig = {}
+        total_added = 0
         for contig_id, ref_seq in reference.contigs.items():
             if contig_id not in strain.contigs:
                 # Copy reference contig if strain doesn't have it
@@ -187,6 +284,8 @@ def introduce_snvs(strains: List[Strain], config: SimulationConfig, rng: np.rand
                 contig_snvs = len(valid_positions)
 
             snv_positions = sorted(rng.choice(valid_positions, size=contig_snvs, replace=False))
+            chosen_by_contig[contig_id] = set(snv_positions)
+            total_added += len(snv_positions)
 
             # Create SNVs
             strain.snvs[contig_id] = {}
@@ -202,6 +301,32 @@ def introduce_snvs(strains: List[Strain], config: SimulationConfig, rng: np.rand
                 all_snv_positions[contig_id].add(pos)
 
             strain.contigs[contig_id] = ''.join(seq_list)
+
+        # If exact counts were requested and proportional allocation under-shot, top up.
+        if config.snv_counts_per_strain is not None and total_added < snvs_to_add:
+            remaining = snvs_to_add - total_added
+            remaining_positions = []
+            for contig_id, ref_seq in reference.contigs.items():
+                valid_positions = range(100, len(ref_seq) - 100)
+                already = chosen_by_contig.get(contig_id, set())
+                for pos in valid_positions:
+                    if pos not in already:
+                        remaining_positions.append((contig_id, pos))
+            if remaining_positions:
+                pick_count = min(remaining, len(remaining_positions))
+                extra = rng.choice(len(remaining_positions), size=pick_count, replace=False)
+                for idx in extra:
+                    contig_id, pos = remaining_positions[idx]
+                    ref_seq = reference.contigs[contig_id]
+                    ref_base = ref_seq[pos]
+                    alt_bases = [b for b in bases if b != ref_base]
+                    alt_base = rng.choice(alt_bases)
+                    strain.snvs.setdefault(contig_id, {})
+                    seq_list = list(strain.contigs[contig_id])
+                    strain.snvs[contig_id][pos] = alt_base
+                    seq_list[pos] = alt_base
+                    strain.contigs[contig_id] = ''.join(seq_list)
+                    all_snv_positions[contig_id].add(pos)
 
     # Convert to sorted lists
     return {contig: sorted(positions) for contig, positions in all_snv_positions.items()}
@@ -470,6 +595,8 @@ def write_vcf(
         all_sites_to_write = filtered_positions + fp_sites
         for site_idx, (contig_id, pos) in enumerate(all_sites_to_write):
             ref_seq = reference.contigs.get(contig_id, "")
+            # pos is 0-indexed from snv_positions dict, convert to 1-indexed for VCF
+            vcf_pos = pos + 1
             ref_base = ref_seq[pos] if pos < len(ref_seq) else 'N'
             
             # Check if this is a false positive (not in truth)
@@ -483,7 +610,11 @@ def write_vcf(
             else:
                 # Find all alt alleles and which strains have them
                 alt_alleles = {}
-                for strain in strains[1:]:
+                # Find all alt alleles and which strains have them
+                # pos is 0-indexed from snv_positions dict
+                for strain in strains:
+                    if strain.id == reference.id:
+                        continue  # Skip reference
                     if contig_id in strain.snvs and pos in strain.snvs[contig_id]:
                         alt = strain.snvs[contig_id][pos]
                         if alt not in alt_alleles:
@@ -512,7 +643,7 @@ def write_vcf(
             else:
                 gt_sample = "0/1:50:25,25"
             
-            f.write(f"{contig_id}\t{pos+1}\t.\t{ref_base}\t{alt_base}\t30\tPASS\t{info}\t{gt_format}\t{gt_sample}\n")
+            f.write(f"{contig_id}\t{vcf_pos}\t.\t{ref_base}\t{alt_base}\t30\tPASS\t{info}\t{gt_format}\t{gt_sample}\n")
             
             # Track perturbations
             if is_fp:
@@ -673,53 +804,89 @@ def run_simulation(
     genome_strains = load_genomes(genome_dir)
     logger.info(f"Loaded {len(genome_strains)} genome file(s)")
 
-    # CRITICAL RULE: For EVERY SINGLE genome file provided, randomly create between 2 and max_strains strains
-    # This ensures SNVs can be introduced (introduce_snvs only processes strains[1:], so we need >= 2 strains)
-    max_strains_per_genome = max_strains if max_strains and max_strains >= 2 else 2
-    min_strains_per_genome = 2
-    
-    logger.info(f"Creating between {min_strains_per_genome} and {max_strains_per_genome} strains per genome file (randomly chosen)")
+    if config.use_real_strains:
+        # Mode: Use FASTA files directly as distinct strains
+        logger.info("Using real strains mode: each FASTA file represents a distinct strain")
+        
+        if len(genome_strains) < 2:
+            raise ValueError(f"Real strains mode requires at least 2 FASTA files (found {len(genome_strains)})")
+        
+        # Use loaded genomes directly as strains
+        strains = genome_strains
+        
+        # First strain is the reference
+        reference = strains[0]
+        logger.info(f"Using {reference.id} as reference strain")
+        
+        # Detect SNVs from real differences
+        logger.info("Detecting SNVs from real strain differences")
+        snv_positions = detect_snvs_from_real_strains(strains, reference)
+        total_snvs = sum(len(pos) for pos in snv_positions.values())
+        logger.info(f"Detected {total_snvs:,} SNV positions from real differences")
+        
+        # Assign sweeping patterns randomly (for abundance dynamics)
+        n_sweeping = int(len(strains) * config.sweep_fraction)
+        sweeping_indices = set(rng.choice(range(1, len(strains)), size=min(n_sweeping, len(strains)-1), replace=False))
+        for i, strain in enumerate(strains[1:], 1):
+            strain.is_sweeping = i in sweeping_indices
+        
+    else:
+        # Mode: Create synthetic strains from genomes (original behavior)
+        # CRITICAL RULE: For EVERY SINGLE genome file provided, randomly create between 2 and max_strains strains
+        # This ensures SNVs can be introduced (introduce_snvs only processes strains[1:], so we need >= 2 strains)
+        if config.fixed_strains_per_genome is not None:
+            if config.fixed_strains_per_genome < 2:
+                raise ValueError("fixed_strains_per_genome must be >= 2")
+            min_strains_per_genome = config.fixed_strains_per_genome
+            max_strains_per_genome = config.fixed_strains_per_genome
+            logger.info(f"Using fixed strains per genome: {config.fixed_strains_per_genome}")
+        else:
+            max_strains_per_genome = max_strains if max_strains and max_strains >= 2 else 2
+            min_strains_per_genome = 2
+        
+        logger.info(f"Creating between {min_strains_per_genome} and {max_strains_per_genome} strains per genome file (randomly chosen)")
 
-    # Expand each genome file into multiple strains
-    strains = []
-    for genome_strain in genome_strains:
-        # Randomly choose number of strains for this genome file (between 2 and max_strains)
-        n_strains_for_this_genome = rng.integers(min_strains_per_genome, max_strains_per_genome + 1)
-        logger.info(f"  {genome_strain.id}: creating {n_strains_for_this_genome} strains")
-        
-        # First strain is the reference (no SNVs introduced)
-        reference_strain = Strain(
-            id=f"{genome_strain.id}_ref",
-            genome_file=genome_strain.genome_file,
-            contigs=dict(genome_strain.contigs),  # Deep copy
-            total_length=genome_strain.total_length
-        )
-        strains.append(reference_strain)
-        
-        # Create additional variant strains from this genome (strains[1:] will get SNVs)
-        for i in range(1, n_strains_for_this_genome):
-            variant_strain = Strain(
-                id=f"{genome_strain.id}_var_{i}",
+        # Expand each genome file into multiple strains
+        strains = []
+        for genome_strain in genome_strains:
+            # Randomly choose number of strains for this genome file (between 2 and max_strains)
+            n_strains_for_this_genome = rng.integers(min_strains_per_genome, max_strains_per_genome + 1)
+            logger.info(f"  {genome_strain.id}: creating {n_strains_for_this_genome} strains")
+            
+            # First strain is the reference (no SNVs introduced)
+            reference_strain = Strain(
+                id=f"{genome_strain.id}_ref",
                 genome_file=genome_strain.genome_file,
                 contigs=dict(genome_strain.contigs),  # Deep copy
                 total_length=genome_strain.total_length
             )
-            strains.append(variant_strain)
-    
-    logger.info(f"Created {len(strains)} total strains ({len(genome_strains)} references + {len(strains) - len(genome_strains)} variants)")
+            strains.append(reference_strain)
+            
+            # Create additional variant strains from this genome (strains[1:] will get SNVs)
+            for i in range(1, n_strains_for_this_genome):
+                variant_strain = Strain(
+                    id=f"{genome_strain.id}_var_{i}",
+                    genome_file=genome_strain.genome_file,
+                    contigs=dict(genome_strain.contigs),  # Deep copy
+                    total_length=genome_strain.total_length
+                )
+                strains.append(variant_strain)
+        
+        logger.info(f"Created {len(strains)} total strains ({len(genome_strains)} references + {len(strains) - len(genome_strains)} variants)")
 
-    # Introduce SNVs
-    logger.info("Introducing SNVs between strains")
-    snv_positions = introduce_snvs(strains, config, rng)
-    total_snvs = sum(len(pos) for pos in snv_positions.values())
-    logger.info(f"Introduced {total_snvs:,} SNV positions")
+        # Introduce SNVs synthetically
+        logger.info("Introducing SNVs between strains")
+        reference = strains[0]
+        snv_positions = introduce_snvs(strains, config, rng)
+        total_snvs = sum(len(pos) for pos in snv_positions.values())
+        logger.info(f"Introduced {total_snvs:,} SNV positions")
 
     # Generate abundance profiles
     logger.info("Generating abundance profiles")
     abundances = generate_abundances(strains, config, rng)
 
     # Write reference genome (first strain)
-    reference = strains[0]
+    # Reference is already set above for both modes
     ref_path = os.path.join(output_dir, "reference.fasta")
     write_reference_fasta(reference, ref_path)
     logger.info(f"Wrote reference to {ref_path}")
@@ -776,10 +943,12 @@ def run_simulation(
             'mean_read_length': config.mean_read_length,
             'error_rate': config.error_rate,
             'snv_density': config.snv_density,
+            'snv_counts_per_strain': config.snv_counts_per_strain,
             'coverage': config.coverage,
             'n_timepoints': config.n_timepoints,
             'sweep_fraction': config.sweep_fraction,
             'seed': config.seed,
+            'fixed_strains_per_genome': config.fixed_strains_per_genome,
             'n_strains': len(strains),
             'n_snv_positions': total_snvs,
         }, f, indent=2)
@@ -802,13 +971,19 @@ def main():
     parser.add_argument("--output", required=True, help="Output directory")
     parser.add_argument("--complexity", choices=["simple", "medium", "complex"], default="medium",
                         help="Community complexity (affects strain selection)")
-    parser.add_argument("--snv-density", type=int, default=10, help="SNVs per 10kb to introduce")
+    parser.add_argument("--snv-density", type=int, default=10, help="SNVs per 10kb to introduce (only for synthetic mode)")
+    parser.add_argument("--snv-counts", type=str, default=None,
+                        help="Comma-separated SNV counts for strains[1:] (exact overrides density)")
     parser.add_argument("--error-rate", type=float, default=0.001, help="Sequencing error rate")
     parser.add_argument("--coverage", type=int, default=30, help="Read coverage per timepoint")
     parser.add_argument("--timepoints", type=int, default=4, help="Number of timepoints")
     parser.add_argument("--sweep-fraction", type=float, default=0.3, help="Fraction of sweeping strains")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--max-strains", type=int, default=None, help="Limit number of strains to use")
+    parser.add_argument("--fixed-strains-per-genome", type=int, default=None,
+                        help="Use an exact number of strains per genome (synthetic mode only)")
+    parser.add_argument("--use-real-strains", action="store_true",
+                        help="Use FASTA files directly as distinct strains (detect real SNVs instead of introducing synthetic ones)")
 
     args = parser.parse_args()
 
@@ -820,6 +995,9 @@ def main():
         n_timepoints=args.timepoints,
         sweep_fraction=args.sweep_fraction,
         seed=args.seed,
+        snv_counts_per_strain=[int(x) for x in args.snv_counts.split(",")] if args.snv_counts else None,
+        fixed_strains_per_genome=args.fixed_strains_per_genome,
+        use_real_strains=args.use_real_strains,
     )
 
     # Adjust max strains based on complexity

@@ -76,6 +76,21 @@ def load_sweep_results(results_dir: str) -> Tuple[List[Dict], Dict, List[Dict]]:
         with open(stable_file) as f:
             stable = json.load(f)
 
+    # Attach benchmark-level parameters (e.g., coverage) if available.
+    summary_file = results_path.parent / "benchmark_summary.json"
+    if summary_file.exists():
+        try:
+            with open(summary_file) as f:
+                benchmark_summary = json.load(f)
+            params = benchmark_summary.get("parameters", {})
+            for r in results:
+                if r.get("coverage") is None and params.get("coverage") is not None:
+                    r["coverage"] = params.get("coverage")
+                if r.get("n_timepoints") is None and params.get("n_timepoints") is not None:
+                    r["n_timepoints"] = params.get("n_timepoints")
+        except (OSError, json.JSONDecodeError):
+            pass
+
     return results, summary, stable
 
 
@@ -88,7 +103,15 @@ def load_validation_metrics(validation_dir: str) -> Optional[Dict]:
     
     # Also try loading from config-specific validation directories
     # (for parameter sweep with per-config validation)
-    config_dirs = list(Path(validation_dir).parent.glob("configs/*/validation"))
+    search_roots = [
+        Path(validation_dir).parent,
+        Path(validation_dir),
+        Path(validation_dir) / "sweep_results",
+        Path(validation_dir).parent / "sweep_results",
+    ]
+    config_dirs = []
+    for root in search_roots:
+        config_dirs.extend(list(root.glob("configs/*/validation")))
     if config_dirs:
         # Load from best config (highest F1) or first available
         best_metrics = None
@@ -113,93 +136,104 @@ def load_validation_metrics(validation_dir: str) -> Optional[Dict]:
 
 # Professional color palette
 COLOR_PALETTE = {
-    'primary': '#2C3E50',      # Dark blue-gray
-    'secondary': '#34495E',    # Medium blue-gray
-    'accent': '#3498DB',       # Bright blue
-    'success': '#27AE60',      # Green
-    'warning': '#F39C12',      # Orange
-    'error': '#E74C3C',        # Red
-    'info': '#9B59B6',         # Purple
-    'neutral': '#95A5A6',      # Gray
-    'light': '#ECF0F1',        # Light gray
-    'dark': '#1A1A1A',         # Near black
+    'primary': '#1F2933',      # Charcoal
+    'secondary': '#3E4C59',    # Slate
+    'accent': '#4B7F9D',       # Muted blue
+    'success': '#5B8A72',      # Muted green
+    'warning': '#7C8AA5',      # Cool steel
+    'error': '#6B7280',        # Cool gray
+    'info': '#6A8EAE',         # Dusty blue
+    'neutral': '#9AA5B1',      # Soft gray
+    'light': '#E4E7EB',        # Light gray
+    'dark': '#111827',         # Near black
 }
 
 # Professional color sequences for multi-series plots
 COLOR_SEQUENCES = {
-    'qualitative': ['#2C3E50', '#3498DB', '#27AE60', '#F39C12', '#9B59B6', '#E74C3C', '#1ABC9C', '#E67E22'],
-    'sequential': ['#ECF0F1', '#BDC3C7', '#95A5A6', '#7F8C8D', '#34495E', '#2C3E50'],
-    'diverging': ['#E74C3C', '#F39C12', '#F1C40F', '#27AE60', '#3498DB'],
+    'qualitative': [
+        '#4B7F9D', '#5B8A72', '#6A8EAE', '#7C8AA5',
+        '#8AA1B1', '#65748B', '#3E4C59', '#9AA5B1'
+    ],
+    'sequential': ['#E4E7EB', '#CBD2D9', '#9AA5B1', '#7B8794', '#52606D', '#3E4C59'],
+    'diverging': ['#6B7280', '#7C8AA5', '#9AA5B1', '#5B8A72', '#4B7F9D'],
 }
 
 def set_figure_style():
-    """Set professional, clean figure style with Arial font and no grid."""
+    """Set Nature-style figure defaults for publication-quality plots."""
     if not HAS_MATPLOTLIB:
         return
 
-    # Use clean style without grid
     plt.style.use('default')
-    
-    # Font settings - Arial family
-    plt.rcParams['font.family'] = 'Arial'
-    plt.rcParams['font.sans-serif'] = ['Arial', 'DejaVu Sans', 'Liberation Sans', 'sans-serif']
-    plt.rcParams['font.size'] = 11
-    plt.rcParams['axes.titlesize'] = 15
-    plt.rcParams['axes.labelsize'] = 12
-    plt.rcParams['xtick.labelsize'] = 10
-    plt.rcParams['ytick.labelsize'] = 10
-    plt.rcParams['legend.fontsize'] = 10
-    plt.rcParams['figure.titlesize'] = 16
-    
-    # Remove grid completely
+
+    # Font settings (Nature-style sans)
+    plt.rcParams['font.family'] = 'Helvetica'
+    plt.rcParams['font.sans-serif'] = [
+        'Helvetica',
+        'Arial',
+        'DejaVu Sans',
+        'Liberation Sans',
+        'sans-serif',
+    ]
+    plt.rcParams['font.size'] = 10
+    plt.rcParams['axes.titlesize'] = 13
+    plt.rcParams['axes.labelsize'] = 11
+    plt.rcParams['xtick.labelsize'] = 9
+    plt.rcParams['ytick.labelsize'] = 9
+    plt.rcParams['legend.fontsize'] = 9
+    plt.rcParams['figure.titlesize'] = 14
+
+    # No gridlines
     plt.rcParams['axes.grid'] = False
     plt.rcParams['axes.grid.axis'] = 'both'
-    
-    # Clean spines - only show bottom and left
+
+    # Spines
     plt.rcParams['axes.spines.top'] = False
     plt.rcParams['axes.spines.right'] = False
     plt.rcParams['axes.spines.left'] = True
     plt.rcParams['axes.spines.bottom'] = True
-    
-    # Spine styling
-    plt.rcParams['axes.linewidth'] = 1.2
-    plt.rcParams['axes.edgecolor'] = COLOR_PALETTE['primary']
-    
+    plt.rcParams['axes.edgecolor'] = '#1F2933'
+    plt.rcParams['axes.linewidth'] = 0.9
+
     # Figure and axes background
     plt.rcParams['figure.facecolor'] = 'white'
     plt.rcParams['axes.facecolor'] = 'white'
     plt.rcParams['savefig.facecolor'] = 'white'
     plt.rcParams['savefig.edgecolor'] = 'none'
-    
+
     # Tick styling
-    plt.rcParams['xtick.color'] = COLOR_PALETTE['primary']
-    plt.rcParams['ytick.color'] = COLOR_PALETTE['primary']
+    plt.rcParams['xtick.color'] = '#1F2933'
+    plt.rcParams['ytick.color'] = '#1F2933'
     plt.rcParams['xtick.direction'] = 'out'
     plt.rcParams['ytick.direction'] = 'out'
-    plt.rcParams['xtick.major.width'] = 1.0
-    plt.rcParams['ytick.major.width'] = 1.0
+    plt.rcParams['xtick.major.width'] = 0.8
+    plt.rcParams['ytick.major.width'] = 0.8
     plt.rcParams['xtick.minor.width'] = 0.5
     plt.rcParams['ytick.minor.width'] = 0.5
-    
+    plt.rcParams['xtick.major.size'] = 4
+    plt.rcParams['ytick.major.size'] = 4
+
     # Line and marker styling
-    plt.rcParams['lines.linewidth'] = 2.0
-    plt.rcParams['lines.markersize'] = 6
-    plt.rcParams['patch.linewidth'] = 1.2
-    plt.rcParams['patch.edgecolor'] = COLOR_PALETTE['primary']
-    
+    plt.rcParams['lines.linewidth'] = 1.8
+    plt.rcParams['lines.markersize'] = 5
+    plt.rcParams['patch.linewidth'] = 0.8
+    plt.rcParams['patch.edgecolor'] = '#1F2933'
+
     # Legend styling
     plt.rcParams['legend.frameon'] = True
     plt.rcParams['legend.framealpha'] = 0.95
-    plt.rcParams['legend.edgecolor'] = COLOR_PALETTE['neutral']
+    plt.rcParams['legend.edgecolor'] = '#CBD2D9'
     plt.rcParams['legend.facecolor'] = 'white'
-    plt.rcParams['legend.borderpad'] = 0.5
-    plt.rcParams['legend.labelspacing'] = 0.5
-    
-    # Default figure size
-    plt.rcParams['figure.figsize'] = (10, 6)
-    plt.rcParams['figure.dpi'] = 150
-    plt.rcParams['savefig.dpi'] = 300
+    plt.rcParams['legend.borderpad'] = 0.4
+    plt.rcParams['legend.labelspacing'] = 0.4
+
+    # Figure sizing
+    plt.rcParams['figure.figsize'] = (7.0, 4.5)
+    plt.rcParams['figure.dpi'] = 200
+    plt.rcParams['savefig.dpi'] = 600
     plt.rcParams['savefig.bbox'] = 'tight'
+
+    # Color cycle (colorblind-friendly)
+    plt.rcParams['axes.prop_cycle'] = plt.cycler(color=COLOR_SEQUENCES['qualitative'])
 
 
 def _select_metric(results: List[Dict]) -> str:
@@ -223,8 +257,10 @@ def generate_parameter_heatmap(
 
     Returns path to saved figure.
     """
-    if not HAS_MATPLOTLIB or not results:
+    if not HAS_MATPLOTLIB:
         return ""
+    if not results:
+        raise ValueError("Parameter heatmap requires sweep results.")
 
     if metric is None:
         metric = _select_metric(results)
@@ -301,8 +337,10 @@ def generate_parameter_sensitivity(
 
     Returns path to saved figure.
     """
-    if not HAS_MATPLOTLIB or not results:
+    if not HAS_MATPLOTLIB:
         return ""
+    if not results:
+        raise ValueError("Parameter sensitivity plot requires sweep results.")
 
     params_to_plot = [
         'max_mismatch_frac',
@@ -392,7 +430,6 @@ def generate_runtime_scaling(
     ax2.set_xlabel('Number of Lineages', fontweight='bold', color=COLOR_PALETTE['primary'])
     ax2.set_ylabel('Runtime (seconds)', fontweight='bold', color=COLOR_PALETTE['primary'])
     ax2.set_title('Runtime vs Complexity', fontweight='bold', color=COLOR_PALETTE['primary'])
-    ax2.legend(frameon=True, framealpha=0.95, edgecolor=COLOR_PALETTE['neutral'])
 
     # Add trend line (only if there's variance in the data)
     if len(n_lineages) > 2 and len(set(n_lineages)) > 1:
@@ -401,7 +438,9 @@ def generate_runtime_scaling(
             p = np.poly1d(z)
             x_line = np.linspace(min(n_lineages), max(n_lineages), 100)
             ax2.plot(x_line, p(x_line), 'r--', alpha=0.8, label='Trend')
-            ax2.legend()
+            handles, labels = ax2.get_legend_handles_labels()
+            if handles:
+                ax2.legend(frameon=True, framealpha=0.95, edgecolor=COLOR_PALETTE['neutral'])
         except (np.linalg.LinAlgError, ValueError):
             pass  # Skip trend line if fitting fails
 
@@ -419,48 +458,88 @@ def generate_complexity_comparison(
     output_dir: str
 ) -> str:
     """
-    Generate grouped bar chart comparing metrics across complexity levels.
+    Generate enhanced grouped bar chart comparing metrics across complexity levels.
+    Publication-quality visualization with multiple metrics.
 
     Returns path to saved figure.
     """
     if not HAS_MATPLOTLIB:
         return ""
+    if not results:
+        raise ValueError("Complexity comparison requires sweep results.")
 
     scenarios = summary.get('scenarios', {})
     if not scenarios:
-        return ""
+        raise ValueError("Complexity comparison requires scenario stats in sweep_summary.json.")
 
     scenario_names = list(scenarios.keys())
-    metrics = ['n_lineages', 'sweep_detection', 'converged_fraction']
-    metric_labels = ['Mean Lineages', 'Sweep Detection Rate', 'Convergence Rate']
+    
+    # Enhanced metrics for publication
+    metrics = ['haplotype_f1', 'snv_f1', 'abundance_pearson_r', 'track_fragmentation_mean']
+    metric_labels = ['Haplotype F1', 'SNV F1', 'Abundance r', 'Track Fragmentation']
+    
+    # Extract metrics from results (more accurate than summary stats)
+    metric_by_scenario = {name: {m: [] for m in metrics} for name in scenario_names}
+    for r in results:
+        scenario = r.get('community', r.get('scenario_name', 'default'))
+        if scenario in scenario_names:
+            metrics_dict = r.get('metrics', {})
+            for metric in metrics:
+                val = metrics_dict.get(metric)
+                if val is not None:
+                    metric_by_scenario[scenario][metric].append(val)
+    
+    # Compute means
+    scenario_means = {}
+    for scenario in scenario_names:
+        scenario_means[scenario] = {}
+        for metric in metrics:
+            vals = metric_by_scenario[scenario][metric]
+            scenario_means[scenario][metric] = np.mean(vals) if vals else None
 
-    fig, ax = plt.subplots(figsize=(12, 6))
-    colors = COLOR_SEQUENCES['qualitative'][:3]  # Use professional color palette
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    axes = axes.flatten()
+    colors = COLOR_SEQUENCES['qualitative']
 
     x = np.arange(len(scenario_names))
-    width = 0.25
+    width = 0.6
 
-    for i, (metric, label) in enumerate(zip(metrics, metric_labels)):
-        values = []
-        for name in scenario_names:
-            stats = scenarios[name]
-            if metric == 'n_lineages':
-                values.append(stats.get('n_lineages', {}).get('mean', 0))
-            elif metric == 'sweep_detection':
-                values.append(stats.get('sweep_detection', {}).get('detection_rate', 0))
-            else:
-                values.append(stats.get(metric, 0))
+    for idx, (metric, label) in enumerate(zip(metrics, metric_labels)):
+        ax = axes[idx]
+        values = [scenario_means[name].get(metric, 0) if scenario_means[name].get(metric) is not None else 0 
+                 for name in scenario_names]
+        
+        bars = ax.bar(x, values, width, label=label, 
+                     color=colors[idx % len(colors)], 
+                     edgecolor=COLOR_PALETTE['primary'],
+                     linewidth=1.2, alpha=0.85)
+        
+        # Add value labels on bars
+        for bar, val in zip(bars, values):
+            if val > 0:
+                height = bar.get_height()
+                ax.text(bar.get_x() + bar.get_width()/2., height + 0.01,
+                       f'{val:.3f}', ha='center', va='bottom', fontsize=9,
+                       fontweight='bold', color=COLOR_PALETTE['primary'])
+        
+        ax.set_ylabel(label, fontweight='bold', color=COLOR_PALETTE['primary'])
+        ax.set_title(f'{label} by Complexity', fontweight='bold', color=COLOR_PALETTE['primary'])
+        ax.set_xticks(x)
+        ax.set_xticklabels(scenario_names, rotation=45, ha='right', color=COLOR_PALETTE['primary'])
+        if metric == 'track_fragmentation_mean':
+            max_val = max(values) if values else 0
+            ax.set_ylim(0, max_val * 1.2 if max_val > 0 else 1.0)
+            ax.axhline(y=1.0, color=COLOR_PALETTE['error'], linestyle='--', 
+                      linewidth=2.0, alpha=0.7, label='Ideal (1.0)')
+        else:
+            ax.set_ylim(0, 1.1)
+            ax.axhline(y=0.9, color=COLOR_PALETTE['warning'], linestyle='--',
+                      linewidth=2.0, alpha=0.7, label='Target (0.9)')
+        if idx == 0:
+            ax.legend(frameon=True, framealpha=0.95, edgecolor=COLOR_PALETTE['neutral'], fontsize=8)
 
-        ax.bar(x + i * width, values, width, label=label, color=colors[i % len(colors)])
-
-    ax.set_xlabel('Scenario', fontweight='bold', color=COLOR_PALETTE['primary'])
-    ax.set_ylabel('Value', fontweight='bold', color=COLOR_PALETTE['primary'])
-    ax.set_title('Performance Across Complexity Levels',
-                fontweight='bold', color=COLOR_PALETTE['primary'])
-    ax.set_xticks(x + width)
-    ax.set_xticklabels(scenario_names, rotation=45, ha='right', color=COLOR_PALETTE['primary'])
-    ax.legend(frameon=True, framealpha=0.95, edgecolor=COLOR_PALETTE['neutral'])
-
+    plt.suptitle('Performance Metrics Across Complexity Levels', 
+                fontsize=16, fontweight='bold', color=COLOR_PALETTE['primary'], y=0.995)
     plt.tight_layout()
     filepath = os.path.join(output_dir, 'complexity_comparison.png')
     plt.savefig(filepath, dpi=300, bbox_inches='tight')
@@ -478,8 +557,10 @@ def generate_ablation_summary(
     
     Returns path to saved figure.
     """
-    if not HAS_MATPLOTLIB or not results:
+    if not HAS_MATPLOTLIB:
         return ""
+    if not results:
+        raise ValueError("Ablation summary requires sweep results.")
     
     # Group by ablation mode
     by_ablation = defaultdict(list)
@@ -488,12 +569,12 @@ def generate_ablation_summary(
         by_ablation[ablation].append(r)
     
     if len(by_ablation) < 2:
-        return ""  # Need at least 2 modes for comparison
+        raise ValueError("Ablation summary requires multiple ablation modes in results.")
     
     # Compare each ablation to 'full'
     full_results = by_ablation.get('full', [])
     if not full_results:
-        return ""
+        raise ValueError("Ablation summary requires a 'full' ablation baseline in results.")
     
     ablation_modes = [m for m in by_ablation.keys() if m != 'full']
     metrics = ['haplotype_f1', 'snv_f1', 'track_fragmentation_mean', 'lineage_f1']
@@ -572,7 +653,7 @@ def generate_seed_sensitivity(
     # Find configs with multiple seeds
     multi_seed_configs = {k: v for k, v in by_config.items() if len(v) > 1}
     if not multi_seed_configs:
-        return ""
+        raise ValueError("Seed sensitivity requires multiple seeds per config in results.")
     
     # Select metric
     metric = _select_metric(results)
@@ -598,7 +679,7 @@ def generate_seed_sensitivity(
             stds.append(np.std(all_values))
     
     if not means:
-        return ""
+        raise ValueError("Seed sensitivity requires metric values for multiple seeds.")
     
     x = np.arange(len(config_names))
     ax.errorbar(x, means, yerr=stds, marker='o', capsize=5, linestyle='None', 
@@ -632,24 +713,37 @@ def generate_vcf_robustness(
     
     Returns path to saved figure.
     """
-    if not HAS_MATPLOTLIB or not results:
+    if not HAS_MATPLOTLIB:
         return ""
+    if not results:
+        raise ValueError("VCF robustness requires sweep results with VCF condition metadata.")
     
-    # Check if any results have VCF realism data
-    # This would require results to be tagged with vcf_realism flag
-    # For now, we'll check if there are results with different VCF conditions
-    
-    # Group by VCF condition (if available in results)
-    # This is a placeholder - actual implementation would need VCF condition metadata
     metric = _select_metric(results)
-    
-    # For now, create a simple plot showing that VCF robustness can be measured
+
+    # Expect results to include VCF condition metadata.
+    condition_key = None
+    for key in ("vcf_condition", "vcf_realism", "vcf_tag"):
+        if any(r.get(key) is not None for r in results):
+            condition_key = key
+            break
+    if condition_key is None:
+        raise ValueError("VCF robustness requires VCF condition metadata in results.")
+
+    condition_map: Dict[str, List[float]] = defaultdict(list)
+    for r in results:
+        condition = r.get(condition_key)
+        score = r.get(metric)
+        if condition is None or score is None:
+            continue
+        condition_map[str(condition)].append(score)
+
+    if not condition_map:
+        raise ValueError("VCF robustness has no condition scores to plot.")
+
+    conditions = list(condition_map.keys())
+    values = [float(np.mean(condition_map[c])) for c in conditions]
+
     fig, ax = plt.subplots(figsize=(10, 6))
-    
-    # Placeholder: would show performance with perfect vs perturbed VCF
-    conditions = ['Perfect VCF', 'Missing AF/DP', 'FP Sites', 'FN Sites']
-    # In real implementation, would extract from results metadata
-    values = [0.95, 0.92, 0.88, 0.85]  # Placeholder values
     
     ax.bar(conditions, values, color=[COLOR_PALETTE['success'], COLOR_PALETTE['warning'], 
           COLOR_PALETTE['error'], COLOR_PALETTE['info']], 
@@ -659,6 +753,7 @@ def generate_vcf_robustness(
     ax.set_title('VCF Robustness: Performance Under Perturbed VCF Conditions',
                 fontweight='bold', color=COLOR_PALETTE['primary'])
     ax.set_ylim(0, 1.0)
+    ax.set_xticks(range(len(conditions)))
     ax.set_xticklabels(conditions, color=COLOR_PALETTE['primary'])
     
     for i, (cond, val) in enumerate(zip(conditions, values)):
@@ -673,6 +768,117 @@ def generate_vcf_robustness(
     return filepath
 
 
+def generate_coverage_performance(
+    results: List[Dict],
+    output_dir: str
+ ) -> str:
+    """
+    Plot performance vs coverage when coverage metadata is available.
+    """
+    if not HAS_MATPLOTLIB:
+        return ""
+    if not results:
+        raise ValueError("Performance vs coverage requires sweep results.")
+
+    metric = _select_metric(results)
+    coverage_map: Dict[int, List[float]] = defaultdict(list)
+
+    for r in results:
+        cov = r.get("coverage")
+        if cov is None:
+            cov = r.get("params", {}).get("coverage")
+        score = r.get(metric)
+        if cov is None or score is None:
+            continue
+        coverage_map[int(cov)].append(score)
+
+    if not coverage_map:
+        raise ValueError("Performance vs coverage requires coverage metadata in results.")
+
+    coverages = sorted(coverage_map.keys())
+    means = [float(np.mean(coverage_map[c])) for c in coverages]
+    stds = [float(np.std(coverage_map[c])) for c in coverages]
+
+    fig, ax = plt.subplots(figsize=(6.5, 4.5))
+    ax.errorbar(
+        coverages,
+        means,
+        yerr=stds,
+        fmt='o-',
+        color=COLOR_PALETTE['accent'],
+        ecolor=COLOR_PALETTE['neutral'],
+        capsize=4,
+        linewidth=1.6,
+        markersize=5,
+    )
+    ax.set_xlabel("Coverage (x)")
+    ax.set_ylabel(metric.replace("_", " ").title())
+    ax.set_title("Performance vs coverage")
+    ax.set_ylim(0, 1.05 if metric.endswith("f1") else max(means) * 1.2)
+
+    plt.tight_layout()
+    filepath = os.path.join(output_dir, "coverage_performance.png")
+    plt.savefig(filepath, dpi=600, bbox_inches="tight")
+    plt.close()
+    return filepath
+
+
+def generate_metric_correlation(
+    results: List[Dict],
+    output_dir: str
+) -> str:
+    """
+    Plot correlation matrix among available numeric metrics.
+    """
+    if not HAS_MATPLOTLIB:
+        return ""
+    if not results:
+        raise ValueError("Metric correlation matrix requires sweep results.")
+
+    metric_candidates = [
+        "haplotype_f1",
+        "snv_f1",
+        "abundance_pearson_r",
+        "n_lineages",
+        "runtime_seconds",
+    ]
+
+    metric_values = {}
+    for metric in metric_candidates:
+        values = [r.get(metric) for r in results if r.get(metric) is not None]
+        if len(values) >= 3:
+            metric_values[metric] = values
+
+    if len(metric_values) < 2:
+        raise ValueError("Metric correlation matrix requires at least two metrics with data.")
+
+    metrics = list(metric_values.keys())
+    data = np.array([metric_values[m] for m in metrics])
+    corr = np.corrcoef(data)
+
+    fig, ax = plt.subplots(figsize=(6.5, 5))
+    im = ax.imshow(corr, cmap="coolwarm", vmin=-1, vmax=1)
+    ax.set_xticks(range(len(metrics)))
+    ax.set_yticks(range(len(metrics)))
+    ax.set_xticklabels([m.replace("_", " ") for m in metrics], rotation=35, ha="right")
+    ax.set_yticklabels([m.replace("_", " ") for m in metrics])
+
+    for i in range(len(metrics)):
+        for j in range(len(metrics)):
+            ax.text(j, i, f"{corr[i, j]:.2f}", ha="center", va="center", fontsize=8,
+                    color="white" if abs(corr[i, j]) > 0.5 else COLOR_PALETTE['dark'])
+
+    cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label("Correlation")
+    ax.set_title("Metric correlation matrix")
+
+    plt.tight_layout()
+    filepath = os.path.join(output_dir, "metric_correlation.png")
+    plt.savefig(filepath, dpi=600, bbox_inches="tight")
+    plt.close()
+    return filepath
+
+
 def generate_optimal_params(
     stable_params: List[Dict],
     output_dir: str
@@ -682,8 +888,10 @@ def generate_optimal_params(
 
     Returns path to saved figure.
     """
-    if not HAS_MATPLOTLIB or not stable_params:
+    if not HAS_MATPLOTLIB:
         return ""
+    if not stable_params:
+        raise ValueError("Optimal parameter ranges require stable_parameters.json.")
 
     # Filter to only parameters that have numeric values
     numeric_params = []
@@ -703,8 +911,7 @@ def generate_optimal_params(
             numeric_params.append(param)
 
     if not numeric_params:
-        logger.warning("No numeric parameters found in stable_params, skipping optimal params visualization")
-        return ""
+        raise ValueError("Optimal parameter ranges require numeric parameter values.")
 
     n_params = len(numeric_params)
 
@@ -728,10 +935,7 @@ def generate_optimal_params(
                     continue
         
         if not values:
-            ax.text(0.5, 0.5, "No numeric data", ha="center", va="center", fontsize=11)
-            ax.set_xlabel(param.replace('_', ' ').title())
-            ax.set_axis_off()
-            continue
+            raise ValueError(f"Optimal parameter ranges missing numeric values for {param}.")
 
         ax.hist(values, bins=10, color=COLOR_PALETTE['success'], 
                edgecolor=COLOR_PALETTE['primary'], alpha=0.8, linewidth=1.2)
@@ -750,6 +954,373 @@ def generate_optimal_params(
     plt.savefig(filepath, dpi=300, bbox_inches='tight')
     plt.close()
 
+    return filepath
+
+
+def generate_per_contig_f1_distribution(
+    validation_metrics: Optional[Dict],
+    output_dir: str
+) -> str:
+    """Plot per-contig F1 distribution."""
+    if not HAS_MATPLOTLIB:
+        return ""
+
+    validation_metrics = _require_validation_metrics(
+        validation_metrics, "Per-contig F1 distribution"
+    )
+    per_contig = _require_per_contig(validation_metrics, "Per-contig F1 distribution")
+
+    f1_values = []
+    for metrics in per_contig.values():
+        precision = metrics.get("precision")
+        recall = metrics.get("recall")
+        if precision is None or recall is None:
+            continue
+        denom = precision + recall
+        f1 = (2 * precision * recall / denom) if denom else 0.0
+        f1_values.append(f1)
+
+    if not f1_values:
+        raise ValueError("Per-contig F1 distribution requires precision/recall values.")
+
+    fig, ax = plt.subplots(figsize=(6, 4))
+    ax.boxplot(
+        f1_values,
+        vert=True,
+        widths=0.4,
+        patch_artist=True,
+        boxprops=dict(facecolor=COLOR_PALETTE['accent'], alpha=0.35),
+        medianprops=dict(color=COLOR_PALETTE['dark'], linewidth=1.6),
+    )
+    jitter = np.random.normal(1, 0.04, size=len(f1_values))
+    ax.scatter(jitter, f1_values, s=20, color=COLOR_PALETTE['primary'], alpha=0.6)
+    ax.set_xlim(0.6, 1.4)
+    ax.set_ylabel("F1 score")
+    ax.set_xticks([])
+    ax.set_title("Per-contig F1 distribution")
+    ax.set_ylim(0, 1.05)
+
+    plt.tight_layout()
+    filepath = os.path.join(output_dir, "per_contig_f1.png")
+    plt.savefig(filepath, dpi=600, bbox_inches="tight")
+    plt.close()
+    return filepath
+
+
+def generate_precision_recall_scatter(
+    validation_metrics: Optional[Dict],
+    output_dir: str
+) -> str:
+    """Scatter precision vs recall per contig with iso-F1 curves."""
+    if not HAS_MATPLOTLIB:
+        return ""
+
+    validation_metrics = _require_validation_metrics(
+        validation_metrics, "Per-contig precision vs recall"
+    )
+    per_contig = _require_per_contig(validation_metrics, "Per-contig precision vs recall")
+
+    points = []
+    for metrics in per_contig.values():
+        precision = metrics.get("precision")
+        recall = metrics.get("recall")
+        if precision is None or recall is None:
+            continue
+        points.append((precision, recall))
+
+    if not points:
+        raise ValueError("Per-contig precision vs recall requires precision/recall values.")
+
+    fig, ax = plt.subplots(figsize=(6, 5))
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+    ax.scatter(xs, ys, s=35, color=COLOR_PALETTE['accent'], edgecolor=COLOR_PALETTE['dark'])
+
+    for f1 in [0.5, 0.7, 0.9]:
+        recall = np.linspace(0.01, 1.0, 200)
+        precision = (f1 * recall) / (2 * recall - f1)
+        precision = np.clip(precision, 0, 1)
+        ax.plot(precision, recall, color=COLOR_PALETTE['neutral'], linestyle='--', linewidth=1.0)
+        ax.text(0.98, f1 * 0.98, f"F1={f1}", ha="right", va="bottom", fontsize=8, color=COLOR_PALETTE['neutral'])
+
+    ax.set_xlim(0, 1.02)
+    ax.set_ylim(0, 1.02)
+    ax.set_xlabel("Precision")
+    ax.set_ylabel("Recall")
+    ax.set_title("Per-contig precision vs recall")
+
+    plt.tight_layout()
+    filepath = os.path.join(output_dir, "precision_recall_scatter.png")
+    plt.savefig(filepath, dpi=600, bbox_inches="tight")
+    plt.close()
+    return filepath
+
+
+def generate_lineage_count_error(
+    validation_metrics: Optional[Dict],
+    output_dir: str
+) -> str:
+    """Scatter of detected vs true lineage counts per contig."""
+    if not HAS_MATPLOTLIB:
+        return ""
+
+    validation_metrics = _require_validation_metrics(validation_metrics, "Lineage count agreement")
+    per_contig = _require_per_contig(validation_metrics, "Lineage count agreement")
+
+    xs = []
+    ys = []
+    for metrics in per_contig.values():
+        n_true = metrics.get("n_true")
+        n_detected = metrics.get("n_detected")
+        if n_true is None or n_detected is None:
+            continue
+        xs.append(n_true)
+        ys.append(n_detected)
+
+    if not xs:
+        raise ValueError("Lineage count agreement requires n_true and n_detected.")
+
+    fig, ax = plt.subplots(figsize=(6, 5))
+    ax.scatter(xs, ys, s=40, color=COLOR_PALETTE['success'], edgecolor=COLOR_PALETTE['dark'])
+    min_v = min(xs + ys)
+    max_v = max(xs + ys)
+    ax.plot([min_v, max_v], [min_v, max_v], color=COLOR_PALETTE['neutral'], linestyle='--', linewidth=1.2)
+    ax.set_xlabel("True lineages")
+    ax.set_ylabel("Detected lineages")
+    ax.set_title("Lineage count agreement by contig")
+
+    plt.tight_layout()
+    filepath = os.path.join(output_dir, "lineage_count_error.png")
+    plt.savefig(filepath, dpi=600, bbox_inches="tight")
+    plt.close()
+    return filepath
+
+
+def generate_pareto_front(
+    results: List[Dict],
+    output_dir: str,
+    metric: Optional[str] = None
+) -> str:
+    """Plot Pareto front (metric vs runtime)."""
+    if not HAS_MATPLOTLIB:
+        return ""
+    if not results:
+        raise ValueError("Performance vs runtime tradeoff requires sweep results.")
+
+    metric = metric or _select_metric(results)
+    points = []
+    for r in results:
+        score = r.get(metric)
+        runtime = r.get("runtime_seconds")
+        if score is None or runtime is None:
+            continue
+        params = r.get("params", {})
+        window_size = params.get("window_size", r.get("window_size"))
+        points.append((runtime, score, window_size))
+
+    if not points:
+        raise ValueError("Performance vs runtime tradeoff requires metric and runtime data.")
+
+    points.sort(key=lambda x: x[0])
+    pareto = []
+    best_score = -1.0
+    for runtime, score, window_size in points:
+        if score > best_score:
+            pareto.append((runtime, score))
+            best_score = score
+
+    fig, ax = plt.subplots(figsize=(6.5, 4.5))
+    runtimes = [p[0] for p in points]
+    scores = [p[1] for p in points]
+    colors = [p[2] if p[2] is not None else 0 for p in points]
+    sc = ax.scatter(runtimes, scores, c=colors, cmap="viridis", s=35, alpha=0.75)
+
+    ax.plot([p[0] for p in pareto], [p[1] for p in pareto],
+            color=COLOR_PALETTE['error'], linewidth=1.8, label="Pareto front")
+    ax.set_xlabel("Runtime (s)")
+    ax.set_ylabel(metric.replace("_", " ").title())
+    ax.set_title("Performance vs runtime tradeoff")
+    ax.legend(frameon=False, loc="lower right")
+    cbar = plt.colorbar(sc, ax=ax)
+    cbar.set_label("Window size")
+
+    plt.tight_layout()
+    filepath = os.path.join(output_dir, "pareto_front.png")
+    plt.savefig(filepath, dpi=600, bbox_inches="tight")
+    plt.close()
+    return filepath
+
+
+def generate_timepoint_abundance(
+    validation_metrics: Optional[Dict],
+    output_dir: str
+) -> str:
+    """Plot abundance correlation per timepoint."""
+    if not HAS_MATPLOTLIB:
+        return ""
+
+    validation_metrics = _require_validation_metrics(
+        validation_metrics, "Abundance correlation over time"
+    )
+    per_tp = _require_per_timepoint(validation_metrics, "Abundance correlation over time")
+
+    pairs = []
+    for tp, metrics in per_tp.items():
+        val = metrics.get("abundance_pearson_r")
+        if val is not None:
+            pairs.append((tp, val))
+
+    if not pairs:
+        raise ValueError("Abundance correlation over time requires abundance_pearson_r values.")
+
+    def _parse_tp(value: str) -> float | None:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    numeric_tps = [_parse_tp(tp) for tp, _ in pairs]
+    if all(tp is not None for tp in numeric_tps):
+        pairs = sorted(((numeric_tps[i], pairs[i][1]) for i in range(len(pairs))), key=lambda x: x[0])
+        timepoints = [tp for tp, _ in pairs]
+    else:
+        pairs = sorted(pairs, key=lambda x: str(x[0]))
+        timepoints = [tp for tp, _ in pairs]
+
+    values = [val for _, val in pairs]
+
+    fig, ax = plt.subplots(figsize=(6.5, 4))
+    ax.plot(timepoints, values, marker='o', color=COLOR_PALETTE['accent'])
+    ax.set_ylim(0, 1.05)
+    ax.set_xlabel("Timepoint")
+    ax.set_ylabel("Abundance Pearson r")
+    ax.set_title("Abundance correlation over time")
+    plt.tight_layout()
+    filepath = os.path.join(output_dir, "abundance_timepoint.png")
+    plt.savefig(filepath, dpi=600, bbox_inches="tight")
+    plt.close()
+    return filepath
+
+
+def _save_no_data_plot(output_dir: str, filename: str, title: str) -> str:
+    """Create a placeholder plot when data is unavailable."""
+    if not HAS_MATPLOTLIB:
+        return ""
+    fig, ax = plt.subplots(figsize=(6.5, 4))
+    ax.text(0.5, 0.5, "No data available", ha="center", va="center", fontsize=11)
+    ax.set_title(title)
+    ax.set_axis_off()
+    plt.tight_layout()
+    filepath = os.path.join(output_dir, filename)
+    plt.savefig(filepath, dpi=600, bbox_inches="tight")
+    plt.close()
+    return filepath
+
+
+def _require_validation_metrics(validation_metrics: Optional[Dict], plot_name: str) -> Dict:
+    if not validation_metrics:
+        raise ValueError(
+            f"{plot_name} requires validation metrics. "
+            "Run validation and pass --validation to generate_report."
+        )
+    return validation_metrics
+
+
+def _require_per_contig(validation_metrics: Dict, plot_name: str) -> Dict:
+    per_contig = validation_metrics.get("per_contig_metrics") or {}
+    if not per_contig:
+        raise ValueError(f"{plot_name} requires per-contig metrics in validation output.")
+    return per_contig
+
+
+def _require_per_timepoint(validation_metrics: Dict, plot_name: str) -> Dict:
+    per_tp = validation_metrics.get("per_timepoint_metrics") or {}
+    if not per_tp:
+        raise ValueError(f"{plot_name} requires per-timepoint metrics in validation output.")
+    return per_tp
+
+
+def _require_results_fields(results: List[Dict], fields: List[str], plot_name: str) -> None:
+    missing = []
+    for field in fields:
+        if not any(r.get(field) is not None for r in results):
+            missing.append(field)
+    if missing:
+        raise ValueError(f"{plot_name} requires results fields: {', '.join(missing)}.")
+
+
+def generate_error_decomposition(
+    validation_metrics: Optional[Dict],
+    output_dir: str
+) -> str:
+    """Plot error decomposition: false merges, false splits, missed lineages."""
+    if not HAS_MATPLOTLIB:
+        return ""
+
+    validation_metrics = _require_validation_metrics(validation_metrics, "Error decomposition")
+    per_contig = _require_per_contig(validation_metrics, "Error decomposition")
+    false_negatives = validation_metrics.get("false_negatives") or []
+
+    # Prefer explicit linkage error rates when available.
+    false_link_rate = validation_metrics.get("false_link_rate")
+    missed_link_rate = validation_metrics.get("missed_link_rate")
+
+    total_true = sum(m.get("n_true", 0) for m in per_contig.values()) if per_contig else 0
+
+    if false_link_rate is None or missed_link_rate is None:
+        # Fallback: infer merge/split counts from per-contig lineage counts.
+        merge_count = 0
+        split_count = 0
+        if per_contig:
+            for metrics in per_contig.values():
+                n_true = metrics.get("n_true", 0)
+                n_detected = metrics.get("n_detected", 0)
+                if n_detected < n_true:
+                    merge_count += (n_true - n_detected)
+                elif n_detected > n_true:
+                    split_count += (n_detected - n_true)
+        else:
+            merge_count = 0
+            split_count = 0
+
+        if total_true > 0:
+            merge_rate = (merge_count / total_true) * 100
+            split_rate = (split_count / total_true) * 100
+        else:
+            merge_rate = float(merge_count)
+            split_rate = float(split_count)
+    else:
+        merge_rate = false_link_rate * 100
+        split_rate = missed_link_rate * 100
+
+    if total_true > 0:
+        missed_lineage_rate = (len(false_negatives) / total_true) * 100
+    else:
+        missed_lineage_rate = float(len(false_negatives))
+
+    if merge_rate == 0 and split_rate == 0 and missed_lineage_rate == 0:
+        raise ValueError("Error decomposition has no non-zero values to plot.")
+
+    labels = ["False merges", "False splits", "Missed lineages"]
+    values = [merge_rate, split_rate, missed_lineage_rate]
+
+    fig, ax = plt.subplots(figsize=(6.5, 4.5))
+    bars = ax.bar(labels, values, color=[
+        COLOR_PALETTE['error'],
+        COLOR_PALETTE['warning'],
+        COLOR_PALETTE['accent'],
+    ], edgecolor=COLOR_PALETTE['dark'], linewidth=0.8, alpha=0.85)
+
+    ylabel = "Rate (%)" if total_true else "Count"
+    ax.set_ylabel(ylabel)
+    ax.set_title("Error decomposition")
+    ax.set_ylim(0, max(values) * 1.25 if values else 1.0)
+    ax.bar_label(bars, fmt="%.2f" if total_true else "%d", padding=3)
+
+    plt.tight_layout()
+    filepath = os.path.join(output_dir, "error_decomposition.png")
+    plt.savefig(filepath, dpi=600, bbox_inches="tight")
+    plt.close()
     return filepath
 
 
@@ -1179,21 +1750,47 @@ def generate_html_report(
     figures['parameter_heatmap.png'] = generate_parameter_heatmap(results, output_dir)
     figures['parameter_sensitivity.png'] = generate_parameter_sensitivity(results, output_dir)
     figures['runtime_scaling.png'] = generate_runtime_scaling(results, output_dir)
+    figures['per_contig_f1.png'] = generate_per_contig_f1_distribution(
+        validation_metrics, output_dir
+    )
+    figures['precision_recall_scatter.png'] = generate_precision_recall_scatter(
+        validation_metrics, output_dir
+    )
+    figures['lineage_count_error.png'] = generate_lineage_count_error(
+        validation_metrics, output_dir
+    )
+    figures['pareto_front.png'] = generate_pareto_front(results, output_dir)
+    figures['abundance_timepoint.png'] = generate_timepoint_abundance(
+        validation_metrics, output_dir
+    )
     figures['complexity_comparison.png'] = generate_complexity_comparison(results, summary, output_dir)
     figures['optimal_params.png'] = generate_optimal_params(stable_params, output_dir)
     figures['ablation_summary.png'] = generate_ablation_summary(results, output_dir)
     figures['seed_sensitivity.png'] = generate_seed_sensitivity(results, output_dir)
     figures['vcf_robustness.png'] = generate_vcf_robustness(results, output_dir)
+    figures['coverage_performance.png'] = generate_coverage_performance(results, output_dir)
+    figures['metric_correlation.png'] = generate_metric_correlation(results, output_dir)
+    figures['error_decomposition.png'] = generate_error_decomposition(
+        validation_metrics, output_dir
+    )
     
     figure_titles = {
         'parameter_heatmap.png': 'Parameter Heatmap',
         'parameter_sensitivity.png': 'Parameter Sensitivity Analysis',
         'runtime_scaling.png': 'Runtime Scaling',
+        'per_contig_f1.png': 'Per-contig F1 Distribution',
+        'precision_recall_scatter.png': 'Per-contig Precision vs Recall',
+        'lineage_count_error.png': 'Lineage Count Agreement',
+        'pareto_front.png': 'Performance vs Runtime (Pareto Front)',
+        'abundance_timepoint.png': 'Abundance Correlation Over Time',
         'complexity_comparison.png': 'Performance by Complexity',
         'optimal_params.png': 'Optimal Parameter Ranges',
         'ablation_summary.png': 'Ablation Summary',
         'seed_sensitivity.png': 'Seed Sensitivity',
         'vcf_robustness.png': 'VCF Robustness',
+        'coverage_performance.png': 'Performance vs Coverage',
+        'metric_correlation.png': 'Metric Correlation Matrix',
+        'error_decomposition.png': 'Error Decomposition',
     }
 
     for filename, title in figure_titles.items():
@@ -1438,6 +2035,13 @@ def generate_report(
             "track_fragmentation.png": "Track Fragmentation",
             "linking_errors.png": "Linking Errors",
             "lineage_accuracy.png": "Lineage Accuracy",
+            "track_regions.png": "Track Regions on Contigs",
+            "per_abundance_performance.png": "Performance by Abundance Range",
+            "divergence_performance.png": "Performance vs Strain Divergence",
+            "detection_roc.png": "Detection Performance (ROC-like)",
+            "reference_coverage.png": "Reference Coverage Distribution",
+            "error_breakdown.png": "Error Type Breakdown",
+            "scalability_analysis.png": "Scalability Analysis",
         }
         for filename, title in validation_files.items():
             src_path = os.path.join(validation_dir, filename)
@@ -1455,15 +2059,36 @@ def generate_report(
     logger.info("Generating runtime scaling plot...")
     figures['runtime_scaling.png'] = generate_runtime_scaling(results, output_dir)
 
-    if summary.get('scenarios'):
-        logger.info("Generating complexity comparison...")
-        figures['complexity_comparison.png'] = generate_complexity_comparison(
-            results, summary, output_dir
-        )
+    logger.info("Generating per-contig F1 distribution...")
+    figures['per_contig_f1.png'] = generate_per_contig_f1_distribution(
+        validation_metrics, output_dir
+    )
 
-    if stable_params:
-        logger.info("Generating optimal params visualization...")
-        figures['optimal_params.png'] = generate_optimal_params(stable_params, output_dir)
+    logger.info("Generating precision-recall scatter...")
+    figures['precision_recall_scatter.png'] = generate_precision_recall_scatter(
+        validation_metrics, output_dir
+    )
+
+    logger.info("Generating lineage count agreement plot...")
+    figures['lineage_count_error.png'] = generate_lineage_count_error(
+        validation_metrics, output_dir
+    )
+
+    logger.info("Generating Pareto front plot...")
+    figures['pareto_front.png'] = generate_pareto_front(results, output_dir)
+
+    logger.info("Generating timepoint abundance plot...")
+    figures['abundance_timepoint.png'] = generate_timepoint_abundance(
+        validation_metrics, output_dir
+    )
+
+    logger.info("Generating complexity comparison...")
+    figures['complexity_comparison.png'] = generate_complexity_comparison(
+        results, summary, output_dir
+    )
+
+    logger.info("Generating optimal params visualization...")
+    figures['optimal_params.png'] = generate_optimal_params(stable_params, output_dir)
     
     logger.info("Generating ablation summary...")
     figures['ablation_summary.png'] = generate_ablation_summary(results, output_dir)
@@ -1473,6 +2098,18 @@ def generate_report(
     
     logger.info("Generating VCF robustness plot...")
     figures['vcf_robustness.png'] = generate_vcf_robustness(results, output_dir)
+    
+    # Additional publication-quality plots
+    logger.info("Generating performance vs coverage plot...")
+    figures['coverage_performance.png'] = generate_coverage_performance(results, output_dir)
+    
+    logger.info("Generating metric correlation matrix...")
+    figures['metric_correlation.png'] = generate_metric_correlation(results, output_dir)
+
+    logger.info("Generating error decomposition plot...")
+    figures['error_decomposition.png'] = generate_error_decomposition(
+        validation_metrics, output_dir
+    )
 
     # Generate HTML report
     logger.info("Generating HTML report...")

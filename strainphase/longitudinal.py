@@ -35,6 +35,7 @@ import logging
 import os
 import sys
 from collections import defaultdict
+from typing import Optional, Set
 
 import pandas as pd
 import pysam  # noqa: F401
@@ -100,7 +101,7 @@ def load_allowed_contigs(path: str) -> set[str]:
 
 
 def parse_reference_contigs(
-    fasta_path: str, allowed_contigs: set[str] | None = None
+    fasta_path: str, allowed_contigs: Optional[Set[str]] = None
 ) -> dict[str, dict[str, int]]:
     """
     Parse reference .fai to get contig info grouped by MAG.
@@ -142,7 +143,7 @@ def parse_reference_contigs(
 
 
 def process_mag_longitudinal(
-    mag_name: str | None,
+    mag_name: Optional[str],
     mag_contigs: dict[str, int],
     samples: list[str],
     bam_paths: dict[str, str],
@@ -595,7 +596,7 @@ def main():
                 sys.exit(1)
 
     # Load optional contig filter
-    allowed_contigs: set[str] | None = None
+    allowed_contigs: Optional[Set[str]] = None
     if args.contig_filter:
         allowed_contigs = load_allowed_contigs(args.contig_filter)
 

@@ -189,8 +189,10 @@ class SweepResult:
     
     # Metadata
     ablation: Optional[str] = None  # e.g., "full", "no_linking", "no_rescue", "no_junk", "no_1snp_guard"
+    vcf_condition: Optional[str] = None  # e.g., "perfect", "missing_af_dp", "fp_sites", "fn_sites"
     config_full: Optional[Dict] = None  # Full HaplotyperConfig fields
     environment: Optional[Dict] = None  # Software versions, platform, CPU, threads
+    seed: Optional[int] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -228,8 +230,10 @@ class SweepResult:
             # Performance and metadata
             'memory_peak_mb': self.memory_peak_mb,
             'ablation': self.ablation,
+            'vcf_condition': self.vcf_condition,
             'config_full': self.config_full,
             'environment': self.environment,
+            'seed': self.seed,
         }
 
 
@@ -414,8 +418,10 @@ class CheckpointManager:
                 abundance_trajectory_error=data.get('abundance_trajectory_error'),
                 # Metadata
                 ablation=data.get('ablation'),
+                vcf_condition=data.get('vcf_condition'),
                 config_full=data.get('config_full'),
                 environment=data.get('environment'),
+                seed=data.get('seed'),
                 memory_peak_mb=data.get('memory_peak_mb'),
             )
             results.append(result)
@@ -469,8 +475,10 @@ class CheckpointManager:
             abundance_trajectory_error=data.get('abundance_trajectory_error'),
             # Metadata
             ablation=data.get('ablation'),
+            vcf_condition=data.get('vcf_condition'),
             config_full=data.get('config_full'),
             environment=data.get('environment'),
+            seed=data.get('seed'),
             memory_peak_mb=data.get('memory_peak_mb'),
         )
 
@@ -860,6 +868,17 @@ class ParameterSweep:
                         config=config,
                     )
                     
+                    # Log per-timepoint results
+                    for sample_id in timepoints:
+                        sample_contigs = mag_results.get(sample_id, {})
+                        total_windows = sum(len(contig_results) for contig_results in sample_contigs.values())
+                        total_haplotypes = sum(
+                            len(wr.haplotypes) 
+                            for contig_results in sample_contigs.values() 
+                            for wr in contig_results
+                        )
+                        logger.info(f"    {sample_id}: {len(sample_contigs)} contigs, {total_windows} windows, {total_haplotypes} haplotypes")
+                    
                     # Flatten results: {sample -> {contig -> [WindowResult]}} -> List[WindowResult]
                     for sample_results in mag_results.values():
                         for contig_results in sample_results.values():
@@ -919,14 +938,45 @@ class ParameterSweep:
                             # Build lineage table (creates records with lineage_id, sample, contig, etc.)
                             lineage_records = build_lineage_table(structured_results, config)
                             
-                            # Write lineages.tsv from lineage records
+                            # Log which timepoints have records
+                            samples_in_records = set(rec.get('sample', '') for rec in lineage_records)
+                            logger.info(f"    Lineage records include timepoints: {sorted(samples_in_records)}")
+                            logger.info(f"    Total lineage records: {len(lineage_records)}")
+                            
+                            # Convert records to format expected by validation
+                            # build_lineage_table returns: mean_weight, consensus (pipe-separated)
+                            # Validation expects: abundance, snv_alleles (comma-separated)
+                            converted_records = []
+                            for rec in lineage_records:
+                                # Convert mean_weight -> abundance
+                                abundance = rec.get('mean_weight', 0.0)
+                                
+                                # Convert consensus format: "pos1:base1|pos2:base2" -> "pos1:base1,pos2:base2"
+                                consensus = rec.get('consensus', '')
+                                snv_alleles = consensus.replace('|', ',') if consensus else ''
+                                
+                                converted_records.append({
+                                    'lineage_id': rec.get('lineage_id', ''),
+                                    'sample': rec.get('sample', ''),
+                                    'contig': rec.get('contig', ''),
+                                    'track_id': rec.get('track_id', ''),
+                                    'abundance': abundance,
+                                    'snv_alleles': snv_alleles,
+                                })
+                            
+                            # Log per-timepoint counts
+                            from collections import Counter
+                            sample_counts = Counter(rec['sample'] for rec in converted_records)
+                            logger.info(f"    Records per timepoint: {dict(sample_counts)}")
+                            
+                            # Write lineages.tsv from converted records
                             import csv
                             fieldnames = ['lineage_id', 'sample', 'contig', 'track_id', 'abundance', 'snv_alleles']
                             with open(lineages_path, 'w', newline='') as f:
                                 writer = csv.DictWriter(f, fieldnames=fieldnames, delimiter='\t')
                                 writer.writeheader()
-                                if lineage_records:
-                                    writer.writerows(lineage_records)
+                                if converted_records:
+                                    writer.writerows(converted_records)
                         else:
                             # Single-timepoint mode: use simple conversion
                             window_results_to_lineages_tsv(
@@ -938,60 +988,55 @@ class ParameterSweep:
                             logger.warning(f"Failed to create lineages.tsv at {lineages_path}")
                             raise FileNotFoundError(f"lineages.tsv not created")
                         
-                        # Skip validation if no haplotypes detected (no point validating empty results)
-                        if len(all_window_results) == 0 or sum(len(wr.haplotypes) for wr in all_window_results) == 0:
-                            logger.info(f"    No haplotypes detected - skipping validation")
-                            accuracy_metrics = {}
-                        else:
-                            # Run detailed validation (handles empty files gracefully)
-                            from validation.validate_haplotypes import run_validation
-                            validation_output = str(config_output_dir / "validation")
-                            
-                            if verbose:
-                                mode_str = "longitudinal" if use_longitudinal else "single-timepoint"
-                                logger.info(f"    Running validation ({mode_str} mode)...")
-                            
-                            validation_result = run_validation(
-                                detected_file=lineages_path,
-                                truth_dir=self.truth_dir,
-                                output_dir=validation_output,
-                                window_results=all_window_results,  # For track validation
-                                window_size=params.window_size  # For track validation
-                            )
-                            
-                            # Extract metrics from validation (including track/linking and lineage metrics)
-                            accuracy_metrics = {
-                                "snv_precision": validation_result.snv_precision,
-                                "snv_recall": validation_result.snv_recall,
-                                "snv_f1": 2 * validation_result.snv_precision * validation_result.snv_recall / 
-                                         (validation_result.snv_precision + validation_result.snv_recall) 
-                                         if (validation_result.snv_precision + validation_result.snv_recall) > 0 else 0.0,
-                                "haplotype_precision": validation_result.precision,
-                                "haplotype_recall": validation_result.recall,
-                                "haplotype_f1": validation_result.f1,
-                                "abundance_pearson_r": validation_result.abundance_pearson_r,
-                                "abundance_mae": validation_result.abundance_mae,
-                                # Track/linking metrics
-                                "track_fragmentation_mean": validation_result.track_fragmentation_mean,
-                                "track_fragmentation_median": validation_result.track_fragmentation_median,
-                                "false_link_rate": validation_result.false_link_rate,
-                                "missed_link_rate": validation_result.missed_link_rate,
-                                "track_consensus_error": validation_result.track_consensus_error,
-                                # Lineage metrics
-                                "lineage_precision": validation_result.lineage_precision,
-                                "lineage_recall": validation_result.lineage_recall,
-                                "lineage_f1": validation_result.lineage_f1,
-                                "rescue_delta_recall_rare": validation_result.rescue_delta_recall_rare,
-                                "abundance_trajectory_error": validation_result.abundance_trajectory_error,
-                            }
-                            if verbose:
-                                logger.info(f"    Validation complete: F1={accuracy_metrics['haplotype_f1']:.3f}, "
-                                          f"Precision={accuracy_metrics['haplotype_precision']:.3f}, "
-                                          f"Recall={accuracy_metrics['haplotype_recall']:.3f}")
-                                if use_longitudinal:
-                                    logger.info(f"      Lineage F1={accuracy_metrics.get('lineage_f1', 0):.3f}, "
-                                              f"Rescue ΔRecall={accuracy_metrics.get('rescue_delta_recall_rare', 0):.3f}")
-                                logger.info(f"    Validation outputs saved to: {validation_output}")
+                        # Run detailed validation (handles empty files gracefully)
+                        from validation.validate_haplotypes import run_validation
+                        validation_output = str(config_output_dir / "validation")
+
+                        if verbose:
+                            mode_str = "longitudinal" if use_longitudinal else "single-timepoint"
+                            logger.info(f"    Running validation ({mode_str} mode)...")
+
+                        validation_result = run_validation(
+                            detected_file=lineages_path,
+                            truth_dir=self.truth_dir,
+                            output_dir=validation_output,
+                            window_results=all_window_results,  # For track validation
+                            window_size=params.window_size  # For track validation
+                        )
+
+                        # Extract metrics from validation (including track/linking and lineage metrics)
+                        accuracy_metrics = {
+                            "snv_precision": validation_result.snv_precision,
+                            "snv_recall": validation_result.snv_recall,
+                            "snv_f1": 2 * validation_result.snv_precision * validation_result.snv_recall /
+                                     (validation_result.snv_precision + validation_result.snv_recall)
+                                     if (validation_result.snv_precision + validation_result.snv_recall) > 0 else 0.0,
+                            "haplotype_precision": validation_result.precision,
+                            "haplotype_recall": validation_result.recall,
+                            "haplotype_f1": validation_result.f1,
+                            "abundance_pearson_r": validation_result.abundance_pearson_r,
+                            "abundance_mae": validation_result.abundance_mae,
+                            # Track/linking metrics
+                            "track_fragmentation_mean": validation_result.track_fragmentation_mean,
+                            "track_fragmentation_median": validation_result.track_fragmentation_median,
+                            "false_link_rate": validation_result.false_link_rate,
+                            "missed_link_rate": validation_result.missed_link_rate,
+                            "track_consensus_error": validation_result.track_consensus_error,
+                            # Lineage metrics
+                            "lineage_precision": validation_result.lineage_precision,
+                            "lineage_recall": validation_result.lineage_recall,
+                            "lineage_f1": validation_result.lineage_f1,
+                            "rescue_delta_recall_rare": validation_result.rescue_delta_recall_rare,
+                            "abundance_trajectory_error": validation_result.abundance_trajectory_error,
+                        }
+                        if verbose:
+                            logger.info(f"    Validation complete: F1={accuracy_metrics['haplotype_f1']:.3f}, "
+                                      f"Precision={accuracy_metrics['haplotype_precision']:.3f}, "
+                                      f"Recall={accuracy_metrics['haplotype_recall']:.3f}")
+                            if use_longitudinal:
+                                logger.info(f"      Lineage F1={accuracy_metrics.get('lineage_f1', 0):.3f}, "
+                                          f"Rescue ΔRecall={accuracy_metrics.get('rescue_delta_recall_rare', 0):.3f}")
+                            logger.info(f"    Validation outputs saved to: {validation_output}")
                     except Exception as e:
                         logger.warning(f"Validation failed for {params.short_name()}: {e}")
                         logger.exception("Validation exception details:")
@@ -1058,8 +1103,10 @@ class ParameterSweep:
                     abundance_trajectory_error=accuracy_metrics.get("abundance_trajectory_error"),
                     # Metadata
                     ablation=None,  # Can be set by caller for ablation studies
+                    vcf_condition="perfect",
                     config_full=config_full,
                     environment=environment,
+                    seed=self.seed,
                 )
 
                 # Log completion
@@ -1142,6 +1189,17 @@ class ParameterSweep:
                 config=config,
             )
             
+            # Log per-timepoint results
+            for sample_id in self.timepoints:
+                sample_contigs = mag_results.get(sample_id, {})
+                total_windows = sum(len(contig_results) for contig_results in sample_contigs.values())
+                total_haplotypes = sum(
+                    len(wr.haplotypes) 
+                    for contig_results in sample_contigs.values() 
+                    for wr in contig_results
+                )
+                logger.info(f"    {sample_id}: {len(sample_contigs)} contigs, {total_windows} windows, {total_haplotypes} haplotypes")
+            
             # Flatten results: {sample -> {contig -> [WindowResult]}} -> List[WindowResult]
             for sample_results in mag_results.values():
                 for contig_results in sample_results.values():
@@ -1212,14 +1270,45 @@ class ParameterSweep:
                     # Build lineage table (creates records with lineage_id, sample, contig, etc.)
                     lineage_records = build_lineage_table(structured_results, config)
                     
-                    # Write lineages.tsv from lineage records
+                    # Log which timepoints have records
+                    samples_in_records = set(rec.get('sample', '') for rec in lineage_records)
+                    logger.info(f"    Lineage records include timepoints: {sorted(samples_in_records)}")
+                    logger.info(f"    Total lineage records: {len(lineage_records)}")
+                    
+                    # Convert records to format expected by validation
+                    # build_lineage_table returns: mean_weight, consensus (pipe-separated)
+                    # Validation expects: abundance, snv_alleles (comma-separated)
+                    converted_records = []
+                    for rec in lineage_records:
+                        # Convert mean_weight -> abundance
+                        abundance = rec.get('mean_weight', 0.0)
+                        
+                        # Convert consensus format: "pos1:base1|pos2:base2" -> "pos1:base1,pos2:base2"
+                        consensus = rec.get('consensus', '')
+                        snv_alleles = consensus.replace('|', ',') if consensus else ''
+                        
+                        converted_records.append({
+                            'lineage_id': rec.get('lineage_id', ''),
+                            'sample': rec.get('sample', ''),
+                            'contig': rec.get('contig', ''),
+                            'track_id': rec.get('track_id', ''),
+                            'abundance': abundance,
+                            'snv_alleles': snv_alleles,
+                        })
+                    
+                    # Log per-timepoint counts
+                    from collections import Counter
+                    sample_counts = Counter(rec['sample'] for rec in converted_records)
+                    logger.info(f"    Records per timepoint: {dict(sample_counts)}")
+                    
+                    # Write lineages.tsv from converted records
                     import csv
                     fieldnames = ['lineage_id', 'sample', 'contig', 'track_id', 'abundance', 'snv_alleles']
                     with open(lineages_path, 'w', newline='') as f:
                         writer = csv.DictWriter(f, fieldnames=fieldnames, delimiter='\t')
                         writer.writeheader()
-                        if lineage_records:
-                            writer.writerows(lineage_records)
+                        if converted_records:
+                            writer.writerows(converted_records)
                 else:
                     # Single-timepoint mode: use simple conversion
                     first_timepoint = self.timepoints[0] if hasattr(self, 'timepoints') and self.timepoints else list(self.bam_paths.keys())[0] if hasattr(self, 'bam_paths') else "T1"
@@ -1227,61 +1316,55 @@ class ParameterSweep:
                         all_window_results, lineages_path, sample_id=first_timepoint
                     )
                 
-                # Skip validation if no haplotypes detected
-                if len(all_window_results) == 0 or sum(len(wr.haplotypes) for wr in all_window_results) == 0:
-                    if verbose:
-                        logger.info(f"    No haplotypes detected - skipping validation")
-                    accuracy_metrics = {}
-                else:
-                    # Run detailed validation (with track/linking support)
-                    from validation.validate_haplotypes import run_validation
-                    validation_output = str(config_output_dir / "validation")
-                    
-                    if verbose:
-                        mode_str = "longitudinal" if hasattr(self, 'use_longitudinal') and self.use_longitudinal else "single-timepoint"
-                        logger.info(f"    Running validation ({mode_str} mode)...")
-                    
-                    validation_result = run_validation(
-                        detected_file=lineages_path,
-                        truth_dir=self.truth_dir,
-                        output_dir=validation_output,
-                        window_results=all_window_results,  # For track validation
-                        window_size=params.window_size  # For track validation
-                    )
-                    
-                    # Extract metrics from validation (including track/linking and lineage metrics)
-                    accuracy_metrics = {
-                        "snv_precision": validation_result.snv_precision,
-                        "snv_recall": validation_result.snv_recall,
-                        "snv_f1": 2 * validation_result.snv_precision * validation_result.snv_recall / 
-                                 (validation_result.snv_precision + validation_result.snv_recall) 
-                                 if (validation_result.snv_precision + validation_result.snv_recall) > 0 else 0.0,
-                        "haplotype_precision": validation_result.precision,
-                        "haplotype_recall": validation_result.recall,
-                        "haplotype_f1": validation_result.f1,
-                        "abundance_pearson_r": validation_result.abundance_pearson_r,
-                        "abundance_mae": validation_result.abundance_mae,
-                        # Track/linking metrics
-                        "track_fragmentation_mean": validation_result.track_fragmentation_mean,
-                        "track_fragmentation_median": validation_result.track_fragmentation_median,
-                        "false_link_rate": validation_result.false_link_rate,
-                        "missed_link_rate": validation_result.missed_link_rate,
-                        "track_consensus_error": validation_result.track_consensus_error,
-                        # Lineage metrics
-                        "lineage_precision": validation_result.lineage_precision,
-                        "lineage_recall": validation_result.lineage_recall,
-                        "lineage_f1": validation_result.lineage_f1,
-                        "rescue_delta_recall_rare": validation_result.rescue_delta_recall_rare,
-                        "abundance_trajectory_error": validation_result.abundance_trajectory_error,
-                    }
-                    if verbose:
-                        logger.info(f"    Validation complete: F1={accuracy_metrics['haplotype_f1']:.3f}, "
-                                  f"Precision={accuracy_metrics['haplotype_precision']:.3f}, "
-                                  f"Recall={accuracy_metrics['haplotype_recall']:.3f}")
-                        if hasattr(self, 'use_longitudinal') and self.use_longitudinal:
-                            logger.info(f"      Lineage F1={accuracy_metrics.get('lineage_f1', 0):.3f}, "
-                                      f"Rescue ΔRecall={accuracy_metrics.get('rescue_delta_recall_rare', 0):.3f}")
-                        logger.info(f"    Validation outputs saved to: {validation_output}")
+                # Run detailed validation (with track/linking support)
+                from validation.validate_haplotypes import run_validation
+                validation_output = str(config_output_dir / "validation")
+
+                if verbose:
+                    mode_str = "longitudinal" if hasattr(self, 'use_longitudinal') and self.use_longitudinal else "single-timepoint"
+                    logger.info(f"    Running validation ({mode_str} mode)...")
+
+                validation_result = run_validation(
+                    detected_file=lineages_path,
+                    truth_dir=self.truth_dir,
+                    output_dir=validation_output,
+                    window_results=all_window_results,  # For track validation
+                    window_size=params.window_size  # For track validation
+                )
+
+                # Extract metrics from validation (including track/linking and lineage metrics)
+                accuracy_metrics = {
+                    "snv_precision": validation_result.snv_precision,
+                    "snv_recall": validation_result.snv_recall,
+                    "snv_f1": 2 * validation_result.snv_precision * validation_result.snv_recall /
+                             (validation_result.snv_precision + validation_result.snv_recall)
+                             if (validation_result.snv_precision + validation_result.snv_recall) > 0 else 0.0,
+                    "haplotype_precision": validation_result.precision,
+                    "haplotype_recall": validation_result.recall,
+                    "haplotype_f1": validation_result.f1,
+                    "abundance_pearson_r": validation_result.abundance_pearson_r,
+                    "abundance_mae": validation_result.abundance_mae,
+                    # Track/linking metrics
+                    "track_fragmentation_mean": validation_result.track_fragmentation_mean,
+                    "track_fragmentation_median": validation_result.track_fragmentation_median,
+                    "false_link_rate": validation_result.false_link_rate,
+                    "missed_link_rate": validation_result.missed_link_rate,
+                    "track_consensus_error": validation_result.track_consensus_error,
+                    # Lineage metrics
+                    "lineage_precision": validation_result.lineage_precision,
+                    "lineage_recall": validation_result.lineage_recall,
+                    "lineage_f1": validation_result.lineage_f1,
+                    "rescue_delta_recall_rare": validation_result.rescue_delta_recall_rare,
+                    "abundance_trajectory_error": validation_result.abundance_trajectory_error,
+                }
+                if verbose:
+                    logger.info(f"    Validation complete: F1={accuracy_metrics['haplotype_f1']:.3f}, "
+                              f"Precision={accuracy_metrics['haplotype_precision']:.3f}, "
+                              f"Recall={accuracy_metrics['haplotype_recall']:.3f}")
+                    if hasattr(self, 'use_longitudinal') and self.use_longitudinal:
+                        logger.info(f"      Lineage F1={accuracy_metrics.get('lineage_f1', 0):.3f}, "
+                                  f"Rescue ΔRecall={accuracy_metrics.get('rescue_delta_recall_rare', 0):.3f}")
+                    logger.info(f"    Validation outputs saved to: {validation_output}")
             except Exception as e:
                 logger.warning(f"Validation failed for {params.short_name()}: {e}")
                 if verbose:
@@ -1349,8 +1432,10 @@ class ParameterSweep:
             abundance_trajectory_error=accuracy_metrics.get("abundance_trajectory_error"),
             # Metadata
             ablation=None,  # Can be set by caller for ablation studies
+            vcf_condition="perfect",
             config_full=config_full,
             environment=environment,
+            seed=self.seed,
         )
 
     def run_sequential_sweep(
@@ -1827,7 +1912,7 @@ def run_parameter_sweep(
             "params": r.params.to_dict(),
             "config_full": r.config_full or {},
             "community": r.scenario_name,
-            "seed": r.params.random_seed if hasattr(r.params, 'random_seed') else None,
+            "seed": r.seed,
             "replicate": idx + 1,  # Sequential index as replicate number
             "environment": r.environment or {},
             "ablation": r.ablation,  # e.g., "full", "no_linking", "no_rescue", etc.
