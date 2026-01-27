@@ -1,4 +1,10 @@
 #!/bin/bash
+#SBATCH --job-name=strainphase_bench
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=64G
+#SBATCH --time=48:00:00
+#SBATCH --output=logs/benchmark_%A_%a.out
+#SBATCH --error=logs/benchmark_%A_%a.err
 # Focused test script for real strains benchmarking
 # Tests 6 key parameter configurations instead of full grid
 
