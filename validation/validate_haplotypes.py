@@ -1869,6 +1869,10 @@ def run_validation(
         n_timepoints = len(all_timepoints_list)
         total_contig_timepoint_pairs = n_contigs * n_timepoints if n_timepoints > 0 else n_contigs
         
+        # Compute matched IDs from result.matches (tuples of (true_id, detected_id, distance))
+        matched_true_ids = {m[0] for m in result.matches} if result.matches else set()
+        matched_detected_ids = {m[1] for m in result.matches} if result.matches else set()
+
         f.write(f"True strains (per genome):     {result.n_true}\n")
         f.write(f"Contigs evaluated:            {n_contigs}\n")
         f.write(f"Timepoints evaluated:         {n_timepoints}\n")
@@ -2004,6 +2008,10 @@ def run_validation(
     n_timepoints = len(all_timepoints_list)
     total_contig_timepoint_pairs = n_contigs * n_timepoints if n_timepoints > 0 else n_contigs
     
+    # Compute matched IDs from result.matches (tuples of (true_id, detected_id, distance))
+    matched_true_ids = {m[0] for m in result.matches} if result.matches else set()
+    matched_detected_ids = {m[1] for m in result.matches} if result.matches else set()
+
     print(f"True strains (per genome):     {result.n_true}")
     print(f"Contigs evaluated:            {n_contigs}")
     print(f"Timepoints evaluated:         {n_timepoints}")
