@@ -2027,11 +2027,21 @@ def main():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
 
-    # Required inputs
-    parser.add_argument("--bam", dest="bam_path", required=True,
-                        help="Input BAM file")
-    parser.add_argument("--vcf", dest="vcf_path", required=True,
-                        help="Input VCF file")
+    # Required inputs - support both single and multi-timepoint modes
+    parser.add_argument("--bam", dest="bam_path",
+                        help="Input BAM file (single-timepoint mode)")
+    parser.add_argument("--vcf", dest="vcf_path",
+                        help="Input VCF file (single-timepoint mode)")
+
+    # Multi-timepoint mode
+    parser.add_argument("--bam-paths", nargs="+",
+                        help="Input BAM files, one per timepoint (multi-timepoint mode)")
+    parser.add_argument("--vcf-paths", nargs="+",
+                        help="Input VCF files, one per timepoint (multi-timepoint mode)")
+    parser.add_argument("--reference",
+                        help="Reference FASTA file (required for multi-timepoint mode)")
+    parser.add_argument("--timepoints", nargs="+",
+                        help="Timepoint IDs (e.g., T1 T2 T3 T4)")
 
     # Optional inputs
     parser.add_argument("--truth", dest="truth_dir",
@@ -2076,21 +2086,57 @@ def main():
 
     args = parser.parse_args()
 
-    run_parameter_sweep(
-        bam_path=args.bam_path,
-        vcf_path=args.vcf_path,
-        output_dir=args.output,
-        truth_dir=args.truth_dir,
-        params_file=args.params_file,
-        max_configs=args.max_configs,
-        max_contigs=args.max_contigs,
-        verbose=not args.quiet,
-        mode=args.mode,
-        resume=args.resume,
-        checkpoint_interval=args.checkpoint_interval,
-        passes=args.passes,
-        n_workers=args.workers,
-    )
+    # Determine mode: multi-timepoint or single-timepoint
+    if args.bam_paths and args.vcf_paths:
+        # Multi-timepoint mode
+        if not args.timepoints:
+            # Generate default timepoint names
+            args.timepoints = [f"T{i+1}" for i in range(len(args.bam_paths))]
+
+        if len(args.bam_paths) != len(args.vcf_paths):
+            parser.error("Number of BAM paths must match number of VCF paths")
+        if len(args.bam_paths) != len(args.timepoints):
+            parser.error("Number of BAM paths must match number of timepoints")
+
+        bam_paths = {tp: bam for tp, bam in zip(args.timepoints, args.bam_paths)}
+        vcf_paths = {tp: vcf for tp, vcf in zip(args.timepoints, args.vcf_paths)}
+
+        run_parameter_sweep(
+            bam_paths=bam_paths,
+            vcf_paths=vcf_paths,
+            reference_path=args.reference,
+            timepoints=args.timepoints,
+            output_dir=args.output,
+            truth_dir=args.truth_dir,
+            params_file=args.params_file,
+            max_configs=args.max_configs,
+            max_contigs=args.max_contigs,
+            verbose=not args.quiet,
+            mode=args.mode,
+            resume=args.resume,
+            checkpoint_interval=args.checkpoint_interval,
+            passes=args.passes,
+            n_workers=args.workers,
+        )
+    elif args.bam_path and args.vcf_path:
+        # Single-timepoint mode (backward compatible)
+        run_parameter_sweep(
+            bam_path=args.bam_path,
+            vcf_path=args.vcf_path,
+            output_dir=args.output,
+            truth_dir=args.truth_dir,
+            params_file=args.params_file,
+            max_configs=args.max_configs,
+            max_contigs=args.max_contigs,
+            verbose=not args.quiet,
+            mode=args.mode,
+            resume=args.resume,
+            checkpoint_interval=args.checkpoint_interval,
+            passes=args.passes,
+            n_workers=args.workers,
+        )
+    else:
+        parser.error("Must provide either --bam/--vcf (single-timepoint) or --bam-paths/--vcf-paths (multi-timepoint)")
 
 
 if __name__ == "__main__":
