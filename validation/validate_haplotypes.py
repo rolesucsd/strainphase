@@ -877,15 +877,14 @@ def generate_figures(
     set_plot_style()
 
     # Figure 1: Accuracy bar plot
-    fig, ax = plt.subplots(figsize=(8, 5))
+    fig, ax = plt.subplots(figsize=(6, 4))
     metrics = ['Precision', 'Recall', 'F1']
     values = [result.precision, result.recall, result.f1]
     colors = [POINT_COLORS[0], POINT_COLORS[1], POINT_COLORS[2]]
 
-    bars = ax.bar(metrics, values, color=colors, edgecolor=COLOR_PALETTE['primary'], 
-                  linewidth=1.5, alpha=0.7)
+    bars = ax.bar(metrics, values, color=colors, alpha=0.7)
     ax.set_ylim(0, 1.1)
-    ax.set_ylabel('Score', fontweight='bold', color=COLOR_PALETTE['primary'])
+    ax.set_ylabel('Score', color=COLOR_PALETTE['primary'])
     ax.set_title('Haplotype Detection Accuracy', fontsize=12, color=COLOR_PALETTE['primary'])
 
     for bar, val in zip(bars, values):
@@ -899,7 +898,7 @@ def generate_figures(
 
     # Figure 2: Abundance correlation
     if matches:
-        fig, ax = plt.subplots(figsize=(6, 6))
+        fig, ax = plt.subplots(figsize=(5, 5))
 
         true_abundances = []
         detected_abundances = []
@@ -916,8 +915,8 @@ def generate_figures(
                       linewidths=0.8)
             ax.plot([0, max(true_abundances)], [0, max(true_abundances)],
                    color=COLOR_PALETTE['error'], linestyle='--', linewidth=2.0, alpha=0.8)
-            ax.set_xlabel('True Abundance', fontweight='bold', color=COLOR_PALETTE['primary'])
-            ax.set_ylabel('Detected Abundance', fontweight='bold', color=COLOR_PALETTE['primary'])
+            ax.set_xlabel('True Abundance', color=COLOR_PALETTE['primary'])
+            ax.set_ylabel('Detected Abundance', color=COLOR_PALETTE['primary'])
             ax.set_title('Abundance Correlation', fontsize=12, color=COLOR_PALETTE['primary'])
             
             # Add r value as text in the graph
@@ -933,26 +932,26 @@ def generate_figures(
 
     # Figure 5: Per-haplotype matching details
     if result.match_details_full:
-        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+        fig, axes = plt.subplots(2, 2, figsize=(10, 7))
         
         # SNV match fraction distribution
         snv_fractions = [m['snv_match_fraction'] for m in result.match_details_full]
-        axes[0, 0].hist(snv_fractions, bins=20, edgecolor=COLOR_PALETTE['primary'], 
-                       color=POINT_COLORS[0], alpha=0.7, linewidth=1.2)
-        axes[0, 0].set_xlabel('SNV Match Fraction', fontweight='bold', color=COLOR_PALETTE['primary'])
-        axes[0, 0].set_ylabel('Matched haplotype pairs', fontweight='bold', color=COLOR_PALETTE['primary'])
+        axes[0, 0].hist(snv_fractions, bins=20, edgecolor='none', 
+                       color=POINT_COLORS[0], alpha=0.7)
+        axes[0, 0].set_xlabel('SNV Match Fraction', color=COLOR_PALETTE['primary'])
+        axes[0, 0].set_ylabel('Matched haplotype pairs', color=COLOR_PALETTE['primary'])
         axes[0, 0].set_title('SNV match fraction per matched haplotype pair', 
                             fontsize=12, color=COLOR_PALETTE['primary'])
         
         # Abundance error distribution
         abund_errors = [m['abundance_mae'] for m in result.match_details_full if m['abundance_mae'] is not None]
         if abund_errors:
-            axes[0, 1].hist(abund_errors, bins=20, edgecolor=COLOR_PALETTE['primary'], 
-                          alpha=0.7, color=POINT_COLORS[2], linewidth=1.2)
+            axes[0, 1].hist(abund_errors, bins=20, edgecolor='none', 
+                          alpha=0.7, color=POINT_COLORS[2])
         axes[0, 1].set_xlabel('Mean Absolute Abundance Error', 
-                                fontweight='bold', color=COLOR_PALETTE['primary'])
+                                color=COLOR_PALETTE['primary'])
         axes[0, 1].set_ylabel('Matched haplotype pairs', 
-                                fontweight='bold', color=COLOR_PALETTE['primary'])
+                                color=COLOR_PALETTE['primary'])
         axes[0, 1].set_title('Abundance MAE per matched haplotype pair',
                                fontsize=12, color=COLOR_PALETTE['primary'])
         
@@ -983,8 +982,8 @@ def generate_figures(
             axes[1, 0].plot([0, max_count], [0, max_count], 
                            color=COLOR_PALETTE['error'], linestyle='--', linewidth=2.0,
                            alpha=0.8)
-        axes[1, 0].set_xlabel('True SNV Count (on detected contigs)', fontweight='bold', color=COLOR_PALETTE['primary'])
-        axes[1, 0].set_ylabel('Detected SNV Count', fontweight='bold', color=COLOR_PALETTE['primary'])
+        axes[1, 0].set_xlabel('True SNV Count (on detected contigs)', color=COLOR_PALETTE['primary'])
+        axes[1, 0].set_ylabel('Detected SNV Count', color=COLOR_PALETTE['primary'])
         axes[1, 0].set_title('SNV counts: true vs detected (matched pairs)', 
                            fontsize=12, color=COLOR_PALETTE['primary'])
         
@@ -996,13 +995,11 @@ def generate_figures(
             x = np.arange(len(tps))
             width = 0.35
             axes[1, 1].bar(x - width/2, recalls, width, label='Recall', 
-                          alpha=0.7, color=POINT_COLORS[1], 
-                          edgecolor=COLOR_PALETTE['primary'], linewidth=1.2)
+                          alpha=0.7, color=POINT_COLORS[1])
             axes[1, 1].bar(x + width/2, precisions, width, label='Precision', 
-                          alpha=0.7, color=POINT_COLORS[0],
-                          edgecolor=COLOR_PALETTE['primary'], linewidth=1.2)
-            axes[1, 1].set_xlabel('Timepoint', fontweight='bold', color=COLOR_PALETTE['primary'])
-            axes[1, 1].set_ylabel('Score', fontweight='bold', color=COLOR_PALETTE['primary'])
+                          alpha=0.7, color=POINT_COLORS[0])
+            axes[1, 1].set_xlabel('Timepoint', color=COLOR_PALETTE['primary'])
+            axes[1, 1].set_ylabel('Score', color=COLOR_PALETTE['primary'])
             axes[1, 1].set_title('Precision/Recall by Timepoint',
                                fontsize=12, color=COLOR_PALETTE['primary'])
             axes[1, 1].set_xticks(x)
@@ -1020,14 +1017,13 @@ def generate_figures(
 
     # Figure 8: Linking errors (if track metrics available)
     if result.false_link_rate > 0 or result.missed_link_rate > 0:
-        fig, ax = plt.subplots(figsize=(8, 5))
+        fig, ax = plt.subplots(figsize=(6, 4))
         metrics = ['False Link Rate', 'Missed Link Rate']
         values = [result.false_link_rate, result.missed_link_rate]
         colors = [POINT_COLORS[3], POINT_COLORS[2]]
         
-        bars = ax.bar(metrics, values, color=colors, edgecolor=COLOR_PALETTE['primary'], 
-                     linewidth=1.5, alpha=0.7)
-        ax.set_ylabel('Rate', fontweight='bold', color=COLOR_PALETTE['primary'])
+        bars = ax.bar(metrics, values, color=colors, alpha=0.7)
+        ax.set_ylabel('Rate', color=COLOR_PALETTE['primary'])
         ax.set_title('Window Linking Errors', fontsize=12, color=COLOR_PALETTE['primary'])
         ax.set_ylim(0, max(values) * 1.2 if values else 1.0)
         
@@ -1043,15 +1039,14 @@ def generate_figures(
 
     # Figure 9: Lineage accuracy (if lineage metrics available)
     if result.lineage_precision > 0 or result.lineage_recall > 0:
-        fig, ax = plt.subplots(figsize=(8, 5))
+        fig, ax = plt.subplots(figsize=(6, 4))
         metrics = ['Lineage Precision', 'Lineage Recall', 'Lineage F1']
         values = [result.lineage_precision, result.lineage_recall, result.lineage_f1]
         colors = [POINT_COLORS[0], POINT_COLORS[1], POINT_COLORS[2]]
         
-        bars = ax.bar(metrics, values, color=colors, edgecolor=COLOR_PALETTE['primary'], 
-                     linewidth=1.5, alpha=0.7)
+        bars = ax.bar(metrics, values, color=colors, alpha=0.7)
         ax.set_ylim(0, 1.1)
-        ax.set_ylabel('Score', fontweight='bold', color=COLOR_PALETTE['primary'])
+        ax.set_ylabel('Score', color=COLOR_PALETTE['primary'])
         ax.set_title('Longitudinal Lineage Accuracy', fontsize=12, color=COLOR_PALETTE['primary'])
         
         for bar, val in zip(bars, values):
@@ -1122,7 +1117,7 @@ def generate_figures(
                     n_cols = min(3, n_contigs)
                     n_rows = (n_contigs + n_cols - 1) // n_cols
                     
-                    fig, axes = plt.subplots(n_rows, n_cols, figsize=(6 * n_cols, 4 * n_rows))
+                    fig, axes = plt.subplots(n_rows, n_cols, figsize=(4 * n_cols, 3 * n_rows))
                     if n_rows == 1:
                         axes = axes.reshape(1, -1) if n_cols > 1 else [axes]
                     axes = axes.flatten()
@@ -1156,8 +1151,8 @@ def generate_figures(
                                 if label:
                                     truth_labels_added.add('Truth track')
                                 ax.barh(y_offset, end - start, left=start, height=0.6,
-                                       color=COLOR_PALETTE['light'], edgecolor=COLOR_PALETTE['neutral'], 
-                                       alpha=0.4, linewidth=1.0, label=label)
+                                       color=COLOR_PALETTE['light'], 
+                                       alpha=0.4, label=label)
                                 # Add strain label
                                 ax.text(start + (end - start) / 2, y_offset, strain_id[:12],
                                        ha='center', va='center', fontsize=9, rotation=0,
@@ -1206,8 +1201,7 @@ def generate_figures(
                                 
                                 # Plot detected track
                                 ax.barh(y_offset, end - start, left=start, height=0.4,
-                                       color=color, edgecolor=COLOR_PALETTE['primary'], 
-                                       alpha=0.7, linewidth=1.2, label=label)
+                                       color=color, alpha=0.7, label=label)
                                 # Add track label
                                 label_text = track_id[:12] if not track_id.startswith('unlinked') else 'unlinked'
                                 text_color = 'white' if color == POINT_COLORS[0] else COLOR_PALETTE['primary']
@@ -1217,8 +1211,8 @@ def generate_figures(
                                        weight='bold' if color == POINT_COLORS[0] else '600')
                                 y_offset += 1
                         
-                        ax.set_xlabel('Position (bp)', fontweight='bold', color=COLOR_PALETTE['primary'])
-                        ax.set_ylabel('Track', fontweight='bold', color=COLOR_PALETTE['primary'])
+                        ax.set_xlabel('Position (bp)', color=COLOR_PALETTE['primary'])
+                        ax.set_ylabel('Track', color=COLOR_PALETTE['primary'])
                         ax.set_title(f'{contig}\nTruth (gray) vs Detected (colored)',
                                    fontsize=12, color=COLOR_PALETTE['primary'])
                         ax.set_xlim(0, max_pos * 1.05)
@@ -1325,19 +1319,16 @@ def _generate_per_abundance_performance(
         bin_counts.append(len(strains_in_bin))
     
     # Plot
-    fig, ax = plt.subplots(figsize=(10, 6))
+    fig, ax = plt.subplots(figsize=(7, 4))
     x = np.arange(len(bin_labels))
     width = 0.25
     
     bars1 = ax.bar(x - width, bin_precision, width, label='Precision', 
-                   color=POINT_COLORS[0], edgecolor=COLOR_PALETTE['primary'],
-                   linewidth=1.2, alpha=0.7)
+                   color=POINT_COLORS[0], alpha=0.7)
     bars2 = ax.bar(x, bin_recall, width, label='Recall',
-                   color=POINT_COLORS[1], edgecolor=COLOR_PALETTE['primary'],
-                   linewidth=1.2, alpha=0.7)
+                   color=POINT_COLORS[1], alpha=0.7)
     bars3 = ax.bar(x + width, bin_f1, width, label='F1',
-                   color=POINT_COLORS[2], edgecolor=COLOR_PALETTE['primary'],
-                   linewidth=1.2, alpha=0.7)
+                   color=POINT_COLORS[2], alpha=0.7)
     
     # Add count annotations
     for i, (bar, count) in enumerate(zip(bars2, bin_counts)):
@@ -1346,8 +1337,8 @@ def _generate_per_abundance_performance(
                    f'n={count}', ha='center', va='top', fontsize=9,
                    color=COLOR_PALETTE['secondary'], style='italic')
     
-    ax.set_xlabel('Abundance Range', fontweight='bold', color=COLOR_PALETTE['primary'])
-    ax.set_ylabel('Score', fontweight='bold', color=COLOR_PALETTE['primary'])
+    ax.set_xlabel('Abundance Range', color=COLOR_PALETTE['primary'])
+    ax.set_ylabel('Score', color=COLOR_PALETTE['primary'])
     ax.set_title('Performance by Abundance Range', fontsize=12, color=COLOR_PALETTE['primary'])
     ax.set_xticks(x)
     ax.set_xticklabels(bin_labels, color=COLOR_PALETTE['primary'])
@@ -1423,11 +1414,10 @@ def _generate_divergence_performance(
         bin_counts.append(len(in_bin))
     
     # Plot
-    fig, ax = plt.subplots(figsize=(10, 6))
+    fig, ax = plt.subplots(figsize=(7, 4))
     x = np.arange(len(bin_labels))
     
-    bars = ax.bar(x, bin_recall, color=POINT_COLORS[1], 
-                 edgecolor=COLOR_PALETTE['primary'], linewidth=1.5, alpha=0.7)
+    bars = ax.bar(x, bin_recall, color=POINT_COLORS[1], alpha=0.7)
     
     # Add count annotations
     for bar, count in zip(bars, bin_counts):
@@ -1436,8 +1426,8 @@ def _generate_divergence_performance(
                    f'n={count}', ha='center', fontsize=9,
                    color=COLOR_PALETTE['secondary'], style='italic')
     
-    ax.set_xlabel('SNV Density (SNVs per 10kb)', fontweight='bold', color=COLOR_PALETTE['primary'])
-    ax.set_ylabel('Recall', fontweight='bold', color=COLOR_PALETTE['primary'])
+    ax.set_xlabel('SNV Density (SNVs per 10kb)', color=COLOR_PALETTE['primary'])
+    ax.set_ylabel('Recall', color=COLOR_PALETTE['primary'])
     ax.set_title('Detection Performance vs Strain Divergence', 
                 fontsize=12, color=COLOR_PALETTE['primary'])
     ax.set_xticks(x)
@@ -1476,7 +1466,7 @@ def _generate_detection_roc_curve(
     
     # For a full ROC curve, we'd vary thresholds, but here we show the operating point
     # and add a diagonal reference line
-    fig, ax = plt.subplots(figsize=(8, 8))
+    fig, ax = plt.subplots(figsize=(6, 6))
     
     # Plot diagonal (random classifier)
     ax.plot([0, 1], [0, 1], '--', color=COLOR_PALETTE['neutral'], 
@@ -1487,8 +1477,8 @@ def _generate_detection_roc_curve(
               edgecolors=COLOR_PALETTE['primary'], linewidths=2.5, zorder=5,
               label=f'Strainphase (TPR={tpr:.3f}, FPR={fpr:.3f})')
     
-    ax.set_xlabel('False Positive Rate', fontweight='bold', color=COLOR_PALETTE['primary'])
-    ax.set_ylabel('True Positive Rate (Recall)', fontweight='bold', color=COLOR_PALETTE['primary'])
+    ax.set_xlabel('False Positive Rate', color=COLOR_PALETTE['primary'])
+    ax.set_ylabel('True Positive Rate (Recall)', color=COLOR_PALETTE['primary'])
     ax.set_title('Detection Performance (ROC-like)', fontsize=12, color=COLOR_PALETTE['primary'])
     ax.set_xlim(-0.05, 1.05)
     ax.set_ylim(-0.05, 1.05)
@@ -1543,11 +1533,11 @@ def _generate_reference_coverage(
         return
     
     # Plot histogram
-    fig, ax = plt.subplots(figsize=(10, 6))
+    fig, ax = plt.subplots(figsize=(7, 4))
     bins = np.linspace(0, 1.0, 21)
     
     ax.hist(coverages, bins=bins, color=POINT_COLORS[0],
-           edgecolor=COLOR_PALETTE['primary'], linewidth=1.2, alpha=0.7)
+           edgecolor='none', alpha=0.7)
     
     # Add mean line
     mean_cov = np.mean(coverages)
@@ -1555,8 +1545,8 @@ def _generate_reference_coverage(
               linewidth=2.5, label=f'Mean: {mean_cov:.3f}', alpha=0.8)
     
     ax.set_xlabel('Reference Coverage (Fraction of SNVs Recovered)', 
-                 fontweight='bold', color=COLOR_PALETTE['primary'])
-    ax.set_ylabel('Number of Strains', fontweight='bold', color=COLOR_PALETTE['primary'])
+                 color=COLOR_PALETTE['primary'])
+    ax.set_ylabel('Number of Strains', color=COLOR_PALETTE['primary'])
     ax.set_title('Haplotype Reference Coverage Distribution',
                 fontsize=12, color=COLOR_PALETTE['primary'])
     ax.set_xlim(0, 1.05)
@@ -1604,16 +1594,15 @@ def _generate_error_breakdown(
             fn_low_abund += 1  # No abundance data = treat as low
     
     # Plot
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 4))
     
     # False negatives breakdown
     fn_categories = ['Low (<1%)', 'Medium (1-10%)', 'High (≥10%)']
     fn_counts = [fn_low_abund, fn_med_abund, fn_high_abund]
     colors_fn = [POINT_COLORS[3], POINT_COLORS[2], POINT_COLORS[0]]
     
-    bars1 = ax1.bar(fn_categories, fn_counts, color=colors_fn,
-                   edgecolor=COLOR_PALETTE['primary'], linewidth=1.5, alpha=0.7)
-    ax1.set_ylabel('Count', fontweight='bold', color=COLOR_PALETTE['primary'])
+    bars1 = ax1.bar(fn_categories, fn_counts, color=colors_fn, alpha=0.7)
+    ax1.set_ylabel('Count', color=COLOR_PALETTE['primary'])
     ax1.set_title('False Negatives by Abundance', fontsize=12, color=COLOR_PALETTE['primary'])
     ax1.set_xticklabels(fn_categories, color=COLOR_PALETTE['primary'])
     
@@ -1625,10 +1614,9 @@ def _generate_error_breakdown(
     
     # False positives count
     fp_total = len(fp_lineages)
-    ax2.bar(['False Positives'], [fp_total], color=POINT_COLORS[3],
-           edgecolor=COLOR_PALETTE['primary'], linewidth=1.5, alpha=0.7)
-    ax2.set_ylabel('Count', fontweight='bold', color=COLOR_PALETTE['primary'])
-    ax2.set_title('False Positives', fontweight='bold', color=COLOR_PALETTE['primary'])
+    ax2.bar(['False Positives'], [fp_total], color=POINT_COLORS[3], alpha=0.7)
+    ax2.set_ylabel('Count', color=COLOR_PALETTE['primary'])
+    ax2.set_title('False Positives', fontsize=12, color=COLOR_PALETTE['primary'])
     
     if fp_total > 0:
         ax2.text(0, fp_total + 0.1, str(fp_total), ha='center', fontsize=11,

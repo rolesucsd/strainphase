@@ -6,49 +6,145 @@
 #SBATCH --output=logs/benchmark_%A_%a.out
 #SBATCH --error=logs/benchmark_%A_%a.err
 # Focused test script for real strains benchmarking
-# Tests 6 key parameter configurations instead of full grid
+# Uses real isolate BAMs and VCFs to create mixed samples
 
 set -e
 
-GENOMES_DIR="/Users/reneeoles/Desktop/strainphase/strains"
+# =============================================================================
+# Configuration
+# =============================================================================
+
+STRAINS_DIR="/Users/reneeoles/Desktop/strainphase/strains"
 OUTPUT_DIR="/Users/reneeoles/Desktop/strainphase/results/test_real_strains_$(date +%Y%m%d_%H%M%S)"
+MIXED_DATA_DIR="${OUTPUT_DIR}/mixed_samples"
+
+# Reference genome
+REFERENCE="${STRAINS_DIR}/F9DRQ4_1_sample_1_1_reference.fasta"
+
+# Input BAM files (one per isolate)
+BAMS=(
+    "${STRAINS_DIR}/F9DRQ4_1_sample_1.sorted.bam"
+    "${STRAINS_DIR}/F9DRQ4_2_sample_2.sorted.bam"
+    "${STRAINS_DIR}/F9DRQ4_4_sample_4.sorted.bam"
+    "${STRAINS_DIR}/F9DRQ4_5_sample_5.sorted.bam"
+)
+
+# Input VCF files (one per isolate, same order as BAMs)
+VCFS=(
+    "${STRAINS_DIR}/F9DRQ4_1_sample_1.filtered.vcf.gz"
+    "${STRAINS_DIR}/F9DRQ4_2_sample_2.filtered.vcf.gz"
+    "${STRAINS_DIR}/F9DRQ4_4_sample_4.filtered.vcf.gz"
+    "${STRAINS_DIR}/F9DRQ4_5_sample_5.filtered.vcf.gz"
+)
+
+# Benchmark parameters
+N_TIMEPOINTS=4
+TARGET_COVERAGE=30
+N_WORKERS=8
+
+# =============================================================================
+# Main Script
+# =============================================================================
 
 echo "============================================================"
-echo "FOCUSED BENCHMARK TEST - REAL STRAINS"
+echo "REAL STRAINS BENCHMARK - ISOLATE MIX MODE"
 echo "============================================================"
 echo ""
-echo "Input strains: $GENOMES_DIR"
+echo "Input strains directory: $STRAINS_DIR"
 echo "Output directory: $OUTPUT_DIR"
+echo "Number of isolates: ${#BAMS[@]}"
 echo ""
-echo "Test configurations (6 total):"
-echo "  1. baseline      - Default recommended parameters"
-echo "  2. sensitive     - More sensitive clustering"
-echo "  3. strict        - Stricter clustering"
-echo "  4. large_windows - Larger windows (50kb)"
-echo "  5. small_windows - Smaller windows (10kb)"
-echo "  6. high_quality  - Stricter quality filters"
+echo "Step 1: Prepare mixed samples from isolate BAMs"
+echo "Step 2: Run strainphase parameter sweep"
+echo "Step 3: Generate benchmark report"
 echo ""
-echo "Simulation parameters:"
-echo "  - Timepoints: 4"
-echo "  - Coverage: 30x per timepoint"
-echo "  - Mode: Real strains (detect SNVs from FASTA differences)"
+echo "Parameters:"
+echo "  - Timepoints: $N_TIMEPOINTS"
+echo "  - Target coverage: ${TARGET_COVERAGE}x per timepoint"
+echo "  - Workers: $N_WORKERS"
 echo ""
 
-python benchmarks/run_full_benchmark.py \
-    --genomes "$GENOMES_DIR" \
-    --output "$OUTPUT_DIR" \
-    --use-real-strains \
-    --timepoints 4 \
-    --coverage 30 \
+mkdir -p "$OUTPUT_DIR"
+
+# =============================================================================
+# Step 1: Prepare mixed samples from isolate BAMs and VCFs
+# =============================================================================
+
+echo "============================================================"
+echo "STEP 1: Preparing mixed samples from isolates"
+echo "============================================================"
+echo ""
+
+python benchmarks/prepare_isolate_mix.py \
+    --bams "${BAMS[@]}" \
+    --vcfs "${VCFS[@]}" \
+    --reference "$REFERENCE" \
+    --output "$MIXED_DATA_DIR" \
+    --timepoints "$N_TIMEPOINTS" \
+    --target-coverage "$TARGET_COVERAGE"
+
+echo ""
+echo "Mixed samples created in: $MIXED_DATA_DIR"
+echo ""
+
+# =============================================================================
+# Step 2: Run parameter sweep on mixed data
+# =============================================================================
+
+echo "============================================================"
+echo "STEP 2: Running parameter sweep"
+echo "============================================================"
+echo ""
+
+# The mixed data directory now contains:
+# - T1.bam, T2.bam, T3.bam, T4.bam (mixed samples)
+# - variants.vcf.gz (combined variant sites)
+# - reference.fasta (reference genome)
+# - truth_*.tsv files (ground truth for validation)
+
+python benchmarks/parameter_sweep.py \
+    --bam-paths "${MIXED_DATA_DIR}/T1.bam" "${MIXED_DATA_DIR}/T2.bam" "${MIXED_DATA_DIR}/T3.bam" "${MIXED_DATA_DIR}/T4.bam" \
+    --vcf-paths "${MIXED_DATA_DIR}/variants.vcf.gz" "${MIXED_DATA_DIR}/variants.vcf.gz" "${MIXED_DATA_DIR}/variants.vcf.gz" "${MIXED_DATA_DIR}/variants.vcf.gz" \
+    --reference "${MIXED_DATA_DIR}/reference.fasta" \
+    --timepoints T1 T2 T3 T4 \
+    --output "${OUTPUT_DIR}/sweep_results" \
+    --truth "$MIXED_DATA_DIR" \
     --mode sequential \
     --passes 1 \
-    --max-configs 6 \
-    --workers 8 \
+    --workers "$N_WORKERS" \
     --checkpoint-interval 2
 
 echo ""
+
+# =============================================================================
+# Step 3: Generate report
+# =============================================================================
+
 echo "============================================================"
-echo "TEST COMPLETE"
+echo "STEP 3: Generating benchmark report"
 echo "============================================================"
+echo ""
+
+python benchmarks/generate_report.py \
+    --results "${OUTPUT_DIR}/sweep_results" \
+    --output "${OUTPUT_DIR}/report" \
+    --validation "${OUTPUT_DIR}/sweep_results" \
+    2>/dev/null || echo "Report generation skipped (optional)"
+
+echo ""
+echo "============================================================"
+echo "BENCHMARK COMPLETE"
+echo "============================================================"
+echo ""
 echo "Results saved to: $OUTPUT_DIR"
-echo "View report: $OUTPUT_DIR/report/benchmark_report.html"
+echo ""
+echo "Key outputs:"
+echo "  - Mixed samples: ${MIXED_DATA_DIR}/"
+echo "  - Sweep results: ${OUTPUT_DIR}/sweep_results/"
+echo "  - Report: ${OUTPUT_DIR}/report/benchmark_report.html"
+echo ""
+echo "Ground truth files:"
+echo "  - ${MIXED_DATA_DIR}/truth_strains.tsv"
+echo "  - ${MIXED_DATA_DIR}/truth_abundances.tsv"
+echo "  - ${MIXED_DATA_DIR}/truth_haplotypes.tsv"
+echo ""
