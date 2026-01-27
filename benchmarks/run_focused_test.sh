@@ -11,11 +11,25 @@
 set -e
 
 # =============================================================================
+# Setup Python path for validation module
+# =============================================================================
+
+# Get the directory where this script is located
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+PROJECT_ROOT="$( cd "$SCRIPT_DIR/.." && pwd )"
+
+# Add project root to PYTHONPATH so validation module can be found
+export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH}"
+
+echo "Project root: $PROJECT_ROOT"
+echo "PYTHONPATH: $PYTHONPATH"
+
+# =============================================================================
 # Configuration
 # =============================================================================
 
-STRAINS_DIR="/Users/reneeoles/Desktop/strainphase/strains"
-OUTPUT_DIR="/Users/reneeoles/Desktop/strainphase/results/test_real_strains_$(date +%Y%m%d_%H%M%S)"
+STRAINS_DIR="${PROJECT_ROOT}/strains"
+OUTPUT_DIR="${PROJECT_ROOT}/results/test_real_strains_$(date +%Y%m%d_%H%M%S)"
 MIXED_DATA_DIR="${OUTPUT_DIR}/mixed_samples"
 
 # Reference genome
@@ -75,7 +89,7 @@ echo "STEP 1: Preparing mixed samples from isolates"
 echo "============================================================"
 echo ""
 
-python benchmarks/prepare_isolate_mix.py \
+python "${PROJECT_ROOT}/benchmarks/prepare_isolate_mix.py" \
     --bams "${BAMS[@]}" \
     --vcfs "${VCFS[@]}" \
     --reference "$REFERENCE" \
@@ -102,7 +116,7 @@ echo ""
 # - reference.fasta (reference genome)
 # - truth_*.tsv files (ground truth for validation)
 
-python benchmarks/parameter_sweep.py \
+python "${PROJECT_ROOT}/benchmarks/parameter_sweep.py" \
     --bam-paths "${MIXED_DATA_DIR}/T1.bam" "${MIXED_DATA_DIR}/T2.bam" "${MIXED_DATA_DIR}/T3.bam" "${MIXED_DATA_DIR}/T4.bam" \
     --vcf-paths "${MIXED_DATA_DIR}/variants.vcf.gz" "${MIXED_DATA_DIR}/variants.vcf.gz" "${MIXED_DATA_DIR}/variants.vcf.gz" "${MIXED_DATA_DIR}/variants.vcf.gz" \
     --reference "${MIXED_DATA_DIR}/reference.fasta" \
@@ -125,7 +139,7 @@ echo "STEP 3: Generating benchmark report"
 echo "============================================================"
 echo ""
 
-python benchmarks/generate_report.py \
+python "${PROJECT_ROOT}/benchmarks/generate_report.py" \
     --results "${OUTPUT_DIR}/sweep_results" \
     --output "${OUTPUT_DIR}/report" \
     --validation "${OUTPUT_DIR}/sweep_results" \
