@@ -67,11 +67,6 @@ echo "  - Coverage: 30x per timepoint"
 echo "  - Mode: Real strains (detect SNVs from FASTA differences)"
 echo ""
 
-# Skip interactive prompt if running under SLURM or if CI/CD
-if [ -z "$SLURM_JOB_ID" ] && [ -z "$CI" ]; then
-    read -p "Press Enter to continue or Ctrl+C to cancel..."
-fi
-
 python "$PROJECT_ROOT/benchmarks/run_full_benchmark.py" \
     --genomes "$GENOMES_DIR" \
     --output "$OUTPUT_DIR" \
