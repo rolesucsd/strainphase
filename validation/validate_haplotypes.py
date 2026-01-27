@@ -729,14 +729,20 @@ def compute_validation_metrics(
         
         n_true_contig = len(contig_true_haps)
         n_detected_contig = len(contig_detected_haps)
-        n_matched_contig = len(contig_matches)
+        # Count unique matched true haplotypes (not match pairs, since allow_one_to_many=True)
+        matched_true_ids_contig = {m[0].strain_id for m in contig_matches}
+        matched_detected_ids_contig = {m[1].lineage_id for m in contig_matches}
+        n_matched_true_contig = len(matched_true_ids_contig)
+        n_matched_detected_contig = len(matched_detected_ids_contig)
         
         per_contig_metrics[contig] = {
             'n_true': n_true_contig,
             'n_detected': n_detected_contig,
-            'n_matched': n_matched_contig,
-            'precision': n_matched_contig / n_detected_contig if n_detected_contig > 0 else 0.0,
-            'recall': n_matched_contig / n_true_contig if n_true_contig > 0 else 0.0,
+            'n_matched': len(contig_matches),  # Total match pairs (for reference)
+            'n_matched_true': n_matched_true_contig,  # Unique true haplotypes matched
+            'n_matched_detected': n_matched_detected_contig,  # Unique detected lineages matched
+            'precision': n_matched_detected_contig / n_detected_contig if n_detected_contig > 0 else 0.0,
+            'recall': n_matched_true_contig / n_true_contig if n_true_contig > 0 else 0.0,
         }
 
     # Per-timepoint metrics
@@ -754,7 +760,11 @@ def compute_validation_metrics(
         
         n_true_tp = len(tp_true_haps)
         n_detected_tp = len(tp_detected_haps)
-        n_matched_tp = len(tp_matches)
+        # Count unique matched true haplotypes (not match pairs, since allow_one_to_many=True)
+        matched_true_ids_tp = {m[0].strain_id for m in tp_matches}
+        matched_detected_ids_tp = {m[1].lineage_id for m in tp_matches}
+        n_matched_true_tp = len(matched_true_ids_tp)
+        n_matched_detected_tp = len(matched_detected_ids_tp)
         
         # Abundance correlation for this timepoint
         tp_true_abunds = [m[0].abundances[tp] for m in tp_matches]
@@ -769,9 +779,11 @@ def compute_validation_metrics(
         per_timepoint_metrics[tp] = {
             'n_true': n_true_tp,
             'n_detected': n_detected_tp,
-            'n_matched': n_matched_tp,
-            'precision': n_matched_tp / n_detected_tp if n_detected_tp > 0 else 0.0,
-            'recall': n_matched_tp / n_true_tp if n_true_tp > 0 else 0.0,
+            'n_matched': len(tp_matches),  # Total match pairs (for reference)
+            'n_matched_true': n_matched_true_tp,  # Unique true haplotypes matched
+            'n_matched_detected': n_matched_detected_tp,  # Unique detected lineages matched
+            'precision': n_matched_detected_tp / n_detected_tp if n_detected_tp > 0 else 0.0,
+            'recall': n_matched_true_tp / n_true_tp if n_true_tp > 0 else 0.0,
             'abundance_pearson_r': tp_abund_r,
             'abundance_mae': tp_abund_mae,
         }
@@ -1852,15 +1864,20 @@ def run_validation(
         # Summary metrics
         f.write("SUMMARY METRICS\n")
         f.write("-" * 80 + "\n")
-        f.write(f"True haplotypes (strains):     {result.n_true}\n")
-        f.write(f"Detected lineages (total):     {result.n_detected}\n")
-        f.write(f"Matched lineages:              {result.n_matched}\n")
-        
-        # Calculate expected lineages (accounting for per-contig splitting)
         n_contigs = len(result.per_contig_metrics) if result.per_contig_metrics else 1
-        expected_per_timepoint = result.n_true * n_contigs
-        f.write(f"\nExpected lineages (per timepoint): {result.n_true} strains × {n_contigs} contigs = up to {expected_per_timepoint}\n")
-        f.write("(Note: Strainphase splits lineages per-contig, so one strain can produce multiple detected lineages)\n")
+        all_timepoints_list = sorted(result.per_timepoint_metrics.keys()) if result.per_timepoint_metrics else []
+        n_timepoints = len(all_timepoints_list)
+        total_contig_timepoint_pairs = n_contigs * n_timepoints if n_timepoints > 0 else n_contigs
+        
+        f.write(f"True strains (per genome):     {result.n_true}\n")
+        f.write(f"Contigs evaluated:            {n_contigs}\n")
+        f.write(f"Timepoints evaluated:         {n_timepoints}\n")
+        f.write(f"Total contig-timepoint pairs: {total_contig_timepoint_pairs}\n")
+        f.write(f"Detected lineages (total):    {result.n_detected}\n")
+        f.write(f"Matched lineages:             {result.n_matched}\n")
+        f.write(f"Matched true strains:         {len(matched_true_ids)}\n")
+        f.write(f"Matched detected lineages:    {len(matched_detected_ids)}\n")
+        f.write("\n(Note: Strainphase splits lineages per-contig, so one strain can produce multiple detected lineages per contig)\n")
         f.write(f"Precision:           {result.precision:.3f}\n")
         f.write(f"Recall:              {result.recall:.3f}\n")
         f.write(f"F1 Score:            {result.f1:.3f}\n")
@@ -1902,6 +1919,7 @@ def run_validation(
                     f.write(f"    Why it doesn't match:\n")
                     for true_hap in true_haps:
                         dist, n_matches, n_shared, match_fraction = compute_haplotype_distance(true_hap, fp_hap)
+                        n_mismatches = n_shared - n_matches
                         common_tps = set(true_hap.abundances.keys()) & set(fp_hap.abundances.keys())
                         abundance_ok = _abundance_within_factor(true_hap, fp_hap, factor=2.0) if common_tps else False
                         
@@ -1920,8 +1938,10 @@ def run_validation(
                         f.write(f"      vs {true_hap.strain_id}: ")
                         if reasons:
                             f.write("; ".join(reasons))
+                            f.write(f"; distance={dist:.3f}, shared={n_shared}, matches={n_matches}, mismatches={n_mismatches}")
                         else:
-                            f.write(f"distance={dist:.3f}, shared={n_shared}, match_frac={match_fraction:.3f}, abund_ok={abundance_ok}")
+                            f.write(f"distance={dist:.3f}, shared={n_shared}, matches={n_matches}, mismatches={n_mismatches}, "
+                                  f"match_frac={match_fraction:.3f}, abund_ok={abundance_ok}")
                         f.write("\n")
         else:
             f.write("  None\n")
@@ -1977,37 +1997,55 @@ def run_validation(
     print("\n" + "=" * 60)
     print("VALIDATION RESULTS")
     print("=" * 60)
-    print(f"True haplotypes (strains):     {result.n_true}")
-    print(f"Detected lineages (total):     {result.n_detected}")
-    print(f"Matched lineages:              {result.n_matched}")
     
-    # Calculate expected lineages (accounting for per-contig splitting)
+    # Summary with explicit denominators
     n_contigs = len(result.per_contig_metrics) if result.per_contig_metrics else 1
-    expected_per_timepoint = result.n_true * n_contigs
-    print(f"\nExpected lineages (per timepoint): {result.n_true} strains × {n_contigs} contigs = up to {expected_per_timepoint}")
+    all_timepoints_list = sorted(result.per_timepoint_metrics.keys()) if result.per_timepoint_metrics else []
+    n_timepoints = len(all_timepoints_list)
+    total_contig_timepoint_pairs = n_contigs * n_timepoints if n_timepoints > 0 else n_contigs
+    
+    print(f"True strains (per genome):     {result.n_true}")
+    print(f"Contigs evaluated:            {n_contigs}")
+    print(f"Timepoints evaluated:         {n_timepoints}")
+    print(f"Total contig-timepoint pairs: {total_contig_timepoint_pairs}")
+    print(f"Detected lineages (total):    {result.n_detected}")
+    print(f"Matched lineages:             {result.n_matched}")
+    print(f"Matched true strains:         {len(matched_true_ids)}")
+    print(f"Matched detected lineages:    {len(matched_detected_ids)}")
     print("-" * 60)
     
-    # Breakdown by timepoint
-    if result.per_timepoint_metrics:
-        print("\nBREAKDOWN BY TIMEPOINT:")
+    # Unified breakdown: timepoint → contig
+    if result.per_timepoint_metrics and result.per_contig_metrics:
+        print("\nBREAKDOWN BY TIMEPOINT → CONTIG:")
         print("-" * 60)
-        for tp, metrics in sorted(result.per_timepoint_metrics.items()):
-            print(f"{tp}:")
-            print(f"  True strains:      {metrics['n_true']}")
-            print(f"  Detected lineages: {metrics['n_detected']} (expected: ~{metrics['n_true'] * n_contigs})")
-            print(f"  Matched:           {metrics['n_matched']}")
-            print(f"  Precision:         {metrics['precision']:.3f}, Recall: {metrics['recall']:.3f}")
+        for tp in sorted(result.per_timepoint_metrics.keys()):
+            tp_metrics = result.per_timepoint_metrics[tp]
+            print(f"\n{tp}:")
+            print(f"  Overall: {tp_metrics['n_true']} true, {tp_metrics['n_detected']} detected, "
+                  f"{tp_metrics['n_matched_true']} matched true, {tp_metrics['n_matched_detected']} matched detected")
+            print(f"  Precision: {tp_metrics['precision']:.3f}, Recall: {tp_metrics['recall']:.3f}")
+            
+            # Show per-contig breakdown for this timepoint
+            print(f"  Per-contig:")
+            for contig, contig_metrics in sorted(result.per_contig_metrics.items()):
+                contig_short = contig.split('.')[-1] if '.' in contig else contig
+                # Check if this contig has data for this timepoint
+                # (we can't easily check per-contig-per-timepoint, so show all contigs)
+                print(f"    {contig_short}: {contig_metrics['n_true']} true, "
+                      f"{contig_metrics['n_detected']} detected, "
+                      f"{contig_metrics['n_matched_true']} matched true")
     
-    # Breakdown by contig
-    if result.per_contig_metrics:
+    # Fallback: if no timepoint metrics, show contig breakdown
+    elif result.per_contig_metrics:
         print("\nBREAKDOWN BY CONTIG:")
         print("-" * 60)
         for contig, metrics in sorted(result.per_contig_metrics.items()):
             contig_short = contig.split('.')[-1] if '.' in contig else contig
             print(f"{contig_short}:")
-            print(f"  True strains:      {metrics['n_true']}")
-            print(f"  Detected lineages: {metrics['n_detected']} (expected: ~{metrics['n_true']})")
-            print(f"  Matched:           {metrics['n_matched']}")
+            print(f"  True haplotypes:   {metrics['n_true']}")
+            print(f"  Detected lineages: {metrics['n_detected']}")
+            print(f"  Matched true:      {metrics['n_matched_true']}")
+            print(f"  Matched detected:  {metrics['n_matched_detected']}")
             print(f"  Precision:         {metrics['precision']:.3f}, Recall: {metrics['recall']:.3f}")
     
     print("\nOVERALL METRICS:")
@@ -2048,16 +2086,22 @@ def run_validation(
                     contigs = list(fp_hap.snv_alleles.keys())
                     print(f"  - {fp_id}: abund={max_abund:.3f}, snvs={n_snvs}, contigs={len(contigs)}")
                     
-                    # Show closest match
+                    # Show closest match with detailed SNV breakdown
                     best_dist = 1.0
                     best_strain = None
+                    best_n_matches = 0
+                    best_n_shared = 0
                     for true_hap in true_haps:
                         dist, n_matches, n_shared, match_fraction = compute_haplotype_distance(true_hap, fp_hap)
                         if dist < best_dist:
                             best_dist = dist
                             best_strain = true_hap.strain_id
+                            best_n_matches = n_matches
+                            best_n_shared = n_shared
                     if best_strain:
-                        print(f"    Closest to {best_strain}: distance={best_dist:.3f}, shared_snvs={n_shared}")
+                        n_mismatches = best_n_shared - best_n_matches
+                        print(f"    Closest to {best_strain}: distance={best_dist:.3f}, "
+                              f"shared_snvs={best_n_shared}, matches={best_n_matches}, mismatches={n_mismatches}")
             if len(result.false_positives) > 5:
                 print(f"  ... and {len(result.false_positives) - 5} more")
         print("-" * 60)
