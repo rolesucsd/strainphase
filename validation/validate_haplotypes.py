@@ -36,6 +36,8 @@ try:
     import matplotlib.pyplot as plt
     # Suppress matplotlib warnings about categorical units
     warnings.filterwarnings('ignore', category=UserWarning, module='matplotlib')
+    # Silence missing font warnings (e.g., Arial not found)
+    logging.getLogger("matplotlib.font_manager").setLevel(logging.ERROR)
     HAS_MATPLOTLIB = True
 except ImportError:
     HAS_MATPLOTLIB = False
@@ -476,8 +478,7 @@ def match_haplotypes(
                 continue
             if match_fraction < min_match_fraction:
                 continue
-            if not _abundance_within_factor(true_hap, det_hap, factor=2.0):
-                continue
+            # Abundance threshold removed - match based on SNV similarity only
             distances.append((dist, true_hap, det_hap, n_shared))
 
     # Sort by distance
