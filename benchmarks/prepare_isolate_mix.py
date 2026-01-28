@@ -351,9 +351,10 @@ def create_combined_vcf(
 
         f.write('##INFO=<ID=DP,Number=1,Type=Integer,Description="Read depth">\n')
         f.write('##INFO=<ID=AF,Number=A,Type=Float,Description="Allele frequency">\n')
-        f.write('##INFO=<ID=STRAINS,Number=.,Type=String,Description="Strains with this variant">\n')
+        f.write('##INFO=<ID=STRAINS,Number=.,Type=String,Description="Strains with alt allele">\n')
         f.write('##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">\n')
         f.write('##FORMAT=<ID=DP,Number=1,Type=Integer,Description="Read depth">\n')
+        f.write('##FORMAT=<ID=AD,Number=R,Type=Integer,Description="Allelic depths">\n')
         f.write("#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE\n")
 
         # Sort positions and write
@@ -364,23 +365,34 @@ def create_combined_vcf(
                 strains_at_pos = position_alleles.get((contig, pos), {})
 
                 if strains_at_pos:
-                    # Get the alt allele (should be same across strains for same position)
-                    alt_base = list(strains_at_pos.values())[0]
-                    strain_list = ",".join(sorted(strains_at_pos.keys()))
+                    # Group strains by allele
+                    allele_strains = defaultdict(list)
+                    for strain, allele in strains_at_pos.items():
+                        allele_strains[allele].append(strain)
 
-                    all_vars.append((contig, pos, ref_base, alt_base, strain_list))
+                    # Get the alt allele (use the most common one if multiple)
+                    alt_base = max(allele_strains.keys(), key=lambda a: len(allele_strains[a]))
+
+                    # Format STRAINS field as "allele:strain1,strain2|allele:strain3"
+                    # For validation compatibility
+                    strains_info_parts = []
+                    for allele, strains in sorted(allele_strains.items()):
+                        strains_info_parts.append(f"{allele}:{','.join(sorted(strains))}")
+                    strains_info = "|".join(strains_info_parts)
+
+                    all_vars.append((contig, pos, ref_base, alt_base, strains_info))
 
         # Sort by contig and position
         all_vars.sort(key=lambda x: (x[0], x[1]))
 
-        for contig, pos, ref_base, alt_base, strain_list in all_vars:
-            info = f"DP=50;AF=0.5;STRAINS={strain_list}"
-            f.write(f"{contig}\t{pos}\t.\t{ref_base}\t{alt_base}\t30\tPASS\t{info}\tGT:DP\t0/1:50\n")
+        for contig, pos, ref_base, alt_base, strains_info in all_vars:
+            info = f"DP=50;AF=0.5;STRAINS={strains_info}"
+            f.write(f"{contig}\t{pos}\t.\t{ref_base}\t{alt_base}\t30\tPASS\t{info}\tGT:DP:AD\t0/1:50:25,25\n")
 
     ref.close()
     logger.info(f"  Created combined VCF with {len(all_vars)} SNV positions")
 
-    return len(all_vars)
+    return len(all_vars), all_vars
 
 
 def write_ground_truth_from_vcfs(
@@ -553,9 +565,18 @@ def prepare_isolate_mix(
         logger.info("  Using provided per-isolate VCF files")
         variants_by_strain, all_positions = load_isolate_vcfs(vcf_paths, strain_names)
 
-        # Create combined VCF
+        # Create combined VCF for strainphase input
         combined_vcf = os.path.join(output_dir, "variants.vcf")
-        n_variants = create_combined_vcf(all_positions, variants_by_strain, reference_path, combined_vcf)
+        n_variants, all_vars = create_combined_vcf(all_positions, variants_by_strain, reference_path, combined_vcf)
+
+        # Create truth_snvs.vcf for validation (same format, required by validation module)
+        truth_vcf = os.path.join(output_dir, "truth_snvs.vcf")
+        import shutil
+        shutil.copy(combined_vcf, truth_vcf)
+        # Also create truth_variants.vcf as a symlink/copy (validation checks both names)
+        truth_vcf2 = os.path.join(output_dir, "truth_variants.vcf")
+        shutil.copy(combined_vcf, truth_vcf2)
+        logger.info(f"  Created truth_snvs.vcf and truth_variants.vcf for validation")
     else:
         logger.info("  No per-isolate VCFs provided, calling variants from merged BAM")
         first_bam = os.path.join(output_dir, f"{timepoints[0]}.bam")

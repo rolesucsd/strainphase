@@ -339,6 +339,22 @@ class WindowResult:
         return True
 
 
+@dataclass
+class RescueStatistic:
+    """Statistics for a single haplotype rescue event."""
+
+    sample: str  # Timepoint where rescue occurred
+    contig: str
+    window_start: int
+    track_id: str
+    was_rescued: bool
+    original_weight: float
+    rescued_weight: float
+    donor_timepoint: str  # Timepoint that provided the anchor
+    anchor_distance: float  # Distance to matching anchor
+    n_shared_with_anchor: int  # Number of shared SNVs with anchor
+
+
 # =============================================================================
 # LOG-PROBABILITY CACHE
 # =============================================================================
@@ -1140,6 +1156,7 @@ class LongitudinalIntegrator:
 
     def __init__(self, config: HaplotyperConfig = DEFAULT_CONFIG):
         self.config = config
+        self.rescue_statistics: List[RescueStatistic] = []
 
     def build_anchor_panel_for_key(
         self, sample_results: dict[str, WindowResult]
@@ -1180,7 +1197,9 @@ class LongitudinalIntegrator:
         self,
         window_result: WindowResult,
         anchor_haps: list[Haplotype],
+        anchor_samples: list[str],
         sample_results: dict[str, WindowResult],
+        current_sample: str,
     ) -> WindowResult:
         """Rescue low-confidence haplotypes using anchors."""
         if not anchor_haps:
@@ -1200,11 +1219,13 @@ class LongitudinalIntegrator:
             # Check for anchor match - only consider anchors with sufficient shared positions
             best_dist = float("inf")
             best_n_shared = 0
-            for anchor in anchor_haps:
+            best_anchor_idx = -1
+            for anchor_idx, anchor in enumerate(anchor_haps):
                 dist, _, n_shared = hap.distance_to(anchor, window.snv_pos)
                 if n_shared >= self.config.min_shared_for_rescue and dist < best_dist:
                     best_dist = dist
                     best_n_shared = n_shared
+                    best_anchor_idx = anchor_idx
 
             if (
                 best_n_shared >= self.config.min_shared_for_rescue
@@ -1224,6 +1245,35 @@ class LongitudinalIntegrator:
                     pi = pi / pi.sum()
                     hap.confidence = 1.0
                     rescued_any = True
+
+                    # Record rescue statistic
+                    donor_timepoint = anchor_samples[best_anchor_idx] if best_anchor_idx >= 0 else "unknown"
+                    self.rescue_statistics.append(RescueStatistic(
+                        sample=current_sample,
+                        contig=window.contig,
+                        window_start=window.start,
+                        track_id=hap.track_id or f"unlinked_{window.start}_{k}",
+                        was_rescued=True,
+                        original_weight=old_weight,
+                        rescued_weight=new_weight,
+                        donor_timepoint=donor_timepoint,
+                        anchor_distance=best_dist,
+                        n_shared_with_anchor=best_n_shared,
+                    ))
+            else:
+                # Record non-rescued haplotype (below anchor threshold)
+                self.rescue_statistics.append(RescueStatistic(
+                    sample=current_sample,
+                    contig=window.contig,
+                    window_start=window.start,
+                    track_id=hap.track_id or f"unlinked_{window.start}_{k}",
+                    was_rescued=False,
+                    original_weight=pi[k],
+                    rescued_weight=pi[k],
+                    donor_timepoint="",
+                    anchor_distance=best_dist if best_n_shared > 0 else -1.0,
+                    n_shared_with_anchor=best_n_shared,
+                ))
 
         if rescued_any:
             pi = pi / pi.sum()
@@ -1332,10 +1382,42 @@ class LongitudinalIntegrator:
             anchor_haps, anchor_samples = self.build_anchor_panel_for_key(sample_results)
 
             for sample_id, wr in sample_results.items():
-                rescued_wr = self.rescue_window_result(wr, anchor_haps, sample_results)
+                rescued_wr = self.rescue_window_result(
+                    wr, anchor_haps, anchor_samples, sample_results, sample_id
+                )
                 rescued_results[sample_id].append(rescued_wr)
 
         return dict(rescued_results)
+
+    def write_rescue_statistics(self, output_path: str) -> str:
+        """Write rescue_statistics.tsv with details of rescue events."""
+        import csv
+
+        fieldnames = [
+            'sample', 'contig', 'window_start', 'track_id',
+            'was_rescued', 'original_weight', 'rescued_weight',
+            'donor_timepoint', 'anchor_distance', 'n_shared_with_anchor'
+        ]
+
+        with open(output_path, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames, delimiter='\t')
+            writer.writeheader()
+
+            for stat in self.rescue_statistics:
+                writer.writerow({
+                    'sample': stat.sample,
+                    'contig': stat.contig,
+                    'window_start': stat.window_start,
+                    'track_id': stat.track_id,
+                    'was_rescued': stat.was_rescued,
+                    'original_weight': f"{stat.original_weight:.6f}",
+                    'rescued_weight': f"{stat.rescued_weight:.6f}",
+                    'donor_timepoint': stat.donor_timepoint,
+                    'anchor_distance': f"{stat.anchor_distance:.6f}" if stat.anchor_distance >= 0 else "NA",
+                    'n_shared_with_anchor': stat.n_shared_with_anchor,
+                })
+
+        return output_path
 
 
 # =============================================================================

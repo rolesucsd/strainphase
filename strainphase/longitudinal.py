@@ -44,6 +44,7 @@ from strainphase.core import (
     Haplotype,
     HaplotyperConfig,
     LongitudinalIntegrator,
+    RescueStatistic,
     WindowResult,
     link_windows,
     process_contig,
@@ -196,6 +197,7 @@ def process_mag_longitudinal(
                 continue
 
     # ------------------ Second pass: cross-timepoint rescue -------------------
+    integrator = None
     if len(samples) >= 2:
         logging.info(f"  Performing longitudinal rescue across {len(samples)} samples")
         integrator = LongitudinalIntegrator(config)
@@ -216,6 +218,16 @@ def process_mag_longitudinal(
                 for sample_id, window_results in rescued.items():
                     window_results = link_windows(window_results, config)
                     all_results[sample_id][contig_id] = window_results
+
+        # Log rescue statistics
+        n_rescued = sum(1 for s in integrator.rescue_statistics if s.was_rescued)
+        n_total = len(integrator.rescue_statistics)
+        logging.info(f"  Rescue completed: {n_rescued}/{n_total} haplotypes rescued")
+
+    # Store integrator on the config for later retrieval (rescue_statistics)
+    # This allows downstream code to access and write rescue statistics
+    if integrator:
+        config._rescue_integrator = integrator
 
     return all_results
 

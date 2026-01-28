@@ -1840,6 +1840,137 @@ class ParameterSweep:
         return stable_params
 
 
+def write_parameter_grid_summary(
+    results: List[SweepResult],
+    stable_params: List[ParameterSet],
+    output_dir: str
+) -> str:
+    """
+    Write parameter_grid_summary.tsv - comprehensive parameter comparison.
+
+    Long-format table with one row per parameter configuration, summarizing
+    all accuracy, linking, longitudinal, speed, stability, and parameter metrics.
+    """
+    import csv
+
+    output_path = os.path.join(output_dir, 'parameter_grid_summary.tsv')
+
+    # Build set of stable config names for is_stable lookup
+    stable_config_names = {p.short_name() for p in stable_params}
+
+    records = []
+    for result in results:
+        params = result.params
+
+        # Compute SNV F1 from precision/recall
+        snv_f1 = 0.0
+        if result.snv_precision is not None and result.snv_recall is not None:
+            if (result.snv_precision + result.snv_recall) > 0:
+                snv_f1 = 2 * result.snv_precision * result.snv_recall / (result.snv_precision + result.snv_recall)
+
+        # Determine if this config is stable
+        is_stable = params.short_name() in stable_config_names
+
+        records.append({
+            # Config identification
+            'config_name': params.short_name(),
+
+            # Accuracy metrics
+            'haplotype_precision': f"{result.haplotype_precision:.6f}" if result.haplotype_precision is not None else "NA",
+            'haplotype_recall': f"{result.haplotype_recall:.6f}" if result.haplotype_recall is not None else "NA",
+            'haplotype_f1': f"{result.haplotype_f1:.6f}" if result.haplotype_f1 is not None else "NA",
+            'snv_precision': f"{result.snv_precision:.6f}" if result.snv_precision is not None else "NA",
+            'snv_recall': f"{result.snv_recall:.6f}" if result.snv_recall is not None else "NA",
+            'snv_f1': f"{snv_f1:.6f}",
+            'abundance_pearson_r': f"{result.abundance_pearson_r:.6f}" if result.abundance_pearson_r is not None else "NA",
+            'abundance_mae': f"{result.abundance_mae:.6f}" if result.abundance_mae is not None else "NA",
+
+            # Track/Linking metrics
+            'track_fragmentation_mean': f"{result.track_fragmentation_mean:.6f}" if result.track_fragmentation_mean is not None else "NA",
+            'track_fragmentation_median': f"{result.track_fragmentation_median:.6f}" if result.track_fragmentation_median is not None else "NA",
+            'false_link_rate': f"{result.false_link_rate:.6f}" if result.false_link_rate is not None else "NA",
+            'missed_link_rate': f"{result.missed_link_rate:.6f}" if result.missed_link_rate is not None else "NA",
+            'track_consensus_error': f"{result.track_consensus_error:.6f}" if result.track_consensus_error is not None else "NA",
+
+            # Longitudinal metrics
+            'lineage_precision': f"{result.lineage_precision:.6f}" if result.lineage_precision is not None else "NA",
+            'lineage_recall': f"{result.lineage_recall:.6f}" if result.lineage_recall is not None else "NA",
+            'lineage_f1': f"{result.lineage_f1:.6f}" if result.lineage_f1 is not None else "NA",
+            'rescue_delta_recall_rare': f"{result.rescue_delta_recall_rare:.6f}" if result.rescue_delta_recall_rare is not None else "NA",
+            'abundance_trajectory_error': f"{result.abundance_trajectory_error:.6f}" if result.abundance_trajectory_error is not None else "NA",
+
+            # Speed metrics
+            'runtime_seconds': f"{result.runtime_seconds:.2f}",
+            'memory_peak_mb': f"{result.memory_peak_mb:.2f}" if result.memory_peak_mb is not None else "NA",
+
+            # Stability metrics
+            'converged': result.converged,
+            'mean_confidence': f"{result.mean_confidence:.6f}",
+            'n_lineages': result.n_lineages,
+            'is_stable': is_stable,
+
+            # Parameters
+            'window_size': params.window_size,
+            'max_mismatch_frac': params.max_mismatch_frac,
+            'min_shared_snvs_for_edge': params.min_shared_snvs_for_edge,
+            'merge_distance_threshold': params.merge_distance_threshold,
+            'min_mapq': params.min_mapq,
+            'min_base_quality': params.min_base_quality,
+            'min_weight_for_anchor': params.min_weight_for_anchor,
+            'rescued_min_weight': params.rescued_min_weight,
+        })
+
+    # Write TSV
+    if records:
+        fieldnames = [
+            # Config
+            'config_name',
+            # Accuracy
+            'haplotype_precision', 'haplotype_recall', 'haplotype_f1',
+            'snv_precision', 'snv_recall', 'snv_f1',
+            'abundance_pearson_r', 'abundance_mae',
+            # Track/Linking
+            'track_fragmentation_mean', 'track_fragmentation_median',
+            'false_link_rate', 'missed_link_rate', 'track_consensus_error',
+            # Longitudinal
+            'lineage_precision', 'lineage_recall', 'lineage_f1',
+            'rescue_delta_recall_rare', 'abundance_trajectory_error',
+            # Speed
+            'runtime_seconds', 'memory_peak_mb',
+            # Stability
+            'converged', 'mean_confidence', 'n_lineages', 'is_stable',
+            # Parameters
+            'window_size', 'max_mismatch_frac', 'min_shared_snvs_for_edge',
+            'merge_distance_threshold', 'min_mapq', 'min_base_quality',
+            'min_weight_for_anchor', 'rescued_min_weight',
+        ]
+        with open(output_path, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames, delimiter='\t')
+            writer.writeheader()
+            writer.writerows(records)
+    else:
+        # Write empty file with headers
+        with open(output_path, 'w') as f:
+            f.write('\t'.join([
+                'config_name',
+                'haplotype_precision', 'haplotype_recall', 'haplotype_f1',
+                'snv_precision', 'snv_recall', 'snv_f1',
+                'abundance_pearson_r', 'abundance_mae',
+                'track_fragmentation_mean', 'track_fragmentation_median',
+                'false_link_rate', 'missed_link_rate', 'track_consensus_error',
+                'lineage_precision', 'lineage_recall', 'lineage_f1',
+                'rescue_delta_recall_rare', 'abundance_trajectory_error',
+                'runtime_seconds', 'memory_peak_mb',
+                'converged', 'mean_confidence', 'n_lineages', 'is_stable',
+                'window_size', 'max_mismatch_frac', 'min_shared_snvs_for_edge',
+                'merge_distance_threshold', 'min_mapq', 'min_base_quality',
+                'min_weight_for_anchor', 'rescued_min_weight',
+            ]) + '\n')
+
+    logger.info(f"Wrote {len(records)} parameter grid summary records to {output_path}")
+    return output_path
+
+
 def run_parameter_sweep(
     bam_path: Optional[str] = None,
     vcf_path: Optional[str] = None,
@@ -2000,6 +2131,12 @@ def run_parameter_sweep(
     stable_data = [p.to_dict() for p in stable]
     with open(os.path.join(output_dir, 'stable_parameters.json'), 'w') as f:
         json.dump(stable_data, f, indent=2)
+
+    # Write parameter grid summary TSV
+    try:
+        write_parameter_grid_summary(results, stable, output_dir)
+    except Exception as e:
+        logger.warning(f"Failed to write parameter_grid_summary.tsv: {e}")
 
     if verbose:
         logger.info(f"\n=== SWEEP SUMMARY ===")
