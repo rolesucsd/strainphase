@@ -69,7 +69,7 @@ echo "Output directory: $OUTPUT_DIR"
 echo "Number of isolates: ${#BAMS[@]}"
 echo ""
 echo "Step 1: Prepare mixed samples from isolate BAMs"
-echo "Step 2: Run strainphase parameter sweep"
+echo "Step 2: Run strainphase parameter sweep (sequential)"
 echo "Step 3: Generate benchmark report"
 echo ""
 echo "Parameters:"
@@ -102,7 +102,7 @@ echo "Mixed samples created in: $MIXED_DATA_DIR"
 echo ""
 
 # =============================================================================
-# Step 2: Run parameter sweep on mixed data
+# Step 2: Run parameter sweep on mixed data (sequential)
 # =============================================================================
 
 echo "============================================================"
@@ -123,9 +123,8 @@ python "${PROJECT_ROOT}/benchmarks/parameter_sweep.py" \
     --timepoints T1 T2 T3 T4 \
     --output "${OUTPUT_DIR}/sweep_results" \
     --truth "$MIXED_DATA_DIR" \
-    --mode grid \
-    --params "${PROJECT_ROOT}/benchmarks/best_params.json" \
-    --passes 1 \
+    --mode sequential \
+    --passes 3 \
     --workers "$N_WORKERS" \
     --checkpoint-interval 2
 

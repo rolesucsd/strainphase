@@ -52,6 +52,8 @@ def load_truth_tracks(truth_dir: str) -> Dict[str, Dict[str, Tuple[int, int]]]:
     
     if not tracks_file.exists():
         logger.warning(f"truth_tracks.tsv not found at {tracks_file}")
+        logger.warning(f"  Looking in: {truth_path.absolute()}")
+        logger.warning(f"  Files in truth_dir: {list(truth_path.glob('*.tsv')) if truth_path.exists() else 'directory does not exist'}")
         return {}
     
     truth_tracks = defaultdict(dict)
