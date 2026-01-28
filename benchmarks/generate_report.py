@@ -34,6 +34,8 @@ import numpy as np
 try:
     import matplotlib.pyplot as plt
     import matplotlib.cm as cm
+    import logging as _mpl_logging
+    _mpl_logging.getLogger("matplotlib.font_manager").setLevel(_mpl_logging.ERROR)
     HAS_MATPLOTLIB = True
 except ImportError:
     HAS_MATPLOTLIB = False
