@@ -254,6 +254,7 @@ def run_parameter_sweep(
     checkpoint_interval: int = 10,
     passes: int = 1,
     n_workers: int = 1,
+    params_file: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Run parameter sweep on simulated data.
@@ -375,6 +376,7 @@ def run_parameter_sweep(
         checkpoint_interval=checkpoint_interval,
         passes=passes,
         n_workers=n_workers,
+        params_file=params_file,
     )
 
     return summary
@@ -471,6 +473,7 @@ def run_full_benchmark(
     passes: int = 1,
     checkpoint_interval: int = 10,
     n_workers: int = 1,
+    params_file: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Run the complete benchmark pipeline.
@@ -622,6 +625,7 @@ def run_full_benchmark(
         checkpoint_interval=checkpoint_interval,
         passes=passes,
         n_workers=n_workers,
+        params_file=params_file,
     )
     results["steps"]["parameter_sweep"] = {
         "success": bool(sweep_summary),
@@ -728,6 +732,8 @@ def main():
                         help="Limit number of parameter configs to test (grid mode only)")
     parser.add_argument("--max-contigs", type=int,
                         help="Limit number of contigs to process")
+    parser.add_argument("--params", dest="params_file",
+                        help="Custom parameter grid JSON file (optional)")
 
     # Mode selection
     parser.add_argument("--mode", choices=["grid", "sequential"], default="grid",
@@ -779,6 +785,7 @@ def main():
         passes=args.passes,
         checkpoint_interval=args.checkpoint_interval,
         n_workers=args.workers,
+        params_file=args.params_file,
     )
 
     # Exit with error if any critical step failed

@@ -35,15 +35,19 @@ GENOME_SOURCE="${GENOME_SOURCE:-$PROJECT_ROOT/tmp}"  # Directory with source gen
 OUTPUT_BASE="${OUTPUT_BASE:-$PROJECT_ROOT/results/cluster_benchmark}"
 LOG_DIR="${LOG_DIR:-$PROJECT_ROOT/logs}"
 TIMEPOINTS="${TIMEPOINTS:-4}"
-COVERAGE="${COVERAGE:-30}"
+COVERAGE="${COVERAGE:-50}"
 SEED="${SEED:-42}"
 
 # Parameter sweep configuration
 # MODE: "grid" for full sweep (13,824 configs), "sequential" for coordinate descent (~27 configs)
-MODE="${MODE:-sequential}"
-# MAX_CONFIGS: Limit configs for grid mode (empty = all)
-MAX_CONFIGS="${MAX_CONFIGS:-}"
-# PASSES: Number of optimization passes for sequential mode
+# Using "grid" mode with best_params.json to test exactly 4 best parameter combinations
+MODE="${MODE:-grid}"
+# MAX_CONFIGS: Limit configs for grid mode (set to 4 for best params)
+MAX_CONFIGS="${MAX_CONFIGS:-4}"
+# Custom parameter file with best 4 combinations (only used in grid mode)
+# Sequential mode uses the default REQUIRED_GRID for coordinate descent optimization
+PARAMS_FILE="${PARAMS_FILE:-$SCRIPT_DIR/best_params.json}"
+# PASSES: Number of optimization passes for sequential mode (not used in grid mode)
 PASSES="${PASSES:-1}"
 # CHECKPOINT_INTERVAL: Save checkpoint every N configs
 CHECKPOINT_INTERVAL="${CHECKPOINT_INTERVAL:-10}"
@@ -108,8 +112,16 @@ echo "Genome source: $GENOME_SOURCE"
 echo "Sweep mode: $MODE"
 if [[ "$MODE" == "sequential" ]]; then
     echo "Optimization passes: $PASSES"
-elif [[ -n "$MAX_CONFIGS" ]]; then
-    echo "Max configs: $MAX_CONFIGS"
+    echo "Parameter grid: Default REQUIRED_GRID (coordinate descent)"
+elif [[ "$MODE" == "grid" ]]; then
+    if [[ -n "$MAX_CONFIGS" ]]; then
+        echo "Max configs: $MAX_CONFIGS"
+    fi
+    if [[ -n "$PARAMS_FILE" && -f "$PARAMS_FILE" ]]; then
+        echo "Custom parameter file: $PARAMS_FILE"
+    else
+        echo "Parameter grid: Default REQUIRED_GRID"
+    fi
 fi
 echo "Parallel workers: $WORKERS"
 echo "============================================================"
@@ -175,8 +187,17 @@ PYTHON_CMD="python benchmarks/run_full_benchmark.py \
 # Add mode-specific options
 if [[ "$MODE" == "sequential" ]]; then
     PYTHON_CMD="$PYTHON_CMD --passes $PASSES"
-elif [[ -n "$MAX_CONFIGS" ]]; then
+    # Sequential mode uses default REQUIRED_GRID (do NOT pass params_file)
+    echo "Sequential mode: Using default parameter grid for coordinate descent optimization"
+elif [[ "$MODE" == "grid" && -n "$MAX_CONFIGS" ]]; then
     PYTHON_CMD="$PYTHON_CMD --max-configs $MAX_CONFIGS"
+    # Grid mode: use custom parameter file if provided
+    if [[ -n "$PARAMS_FILE" && -f "$PARAMS_FILE" ]]; then
+        PYTHON_CMD="$PYTHON_CMD --params $PARAMS_FILE"
+        echo "Grid mode: Using custom parameter file: $PARAMS_FILE"
+    else
+        echo "Grid mode: Using default parameter grid"
+    fi
 fi
 
 PYTHON_CMD="$PYTHON_CMD --checkpoint-interval $CHECKPOINT_INTERVAL"
