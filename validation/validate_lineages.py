@@ -81,11 +81,21 @@ def compute_lineage_clustering_metrics(
         for contig, lineage_id in contig_lineages.items():
             true_lineage_clusters[lineage_id].add((strain_id, contig))
     
+    logger.debug(f"Built {len(true_lineage_clusters)} true lineage clusters")
+    if true_lineage_clusters:
+        sample_true = list(true_lineage_clusters.items())[0]
+        logger.debug(f"Sample true lineage cluster: {sample_true[0]} -> {sample_true[1]}")
+    
     # Build detected lineage clusters
     detected_lineage_clusters: Dict[str, Set[Tuple[str, str]]] = defaultdict(set)
     for detected_lineage_id, contig_strains in detected_lineages.items():
         for contig, strain_id in contig_strains.items():
             detected_lineage_clusters[detected_lineage_id].add((strain_id, contig))
+    
+    logger.debug(f"Built {len(detected_lineage_clusters)} detected lineage clusters")
+    if detected_lineage_clusters:
+        sample_det = list(detected_lineage_clusters.items())[0]
+        logger.debug(f"Sample detected lineage cluster: {sample_det[0]} -> {sample_det[1]}")
     
     # Match detected to true lineages
     matched_detected = set()
@@ -96,11 +106,14 @@ def compute_lineage_clustering_metrics(
             if det_cluster == true_cluster:
                 matched_detected.add(det_lineage_id)
                 matched_true.add(true_lineage_id)
+                logger.debug(f"Matched detected lineage {det_lineage_id} to true lineage {true_lineage_id}")
                 break
     
     n_detected = len(detected_lineage_clusters)
     n_true = len(true_lineage_clusters)
     n_matched = len(matched_detected)
+    
+    logger.debug(f"Lineage matching: {n_matched} matches out of {n_detected} detected and {n_true} true")
     
     precision = n_matched / n_detected if n_detected > 0 else 0.0
     recall = n_matched / n_true if n_true > 0 else 0.0
@@ -206,10 +219,48 @@ def validate_lineages(
             per_lineage_errors={}
         )
     
+    # Debug logging
+    logger.info(f"Truth lineages loaded: {len(truth_lineages)} strains")
+    logger.info(f"Detected lineages provided: {len(detected_lineages)} lineages")
+    
+    # Check for contig name mismatch (common issue)
+    truth_contigs = set()
+    for strain_id, contig_dict in truth_lineages.items():
+        truth_contigs.update(contig_dict.keys())
+    
+    detected_contigs = set()
+    for lineage_id, contig_dict in detected_lineages.items():
+        detected_contigs.update(contig_dict.keys())
+    
+    logger.info(f"Truth contigs: {sorted(truth_contigs)}")
+    logger.info(f"Detected contigs: {sorted(detected_contigs)}")
+    
+    # Check overlap
+    overlap = truth_contigs & detected_contigs
+    if not overlap and truth_contigs and detected_contigs:
+        logger.warning("="*60)
+        logger.warning("CONTIG NAME MISMATCH DETECTED!")
+        logger.warning(f"  Truth contigs: {sorted(truth_contigs)}")
+        logger.warning(f"  Detected contigs: {sorted(detected_contigs)}")
+        logger.warning("  No overlap - lineage metrics will be ZERO!")
+        logger.warning("  Fix: Ensure truth files use the same contig names as the reference.")
+        logger.warning("="*60)
+    elif overlap and len(overlap) < len(truth_contigs):
+        logger.warning(f"Partial contig overlap: {len(overlap)}/{len(truth_contigs)} truth contigs matched")
+    
+    if detected_lineages:
+        sample_lineage = list(detected_lineages.items())[0]
+        logger.info(f"Sample detected lineage: {sample_lineage[0]} -> {sample_lineage[1]}")
+    if truth_lineages:
+        sample_strain = list(truth_lineages.items())[0]
+        logger.info(f"Sample truth strain: {sample_strain[0]} -> {sample_strain[1]}")
+    
     # Compute lineage clustering metrics
     lineage_precision, lineage_recall, lineage_f1 = compute_lineage_clustering_metrics(
         detected_lineages, truth_lineages
     )
+    
+    logger.info(f"Lineage clustering metrics: precision={lineage_precision:.3f}, recall={lineage_recall:.3f}, f1={lineage_f1:.3f}")
     
     # Compute rescue gain (if without-rescue data provided)
     if detected_without_rescue is not None:

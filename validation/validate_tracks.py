@@ -285,6 +285,29 @@ def validate_tracks(
             missed_links=[]
         )
     
+    # Check for contig name mismatch
+    truth_contigs = set()
+    for strain_id, contig_dict in truth_tracks.items():
+        truth_contigs.update(contig_dict.keys())
+    
+    detected_contigs = set()
+    for wr in window_results:
+        detected_contigs.add(wr.window.contig)
+    
+    overlap = truth_contigs & detected_contigs
+    if not overlap and truth_contigs and detected_contigs:
+        logger.warning("="*60)
+        logger.warning("CONTIG NAME MISMATCH IN TRACK VALIDATION!")
+        logger.warning(f"  Truth contigs: {sorted(truth_contigs)}")
+        logger.warning(f"  Detected contigs: {sorted(detected_contigs)}")
+        logger.warning("  No overlap - track metrics will be ZERO!")
+        logger.warning("  Fix: Ensure truth files use the same contig names as the reference.")
+        logger.warning("="*60)
+    
+    logger.info(f"Track validation: {len(truth_tracks)} truth strains, {len(strain_matches)} strain matches")
+    logger.info(f"  Truth contigs: {sorted(truth_contigs)}")
+    logger.info(f"  Detected contigs: {sorted(detected_contigs)}")
+    
     # Compute fragmentation
     mean_frag, median_frag, per_strain_frag = compute_track_fragmentation(
         window_results, truth_tracks, strain_matches
