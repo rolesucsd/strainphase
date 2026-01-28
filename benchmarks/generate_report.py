@@ -1305,7 +1305,8 @@ def generate_error_decomposition(
         missed_lineage_rate = float(len(false_negatives))
 
     if merge_rate == 0 and split_rate == 0 and missed_lineage_rate == 0:
-        raise ValueError("Error decomposition has no non-zero values to plot.")
+        logger.warning("Error decomposition has no non-zero values; skipping plot.")
+        return ""
 
     labels = ["False merges", "False splits", "Missed lineages"]
     values = [merge_rate, split_rate, missed_lineage_rate]
@@ -1780,9 +1781,9 @@ def generate_html_report(
     figures['vcf_robustness.png'] = generate_vcf_robustness(results, output_dir)
     figures['coverage_performance.png'] = generate_coverage_performance(results, output_dir)
     figures['metric_correlation.png'] = generate_metric_correlation(results, output_dir)
-    figures['error_decomposition.png'] = generate_error_decomposition(
-        validation_metrics, output_dir
-    )
+    error_path = generate_error_decomposition(validation_metrics, output_dir)
+    if error_path:
+        figures['error_decomposition.png'] = error_path
     
     figure_titles = {
         'parameter_heatmap.png': 'Parameter Heatmap',
@@ -2121,9 +2122,9 @@ def generate_report(
     figures['metric_correlation.png'] = generate_metric_correlation(results, output_dir)
 
     logger.info("Generating error decomposition plot...")
-    figures['error_decomposition.png'] = generate_error_decomposition(
-        validation_metrics, output_dir
-    )
+    error_path = generate_error_decomposition(validation_metrics, output_dir)
+    if error_path:
+        figures['error_decomposition.png'] = error_path
 
     # Generate HTML report
     logger.info("Generating HTML report...")
