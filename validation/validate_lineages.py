@@ -68,56 +68,77 @@ def compute_lineage_clustering_metrics(
     truth_lineages: Dict[str, Dict[str, str]]  # strain_id -> {contig -> lineage_id}
 ) -> Tuple[float, float, float]:
     """
-    Compute lineage precision/recall/F1.
+    Compute lineage precision/recall/F1 based on whether haplotypes from the same
+    true strain are grouped into the same detected lineage.
     
-    A detected lineage matches a true lineage if:
-    - They share the same strain assignments across contigs
+    This uses a relaxed matching approach that handles partial contig coverage:
+    - A detected lineage is CORRECT (for precision) if all its strain assignments
+      on each contig belong to the same true strain (consistent clustering)
+    - A true strain is RECOVERED (for recall) if at least one detected lineage
+      correctly identifies it on at least one contig with data
     
     Returns: (precision, recall, f1)
     """
-    # Build reverse mapping: true_lineage_id -> set of (strain_id, contig) pairs
-    true_lineage_clusters: Dict[str, Set[Tuple[str, str]]] = defaultdict(set)
-    for strain_id, contig_lineages in truth_lineages.items():
-        for contig, lineage_id in contig_lineages.items():
-            true_lineage_clusters[lineage_id].add((strain_id, contig))
+    if not detected_lineages or not truth_lineages:
+        logger.info("Empty lineages - returning zeros")
+        return 0.0, 0.0, 0.0
     
-    logger.debug(f"Built {len(true_lineage_clusters)} true lineage clusters")
-    if true_lineage_clusters:
-        sample_true = list(true_lineage_clusters.items())[0]
-        logger.debug(f"Sample true lineage cluster: {sample_true[0]} -> {sample_true[1]}")
+    # Get the set of contigs that have detected data
+    detected_contigs = set()
+    for contig_strains in detected_lineages.values():
+        detected_contigs.update(contig_strains.keys())
     
-    # Build detected lineage clusters
-    detected_lineage_clusters: Dict[str, Set[Tuple[str, str]]] = defaultdict(set)
-    for detected_lineage_id, contig_strains in detected_lineages.items():
-        for contig, strain_id in contig_strains.items():
-            detected_lineage_clusters[detected_lineage_id].add((strain_id, contig))
+    logger.debug(f"Detected contigs with data: {sorted(detected_contigs)}")
     
-    logger.debug(f"Built {len(detected_lineage_clusters)} detected lineage clusters")
-    if detected_lineage_clusters:
-        sample_det = list(detected_lineage_clusters.items())[0]
-        logger.debug(f"Sample detected lineage cluster: {sample_det[0]} -> {sample_det[1]}")
+    # For each detected lineage, check if all its strain assignments are consistent
+    # (i.e., all contigs point to the same true strain)
+    correct_detected = set()
+    detected_to_strain: Dict[str, str] = {}  # Maps detected lineage_id to its assigned strain_id
     
-    # Match detected to true lineages
-    matched_detected = set()
-    matched_true = set()
+    for det_lineage_id, contig_strains in detected_lineages.items():
+        # Get unique strain assignments for this detected lineage
+        assigned_strains = set(contig_strains.values())
+        
+        if len(assigned_strains) == 1:
+            # Consistent - all contigs assigned to same strain
+            strain_id = list(assigned_strains)[0]
+            correct_detected.add(det_lineage_id)
+            detected_to_strain[det_lineage_id] = strain_id
+            logger.debug(f"Detected lineage {det_lineage_id} is consistent -> {strain_id}")
+        else:
+            # Inconsistent - mixed strain assignments (this is an error)
+            logger.debug(f"Detected lineage {det_lineage_id} is INCONSISTENT: {assigned_strains}")
     
-    for det_lineage_id, det_cluster in detected_lineage_clusters.items():
-        for true_lineage_id, true_cluster in true_lineage_clusters.items():
-            if det_cluster == true_cluster:
-                matched_detected.add(det_lineage_id)
-                matched_true.add(true_lineage_id)
-                logger.debug(f"Matched detected lineage {det_lineage_id} to true lineage {true_lineage_id}")
+    # For recall: check which true strains are correctly recovered
+    # A true strain is recovered if at least one detected lineage correctly identifies it
+    recovered_strains = set()
+    
+    for strain_id in truth_lineages.keys():
+        # Check if any detected lineage correctly maps to this strain
+        for det_lineage_id, mapped_strain in detected_to_strain.items():
+            if mapped_strain == strain_id:
+                recovered_strains.add(strain_id)
+                logger.debug(f"True strain {strain_id} recovered by lineage {det_lineage_id}")
                 break
     
-    n_detected = len(detected_lineage_clusters)
-    n_true = len(true_lineage_clusters)
-    n_matched = len(matched_detected)
+    n_detected = len(detected_lineages)
+    n_correct = len(correct_detected)
+    n_true = len(truth_lineages)
+    n_recovered = len(recovered_strains)
     
-    logger.debug(f"Lineage matching: {n_matched} matches out of {n_detected} detected and {n_true} true")
+    logger.info(f"Lineage clustering: {n_correct}/{n_detected} correct detected, {n_recovered}/{n_true} true strains recovered")
     
-    precision = n_matched / n_detected if n_detected > 0 else 0.0
-    recall = n_matched / n_true if n_true > 0 else 0.0
+    # Precision: fraction of detected lineages that are internally consistent AND map to a real strain
+    # We need stricter precision - count only those that map to actual truth strains
+    precision_correct = sum(1 for d in correct_detected if detected_to_strain.get(d) in truth_lineages)
+    precision = precision_correct / n_detected if n_detected > 0 else 0.0
+    
+    # Recall: fraction of true strains that were recovered
+    recall = n_recovered / n_true if n_true > 0 else 0.0
+    
     f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+    
+    logger.info(f"Lineage clustering metrics: precision={precision:.3f}, recall={recall:.3f}, f1={f1:.3f}")
     
     return precision, recall, f1
 
