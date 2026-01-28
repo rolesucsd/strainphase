@@ -1,16 +1,16 @@
 {
-  "window_size": [10000, 20000],
+  "window_size": [10000, 20000, 50000],
   "max_reads_per_window": [300],
-  "max_mismatch_frac": [0.01],
+  "max_mismatch_frac": [0.01, 0.02, 0.05],
   "min_shared_snvs_for_edge": [3, 5],
   "min_mapq": [20],
   "min_base_quality": [20],
   "merge_distance_threshold": [0.02],
   "min_weight_for_anchor": [0.1],
-  "rescued_min_weight": [0.02],
+  "rescued_min_weight": [0.05],
   "junk_divergence_rate": [0.10],
   "max_link_distance": [0.02],
-  "min_shared_snvs_for_link": [3],
+  "min_shared_snvs_for_link": [3, 5],
   "rescue_match_distance": [0.01],
   "lineage_merge_distance": [0.02]
 }
