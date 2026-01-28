@@ -655,7 +655,8 @@ def generate_seed_sensitivity(
     # Find configs with multiple seeds
     multi_seed_configs = {k: v for k, v in by_config.items() if len(v) > 1}
     if not multi_seed_configs:
-        raise ValueError("Seed sensitivity requires multiple seeds per config in results.")
+        logger.warning("Seed sensitivity requires multiple seeds per config; skipping plot.")
+        return ""
     
     # Select metric
     metric = _select_metric(results)
@@ -681,7 +682,8 @@ def generate_seed_sensitivity(
             stds.append(np.std(all_values))
     
     if not means:
-        raise ValueError("Seed sensitivity requires metric values for multiple seeds.")
+        logger.warning("Seed sensitivity requires metric values for multiple seeds; skipping plot.")
+        return ""
     
     x = np.arange(len(config_names))
     ax.errorbar(x, means, yerr=stds, marker='o', capsize=5, linestyle='None', 
@@ -1770,7 +1772,9 @@ def generate_html_report(
     ablation_path = generate_ablation_summary(results, output_dir)
     if ablation_path:
         figures['ablation_summary.png'] = ablation_path
-    figures['seed_sensitivity.png'] = generate_seed_sensitivity(results, output_dir)
+    seed_path = generate_seed_sensitivity(results, output_dir)
+    if seed_path:
+        figures['seed_sensitivity.png'] = seed_path
     figures['vcf_robustness.png'] = generate_vcf_robustness(results, output_dir)
     figures['coverage_performance.png'] = generate_coverage_performance(results, output_dir)
     figures['metric_correlation.png'] = generate_metric_correlation(results, output_dir)
@@ -2100,7 +2104,9 @@ def generate_report(
         figures['ablation_summary.png'] = ablation_path
     
     logger.info("Generating seed sensitivity plot...")
-    figures['seed_sensitivity.png'] = generate_seed_sensitivity(results, output_dir)
+    seed_path = generate_seed_sensitivity(results, output_dir)
+    if seed_path:
+        figures['seed_sensitivity.png'] = seed_path
     
     logger.info("Generating VCF robustness plot...")
     figures['vcf_robustness.png'] = generate_vcf_robustness(results, output_dir)
