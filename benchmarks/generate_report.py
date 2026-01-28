@@ -569,12 +569,14 @@ def generate_ablation_summary(
         by_ablation[ablation].append(r)
     
     if len(by_ablation) < 2:
-        raise ValueError("Ablation summary requires multiple ablation modes in results.")
+        logger.warning("Ablation summary requires multiple ablation modes; skipping plot.")
+        return ""
     
     # Compare each ablation to 'full'
     full_results = by_ablation.get('full', [])
     if not full_results:
-        raise ValueError("Ablation summary requires a 'full' ablation baseline in results.")
+        logger.warning("Ablation summary requires a 'full' baseline; skipping plot.")
+        return ""
     
     ablation_modes = [m for m in by_ablation.keys() if m != 'full']
     metrics = ['haplotype_f1', 'snv_f1', 'track_fragmentation_mean', 'lineage_f1']
@@ -1765,7 +1767,9 @@ def generate_html_report(
     )
     figures['complexity_comparison.png'] = generate_complexity_comparison(results, summary, output_dir)
     figures['optimal_params.png'] = generate_optimal_params(stable_params, output_dir)
-    figures['ablation_summary.png'] = generate_ablation_summary(results, output_dir)
+    ablation_path = generate_ablation_summary(results, output_dir)
+    if ablation_path:
+        figures['ablation_summary.png'] = ablation_path
     figures['seed_sensitivity.png'] = generate_seed_sensitivity(results, output_dir)
     figures['vcf_robustness.png'] = generate_vcf_robustness(results, output_dir)
     figures['coverage_performance.png'] = generate_coverage_performance(results, output_dir)
@@ -2091,7 +2095,9 @@ def generate_report(
     figures['optimal_params.png'] = generate_optimal_params(stable_params, output_dir)
     
     logger.info("Generating ablation summary...")
-    figures['ablation_summary.png'] = generate_ablation_summary(results, output_dir)
+    ablation_path = generate_ablation_summary(results, output_dir)
+    if ablation_path:
+        figures['ablation_summary.png'] = ablation_path
     
     logger.info("Generating seed sensitivity plot...")
     figures['seed_sensitivity.png'] = generate_seed_sensitivity(results, output_dir)
