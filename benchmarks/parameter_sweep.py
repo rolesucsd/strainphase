@@ -687,7 +687,11 @@ class ParameterSweep:
         self.truth_dir: Optional[str] = None
 
     def _validate_grid(self, grid: Dict[str, List]) -> None:
-        """Enforce that the parameter grid matches agents.md."""
+        """Enforce that the parameter grid matches agents.md.
+        
+        Allows subsets of required values (for custom parameter files),
+        but requires all keys to be present and values to be valid.
+        """
         required_keys = set(self.REQUIRED_GRID.keys())
         provided_keys = set(grid.keys())
         if required_keys != provided_keys:
@@ -697,10 +701,18 @@ class ParameterSweep:
 
         for key, required_values in self.REQUIRED_GRID.items():
             provided_values = grid.get(key, [])
-            if sorted(required_values) != sorted(provided_values):
+            if not provided_values:
                 raise ValueError(
                     f"Parameter grid mismatch for {key}: "
-                    f"expected {required_values}, got {provided_values}"
+                    f"empty value list not allowed"
+                )
+            # Check that all provided values are valid (subset of required)
+            invalid_values = set(provided_values) - set(required_values)
+            if invalid_values:
+                raise ValueError(
+                    f"Parameter grid mismatch for {key}: "
+                    f"invalid values {sorted(invalid_values)} not in required set {required_values}. "
+                    f"Provided: {provided_values}, Required: {required_values}"
                 )
 
     def generate_parameter_sets(self) -> List[ParameterSet]:
