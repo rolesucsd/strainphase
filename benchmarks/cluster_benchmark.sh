@@ -40,15 +40,14 @@ SEED="${SEED:-42}"
 
 # Parameter sweep configuration
 # MODE: "grid" for full sweep (13,824 configs), "sequential" for coordinate descent (~27 configs)
-# Using "grid" mode with best_params.json to test exactly 4 best parameter combinations
-MODE="${MODE:-grid}"
+MODE="${MODE:-sequential}"
 # MAX_CONFIGS: Limit configs for grid mode (set to 4 for best params)
 MAX_CONFIGS="${MAX_CONFIGS:-4}"
 # Custom parameter file with best 4 combinations (only used in grid mode)
 # Sequential mode uses the default REQUIRED_GRID for coordinate descent optimization
 PARAMS_FILE="${PARAMS_FILE:-$SCRIPT_DIR/best_params.json}"
 # PASSES: Number of optimization passes for sequential mode (not used in grid mode)
-PASSES="${PASSES:-1}"
+PASSES="${PASSES:-3}"
 # CHECKPOINT_INTERVAL: Save checkpoint every N configs
 CHECKPOINT_INTERVAL="${CHECKPOINT_INTERVAL:-10}"
 # WORKERS: Number of parallel workers for window processing (use SLURM cpus if available)

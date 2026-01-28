@@ -252,7 +252,7 @@ def run_parameter_sweep(
     mode: str = "grid",
     resume: bool = False,
     checkpoint_interval: int = 10,
-    passes: int = 1,
+    passes: int = 3,
     n_workers: int = 1,
     params_file: Optional[str] = None,
     coverage: Optional[int] = None,
@@ -765,7 +765,7 @@ def main():
                         help="Save checkpoint every N configs")
 
     # Sequential mode options
-    parser.add_argument("--passes", type=int, default=1,
+    parser.add_argument("--passes", type=int, default=3,
                         help="Number of optimization passes (sequential mode only)")
 
     # Parallelization

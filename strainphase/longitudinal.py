@@ -35,7 +35,6 @@ import logging
 import os
 import sys
 from collections import defaultdict
-from typing import Optional, Set
 
 import pandas as pd
 import pysam  # noqa: F401
@@ -44,7 +43,6 @@ from strainphase.core import (
     Haplotype,
     HaplotyperConfig,
     LongitudinalIntegrator,
-    RescueStatistic,
     WindowResult,
     link_windows,
     process_contig,
@@ -102,7 +100,7 @@ def load_allowed_contigs(path: str) -> set[str]:
 
 
 def parse_reference_contigs(
-    fasta_path: str, allowed_contigs: Optional[Set[str]] = None
+    fasta_path: str, allowed_contigs: set[str] | None = None
 ) -> dict[str, dict[str, int]]:
     """
     Parse reference .fai to get contig info grouped by MAG.
@@ -144,7 +142,7 @@ def parse_reference_contigs(
 
 
 def process_mag_longitudinal(
-    mag_name: Optional[str],
+    mag_name: str | None,
     mag_contigs: dict[str, int],
     samples: list[str],
     bam_paths: dict[str, str],
@@ -608,7 +606,7 @@ def main():
                 sys.exit(1)
 
     # Load optional contig filter
-    allowed_contigs: Optional[Set[str]] = None
+    allowed_contigs: set[str] | None = None
     if args.contig_filter:
         allowed_contigs = load_allowed_contigs(args.contig_filter)
 

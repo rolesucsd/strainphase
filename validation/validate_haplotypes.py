@@ -2200,6 +2200,8 @@ def run_validation(
     if window_results and window_size:
         try:
             from validation.validate_tracks import validate_tracks
+            logger.info(f"Running track validation with {len(window_results)} window results")
+            logger.info(f"Strain matches: {len(strain_matches)} mappings")
             track_result = validate_tracks(
                 window_results, truth_dir, strain_matches, truth_snvs, window_size
             )
@@ -2208,8 +2210,12 @@ def run_validation(
             result.false_link_rate = track_result.false_link_rate
             result.missed_link_rate = track_result.missed_link_rate
             result.track_consensus_error = track_result.track_consensus_error
+            logger.info(f"Track validation complete: fragmentation={result.track_fragmentation_mean:.3f}, "
+                       f"false_link={result.false_link_rate:.3f}, missed_link={result.missed_link_rate:.3f}")
         except Exception as e:
             logger.warning(f"Track validation failed: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
 
     # Lineage validation
     try:
@@ -2236,6 +2242,10 @@ def run_validation(
         true_abundances = {h.strain_id: h.abundances for h in true_haps}
         detected_abundances = {h.lineage_id: h.abundances for h in detected_haps if h.lineage_id}
         
+        logger.info(f"Running lineage validation with {len(detected_lineages)} detected lineages")
+        logger.info(f"True abundances: {len(true_abundances)} strains")
+        logger.info(f"Detected abundances: {len(detected_abundances)} lineages")
+        
         lineage_result = validate_lineages(
             detected_lineages, truth_dir, true_abundances, detected_abundances,
             detected_without_rescue=detected_without_rescue
@@ -2245,8 +2255,12 @@ def run_validation(
         result.lineage_f1 = lineage_result.lineage_f1
         result.rescue_delta_recall_rare = lineage_result.rescue_delta_recall_rare
         result.abundance_trajectory_error = lineage_result.abundance_trajectory_error
+        logger.info(f"Lineage validation complete: precision={result.lineage_precision:.3f}, "
+                   f"recall={result.lineage_recall:.3f}, f1={result.lineage_f1:.3f}")
     except Exception as e:
         logger.warning(f"Lineage validation failed: {e}")
+        import traceback
+        logger.debug(traceback.format_exc())
 
     # Generate figures
     generate_figures(

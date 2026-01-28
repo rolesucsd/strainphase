@@ -614,7 +614,7 @@ class ParameterSweep:
         # Minimum window_size is 10000 to ensure sufficient shared SNVs for reliable linking.
         # With ~1-2 SNVs/kb, smaller windows have too few SNVs in the 50% overlap region.
         'window_size': [10000, 20000, 50000, 100000],
-        'max_reads_per_window': [100, 300, 600],
+        'max_reads_per_window': [100, 500],
         
         # Clustering parameters
         'max_mismatch_frac': [0.005, 0.01, 0.02, 0.04],
@@ -632,7 +632,7 @@ class ParameterSweep:
         
         # Linking thresholds (publication expansion)
         'max_link_distance': [0.01, 0.02, 0.04],
-        'min_shared_snvs_for_link': [2, 3, 5],
+        'min_shared_snvs_for_link': [2, 3, 4, 5],
         
         # Abundance thresholds
         'min_weight_for_anchor': [0.05, 0.10, 0.15, 0.20],
@@ -659,10 +659,10 @@ class ParameterSweep:
     # These match the best parameters found in benchmarking
     DEFAULT_START_VALUES = {
         'window_size': 20000,
-        'max_mismatch_frac': 0.01,
-        'min_shared_snvs_for_edge': 4,  # Increased from 2 for better cluster purity
-        'merge_distance_threshold': 0.02,  # Increased from 0.005 for better merging
-        'min_mapq': 20,  # Increased from 10 for higher quality reads
+        'max_mismatch_frac': 0.02,
+        'min_shared_snvs_for_edge': 3,
+        'merge_distance_threshold': 0.02,
+        'min_mapq': 20, 
         'min_base_quality': 20,
         'min_weight_for_anchor': 0.10,
         'rescued_min_weight': 0.02,
@@ -2000,7 +2000,7 @@ def run_parameter_sweep(
     mode: str = "grid",
     resume: bool = False,
     checkpoint_interval: int = 10,
-    passes: int = 1,
+    passes: int = 3,
     n_workers: int = 1,
 ) -> Dict[str, Any]:
     """
@@ -2230,7 +2230,7 @@ def main():
                         help="Save checkpoint every N configs")
 
     # Sequential mode options
-    parser.add_argument("--passes", type=int, default=1,
+    parser.add_argument("--passes", type=int, default=3,
                         help="Number of optimization passes (sequential mode only)")
 
     # Parallelization

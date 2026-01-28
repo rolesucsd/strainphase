@@ -276,6 +276,51 @@ def write_ground_truth(
                 allele_str = ",".join(alleles) if alleles else "."
                 f.write(f"{strain}\t{contig}\t{allele_str}\n")
 
+    # truth_tracks.tsv - Track spans per strain per contig
+    # Get contig lengths from reference
+    try:
+        import pysam
+        ref = pysam.FastaFile(reference_path)
+        contig_lengths = {name: ref.get_reference_length(name) for name in ref.references}
+        ref.close()
+    except Exception as e:
+        logger.warning(f"Could not read reference to get contig lengths: {e}")
+        contig_lengths = {contig: 1000000 for contig in all_snv_positions.keys()}  # Fallback
+    
+    with open(os.path.join(output_dir, "truth_tracks.tsv"), "w") as f:
+        f.write("strain_id\tcontig\tstart\tend\twindow_chain\n")
+        for strain in strain_names:
+            # Get contigs where this strain has variants
+            strain_contigs = set()
+            for var in variants_by_strain.get(strain, []):
+                strain_contigs.add(var["contig"])
+            # Also include all contigs that have SNVs (for reference strain)
+            for contig in all_snv_positions.keys():
+                if contig not in strain_contigs:
+                    strain_contigs.add(contig)
+            
+            for contig in sorted(strain_contigs):
+                contig_len = contig_lengths.get(contig, 1000000)
+                f.write(f"{strain}\t{contig}\t1\t{contig_len}\tfull\n")
+    
+    # truth_lineages.tsv - Lineage mapping (strain_id -> lineage_id per contig)
+    # For isolate mix: each strain is a distinct lineage
+    with open(os.path.join(output_dir, "truth_lineages.tsv"), "w") as f:
+        f.write("strain_id\tlineage_id\tcontig\n")
+        for strain in strain_names:
+            # Get contigs where this strain has variants or appears
+            strain_contigs = set()
+            for var in variants_by_strain.get(strain, []):
+                strain_contigs.add(var["contig"])
+            # Include all contigs that have SNVs (for reference/comparison)
+            for contig in all_snv_positions.keys():
+                strain_contigs.add(contig)
+            
+            # Each strain gets its own lineage_id (same as strain_id)
+            lineage_id = strain
+            for contig in sorted(strain_contigs):
+                f.write(f"{strain}\t{lineage_id}\t{contig}\n")
+
     logger.info(f"Wrote ground truth files to {output_dir}")
 
 
@@ -454,8 +499,45 @@ def write_ground_truth_from_vcfs(
             for pos in sorted(all_positions[contig]):
                 f.write(f"{contig}\t{pos}\n")
 
+    # truth_tracks.tsv - Track spans per strain per contig
+    # Get contig lengths from reference
+    contig_lengths = {name: ref.get_reference_length(name) for name in ref.references}
+    
+    with open(os.path.join(output_dir, "truth_tracks.tsv"), "w") as f:
+        f.write("strain_id\tcontig\tstart\tend\twindow_chain\n")
+        for strain in strain_names:
+            # Get contigs where this strain has variants
+            strain_contigs = set()
+            for var in variants_by_strain.get(strain, []):
+                strain_contigs.add(var["contig"])
+            # Also include all contigs that have SNVs (for reference strain)
+            for contig in all_positions.keys():
+                strain_contigs.add(contig)
+            
+            for contig in sorted(strain_contigs):
+                contig_len = contig_lengths.get(contig, 1000000)
+                f.write(f"{strain}\t{contig}\t1\t{contig_len}\tfull\n")
+    
+    # truth_lineages.tsv - Lineage mapping (strain_id -> lineage_id per contig)
+    # For isolate mix: each strain is a distinct lineage
+    with open(os.path.join(output_dir, "truth_lineages.tsv"), "w") as f:
+        f.write("strain_id\tlineage_id\tcontig\n")
+        for strain in strain_names:
+            # Get contigs where this strain has variants or appears
+            strain_contigs = set()
+            for var in variants_by_strain.get(strain, []):
+                strain_contigs.add(var["contig"])
+            # Include all contigs that have SNVs (for reference/comparison)
+            for contig in all_positions.keys():
+                strain_contigs.add(contig)
+            
+            # Each strain gets its own lineage_id (same as strain_id)
+            lineage_id = strain
+            for contig in sorted(strain_contigs):
+                f.write(f"{strain}\t{lineage_id}\t{contig}\n")
+
     ref.close()
-    logger.info(f"  Wrote ground truth files to {output_dir}")
+    logger.info(f"  Wrote ground truth files (including truth_tracks.tsv and truth_lineages.tsv) to {output_dir}")
 
 
 def prepare_isolate_mix(
