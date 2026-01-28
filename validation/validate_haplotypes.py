@@ -2222,27 +2222,63 @@ def run_validation(
         from validation.validate_lineages import validate_lineages
         
         # Build detected lineages: lineage_id -> {contig -> strain_id}
+        # We need to map each (lineage_id, contig) pair to a strain_id
+        # Use the matches to determine which strain each detected lineage belongs to on each contig
+        
+        # The matches list contains (true_hap, det_hap, distance) tuples
+        # For each match, map the detected haplotype's (lineage_id, contig) pairs to the matched strain_id
+        lineage_contig_to_strain = {}
+        
+        # Process matches to build the mapping
+        for true_hap, det_match, _ in matches:
+            if not det_match.lineage_id:
+                continue
+            matched_strain = true_hap.strain_id
+            
+            # For each contig where this detected haplotype has SNVs
+            for contig in det_match.snv_alleles.keys():
+                # Check if this contig exists in the true haplotype (to ensure it's a valid match)
+                if contig in true_hap.snv_positions:
+                    key = (det_match.lineage_id, contig)
+                    # Only add if we haven't seen this (lineage_id, contig) pair before
+                    # or if it matches the same strain (to avoid conflicts)
+                    if key not in lineage_contig_to_strain:
+                        lineage_contig_to_strain[key] = matched_strain
+                    elif lineage_contig_to_strain[key] != matched_strain:
+                        # Conflict: same lineage_id+contig matches different strains
+                        # This can happen if a detected lineage is incorrectly linked across strains
+                        logger.debug(f"Conflict: lineage {det_match.lineage_id} on contig {contig} "
+                                   f"matches both {lineage_contig_to_strain[key]} and {matched_strain}")
+        
+        # Now build detected_lineages structure: lineage_id -> {contig -> strain_id}
         detected_lineages = {}
-        for det_hap in detected_haps:
-            if det_hap.lineage_id:
-                if det_hap.lineage_id not in detected_lineages:
-                    detected_lineages[det_hap.lineage_id] = {}
-                # Map contigs from SNV alleles
-                for contig in det_hap.snv_alleles.keys():
-                    # Find matching true strain
-                    matching_strain = None
-                    for true_hap, det_match, _ in matches:
-                        if det_match.lineage_id == det_hap.lineage_id and contig in true_hap.snv_positions:
-                            matching_strain = true_hap.strain_id
-                            break
-                    if matching_strain:
-                        detected_lineages[det_hap.lineage_id][contig] = matching_strain
+        for (lineage_id, contig), strain_id in lineage_contig_to_strain.items():
+            if lineage_id not in detected_lineages:
+                detected_lineages[lineage_id] = {}
+            detected_lineages[lineage_id][contig] = strain_id
+        
+        logger.info(f"Built detected_lineages: {len(detected_lineages)} lineages, "
+                   f"{sum(len(c) for c in detected_lineages.values())} (lineage_id, contig) pairs")
+        if not detected_lineages:
+            logger.warning("WARNING: detected_lineages is empty! This will cause zero lineage metrics.")
+            logger.warning(f"  Number of matches: {len(matches)}")
+            logger.warning(f"  Number of detected haplotypes: {len(detected_haps)}")
+            if matches:
+                sample_match = matches[0]
+                logger.warning(f"  Sample match: true_strain={sample_match[0].strain_id}, "
+                             f"det_lineage={sample_match[1].lineage_id}, "
+                             f"det_contigs={list(sample_match[1].snv_alleles.keys())}")
         
         # Build abundance dictionaries
         true_abundances = {h.strain_id: h.abundances for h in true_haps}
         detected_abundances = {h.lineage_id: h.abundances for h in detected_haps if h.lineage_id}
         
         logger.info(f"Running lineage validation with {len(detected_lineages)} detected lineages")
+        if detected_lineages:
+            total_contigs = sum(len(contigs) for contigs in detected_lineages.values())
+            logger.info(f"  Total (lineage_id, contig) pairs: {total_contigs}")
+            sample = list(detected_lineages.items())[0]
+            logger.info(f"  Sample: lineage {sample[0]} appears on contigs: {list(sample[1].keys())}")
         logger.info(f"True abundances: {len(true_abundances)} strains")
         logger.info(f"Detected abundances: {len(detected_abundances)} lineages")
         

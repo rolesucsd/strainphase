@@ -103,8 +103,8 @@ class HaplotyperConfig:
     min_reads_per_cluster: int = 3
 
     # =========== EM PARAMETERS ===========
-    em_max_iter: int = 20
-    em_tolerance: float = 1e-4
+    em_max_iter: int = 30
+    em_tolerance: float = 1e-5
     dirichlet_alpha: float = 1.0
     min_hap_eff_weight: float = 3.0
     min_gamma_for_vote: float = 0.01
@@ -1246,33 +1246,39 @@ class LongitudinalIntegrator:
                     rescued_any = True
 
                     # Record rescue statistic
-                    donor_timepoint = anchor_samples[best_anchor_idx] if best_anchor_idx >= 0 else "unknown"
-                    self.rescue_statistics.append(RescueStatistic(
+                    donor_timepoint = (
+                        anchor_samples[best_anchor_idx] if best_anchor_idx >= 0 else "unknown"
+                    )
+                    self.rescue_statistics.append(
+                        RescueStatistic(
+                            sample=current_sample,
+                            contig=window.contig,
+                            window_start=window.start,
+                            track_id=hap.track_id or f"unlinked_{window.start}_{k}",
+                            was_rescued=True,
+                            original_weight=old_weight,
+                            rescued_weight=new_weight,
+                            donor_timepoint=donor_timepoint,
+                            anchor_distance=best_dist,
+                            n_shared_with_anchor=best_n_shared,
+                        )
+                    )
+            else:
+                # Record non-rescued haplotype (below anchor threshold)
+                self.rescue_statistics.append(
+                    RescueStatistic(
                         sample=current_sample,
                         contig=window.contig,
                         window_start=window.start,
                         track_id=hap.track_id or f"unlinked_{window.start}_{k}",
-                        was_rescued=True,
-                        original_weight=old_weight,
-                        rescued_weight=new_weight,
-                        donor_timepoint=donor_timepoint,
-                        anchor_distance=best_dist,
+                        was_rescued=False,
+                        original_weight=pi[k],
+                        rescued_weight=pi[k],
+                        donor_timepoint="",
+                        anchor_distance=best_dist if best_n_shared > 0 else -1.0,
                         n_shared_with_anchor=best_n_shared,
-                    ))
-            else:
-                # Record non-rescued haplotype (below anchor threshold)
-                self.rescue_statistics.append(RescueStatistic(
-                    sample=current_sample,
-                    contig=window.contig,
-                    window_start=window.start,
-                    track_id=hap.track_id or f"unlinked_{window.start}_{k}",
-                    was_rescued=False,
-                    original_weight=pi[k],
-                    rescued_weight=pi[k],
-                    donor_timepoint="",
-                    anchor_distance=best_dist if best_n_shared > 0 else -1.0,
-                    n_shared_with_anchor=best_n_shared,
-                ))
+                    )
+                )
 
         if rescued_any:
             pi = pi / pi.sum()
@@ -1393,28 +1399,39 @@ class LongitudinalIntegrator:
         import csv
 
         fieldnames = [
-            'sample', 'contig', 'window_start', 'track_id',
-            'was_rescued', 'original_weight', 'rescued_weight',
-            'donor_timepoint', 'anchor_distance', 'n_shared_with_anchor'
+            "sample",
+            "contig",
+            "window_start",
+            "track_id",
+            "was_rescued",
+            "original_weight",
+            "rescued_weight",
+            "donor_timepoint",
+            "anchor_distance",
+            "n_shared_with_anchor",
         ]
 
-        with open(output_path, 'w', newline='') as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames, delimiter='\t')
+        with open(output_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames, delimiter="\t")
             writer.writeheader()
 
             for stat in self.rescue_statistics:
-                writer.writerow({
-                    'sample': stat.sample,
-                    'contig': stat.contig,
-                    'window_start': stat.window_start,
-                    'track_id': stat.track_id,
-                    'was_rescued': stat.was_rescued,
-                    'original_weight': f"{stat.original_weight:.6f}",
-                    'rescued_weight': f"{stat.rescued_weight:.6f}",
-                    'donor_timepoint': stat.donor_timepoint,
-                    'anchor_distance': f"{stat.anchor_distance:.6f}" if stat.anchor_distance >= 0 else "NA",
-                    'n_shared_with_anchor': stat.n_shared_with_anchor,
-                })
+                writer.writerow(
+                    {
+                        "sample": stat.sample,
+                        "contig": stat.contig,
+                        "window_start": stat.window_start,
+                        "track_id": stat.track_id,
+                        "was_rescued": stat.was_rescued,
+                        "original_weight": f"{stat.original_weight:.6f}",
+                        "rescued_weight": f"{stat.rescued_weight:.6f}",
+                        "donor_timepoint": stat.donor_timepoint,
+                        "anchor_distance": (
+                            f"{stat.anchor_distance:.6f}" if stat.anchor_distance >= 0 else "NA"
+                        ),
+                        "n_shared_with_anchor": stat.n_shared_with_anchor,
+                    }
+                )
 
         return output_path
 
@@ -1567,7 +1584,9 @@ def link_windows(
                 best_for_i.setdefault(hi, []).append((dist, hj))
                 best_for_j.setdefault(hj, []).append((dist, hi))
 
-            def unique_best(matches: dict[int, list[tuple[float, int]]]) -> dict[int, tuple[int, float]]:
+            def unique_best(
+                matches: dict[int, list[tuple[float, int]]],
+            ) -> dict[int, tuple[int, float]]:
                 unique: dict[int, tuple[int, float]] = {}
                 for idx, options in matches.items():
                     options.sort(key=lambda x: x[0])
