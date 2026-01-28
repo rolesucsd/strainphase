@@ -1,7 +1,7 @@
 {
   "window_size": [10000, 20000, 50000],
   "max_reads_per_window": [300],
-  "max_mismatch_frac": [0.01, 0.02, 0.05],
+  "max_mismatch_frac": [0.01, 0.02, 0.04],
   "min_shared_snvs_for_edge": [3, 5],
   "min_mapq": [20],
   "min_base_quality": [20],
