@@ -87,12 +87,34 @@ def compute_track_fragmentation(
     # Group detected tracks by true strain and contig
     strain_contig_tracks: Dict[str, Dict[str, Set[str]]] = defaultdict(lambda: defaultdict(set))
     
+    # Debug: collect statistics
+    total_haps = 0
+    haps_with_track_id = 0
+    haps_matched = 0
+    sample_track_ids = set()
+    
     for wr in window_results:
         contig = wr.window.contig
         for hap in wr.haplotypes:
-            if hap.track_id and hap.track_id in strain_matches:
-                true_strain_id = strain_matches[hap.track_id]
-                strain_contig_tracks[true_strain_id][contig].add(hap.track_id)
+            total_haps += 1
+            if hap.track_id:
+                haps_with_track_id += 1
+                sample_track_ids.add(hap.track_id)
+                if hap.track_id in strain_matches:
+                    haps_matched += 1
+                    true_strain_id = strain_matches[hap.track_id]
+                    strain_contig_tracks[true_strain_id][contig].add(hap.track_id)
+    
+    logger.info(f"Track fragmentation debug: {total_haps} total haplotypes, "
+                f"{haps_with_track_id} with track_id, {haps_matched} matched to strain")
+    
+    # Show sample track_ids if no matches
+    if haps_with_track_id > 0 and haps_matched == 0:
+        sample_hap_tracks = list(sample_track_ids)[:5]
+        sample_match_keys = list(strain_matches.keys())[:5]
+        logger.warning(f"No track_id matches found!")
+        logger.warning(f"  Sample haplotype track_ids: {sample_hap_tracks}")
+        logger.warning(f"  Sample strain_matches keys: {sample_match_keys}")
     
     # Count tracks per strain/contig
     fragmentation_counts = []
@@ -106,10 +128,14 @@ def compute_track_fragmentation(
             per_strain_fragmentation[strain_id][contig] = n_tracks
     
     if not fragmentation_counts:
+        logger.info("No fragmentation data collected - returning zeros")
         return 0.0, 0.0, {}
     
     mean_frag = np.mean(fragmentation_counts)
     median_frag = np.median(fragmentation_counts)
+    
+    logger.info(f"Track fragmentation: {len(fragmentation_counts)} strain/contig pairs, "
+                f"mean={mean_frag:.3f}, median={median_frag:.3f}")
     
     return mean_frag, median_frag, per_strain_fragmentation
 

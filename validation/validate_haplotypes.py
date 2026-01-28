@@ -2185,11 +2185,46 @@ def run_validation(
     matches = match_haplotypes(true_haps, detected_haps, allow_one_to_many=True)
     
     # Build strain matches for track validation: detected_track_id -> true_strain_id
-    strain_matches = {}
+    # We need two mappings:
+    # 1. lineage_id -> strain_id (for lineage validation - from matches)
+    # 2. track_id -> strain_id (for track validation - need to map through lineage_id)
+    
+    lineage_to_strain = {}
     for true_hap, det_hap, _ in matches:
-        # Use lineage_id as track_id (they should be equivalent)
         if det_hap.lineage_id:
-            strain_matches[det_hap.lineage_id] = true_hap.strain_id
+            lineage_to_strain[det_hap.lineage_id] = true_hap.strain_id
+    
+    # Now build track_id -> strain_id mapping by reading the lineages.tsv file
+    # which contains the mapping from original track_ids to lineage_ids
+    strain_matches = {}
+    
+    # First, copy the lineage_id -> strain_id mapping (some code expects this)
+    strain_matches.update(lineage_to_strain)
+    
+    # Then, read the lineages.tsv to get track_id -> lineage_id mapping
+    # lineages.tsv may be in output_dir or its parent (if output_dir is 'validation' subdirectory)
+    lineages_file = os.path.join(output_dir, 'lineages.tsv')
+    if not os.path.exists(lineages_file):
+        lineages_file = os.path.join(os.path.dirname(output_dir), 'lineages.tsv')
+    if os.path.exists(lineages_file):
+        try:
+            with open(lineages_file) as f:
+                header = f.readline().strip().split('\t')
+                if 'track_id' in header and 'lineage_id' in header:
+                    track_idx = header.index('track_id')
+                    lineage_idx = header.index('lineage_id')
+                    for line in f:
+                        parts = line.strip().split('\t')
+                        if len(parts) > max(track_idx, lineage_idx):
+                            track_id = parts[track_idx]
+                            lineage_id = parts[lineage_idx]
+                            # Map track_id to the same strain_id as its lineage_id
+                            if lineage_id in lineage_to_strain and track_id != lineage_id:
+                                strain_matches[track_id] = lineage_to_strain[lineage_id]
+            logger.info(f"Built track mapping: {len(lineage_to_strain)} lineage->strain, "
+                       f"{len(strain_matches)} total track->strain mappings")
+        except Exception as e:
+            logger.warning(f"Failed to read track_id mapping from lineages.tsv: {e}")
     
     # Build truth SNVs: strain_id -> {contig -> {pos -> allele}}
     truth_snvs = {}
