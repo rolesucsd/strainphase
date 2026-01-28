@@ -1981,6 +1981,7 @@ def run_parameter_sweep(
     output_dir: str = "benchmarks/results",
     truth_dir: Optional[str] = None,
     params_file: Optional[str] = None,
+    coverage: Optional[int] = None,
     max_configs: Optional[int] = None,
     max_contigs: Optional[int] = None,
     verbose: bool = True,
@@ -2003,6 +2004,7 @@ def run_parameter_sweep(
         output_dir: Output directory for results
         truth_dir: Ground truth directory (optional, for accuracy metrics)
         params_file: Custom parameter grid JSON file (optional)
+        coverage: Coverage metadata to attach to each result (optional)
         max_configs: Limit number of configs to test (grid mode only)
         max_contigs: Limit number of contigs
         verbose: Print progress
@@ -2078,6 +2080,9 @@ def run_parameter_sweep(
 
     # Save raw results
     results_data = [r.to_dict() for r in results]
+    if coverage is not None:
+        for r in results_data:
+            r.setdefault("coverage", coverage)
     with open(os.path.join(output_dir, 'sweep_results.json'), 'w') as f:
         json.dump(results_data, f, indent=2, default=str)
 
@@ -2092,6 +2097,7 @@ def run_parameter_sweep(
             "replicate": idx + 1,  # Sequential index as replicate number
             "environment": r.environment or {},
             "ablation": r.ablation,  # e.g., "full", "no_linking", "no_rescue", etc.
+            "coverage": coverage,
             "metrics": {
                 "haplotype_precision": r.haplotype_precision,
                 "haplotype_recall": r.haplotype_recall,
@@ -2185,6 +2191,8 @@ def main():
                         help="Ground truth directory from simulation (optional)")
     parser.add_argument("--params", dest="params_file",
                         help="Custom parameter grid JSON file (optional)")
+    parser.add_argument("--coverage", type=int,
+                        help="Coverage metadata to attach to each result (optional)")
 
     # Output
     parser.add_argument("--output", "-o", default="benchmarks/results",
@@ -2246,6 +2254,7 @@ def main():
             output_dir=args.output,
             truth_dir=args.truth_dir,
             params_file=args.params_file,
+            coverage=args.coverage,
             max_configs=args.max_configs,
             max_contigs=args.max_contigs,
             verbose=not args.quiet,
@@ -2263,6 +2272,7 @@ def main():
             output_dir=args.output,
             truth_dir=args.truth_dir,
             params_file=args.params_file,
+            coverage=args.coverage,
             max_configs=args.max_configs,
             max_contigs=args.max_contigs,
             verbose=not args.quiet,

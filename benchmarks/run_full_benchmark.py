@@ -255,6 +255,7 @@ def run_parameter_sweep(
     passes: int = 1,
     n_workers: int = 1,
     params_file: Optional[str] = None,
+    coverage: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     Run parameter sweep on simulated data.
@@ -368,6 +369,7 @@ def run_parameter_sweep(
         timepoints=timepoints,
         output_dir=str(sweep_output),
         truth_dir=sim_dir,
+        coverage=coverage,
         max_configs=max_configs,
         max_contigs=max_contigs,
         verbose=verbose,
@@ -626,12 +628,30 @@ def run_full_benchmark(
         passes=passes,
         n_workers=n_workers,
         params_file=params_file,
+        coverage=coverage,
     )
     results["steps"]["parameter_sweep"] = {
         "success": bool(sweep_summary),
         "duration_seconds": time.time() - step_start,
         "summary": sweep_summary
     }
+
+    # Ensure coverage metadata exists in sweep_results.json for reporting
+    sweep_results_path = output_path / "sweep_results" / "sweep_results.json"
+    if coverage is not None and sweep_results_path.exists():
+        try:
+            with open(sweep_results_path) as f:
+                sweep_results_data = json.load(f)
+            updated = False
+            for r in sweep_results_data:
+                if r.get("coverage") is None:
+                    r["coverage"] = coverage
+                    updated = True
+            if updated:
+                with open(sweep_results_path, "w") as f:
+                    json.dump(sweep_results_data, f, indent=2, default=str)
+        except (OSError, json.JSONDecodeError) as e:
+            logger.warning(f"Could not update sweep_results.json with coverage: {e}")
 
     # Step 5: Generate report
     step_start = time.time()
