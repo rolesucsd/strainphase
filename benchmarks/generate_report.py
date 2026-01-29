@@ -397,383 +397,6 @@ def generate_parameter_sensitivity(
 
     return filepath
 
-
-def generate_runtime_scaling(
-    results: List[Dict],
-    output_dir: str
-) -> str:
-    """
-    Generate runtime scaling plot.
-
-    Returns path to saved figure.
-    """
-    if not HAS_MATPLOTLIB or not results:
-        return ""
-
-    runtimes = [r.get('runtime_seconds', 0) for r in results]
-    n_lineages = [r.get('n_lineages', 0) for r in results]
-
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
-
-    # Histogram of runtimes
-    ax1.hist(runtimes, bins=20, color=COLOR_PALETTE['accent'], 
-            edgecolor=COLOR_PALETTE['primary'], linewidth=1.2, alpha=0.8)
-    ax1.set_xlabel('Runtime (seconds)', fontweight='bold', color=COLOR_PALETTE['primary'])
-    ax1.set_ylabel('Count', fontweight='bold', color=COLOR_PALETTE['primary'])
-    ax1.set_title('Runtime Distribution', fontweight='bold', color=COLOR_PALETTE['primary'])
-    ax1.axvline(np.mean(runtimes), color=COLOR_PALETTE['error'], linestyle='--', linewidth=2.0,
-                label=f'Mean: {np.mean(runtimes):.2f}s', alpha=0.8)
-    ax1.legend(frameon=True, framealpha=0.95, edgecolor=COLOR_PALETTE['neutral'])
-
-    # Runtime vs lineages
-    ax2.scatter(n_lineages, runtimes, alpha=0.7, s=50, 
-               color=COLOR_PALETTE['accent'], edgecolors=COLOR_PALETTE['primary'], 
-               linewidths=0.8)
-    ax2.set_xlabel('Number of Lineages', fontweight='bold', color=COLOR_PALETTE['primary'])
-    ax2.set_ylabel('Runtime (seconds)', fontweight='bold', color=COLOR_PALETTE['primary'])
-    ax2.set_title('Runtime vs Complexity', fontweight='bold', color=COLOR_PALETTE['primary'])
-
-    # Add trend line (only if there's variance in the data)
-    if len(n_lineages) > 2 and len(set(n_lineages)) > 1:
-        try:
-            z = np.polyfit(n_lineages, runtimes, 1)
-            p = np.poly1d(z)
-            x_line = np.linspace(min(n_lineages), max(n_lineages), 100)
-            ax2.plot(x_line, p(x_line), 'r--', alpha=0.8, label='Trend')
-            handles, labels = ax2.get_legend_handles_labels()
-            if handles:
-                ax2.legend(frameon=True, framealpha=0.95, edgecolor=COLOR_PALETTE['neutral'])
-        except (np.linalg.LinAlgError, ValueError):
-            pass  # Skip trend line if fitting fails
-
-    plt.tight_layout()
-    filepath = os.path.join(output_dir, 'runtime_scaling.png')
-    plt.savefig(filepath, dpi=300, bbox_inches='tight')
-    plt.close()
-
-    return filepath
-
-
-def generate_complexity_comparison(
-    results: List[Dict],
-    summary: Dict,
-    output_dir: str
-) -> str:
-    """
-    Generate enhanced grouped bar chart comparing metrics across complexity levels.
-    Publication-quality visualization with multiple metrics.
-
-    Returns path to saved figure.
-    """
-    if not HAS_MATPLOTLIB:
-        return ""
-    if not results:
-        raise ValueError("Complexity comparison requires sweep results.")
-
-    scenarios = summary.get('scenarios', {})
-    if not scenarios:
-        raise ValueError("Complexity comparison requires scenario stats in sweep_summary.json.")
-
-    scenario_names = list(scenarios.keys())
-    
-    # Enhanced metrics for publication
-    metrics = ['haplotype_f1', 'snv_f1', 'abundance_pearson_r', 'track_fragmentation_mean']
-    metric_labels = ['Haplotype F1', 'SNV F1', 'Abundance r', 'Track Fragmentation']
-    
-    # Extract metrics from results (more accurate than summary stats)
-    metric_by_scenario = {name: {m: [] for m in metrics} for name in scenario_names}
-    for r in results:
-        scenario = r.get('community', r.get('scenario_name', 'default'))
-        if scenario in scenario_names:
-            metrics_dict = r.get('metrics', {})
-            for metric in metrics:
-                val = metrics_dict.get(metric)
-                if val is not None:
-                    metric_by_scenario[scenario][metric].append(val)
-    
-    # Compute means
-    scenario_means = {}
-    for scenario in scenario_names:
-        scenario_means[scenario] = {}
-        for metric in metrics:
-            vals = metric_by_scenario[scenario][metric]
-            scenario_means[scenario][metric] = np.mean(vals) if vals else None
-
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-    axes = axes.flatten()
-    colors = COLOR_SEQUENCES['qualitative']
-
-    x = np.arange(len(scenario_names))
-    width = 0.6
-
-    for idx, (metric, label) in enumerate(zip(metrics, metric_labels)):
-        ax = axes[idx]
-        values = [scenario_means[name].get(metric, 0) if scenario_means[name].get(metric) is not None else 0 
-                 for name in scenario_names]
-        
-        bars = ax.bar(x, values, width, label=label, 
-                     color=colors[idx % len(colors)], 
-                     edgecolor=COLOR_PALETTE['primary'],
-                     linewidth=1.2, alpha=0.85)
-        
-        # Add value labels on bars
-        for bar, val in zip(bars, values):
-            if val > 0:
-                height = bar.get_height()
-                ax.text(bar.get_x() + bar.get_width()/2., height + 0.01,
-                       f'{val:.3f}', ha='center', va='bottom', fontsize=9,
-                       fontweight='bold', color=COLOR_PALETTE['primary'])
-        
-        ax.set_ylabel(label, fontweight='bold', color=COLOR_PALETTE['primary'])
-        ax.set_title(f'{label} by Complexity', fontweight='bold', color=COLOR_PALETTE['primary'])
-        ax.set_xticks(x)
-        ax.set_xticklabels(scenario_names, rotation=45, ha='right', color=COLOR_PALETTE['primary'])
-        if metric == 'track_fragmentation_mean':
-            max_val = max(values) if values else 0
-            ax.set_ylim(0, max_val * 1.2 if max_val > 0 else 1.0)
-            ax.axhline(y=1.0, color=COLOR_PALETTE['error'], linestyle='--', 
-                      linewidth=2.0, alpha=0.7, label='Ideal (1.0)')
-        else:
-            ax.set_ylim(0, 1.1)
-            ax.axhline(y=0.9, color=COLOR_PALETTE['warning'], linestyle='--',
-                      linewidth=2.0, alpha=0.7, label='Target (0.9)')
-        if idx == 0:
-            ax.legend(frameon=True, framealpha=0.95, edgecolor=COLOR_PALETTE['neutral'], fontsize=8)
-
-    plt.suptitle('Performance Metrics Across Complexity Levels', 
-                fontsize=16, fontweight='bold', color=COLOR_PALETTE['primary'], y=0.995)
-    plt.tight_layout()
-    filepath = os.path.join(output_dir, 'complexity_comparison.png')
-    plt.savefig(filepath, dpi=300, bbox_inches='tight')
-    plt.close()
-
-    return filepath
-
-
-def generate_ablation_summary(
-    results: List[Dict],
-    output_dir: str
-) -> str:
-    """
-    Generate ablation summary showing delta-metrics for key ablations.
-    
-    Returns path to saved figure.
-    """
-    if not HAS_MATPLOTLIB:
-        return ""
-    if not results:
-        raise ValueError("Ablation summary requires sweep results.")
-    
-    # Group by ablation mode
-    by_ablation = defaultdict(list)
-    for r in results:
-        ablation = r.get('ablation', 'full')
-        by_ablation[ablation].append(r)
-    
-    if len(by_ablation) < 2:
-        logger.warning("Ablation summary requires multiple ablation modes; skipping plot.")
-        return ""
-    
-    # Compare each ablation to 'full'
-    full_results = by_ablation.get('full', [])
-    if not full_results:
-        logger.warning("Ablation summary requires a 'full' baseline; skipping plot.")
-        return ""
-    
-    ablation_modes = [m for m in by_ablation.keys() if m != 'full']
-    metrics = ['haplotype_f1', 'snv_f1', 'track_fragmentation_mean', 'lineage_f1']
-    metric_labels = ['Haplotype F1', 'SNV F1', 'Track Fragmentation', 'Lineage F1']
-    
-    # Compute baseline (full mode)
-    baseline = {}
-    for metric in metrics:
-        values = [r.get('metrics', {}).get(metric) for r in full_results 
-                 if r.get('metrics', {}).get(metric) is not None]
-        baseline[metric] = np.mean(values) if values else 0.0
-    
-    # Compute deltas for each ablation
-    deltas = {mode: {} for mode in ablation_modes}
-    for mode in ablation_modes:
-        mode_results = by_ablation[mode]
-        for metric in metrics:
-            values = [r.get('metrics', {}).get(metric) for r in mode_results
-                     if r.get('metrics', {}).get(metric) is not None]
-            if values:
-                mean_val = np.mean(values)
-                deltas[mode][metric] = mean_val - baseline[metric]
-            else:
-                deltas[mode][metric] = 0.0
-    
-    # Plot
-    fig, ax = plt.subplots(figsize=(12, 6))
-    x = np.arange(len(metrics))
-    width = 0.8 / len(ablation_modes)
-    
-    colors = COLOR_SEQUENCES['qualitative'][:len(ablation_modes)]
-    for idx, mode in enumerate(ablation_modes):
-        delta_values = [deltas[mode].get(m, 0) for m in metrics]
-        ax.bar(x + idx * width, delta_values, width, label=mode.replace('_', ' '), 
-              color=colors[idx], edgecolor=COLOR_PALETTE['primary'], linewidth=1.2, alpha=0.85)
-    
-    ax.set_xlabel('Metric', fontweight='bold', color=COLOR_PALETTE['primary'])
-    ax.set_ylabel('Δ (Ablation - Full)', fontweight='bold', color=COLOR_PALETTE['primary'])
-    ax.set_title('Ablation Summary: Performance Delta vs Full Mode',
-                fontweight='bold', color=COLOR_PALETTE['primary'])
-    ax.set_xticks(x + width * (len(ablation_modes) - 1) / 2)
-    ax.set_xticklabels(metric_labels, rotation=45, ha='right',
-                      color=COLOR_PALETTE['primary'], fontsize=10)
-    ax.axhline(y=0, color=COLOR_PALETTE['primary'], linestyle='-', linewidth=1.5)
-    ax.legend(frameon=True, framealpha=0.95, edgecolor=COLOR_PALETTE['neutral'])
-    # No grid - clean professional look
-    
-    plt.tight_layout()
-    filepath = os.path.join(output_dir, 'ablation_summary.png')
-    plt.savefig(filepath, dpi=300, bbox_inches='tight')
-    plt.close()
-    
-    return filepath
-
-
-def generate_seed_sensitivity(
-    results: List[Dict],
-    output_dir: str
-) -> str:
-    """
-    Generate seed sensitivity plot showing metric variability across replicate seeds.
-    
-    Returns path to saved figure.
-    """
-    if not HAS_MATPLOTLIB or not results:
-        return ""
-    
-    # Group by parameter config and seed
-    by_config = defaultdict(lambda: defaultdict(list))
-    for r in results:
-        config_key = str(r.get('params', {}))
-        seed = r.get('seed')
-        if seed is not None:
-            by_config[config_key][seed].append(r)
-    
-    # Find configs with multiple seeds
-    multi_seed_configs = {k: v for k, v in by_config.items() if len(v) > 1}
-    if not multi_seed_configs:
-        logger.warning("Seed sensitivity requires multiple seeds per config; skipping plot.")
-        return ""
-    
-    # Select metric
-    metric = _select_metric(results)
-    
-    # Plot variability
-    fig, ax = plt.subplots(figsize=(12, 6))
-    
-    config_names = []
-    means = []
-    stds = []
-    
-    for config_key, seeds_dict in list(multi_seed_configs.items())[:10]:  # Limit to 10 configs
-        all_values = []
-        for seed_results in seeds_dict.values():
-            for r in seed_results:
-                val = r.get('metrics', {}).get(metric, r.get(metric, r.get('n_lineages', 0)))
-                if val is not None:
-                    all_values.append(val)
-        
-        if len(all_values) > 1:
-            config_names.append(config_key[:30] + '...' if len(config_key) > 30 else config_key)
-            means.append(np.mean(all_values))
-            stds.append(np.std(all_values))
-    
-    if not means:
-        logger.warning("Seed sensitivity requires metric values for multiple seeds; skipping plot.")
-        return ""
-    
-    x = np.arange(len(config_names))
-    ax.errorbar(x, means, yerr=stds, marker='o', capsize=5, linestyle='None', 
-               markersize=9, capthick=2, color=COLOR_PALETTE['accent'],
-               markerfacecolor=COLOR_PALETTE['accent'], markeredgecolor=COLOR_PALETTE['primary'],
-               markeredgewidth=1.0, ecolor=COLOR_PALETTE['neutral'], linewidth=2.0)
-    ax.set_xlabel('Parameter Configuration', fontweight='bold', color=COLOR_PALETTE['primary'])
-    ax.set_ylabel(f'{metric.replace("_", " ").title()}', 
-                 fontweight='bold', color=COLOR_PALETTE['primary'])
-    ax.set_title('Seed Sensitivity: Metric Variability Across Replicates',
-                fontweight='bold', color=COLOR_PALETTE['primary'])
-    ax.set_xticks(x)
-    ax.set_xticklabels(config_names, rotation=45, ha='right', fontsize=8,
-                       color=COLOR_PALETTE['primary'])
-    # No grid - clean professional look
-    
-    plt.tight_layout()
-    filepath = os.path.join(output_dir, 'seed_sensitivity.png')
-    plt.savefig(filepath, dpi=300, bbox_inches='tight')
-    plt.close()
-    
-    return filepath
-
-
-def generate_vcf_robustness(
-    results: List[Dict],
-    output_dir: str
-) -> str:
-    """
-    Generate VCF robustness plot showing performance under perturbed VCF conditions.
-    
-    Returns path to saved figure.
-    """
-    if not HAS_MATPLOTLIB:
-        return ""
-    if not results:
-        raise ValueError("VCF robustness requires sweep results with VCF condition metadata.")
-    
-    metric = _select_metric(results)
-
-    # Expect results to include VCF condition metadata.
-    condition_key = None
-    for key in ("vcf_condition", "vcf_realism", "vcf_tag"):
-        if any(r.get(key) is not None for r in results):
-            condition_key = key
-            break
-    if condition_key is None:
-        raise ValueError("VCF robustness requires VCF condition metadata in results.")
-
-    condition_map: Dict[str, List[float]] = defaultdict(list)
-    for r in results:
-        condition = r.get(condition_key)
-        score = r.get(metric)
-        if condition is None or score is None:
-            continue
-        condition_map[str(condition)].append(score)
-
-    if not condition_map:
-        raise ValueError("VCF robustness has no condition scores to plot.")
-
-    conditions = list(condition_map.keys())
-    values = [float(np.mean(condition_map[c])) for c in conditions]
-
-    fig, ax = plt.subplots(figsize=(10, 6))
-    
-    ax.bar(conditions, values, color=[COLOR_PALETTE['success'], COLOR_PALETTE['warning'], 
-          COLOR_PALETTE['error'], COLOR_PALETTE['info']], 
-          edgecolor=COLOR_PALETTE['primary'], linewidth=1.2, alpha=0.85)
-    ax.set_ylabel(f'{metric.replace("_", " ").title()}', 
-                 fontweight='bold', color=COLOR_PALETTE['primary'])
-    ax.set_title('VCF Robustness: Performance Under Perturbed VCF Conditions',
-                fontweight='bold', color=COLOR_PALETTE['primary'])
-    ax.set_ylim(0, 1.0)
-    ax.set_xticks(range(len(conditions)))
-    ax.set_xticklabels(conditions, color=COLOR_PALETTE['primary'])
-    
-    for i, (cond, val) in enumerate(zip(conditions, values)):
-        ax.text(i, val + 0.02, f'{val:.2f}', ha='center', fontsize=11, 
-               fontweight='bold', color=COLOR_PALETTE['primary'])
-    
-    plt.tight_layout()
-    filepath = os.path.join(output_dir, 'vcf_robustness.png')
-    plt.savefig(filepath, dpi=300, bbox_inches='tight')
-    plt.close()
-    
-    return filepath
-
-
 def generate_coverage_performance(
     results: List[Dict],
     output_dir: str
@@ -963,61 +586,14 @@ def generate_optimal_params(
     return filepath
 
 
-def generate_per_contig_f1_distribution(
-    validation_metrics: Optional[Dict],
-    output_dir: str
-) -> str:
-    """Plot per-contig F1 distribution."""
-    if not HAS_MATPLOTLIB:
-        return ""
-
-    validation_metrics = _require_validation_metrics(
-        validation_metrics, "Per-contig F1 distribution"
-    )
-    per_contig = _require_per_contig(validation_metrics, "Per-contig F1 distribution")
-
-    f1_values = []
-    for metrics in per_contig.values():
-        precision = metrics.get("precision")
-        recall = metrics.get("recall")
-        if precision is None or recall is None:
-            continue
-        denom = precision + recall
-        f1 = (2 * precision * recall / denom) if denom else 0.0
-        f1_values.append(f1)
-
-    if not f1_values:
-        raise ValueError("Per-contig F1 distribution requires precision/recall values.")
-
-    fig, ax = plt.subplots(figsize=(6, 4))
-    ax.boxplot(
-        f1_values,
-        vert=True,
-        widths=0.4,
-        patch_artist=True,
-        boxprops=dict(facecolor=COLOR_PALETTE['accent'], alpha=0.35),
-        medianprops=dict(color=COLOR_PALETTE['dark'], linewidth=1.6),
-    )
-    jitter = np.random.normal(1, 0.04, size=len(f1_values))
-    ax.scatter(jitter, f1_values, s=20, color=COLOR_PALETTE['primary'], alpha=0.6)
-    ax.set_xlim(0.6, 1.4)
-    ax.set_ylabel("F1 score")
-    ax.set_xticks([])
-    ax.set_title("Per-contig F1 distribution")
-    ax.set_ylim(0, 1.05)
-
-    plt.tight_layout()
-    filepath = os.path.join(output_dir, "per_contig_f1.png")
-    plt.savefig(filepath, dpi=600, bbox_inches="tight")
-    plt.close()
-    return filepath
-
-
 def generate_precision_recall_scatter(
     validation_metrics: Optional[Dict],
     output_dir: str
 ) -> str:
-    """Scatter precision vs recall per contig with iso-F1 curves."""
+    """
+    Scatter precision vs recall per contig with iso-F1 curves.
+    TODO: I want something like this but I don't like the current layout.
+    """
     if not HAS_MATPLOTLIB:
         return ""
 
@@ -1060,47 +636,6 @@ def generate_precision_recall_scatter(
     plt.savefig(filepath, dpi=600, bbox_inches="tight")
     plt.close()
     return filepath
-
-
-def generate_lineage_count_error(
-    validation_metrics: Optional[Dict],
-    output_dir: str
-) -> str:
-    """Scatter of detected vs true lineage counts per contig."""
-    if not HAS_MATPLOTLIB:
-        return ""
-
-    validation_metrics = _require_validation_metrics(validation_metrics, "Lineage count agreement")
-    per_contig = _require_per_contig(validation_metrics, "Lineage count agreement")
-
-    xs = []
-    ys = []
-    for metrics in per_contig.values():
-        n_true = metrics.get("n_true")
-        n_detected = metrics.get("n_detected")
-        if n_true is None or n_detected is None:
-            continue
-        xs.append(n_true)
-        ys.append(n_detected)
-
-    if not xs:
-        raise ValueError("Lineage count agreement requires n_true and n_detected.")
-
-    fig, ax = plt.subplots(figsize=(6, 5))
-    ax.scatter(xs, ys, s=40, color=COLOR_PALETTE['success'], edgecolor=COLOR_PALETTE['dark'])
-    min_v = min(xs + ys)
-    max_v = max(xs + ys)
-    ax.plot([min_v, max_v], [min_v, max_v], color=COLOR_PALETTE['neutral'], linestyle='--', linewidth=1.2)
-    ax.set_xlabel("True lineages")
-    ax.set_ylabel("Detected lineages")
-    ax.set_title("Lineage count agreement by contig")
-
-    plt.tight_layout()
-    filepath = os.path.join(output_dir, "lineage_count_error.png")
-    plt.savefig(filepath, dpi=600, bbox_inches="tight")
-    plt.close()
-    return filepath
-
 
 def generate_pareto_front(
     results: List[Dict],
@@ -1152,57 +687,6 @@ def generate_pareto_front(
 
     plt.tight_layout()
     filepath = os.path.join(output_dir, "pareto_front.png")
-    plt.savefig(filepath, dpi=600, bbox_inches="tight")
-    plt.close()
-    return filepath
-
-
-def generate_timepoint_abundance(
-    validation_metrics: Optional[Dict],
-    output_dir: str
-) -> str:
-    """Plot abundance correlation per timepoint."""
-    if not HAS_MATPLOTLIB:
-        return ""
-
-    validation_metrics = _require_validation_metrics(
-        validation_metrics, "Abundance correlation over time"
-    )
-    per_tp = _require_per_timepoint(validation_metrics, "Abundance correlation over time")
-
-    pairs = []
-    for tp, metrics in per_tp.items():
-        val = metrics.get("abundance_pearson_r")
-        if val is not None:
-            pairs.append((tp, val))
-
-    if not pairs:
-        raise ValueError("Abundance correlation over time requires abundance_pearson_r values.")
-
-    def _parse_tp(value: str) -> float | None:
-        try:
-            return float(value)
-        except (TypeError, ValueError):
-            return None
-
-    numeric_tps = [_parse_tp(tp) for tp, _ in pairs]
-    if all(tp is not None for tp in numeric_tps):
-        pairs = sorted(((numeric_tps[i], pairs[i][1]) for i in range(len(pairs))), key=lambda x: x[0])
-        timepoints = [tp for tp, _ in pairs]
-    else:
-        pairs = sorted(pairs, key=lambda x: str(x[0]))
-        timepoints = [tp for tp, _ in pairs]
-
-    values = [val for _, val in pairs]
-
-    fig, ax = plt.subplots(figsize=(6.5, 4))
-    ax.plot(timepoints, values, marker='o', color=COLOR_PALETTE['accent'])
-    ax.set_ylim(0, 1.05)
-    ax.set_xlabel("Timepoint")
-    ax.set_ylabel("Abundance Pearson r")
-    ax.set_title("Abundance correlation over time")
-    plt.tight_layout()
-    filepath = os.path.join(output_dir, "abundance_timepoint.png")
     plt.savefig(filepath, dpi=600, bbox_inches="tight")
     plt.close()
     return filepath
@@ -1756,29 +1240,11 @@ def generate_html_report(
     # Generate benchmarking figures
     figures['parameter_heatmap.png'] = generate_parameter_heatmap(results, output_dir)
     figures['parameter_sensitivity.png'] = generate_parameter_sensitivity(results, output_dir)
-    figures['runtime_scaling.png'] = generate_runtime_scaling(results, output_dir)
-    figures['per_contig_f1.png'] = generate_per_contig_f1_distribution(
-        validation_metrics, output_dir
-    )
     figures['precision_recall_scatter.png'] = generate_precision_recall_scatter(
         validation_metrics, output_dir
     )
-    figures['lineage_count_error.png'] = generate_lineage_count_error(
-        validation_metrics, output_dir
-    )
     figures['pareto_front.png'] = generate_pareto_front(results, output_dir)
-    figures['abundance_timepoint.png'] = generate_timepoint_abundance(
-        validation_metrics, output_dir
-    )
-    figures['complexity_comparison.png'] = generate_complexity_comparison(results, summary, output_dir)
     figures['optimal_params.png'] = generate_optimal_params(stable_params, output_dir)
-    ablation_path = generate_ablation_summary(results, output_dir)
-    if ablation_path:
-        figures['ablation_summary.png'] = ablation_path
-    seed_path = generate_seed_sensitivity(results, output_dir)
-    if seed_path:
-        figures['seed_sensitivity.png'] = seed_path
-    figures['vcf_robustness.png'] = generate_vcf_robustness(results, output_dir)
     figures['coverage_performance.png'] = generate_coverage_performance(results, output_dir)
     figures['metric_correlation.png'] = generate_metric_correlation(results, output_dir)
     error_path = generate_error_decomposition(validation_metrics, output_dir)
@@ -1788,17 +1254,10 @@ def generate_html_report(
     figure_titles = {
         'parameter_heatmap.png': 'Parameter Heatmap',
         'parameter_sensitivity.png': 'Parameter Sensitivity Analysis',
-        'runtime_scaling.png': 'Runtime Scaling',
-        'per_contig_f1.png': 'Per-contig F1 Distribution',
         'precision_recall_scatter.png': 'Per-contig Precision vs Recall',
-        'lineage_count_error.png': 'Lineage Count Agreement',
         'pareto_front.png': 'Performance vs Runtime (Pareto Front)',
         'abundance_timepoint.png': 'Abundance Correlation Over Time',
-        'complexity_comparison.png': 'Performance by Complexity',
         'optimal_params.png': 'Optimal Parameter Ranges',
-        'ablation_summary.png': 'Ablation Summary',
-        'seed_sensitivity.png': 'Seed Sensitivity',
-        'vcf_robustness.png': 'VCF Robustness',
         'coverage_performance.png': 'Performance vs Coverage',
         'metric_correlation.png': 'Metric Correlation Matrix',
         'error_decomposition.png': 'Error Decomposition',
@@ -2067,52 +1526,16 @@ def generate_report(
     logger.info("Generating parameter sensitivity plot...")
     figures['parameter_sensitivity.png'] = generate_parameter_sensitivity(results, output_dir)
 
-    logger.info("Generating runtime scaling plot...")
-    figures['runtime_scaling.png'] = generate_runtime_scaling(results, output_dir)
-
-    logger.info("Generating per-contig F1 distribution...")
-    figures['per_contig_f1.png'] = generate_per_contig_f1_distribution(
-        validation_metrics, output_dir
-    )
-
     logger.info("Generating precision-recall scatter...")
     figures['precision_recall_scatter.png'] = generate_precision_recall_scatter(
-        validation_metrics, output_dir
-    )
-
-    logger.info("Generating lineage count agreement plot...")
-    figures['lineage_count_error.png'] = generate_lineage_count_error(
         validation_metrics, output_dir
     )
 
     logger.info("Generating Pareto front plot...")
     figures['pareto_front.png'] = generate_pareto_front(results, output_dir)
 
-    logger.info("Generating timepoint abundance plot...")
-    figures['abundance_timepoint.png'] = generate_timepoint_abundance(
-        validation_metrics, output_dir
-    )
-
-    logger.info("Generating complexity comparison...")
-    figures['complexity_comparison.png'] = generate_complexity_comparison(
-        results, summary, output_dir
-    )
-
     logger.info("Generating optimal params visualization...")
     figures['optimal_params.png'] = generate_optimal_params(stable_params, output_dir)
-    
-    logger.info("Generating ablation summary...")
-    ablation_path = generate_ablation_summary(results, output_dir)
-    if ablation_path:
-        figures['ablation_summary.png'] = ablation_path
-    
-    logger.info("Generating seed sensitivity plot...")
-    seed_path = generate_seed_sensitivity(results, output_dir)
-    if seed_path:
-        figures['seed_sensitivity.png'] = seed_path
-    
-    logger.info("Generating VCF robustness plot...")
-    figures['vcf_robustness.png'] = generate_vcf_robustness(results, output_dir)
     
     # Additional publication-quality plots
     logger.info("Generating performance vs coverage plot...")

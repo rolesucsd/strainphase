@@ -169,6 +169,8 @@ class SweepResult:
     snv_precision: Optional[float] = None
     snv_recall: Optional[float] = None
     snv_f1: Optional[float] = None
+    false_negatives_count: Optional[int] = None
+    false_positives_count: Optional[int] = None
     
     # Track/linking metrics (when ground truth available)
     track_fragmentation_mean: Optional[float] = None
@@ -215,6 +217,8 @@ class SweepResult:
             'snv_precision': self.snv_precision,
             'snv_recall': self.snv_recall,
             'snv_f1': self.snv_f1,
+            'false_negatives_count': self.false_negatives_count,
+            'false_positives_count': self.false_positives_count,
             # Track/linking metrics
             'track_fragmentation_mean': self.track_fragmentation_mean,
             'track_fragmentation_median': self.track_fragmentation_median,
@@ -404,6 +408,8 @@ class CheckpointManager:
                 snv_precision=data.get('snv_precision'),
                 snv_recall=data.get('snv_recall'),
                 snv_f1=data.get('snv_f1'),
+                false_negatives_count=data.get('false_negatives_count'),
+                false_positives_count=data.get('false_positives_count'),
                 # Track/linking metrics
                 track_fragmentation_mean=data.get('track_fragmentation_mean'),
                 track_fragmentation_median=data.get('track_fragmentation_median'),
@@ -461,6 +467,8 @@ class CheckpointManager:
             snv_precision=data.get('snv_precision'),
             snv_recall=data.get('snv_recall'),
             snv_f1=data.get('snv_f1'),
+            false_negatives_count=data.get('false_negatives_count'),
+            false_positives_count=data.get('false_positives_count'),
             # Track/linking metrics
             track_fragmentation_mean=data.get('track_fragmentation_mean'),
             track_fragmentation_median=data.get('track_fragmentation_median'),
@@ -1042,6 +1050,8 @@ class ParameterSweep:
                             "snv_f1": 2 * validation_result.snv_precision * validation_result.snv_recall /
                                      (validation_result.snv_precision + validation_result.snv_recall)
                                      if (validation_result.snv_precision + validation_result.snv_recall) > 0 else 0.0,
+                            "false_negatives_count": len(validation_result.false_negatives or []),
+                            "false_positives_count": len(validation_result.false_positives or []),
                             "haplotype_precision": validation_result.precision,
                             "haplotype_recall": validation_result.recall,
                             "haplotype_f1": validation_result.f1,
@@ -1115,6 +1125,8 @@ class ParameterSweep:
                     snv_precision=accuracy_metrics.get("snv_precision"),
                     snv_recall=accuracy_metrics.get("snv_recall"),
                     snv_f1=accuracy_metrics.get("snv_f1"),
+                    false_negatives_count=accuracy_metrics.get("false_negatives_count"),
+                    false_positives_count=accuracy_metrics.get("false_positives_count"),
                     haplotype_precision=accuracy_metrics.get("haplotype_precision"),
                     haplotype_recall=accuracy_metrics.get("haplotype_recall"),
                     haplotype_f1=accuracy_metrics.get("haplotype_f1"),
@@ -1173,19 +1185,11 @@ class ParameterSweep:
         """
         Score a result for optimization comparison.
 
-        Higher is better. Weights prioritize accuracy metrics.
+        Higher is better. Optimize haplotype F1 only.
         """
-        score = 0.0
-        if res.haplotype_f1 is not None:
-            score += res.haplotype_f1 * 2.0
-        if res.snv_f1 is not None:
-            score += res.snv_f1
-        if res.abundance_pearson_r is not None:
-            score += res.abundance_pearson_r * 0.5
-        score += 0.2 if res.converged else 0.0
-        score += res.mean_confidence * 0.1
-        score += 0.5 if res.sweep_detected else 0.0
-        return score
+        if res.haplotype_f1 is None:
+            return float("-inf")
+        return res.haplotype_f1
 
     def _run_single_config(
         self,
@@ -1389,6 +1393,8 @@ class ParameterSweep:
                     "snv_f1": 2 * validation_result.snv_precision * validation_result.snv_recall /
                              (validation_result.snv_precision + validation_result.snv_recall)
                              if (validation_result.snv_precision + validation_result.snv_recall) > 0 else 0.0,
+                    "false_negatives_count": len(validation_result.false_negatives or []),
+                    "false_positives_count": len(validation_result.false_positives or []),
                     "haplotype_precision": validation_result.precision,
                     "haplotype_recall": validation_result.recall,
                     "haplotype_f1": validation_result.f1,
@@ -1463,6 +1469,8 @@ class ParameterSweep:
             snv_precision=accuracy_metrics.get("snv_precision"),
             snv_recall=accuracy_metrics.get("snv_recall"),
             snv_f1=accuracy_metrics.get("snv_f1"),
+            false_negatives_count=accuracy_metrics.get("false_negatives_count"),
+            false_positives_count=accuracy_metrics.get("false_positives_count"),
             haplotype_precision=accuracy_metrics.get("haplotype_precision"),
             haplotype_recall=accuracy_metrics.get("haplotype_recall"),
             haplotype_f1=accuracy_metrics.get("haplotype_f1"),
@@ -1894,6 +1902,8 @@ def write_parameter_grid_summary(
             'snv_precision': f"{result.snv_precision:.6f}" if result.snv_precision is not None else "NA",
             'snv_recall': f"{result.snv_recall:.6f}" if result.snv_recall is not None else "NA",
             'snv_f1': f"{snv_f1:.6f}",
+            'false_negatives_count': result.false_negatives_count if result.false_negatives_count is not None else "NA",
+            'false_positives_count': result.false_positives_count if result.false_positives_count is not None else "NA",
             'abundance_pearson_r': f"{result.abundance_pearson_r:.6f}" if result.abundance_pearson_r is not None else "NA",
             'abundance_mae': f"{result.abundance_mae:.6f}" if result.abundance_mae is not None else "NA",
 
@@ -1940,6 +1950,7 @@ def write_parameter_grid_summary(
             # Accuracy
             'haplotype_precision', 'haplotype_recall', 'haplotype_f1',
             'snv_precision', 'snv_recall', 'snv_f1',
+            'false_negatives_count', 'false_positives_count',
             'abundance_pearson_r', 'abundance_mae',
             # Track/Linking
             'track_fragmentation_mean', 'track_fragmentation_median',
@@ -1967,6 +1978,7 @@ def write_parameter_grid_summary(
                 'config_name',
                 'haplotype_precision', 'haplotype_recall', 'haplotype_f1',
                 'snv_precision', 'snv_recall', 'snv_f1',
+                'false_negatives_count', 'false_positives_count',
                 'abundance_pearson_r', 'abundance_mae',
                 'track_fragmentation_mean', 'track_fragmentation_median',
                 'false_link_rate', 'missed_link_rate', 'track_consensus_error',

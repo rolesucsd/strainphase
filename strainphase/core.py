@@ -86,7 +86,7 @@ class HaplotyperConfig:
     min_reads_per_window: int = 10
 
     # =========== READ FILTERING ===========
-    min_mapq: int = 20
+    min_mapq: int = 10
     min_base_quality: int = 20
     default_base_quality: int = 20
     max_reads_per_window: int = 100
@@ -98,8 +98,8 @@ class HaplotyperConfig:
     skip_af_filter_if_missing: bool = True
 
     # =========== GRAPH CONSTRUCTION ===========
-    min_shared_snvs_for_edge: int = 4
-    max_mismatch_frac: float = 0.01
+    min_shared_snvs_for_edge: int = 3
+    max_mismatch_frac: float = 0.04
     min_reads_per_cluster: int = 3
 
     # =========== EM PARAMETERS ===========
@@ -114,7 +114,7 @@ class HaplotyperConfig:
     junk_divergence_rate: float = 0.10
 
     # =========== POST-PROCESSING ===========
-    merge_distance_threshold: float = 0.02
+    merge_distance_threshold: float = 0.005
     min_shared_for_merge: int = 3  # Min shared SNVs with actual calls to consider merging
     assign_confidence_threshold: float = 0.90
 
@@ -127,10 +127,10 @@ class HaplotyperConfig:
     binomial_alpha: float = 0.05
 
     # =========== LONGITUDINAL PARAMETERS ===========
-    min_weight_for_anchor: float = 0.10
-    rescue_match_distance: float = 0.01
+    min_weight_for_anchor: float = 0.05
+    rescue_match_distance: float = 0.005
     min_shared_for_rescue: int = 3  # Min shared SNVs with actual calls for rescue matching
-    rescued_min_weight: float = 0.02
+    rescued_min_weight: float = 0.01
 
     # =========== LINEAGE CLUSTERING PARAMETERS ===========
     # Controls how tracks are clustered into lineages across samples
