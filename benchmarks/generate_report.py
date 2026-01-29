@@ -410,8 +410,14 @@ def generate_validation_patchwork(
     ax_dm4.set_ylim(0, 1.1)
 
     # Panel D: Track regions (per contig)
-    track_gs = gs[1, 1].subgridspec(max(1, int(np.ceil(n_contigs / 2))), min(2, max(1, n_contigs)), wspace=0.3, hspace=0.5)
-    track_axes = track_gs.subplots().flatten() if hasattr(track_gs, "subplots") else []
+    track_gs = gs[1, 1].subgridspec(
+        max(1, int(np.ceil(n_contigs / 2))), min(2, max(1, n_contigs)), wspace=0.3, hspace=0.5
+    )
+    track_axes = track_gs.subplots()
+    if hasattr(track_axes, "flatten"):
+        track_axes = track_axes.flatten()
+    else:
+        track_axes = [track_axes]
     truth_tracks = load_truth_tracks(truth_dir)
 
     # Build detected tracks from SNV spans
