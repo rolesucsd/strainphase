@@ -2319,7 +2319,10 @@ def generate_report(
     
     # Additional publication-quality plots
     logger.info("Generating performance vs coverage plot...")
-    figures['coverage_performance.png'] = generate_coverage_performance(results, output_dir)
+    try:
+        figures['coverage_performance.png'] = generate_coverage_performance(results, output_dir)
+    except Exception as e:
+        logger.warning(f"Skipping coverage performance plot: {e}")
     
     logger.info("Generating metric correlation matrix...")
     figures['metric_correlation.png'] = generate_metric_correlation(results, output_dir)
