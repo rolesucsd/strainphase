@@ -19,6 +19,7 @@ Note: For full benchmarking pipeline, use run_full_benchmark.py instead.
 """
 
 import argparse
+import csv
 import json
 import logging
 import os
@@ -146,6 +147,75 @@ def _short_name_from_params(params: Dict) -> Optional[str]:
         )
     except Exception:
         return None
+
+
+def _top_configs_by_f1(results: List[Dict], n: int) -> List[Dict]:
+    ranked = [r for r in results if r.get("haplotype_f1") is not None]
+    ranked.sort(key=lambda r: r.get("haplotype_f1", -1), reverse=True)
+    return ranked[:n]
+
+
+def _config_validation_dir(results_dir: str, result: Dict) -> Optional[Path]:
+    params = result.get("params") or {}
+    config_name = _short_name_from_params(params)
+    if not config_name:
+        return None
+    config_dir = Path(results_dir) / "configs" / config_name / "validation"
+    return config_dir if config_dir.exists() else None
+
+
+def _load_lineage_details(path: Path) -> List[Dict]:
+    records = []
+    with open(path, newline="") as f:
+        reader = csv.DictReader(f, delimiter="\t")
+        for row in reader:
+            records.append(row)
+    return records
+
+
+def _load_lineages(path: Path) -> List[Dict]:
+    records = []
+    with open(path, newline="") as f:
+        reader = csv.DictReader(f, delimiter="\t")
+        for row in reader:
+            records.append(row)
+    return records
+
+
+def _load_truth_snvs(truth_dir: str) -> Dict[str, set]:
+    truth_vcf = Path(truth_dir) / "truth_snvs.vcf"
+    if not truth_vcf.exists():
+        truth_vcf = Path(truth_dir) / "truth_variants.vcf"
+    if not truth_vcf.exists():
+        return {}
+    truth = defaultdict(set)
+    with open(truth_vcf) as f:
+        for line in f:
+            if line.startswith("#"):
+                continue
+            parts = line.split("\t")
+            contig = parts[0]
+            pos = int(parts[1])
+            truth[contig].add(pos)
+    return dict(truth)
+
+
+def _load_truth_tracks(truth_dir: str) -> Dict[str, Dict[str, tuple[int, int]]]:
+    tracks_file = Path(truth_dir) / "truth_tracks.tsv"
+    if not tracks_file.exists():
+        return {}
+    tracks = defaultdict(dict)
+    with open(tracks_file) as f:
+        header = f.readline().strip().split("\t")
+        idx = {h: i for i, h in enumerate(header)}
+        for line in f:
+            parts = line.strip().split("\t")
+            strain_id = parts[idx["strain_id"]]
+            contig = parts[idx["contig"]]
+            start = int(parts[idx["start"]])
+            end = int(parts[idx["end"]])
+            tracks[strain_id][contig] = (start, end)
+    return dict(tracks)
 
 
 def generate_validation_patchwork(
@@ -396,6 +466,266 @@ def generate_validation_patchwork(
     out_path = os.path.join(output_dir, "validation_patchwork.png")
     fig.tight_layout()
     fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+def _make_patchwork_axes(n_panels: int, cols: int, rows: int, title: str) -> Tuple[Any, List[Any]]:
+    fig, axes = plt.subplots(rows, cols, figsize=(cols * 3.2, rows * 2.8))
+    axes_list = axes.flatten() if hasattr(axes, "flatten") else [axes]
+    for i in range(rows * cols):
+        if i >= n_panels:
+            axes_list[i].axis("off")
+    fig.suptitle(title, fontsize=14, color=COLOR_PALETTE["primary"])
+    return fig, axes_list
+
+
+def generate_abundance_correlation_patchwork(
+    results_dir: str,
+    results: List[Dict],
+    output_dir: str,
+    top_n: int = 8,
+    cols: int = 5,
+    rows: int = 2,
+) -> Optional[str]:
+    top_configs = _top_configs_by_f1(results, top_n)
+    if not top_configs:
+        return None
+    fig, axes = _make_patchwork_axes(len(top_configs), cols, rows, "Abundance Correlation (Top F1)")
+    for idx, res in enumerate(top_configs):
+        ax = axes[idx]
+        config_dir = _config_validation_dir(results_dir, res)
+        if not config_dir:
+            ax.text(0.5, 0.5, "missing config", ha="center", va="center")
+            ax.axis("off")
+            continue
+        details_path = config_dir / "lineage_details.tsv"
+        if not details_path.exists():
+            ax.text(0.5, 0.5, "missing lineage_details", ha="center", va="center")
+            ax.axis("off")
+            continue
+        rows_data = _load_lineage_details(details_path)
+        xs = []
+        ys = []
+        for row in rows_data:
+            if row.get("matched_strain") == "UNMATCHED":
+                continue
+            try:
+                xs.append(float(row["true_abundance"]))
+                ys.append(float(row["detected_abundance"]))
+            except (TypeError, ValueError, KeyError):
+                continue
+        if xs and ys:
+            ax.scatter(xs, ys, s=8, alpha=0.7, color=COLOR_PALETTE["accent"])
+            lo = min(xs + ys)
+            hi = max(xs + ys)
+            ax.plot([lo, hi], [lo, hi], color=COLOR_PALETTE["neutral"], linewidth=0.8)
+        ax.set_xlabel("True", fontsize=7)
+        ax.set_ylabel("Detected", fontsize=7)
+        ax.tick_params(labelsize=6)
+        params = res.get("params") or {}
+        name = _short_name_from_params(params) or f"cfg{idx+1}"
+        f1 = res.get("haplotype_f1")
+        f1_str = f"{f1:.2f}" if f1 is not None else "n/a"
+        ax.set_title(f"{name}\nF1={f1_str}", fontsize=7)
+    out_path = os.path.join(output_dir, "abundance_correlation.png")
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+def generate_detailed_matching_patchwork(
+    results_dir: str,
+    results: List[Dict],
+    output_dir: str,
+    top_n: int = 8,
+    cols: int = 5,
+    rows: int = 2,
+) -> Optional[str]:
+    top_configs = _top_configs_by_f1(results, top_n)
+    if not top_configs:
+        return None
+    fig, axes = _make_patchwork_axes(len(top_configs), cols, rows, "Detailed Matching (Top F1)")
+    for idx, res in enumerate(top_configs):
+        ax = axes[idx]
+        config_dir = _config_validation_dir(results_dir, res)
+        if not config_dir:
+            ax.text(0.5, 0.5, "missing config", ha="center", va="center")
+            ax.axis("off")
+            continue
+        details_path = config_dir / "lineage_details.tsv"
+        if not details_path.exists():
+            ax.text(0.5, 0.5, "missing lineage_details", ha="center", va="center")
+            ax.axis("off")
+            continue
+        rows_data = _load_lineage_details(details_path)
+        xs = []
+        ys = []
+        for row in rows_data:
+            if row.get("matched_strain") == "UNMATCHED":
+                continue
+            try:
+                xs.append(float(row["snv_distance"]))
+                ys.append(float(row["abundance_diff"]))
+            except (TypeError, ValueError, KeyError):
+                continue
+        if xs and ys:
+            ax.scatter(xs, ys, s=8, alpha=0.7, color=COLOR_PALETTE["secondary"])
+        ax.set_xlabel("SNV distance", fontsize=7)
+        ax.set_ylabel("Abundance diff", fontsize=7)
+        ax.tick_params(labelsize=6)
+        params = res.get("params") or {}
+        name = _short_name_from_params(params) or f"cfg{idx+1}"
+        f1 = res.get("haplotype_f1")
+        f1_str = f"{f1:.2f}" if f1 is not None else "n/a"
+        ax.set_title(f"{name}\nF1={f1_str}", fontsize=7)
+    out_path = os.path.join(output_dir, "detailed_matching.png")
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+def generate_reference_coverage_patchwork(
+    results_dir: str,
+    results: List[Dict],
+    truth_dir: Optional[str],
+    output_dir: str,
+    top_n: int = 8,
+    cols: int = 5,
+    rows: int = 2,
+) -> Optional[str]:
+    if not truth_dir:
+        logger.warning("No truth_dir provided; skipping reference coverage patchwork.")
+        return None
+    truth_snvs = _load_truth_snvs(truth_dir)
+    if not truth_snvs:
+        logger.warning("No truth SNVs found; skipping reference coverage patchwork.")
+        return None
+    top_configs = _top_configs_by_f1(results, top_n)
+    if not top_configs:
+        return None
+    fig, axes = _make_patchwork_axes(len(top_configs), cols, rows, "Reference Coverage (Top F1)")
+    for idx, res in enumerate(top_configs):
+        ax = axes[idx]
+        config_dir = _config_validation_dir(results_dir, res)
+        if not config_dir:
+            ax.text(0.5, 0.5, "missing config", ha="center", va="center")
+            ax.axis("off")
+            continue
+        lineages_path = config_dir / "lineages.tsv"
+        if not lineages_path.exists():
+            ax.text(0.5, 0.5, "missing lineages", ha="center", va="center")
+            ax.axis("off")
+            continue
+        detected_pos = defaultdict(set)
+        for row in _load_lineages(lineages_path):
+            contig = row.get("contig")
+            snv_alleles = row.get("snv_alleles", "")
+            if not contig or not snv_alleles:
+                continue
+            for entry in snv_alleles.split(","):
+                try:
+                    pos = int(entry.split(":")[0])
+                except Exception:
+                    continue
+                detected_pos[contig].add(pos)
+        contigs = sorted(truth_snvs.keys())
+        coverages = []
+        for contig in contigs:
+            truth_set = truth_snvs.get(contig, set())
+            if not truth_set:
+                coverages.append(0.0)
+                continue
+            recovered = len(truth_set & detected_pos.get(contig, set()))
+            coverages.append(recovered / len(truth_set))
+        ax.bar(range(len(contigs)), coverages, color=COLOR_PALETTE["accent"], alpha=0.8)
+        ax.set_ylim(0, 1.0)
+        ax.set_xticks([])
+        ax.set_ylabel("Coverage", fontsize=7)
+        params = res.get("params") or {}
+        name = _short_name_from_params(params) or f"cfg{idx+1}"
+        f1 = res.get("haplotype_f1")
+        f1_str = f"{f1:.2f}" if f1 is not None else "n/a"
+        ax.set_title(f"{name}\nF1={f1_str}", fontsize=7)
+    out_path = os.path.join(output_dir, "reference_coverage.png")
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+def generate_track_regions_patchwork(
+    results_dir: str,
+    results: List[Dict],
+    truth_dir: Optional[str],
+    output_dir: str,
+    top_n: int = 8,
+    cols: int = 5,
+    rows: int = 2,
+) -> Optional[str]:
+    if not truth_dir:
+        logger.warning("No truth_dir provided; skipping track regions patchwork.")
+        return None
+    truth_tracks = _load_truth_tracks(truth_dir)
+    if not truth_tracks:
+        logger.warning("No truth tracks found; skipping track regions patchwork.")
+        return None
+    top_configs = _top_configs_by_f1(results, top_n)
+    if not top_configs:
+        return None
+    fig, axes = _make_patchwork_axes(len(top_configs), cols, rows, "Track Regions (Top F1)")
+    for idx, res in enumerate(top_configs):
+        ax = axes[idx]
+        config_dir = _config_validation_dir(results_dir, res)
+        if not config_dir:
+            ax.text(0.5, 0.5, "missing config", ha="center", va="center")
+            ax.axis("off")
+            continue
+        lineages_path = config_dir / "lineages.tsv"
+        if not lineages_path.exists():
+            ax.text(0.5, 0.5, "missing lineages", ha="center", va="center")
+            ax.axis("off")
+            continue
+        detected_tracks = defaultdict(list)
+        for row in _load_lineages(lineages_path):
+            contig = row.get("contig")
+            snv_alleles = row.get("snv_alleles", "")
+            if not contig or not snv_alleles:
+                continue
+            positions = []
+            for entry in snv_alleles.split(","):
+                try:
+                    positions.append(int(entry.split(":")[0]))
+                except Exception:
+                    continue
+            if positions:
+                detected_tracks[contig].append((min(positions), max(positions)))
+        contigs = sorted({c for tracks in list(truth_tracks.values()) for c in tracks.keys()} | set(detected_tracks.keys()))
+        if not contigs:
+            ax.text(0.5, 0.5, "no contigs", ha="center", va="center")
+            ax.axis("off")
+            continue
+        y_base = 0.0
+        for contig in contigs:
+            offsets = 0
+            for strain_id, contig_dict in truth_tracks.items():
+                if contig in contig_dict:
+                    start, end = contig_dict[contig]
+                    ax.hlines(y_base + 0.15 + offsets * 0.04, start, end, color="#888888", linewidth=1, alpha=0.7)
+                    offsets += 1
+            for span in detected_tracks.get(contig, []):
+                ax.hlines(y_base - 0.15, span[0], span[1], color=COLOR_PALETTE["primary"], linewidth=1.2, alpha=0.8)
+            ax.text(0, y_base + 0.35, contig, fontsize=6, color=COLOR_PALETTE["neutral"])
+            y_base += 1.0
+        ax.set_yticks([])
+        ax.set_xlabel("Position", fontsize=7)
+        ax.tick_params(axis="x", labelsize=6)
+        params = res.get("params") or {}
+        name = _short_name_from_params(params) or f"cfg{idx+1}"
+        f1 = res.get("haplotype_f1")
+        f1_str = f"{f1:.2f}" if f1 is not None else "n/a"
+        ax.set_title(f"{name}\nF1={f1_str}", fontsize=7)
+    out_path = os.path.join(output_dir, "track_regions.png")
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     return out_path
 
@@ -1661,6 +1991,10 @@ def generate_html_report(
         'lineage_accuracy_summary.png': 'Lineage Accuracy by Parameter Set',
         'linking_errors_summary.png': 'Linking Errors by Parameter Set',
         'error_breakdown_summary.png': 'Error Breakdown by Parameter Set',
+        'abundance_correlation.png': 'Abundance Correlation (Top F1 Patchwork)',
+        'detailed_matching.png': 'Detailed Matching (Top F1 Patchwork)',
+        'reference_coverage.png': 'Reference Coverage (Top F1 Patchwork)',
+        'track_regions.png': 'Track Regions (Top F1 Patchwork)',
     }
 
     for filename, title in figure_titles.items():
@@ -1922,6 +2256,22 @@ def generate_report(
             figures["error_breakdown_summary.png"] = generate_error_breakdown_summary(results, output_dir)
         except Exception as e:
             logger.warning(f"Failed to generate summary bar charts: {e}")
+
+        try:
+            path = generate_abundance_correlation_patchwork(results_dir, results, output_dir)
+            if path:
+                figures["abundance_correlation.png"] = path
+            path = generate_detailed_matching_patchwork(results_dir, results, output_dir)
+            if path:
+                figures["detailed_matching.png"] = path
+            path = generate_reference_coverage_patchwork(results_dir, results, truth_dir, output_dir)
+            if path:
+                figures["reference_coverage.png"] = path
+            path = generate_track_regions_patchwork(results_dir, results, truth_dir, output_dir)
+            if path:
+                figures["track_regions.png"] = path
+        except Exception as e:
+            logger.warning(f"Failed to generate patchwork summaries: {e}")
 
     logger.info("Generating parameter heatmap...")
     figures['parameter_heatmap.png'] = generate_parameter_heatmap(results, output_dir)

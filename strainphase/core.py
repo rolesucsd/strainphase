@@ -138,6 +138,11 @@ class HaplotyperConfig:
     # Controls how tracks are clustered into lineages across samples
     lineage_merge_distance: float = 0.02  # Max distance to merge tracks into same lineage
     min_shared_for_lineage: int = 3  # Min shared SNVs to consider merging into lineage
+
+    # =========== LINKING DIAGNOSTICS ===========
+    linking_debug: bool = False  # Record detailed linking diagnostics
+    linking_debug_max_records: int = 5000  # Cap to avoid massive files
+    linking_ambiguity_delta: float = 0.005  # Skip links if multiple near-best matches
     max_span_gap_for_lineage: int = 10000  # Max gap between track spans to consider same locus
 
     # =========== WINDOW LINKING PARAMETERS ===========
@@ -316,6 +321,7 @@ class WindowResult:
     assignments: list[dict]
     converged: bool
     iterations: int
+    linking_debug: list[dict] = field(default_factory=list)
 
     def validate(self) -> bool:
         """Validate internal consistency."""
@@ -1544,6 +1550,17 @@ def link_windows(
         for j in range(len(wr.haplotypes)):
             graph.add_node((i, j))
 
+    debug_records = 0
+
+    def record_debug(wr: WindowResult, entry: dict):
+        nonlocal debug_records
+        if not config.linking_debug:
+            return
+        if debug_records >= config.linking_debug_max_records:
+            return
+        wr.linking_debug.append(entry)
+        debug_records += 1
+
     # Connect haplotypes in overlapping windows
     for i in range(len(sorted_results) - 1):
         curr_wr = sorted_results[i]
@@ -1566,7 +1583,7 @@ def link_windows(
                 continue
 
             # Evaluate candidate pairings before linking (avoid cross-links).
-            candidates: list[tuple[int, int, float]] = []
+            candidates: list[tuple[int, int, float, int]] = []
             for hi, hap_i in enumerate(curr_wr.haplotypes):
                 for hj, hap_j in enumerate(next_wr.haplotypes):
                     dist, _, n_shared = hap_i.distance_to(hap_j, shared_snvs)
@@ -1574,37 +1591,112 @@ def link_windows(
                     if n_shared < config.min_shared_snvs_for_link:
                         continue
                     if dist <= config.max_link_distance:
-                        candidates.append((hi, hj, dist))
+                        candidates.append((hi, hj, dist, n_shared))
 
             if not candidates:
+                if config.linking_debug:
+                    record_debug(
+                        curr_wr,
+                        {
+                            "contig": curr_wr.window.contig,
+                            "window_start": curr_wr.window.start,
+                            "window_end": curr_wr.window.end,
+                            "next_window_start": next_wr.window.start,
+                            "next_window_end": next_wr.window.end,
+                            "decision": "no_candidates",
+                            "reason": "no_pairs_within_distance_and_shared_snvs",
+                        },
+                    )
                 continue
 
             # Track unique best matches for each haplotype on both sides.
-            best_for_i: dict[int, list[tuple[float, int]]] = {}
-            best_for_j: dict[int, list[tuple[float, int]]] = {}
-            for hi, hj, dist in candidates:
-                best_for_i.setdefault(hi, []).append((dist, hj))
-                best_for_j.setdefault(hj, []).append((dist, hi))
+            best_for_i: dict[int, list[tuple[float, int, int]]] = {}
+            best_for_j: dict[int, list[tuple[float, int, int]]] = {}
+            for hi, hj, dist, n_shared in candidates:
+                best_for_i.setdefault(hi, []).append((dist, hj, n_shared))
+                best_for_j.setdefault(hj, []).append((dist, hi, n_shared))
 
             def unique_best(
-                matches: dict[int, list[tuple[float, int]]],
-            ) -> dict[int, tuple[int, float]]:
-                unique: dict[int, tuple[int, float]] = {}
+                matches: dict[int, list[tuple[float, int, int]]],
+            ) -> dict[int, tuple[int, float, int]]:
+                unique: dict[int, tuple[int, float, int]] = {}
                 for idx, options in matches.items():
                     options.sort(key=lambda x: x[0])
-                    best_dist = options[0][0]
-                    bests = [opt for opt in options if opt[0] == best_dist]
-                    # Skip ambiguous ties (including multiple perfect matches).
-                    if len(bests) == 1:
-                        unique[idx] = (bests[0][1], best_dist)
+                    best_dist, best_partner, best_shared = options[0]
+                    within_delta = [
+                        opt for opt in options if opt[0] <= best_dist + config.linking_ambiguity_delta
+                    ]
+                    # Skip ambiguous ties or near-ties within delta.
+                    if len(within_delta) == 1:
+                        unique[idx] = (best_partner, best_dist, best_shared)
                 return unique
 
             unique_i = unique_best(best_for_i)
             unique_j = unique_best(best_for_j)
 
-            for hi, (hj, _dist) in unique_i.items():
+            if config.linking_debug:
+                for hi, options in best_for_i.items():
+                    options_sorted = sorted(options, key=lambda x: x[0])
+                    best_dist, best_hj, best_shared = options_sorted[0]
+                    second_dist = options_sorted[1][0] if len(options_sorted) > 1 else None
+                    near_best = [
+                        opt for opt in options_sorted
+                        if opt[0] <= best_dist + config.linking_ambiguity_delta
+                    ]
+                    if len(near_best) != 1:
+                        record_debug(
+                            curr_wr,
+                            {
+                                "contig": curr_wr.window.contig,
+                                "window_start": curr_wr.window.start,
+                                "window_end": curr_wr.window.end,
+                                "next_window_start": next_wr.window.start,
+                                "next_window_end": next_wr.window.end,
+                                "hap_i": hi,
+                                "best_hap_j": best_hj,
+                                "best_dist": round(best_dist, 6),
+                                "second_best_dist": round(second_dist, 6) if second_dist is not None else None,
+                                "n_shared_best": best_shared,
+                                "decision": "skip",
+                                "reason": "ambiguous_within_delta",
+                                "near_best_count": len(near_best),
+                                "ambiguity_delta": config.linking_ambiguity_delta,
+                            },
+                        )
+
+            for hi, (hj, _dist, _n_shared) in unique_i.items():
                 if hj in unique_j and unique_j[hj][0] == hi:
                     graph.add_edge((i, hi), (k, hj))
+                    if config.linking_debug:
+                        record_debug(
+                            curr_wr,
+                            {
+                                "contig": curr_wr.window.contig,
+                                "window_start": curr_wr.window.start,
+                                "window_end": curr_wr.window.end,
+                                "next_window_start": next_wr.window.start,
+                                "next_window_end": next_wr.window.end,
+                                "hap_i": hi,
+                                "hap_j": hj,
+                                "decision": "link",
+                                "reason": "unique_best_mutual",
+                            },
+                        )
+                elif config.linking_debug:
+                    record_debug(
+                        curr_wr,
+                        {
+                            "contig": curr_wr.window.contig,
+                            "window_start": curr_wr.window.start,
+                            "window_end": curr_wr.window.end,
+                            "next_window_start": next_wr.window.start,
+                            "next_window_end": next_wr.window.end,
+                            "hap_i": hi,
+                            "hap_j": hj,
+                            "decision": "skip",
+                            "reason": "not_reciprocal_best",
+                        },
+                    )
 
     # Find connected components - each is a track
     components = list(nx.connected_components(graph))
