@@ -29,6 +29,23 @@ from validation.validate_lineages import load_truth_lineages
 
 
 @dataclass
+class TrackLinkabilityInfo:
+    """Information about whether two tracks could potentially be linked."""
+    track_id_1: str
+    track_id_2: str
+    strain_id: str
+    contig: str
+    track1_span: Tuple[int, int]  # (start, end)
+    track2_span: Tuple[int, int]  # (start, end)
+    gap_bp: int  # Gap in base pairs between tracks (0 if overlapping)
+    track1_snv_positions: List[int]
+    track2_snv_positions: List[int]
+    shared_snv_positions: List[int]  # SNVs in overlapping region
+    is_linkable: bool  # True if tracks share SNV positions
+    linkability_reason: str  # Explanation
+
+
+@dataclass
 class TrackValidationResult:
     """Results of track/linking validation."""
     track_fragmentation_mean: float
@@ -39,6 +56,7 @@ class TrackValidationResult:
     per_strain_fragmentation: Dict[str, Dict[str, int]]  # strain_id -> contig -> n_tracks
     false_links: List[Tuple[str, str, str]]  # (track_id1, track_id2, contig)
     missed_links: List[Tuple[str, str, str]]  # (strain_id, contig, window_pair)
+    linkability_analysis: Optional[List[TrackLinkabilityInfo]] = None  # Track gap analysis
 
 
 def load_truth_tracks(truth_dir: str) -> Dict[str, Dict[str, Tuple[int, int]]]:
@@ -275,6 +293,185 @@ def compute_track_consensus_error(
     return error_rate
 
 
+def analyze_track_linkability(
+    window_results: List[WindowResult],
+    strain_matches: Dict[str, str],  # detected_track_id -> true_strain_id
+) -> List[TrackLinkabilityInfo]:
+    """
+    Analyze whether fragmented tracks from the same strain could potentially be linked.
+    
+    For each pair of tracks belonging to the same true strain on the same contig,
+    determines if they:
+    1. Overlap in genomic position (could potentially share SNVs)
+    2. Have shared SNV positions (can be linked by consensus comparison)
+    3. Have a gap that makes linking impossible
+    
+    Returns: List of TrackLinkabilityInfo for each track pair
+    """
+    # Group tracks by (strain_id, contig)
+    # track_info: (strain_id, contig) -> [(track_id, min_pos, max_pos, snv_positions)]
+    track_info: Dict[Tuple[str, str], List[Tuple[str, int, int, List[int]]]] = defaultdict(list)
+    
+    # Build track consensus positions per track
+    track_snv_positions: Dict[str, Dict[str, List[int]]] = defaultdict(lambda: defaultdict(list))
+    
+    for wr in window_results:
+        contig = wr.window.contig
+        for hap in wr.haplotypes:
+            if hap.track_id and hap.track_id in strain_matches:
+                for pos in hap.consensus.keys():
+                    if pos not in track_snv_positions[hap.track_id][contig]:
+                        track_snv_positions[hap.track_id][contig].append(pos)
+    
+    # Build track spans
+    for track_id, contig_positions in track_snv_positions.items():
+        strain_id = strain_matches.get(track_id)
+        if not strain_id:
+            continue
+        
+        for contig, positions in contig_positions.items():
+            if positions:
+                positions_sorted = sorted(positions)
+                min_pos = positions_sorted[0]
+                max_pos = positions_sorted[-1]
+                track_info[(strain_id, contig)].append(
+                    (track_id, min_pos, max_pos, positions_sorted)
+                )
+    
+    # Analyze pairs
+    linkability_results = []
+    
+    for (strain_id, contig), tracks in track_info.items():
+        if len(tracks) < 2:
+            continue  # No fragmentation to analyze
+        
+        # Sort tracks by start position
+        tracks_sorted = sorted(tracks, key=lambda x: x[1])
+        
+        # Analyze each adjacent pair
+        for i in range(len(tracks_sorted) - 1):
+            track1_id, track1_min, track1_max, track1_positions = tracks_sorted[i]
+            track2_id, track2_min, track2_max, track2_positions = tracks_sorted[i + 1]
+            
+            # Calculate gap
+            if track2_min > track1_max:
+                gap_bp = track2_min - track1_max
+            else:
+                gap_bp = 0  # Overlapping
+            
+            # Find shared SNV positions (positions that exist in both tracks)
+            positions_set1 = set(track1_positions)
+            positions_set2 = set(track2_positions)
+            shared_positions = sorted(positions_set1 & positions_set2)
+            
+            # Determine linkability
+            if shared_positions:
+                is_linkable = True
+                reason = f"Linkable: {len(shared_positions)} shared SNV positions"
+            elif gap_bp == 0:
+                # Overlapping spans but no shared SNVs
+                is_linkable = False
+                overlap_start = max(track1_min, track2_min)
+                overlap_end = min(track1_max, track2_max)
+                reason = f"Unlinkable: Spans overlap ({overlap_start}-{overlap_end}) but no shared SNVs"
+            else:
+                is_linkable = False
+                reason = f"Unlinkable: {gap_bp:,}bp gap between tracks (no SNV overlap possible)"
+            
+            linkability_results.append(TrackLinkabilityInfo(
+                track_id_1=track1_id,
+                track_id_2=track2_id,
+                strain_id=strain_id,
+                contig=contig,
+                track1_span=(track1_min, track1_max),
+                track2_span=(track2_min, track2_max),
+                gap_bp=gap_bp,
+                track1_snv_positions=track1_positions,
+                track2_snv_positions=track2_positions,
+                shared_snv_positions=shared_positions,
+                is_linkable=is_linkable,
+                linkability_reason=reason
+            ))
+    
+    return linkability_results
+
+
+def write_linkability_report(
+    linkability_analysis: List[TrackLinkabilityInfo],
+    output_path: str
+) -> None:
+    """Write a human-readable linkability report."""
+    with open(output_path, 'w') as f:
+        f.write("=" * 80 + "\n")
+        f.write("TRACK LINKABILITY ANALYSIS\n")
+        f.write("=" * 80 + "\n\n")
+        f.write("This report analyzes whether fragmented tracks from the same strain\n")
+        f.write("could potentially be linked based on shared SNV positions.\n\n")
+        
+        if not linkability_analysis:
+            f.write("No track pairs to analyze (no fragmentation detected).\n")
+            return
+        
+        # Group by strain
+        by_strain: Dict[str, List[TrackLinkabilityInfo]] = defaultdict(list)
+        for info in linkability_analysis:
+            by_strain[info.strain_id].append(info)
+        
+        # Summary statistics
+        total_pairs = len(linkability_analysis)
+        linkable_pairs = sum(1 for info in linkability_analysis if info.is_linkable)
+        unlinkable_gap = sum(1 for info in linkability_analysis if not info.is_linkable and info.gap_bp > 0)
+        unlinkable_no_shared = sum(1 for info in linkability_analysis if not info.is_linkable and info.gap_bp == 0)
+        
+        f.write("-" * 80 + "\n")
+        f.write("SUMMARY\n")
+        f.write("-" * 80 + "\n")
+        f.write(f"Total track pairs analyzed: {total_pairs}\n")
+        f.write(f"  Linkable (shared SNVs):   {linkable_pairs} ({100*linkable_pairs/total_pairs:.1f}%)\n")
+        f.write(f"  Unlinkable (gap):         {unlinkable_gap} ({100*unlinkable_gap/total_pairs:.1f}%)\n")
+        f.write(f"  Unlinkable (no shared):   {unlinkable_no_shared} ({100*unlinkable_no_shared/total_pairs:.1f}%)\n\n")
+        
+        # Interpretation
+        if linkable_pairs == total_pairs:
+            f.write("INTERPRETATION: All track pairs have shared SNVs and COULD be linked.\n")
+            f.write("Fragmentation is due to algorithm limitations, not physical gaps.\n\n")
+        elif linkable_pairs == 0:
+            f.write("INTERPRETATION: No track pairs share SNV positions.\n")
+            f.write("Fragmentation is UNAVOIDABLE due to sparse SNV distribution.\n\n")
+        else:
+            f.write(f"INTERPRETATION: {linkable_pairs}/{total_pairs} pairs could be linked.\n")
+            f.write("Some fragmentation is avoidable, some is due to SNV gaps.\n\n")
+        
+        # Detail per strain
+        f.write("-" * 80 + "\n")
+        f.write("DETAIL BY STRAIN\n")
+        f.write("-" * 80 + "\n\n")
+        
+        for strain_id in sorted(by_strain.keys()):
+            pairs = by_strain[strain_id]
+            f.write(f"Strain: {strain_id}\n")
+            f.write(f"  Track pairs: {len(pairs)}\n")
+            
+            for info in sorted(pairs, key=lambda x: x.track1_span[0]):
+                f.write(f"\n  {info.track_id_1} <-> {info.track_id_2} ({info.contig})\n")
+                f.write(f"    Track 1: {info.track1_span[0]:,}-{info.track1_span[1]:,} "
+                       f"({len(info.track1_snv_positions)} SNVs)\n")
+                f.write(f"    Track 2: {info.track2_span[0]:,}-{info.track2_span[1]:,} "
+                       f"({len(info.track2_snv_positions)} SNVs)\n")
+                if info.gap_bp > 0:
+                    f.write(f"    Gap: {info.gap_bp:,} bp\n")
+                else:
+                    f.write(f"    Overlap: spans overlap\n")
+                f.write(f"    Shared SNVs: {len(info.shared_snv_positions)}\n")
+                f.write(f"    Status: {info.linkability_reason}\n")
+            
+            f.write("\n")
+        
+        f.write("=" * 80 + "\n")
+        f.write("END OF LINKABILITY REPORT\n")
+        f.write("=" * 80 + "\n")
+
+
 def validate_tracks(
     window_results: List[WindowResult],
     truth_dir: str,
@@ -349,6 +546,15 @@ def validate_tracks(
         window_results, truth_snvs, strain_matches
     )
     
+    # Analyze track linkability (why tracks are fragmented)
+    linkability_analysis = analyze_track_linkability(window_results, strain_matches)
+    
+    # Log linkability summary
+    if linkability_analysis:
+        total_pairs = len(linkability_analysis)
+        linkable = sum(1 for info in linkability_analysis if info.is_linkable)
+        logger.info(f"Track linkability: {linkable}/{total_pairs} pairs could be linked")
+    
     return TrackValidationResult(
         track_fragmentation_mean=mean_frag,
         track_fragmentation_median=median_frag,
@@ -357,5 +563,6 @@ def validate_tracks(
         track_consensus_error=consensus_error,
         per_strain_fragmentation=per_strain_frag,
         false_links=false_links,
-        missed_links=missed_links
+        missed_links=missed_links,
+        linkability_analysis=linkability_analysis
     )
