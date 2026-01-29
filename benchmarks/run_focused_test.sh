@@ -53,7 +53,7 @@ VCFS=(
 
 # Benchmark parameters
 N_TIMEPOINTS=4
-TARGET_COVERAGE=30
+TARGET_COVERAGE=100
 N_WORKERS=8
 
 # =============================================================================
@@ -95,7 +95,8 @@ python "${PROJECT_ROOT}/benchmarks/prepare_isolate_mix.py" \
     --reference "$REFERENCE" \
     --output "$MIXED_DATA_DIR" \
     --timepoints "$N_TIMEPOINTS" \
-    --target-coverage "$TARGET_COVERAGE"
+    --target-coverage "$TARGET_COVERAGE" \
+    --abundance-profile sweep
 
 echo ""
 echo "Mixed samples created in: $MIXED_DATA_DIR"
