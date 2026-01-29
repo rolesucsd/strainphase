@@ -132,6 +132,402 @@ def load_validation_metrics(validation_dir: str) -> Optional[Dict]:
     return None
 
 
+def _short_name_from_params(params: Dict) -> Optional[str]:
+    try:
+        return (
+            f"mm{float(params['max_mismatch_frac']):.3f}_"
+            f"mq{int(params['min_mapq'])}_"
+            f"bq{int(params['min_base_quality'])}_"
+            f"snv{int(params['min_shared_snvs_for_edge'])}_"
+            f"md{float(params['merge_distance_threshold']):.3f}_"
+            f"aw{float(params['min_weight_for_anchor']):.2f}_"
+            f"rw{float(params['rescued_min_weight']):.2f}_"
+            f"ws{int(params['window_size'])}"
+        )
+    except Exception:
+        return None
+
+
+def generate_validation_patchwork(
+    results_dir: str,
+    results: List[Dict],
+    truth_dir: Optional[str],
+    output_dir: str
+) -> Optional[str]:
+    """Generate a patchwork validation figure for the best parameter set."""
+    if not HAS_MATPLOTLIB:
+        return None
+    if not truth_dir:
+        logger.warning("No truth_dir provided; skipping validation patchwork.")
+        return None
+
+    # Pick best config by haplotype_f1
+    best = None
+    best_f1 = -1.0
+    for r in results:
+        f1 = r.get("haplotype_f1")
+        if f1 is None:
+            continue
+        if f1 > best_f1:
+            best_f1 = f1
+            best = r
+    if best is None:
+        best = results[0]
+
+    config_name = _short_name_from_params(best.get("params", {}))
+    if not config_name:
+        logger.warning("Could not derive config name; skipping validation patchwork.")
+        return None
+
+    config_dir = Path(results_dir) / "configs" / config_name
+    lineages_path = config_dir / "lineages.tsv"
+    if not lineages_path.exists():
+        logger.warning(f"Missing lineages.tsv for {config_name}; skipping validation patchwork.")
+        return None
+
+    try:
+        from validation.validate_haplotypes import (
+            load_ground_truth,
+            load_detected_haplotypes,
+            match_haplotypes,
+            compute_haplotype_distance,
+            compute_validation_metrics,
+        )
+        from validation.validate_tracks import load_truth_tracks
+    except Exception as e:
+        logger.warning(f"Failed to import validation helpers: {e}")
+        return None
+
+    true_haps, all_snv_positions = load_ground_truth(truth_dir)
+    detected_haps = load_detected_haplotypes(str(lineages_path))
+    matches = match_haplotypes(true_haps, detected_haps, allow_one_to_many=True)
+    validation_result = compute_validation_metrics(
+        true_haps, detected_haps, all_snv_positions,
+        truth_dir=truth_dir
+    )
+
+    # Build figure
+    n_contigs = len({c for h in detected_haps for c in h.snv_alleles.keys()})
+    fig_height = 10 + max(0, n_contigs - 2) * 1.2
+    fig = plt.figure(figsize=(15, fig_height))
+    gs = fig.add_gridspec(2, 2, wspace=0.25, hspace=0.3)
+
+    # Panel A: Abundance correlation
+    ax_abund = fig.add_subplot(gs[0, 0])
+    true_abundances = []
+    detected_abundances = []
+    for true_hap, det_hap, _ in matches:
+        common_tps = set(true_hap.abundances.keys()) & set(det_hap.abundances.keys())
+        for tp in common_tps:
+            true_abundances.append(true_hap.abundances[tp])
+            detected_abundances.append(det_hap.abundances[tp])
+    if true_abundances:
+        ax_abund.scatter(
+            true_abundances, detected_abundances, alpha=0.7, s=40,
+            color=COLOR_PALETTE['accent'], edgecolors=COLOR_PALETTE['primary'], linewidths=0.6
+        )
+        max_val = max(true_abundances) if true_abundances else 1.0
+        ax_abund.plot([0, max_val], [0, max_val],
+                      color=COLOR_PALETTE['error'], linestyle='--', linewidth=1.5, alpha=0.8)
+        if len(true_abundances) >= 2:
+            r = np.corrcoef(true_abundances, detected_abundances)[0, 1]
+            ax_abund.text(0.05, 0.95, f"r = {r:.3f}",
+                          transform=ax_abund.transAxes, va='top',
+                          bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+    ax_abund.set_title("Abundance Correlation", color=COLOR_PALETTE['primary'])
+    ax_abund.set_xlabel("True Abundance", color=COLOR_PALETTE['primary'])
+    ax_abund.set_ylabel("Detected Abundance", color=COLOR_PALETTE['primary'])
+
+    # Panel B: Reference coverage
+    ax_cov = fig.add_subplot(gs[0, 1])
+    coverages = []
+    for true_hap, det_hap, _ in matches:
+        total_true_snvs = 0
+        recovered_snvs = 0
+        for contig in det_hap.snv_alleles.keys():
+            true_snvs = true_hap.snv_positions.get(contig, {})
+            det_snvs = det_hap.snv_alleles.get(contig, {})
+            total_true_snvs += len(true_snvs)
+            for pos, true_allele in true_snvs.items():
+                if pos in det_snvs and det_snvs[pos] == true_allele:
+                    recovered_snvs += 1
+        if total_true_snvs > 0:
+            coverages.append(recovered_snvs / total_true_snvs)
+    if coverages:
+        bins = np.linspace(0, 1.0, 21)
+        ax_cov.hist(coverages, bins=bins, color=COLOR_PALETTE['accent'], alpha=0.7, edgecolor='none')
+        mean_cov = np.mean(coverages)
+        ax_cov.axvline(mean_cov, color=COLOR_PALETTE['error'], linestyle='--',
+                       linewidth=1.8, label=f"Mean: {mean_cov:.3f}", alpha=0.8)
+        ax_cov.legend(frameon=True, framealpha=0.95, edgecolor=COLOR_PALETTE['neutral'])
+    ax_cov.set_title("Reference Coverage", color=COLOR_PALETTE['primary'])
+    ax_cov.set_xlabel("Fraction of SNVs Recovered", color=COLOR_PALETTE['primary'])
+    ax_cov.set_ylabel("Number of Strains", color=COLOR_PALETTE['primary'])
+
+    # Panel C: Detailed matching (2x2)
+    sub_gs = gs[1, 0].subgridspec(2, 2, wspace=0.35, hspace=0.35)
+    ax_dm1 = fig.add_subplot(sub_gs[0, 0])
+    ax_dm2 = fig.add_subplot(sub_gs[0, 1])
+    ax_dm3 = fig.add_subplot(sub_gs[1, 0])
+    ax_dm4 = fig.add_subplot(sub_gs[1, 1])
+
+    match_details = []
+    for true_hap, det_hap, _ in matches:
+        dist, n_matches, n_shared, _ = compute_haplotype_distance(true_hap, det_hap)
+        common_tps = set(true_hap.abundances.keys()) & set(det_hap.abundances.keys())
+        abund_errors = []
+        for tp in common_tps:
+            abund_errors.append(abs(true_hap.abundances[tp] - det_hap.abundances[tp]))
+        match_details.append({
+            "snv_match_fraction": n_matches / n_shared if n_shared > 0 else 0.0,
+            "abundance_mae": np.mean(abund_errors) if abund_errors else None,
+            "n_detected_snvs": sum(len(snvs) for snvs in det_hap.snv_alleles.values()),
+            "true_id": true_hap.strain_id,
+            "det_id": det_hap.lineage_id,
+        })
+
+    snv_fractions = [m["snv_match_fraction"] for m in match_details]
+    ax_dm1.hist(snv_fractions, bins=20, color=COLOR_PALETTE['accent'], alpha=0.7, edgecolor='none')
+    ax_dm1.set_title("SNV Match Fraction", color=COLOR_PALETTE['primary'])
+    ax_dm1.set_xlabel("Match Fraction", color=COLOR_PALETTE['primary'])
+    ax_dm1.set_ylabel("Pairs", color=COLOR_PALETTE['primary'])
+
+    abund_errors = [m["abundance_mae"] for m in match_details if m["abundance_mae"] is not None]
+    if abund_errors:
+        ax_dm2.hist(abund_errors, bins=20, color=COLOR_PALETTE['muted'], alpha=0.7, edgecolor='none')
+    ax_dm2.set_title("Abundance MAE", color=COLOR_PALETTE['primary'])
+    ax_dm2.set_xlabel("MAE", color=COLOR_PALETTE['primary'])
+    ax_dm2.set_ylabel("Pairs", color=COLOR_PALETTE['primary'])
+
+    true_counts = []
+    detected_counts = []
+    for m in match_details:
+        true_hap = next((h for h in true_haps if h.strain_id == m["true_id"]), None)
+        det_hap = next((h for h in detected_haps if h.lineage_id == m["det_id"]), None)
+        if true_hap and det_hap:
+            true_count = 0
+            for contig in det_hap.snv_alleles.keys():
+                true_count += len(true_hap.snv_positions.get(contig, {}))
+            true_counts.append(true_count)
+            detected_counts.append(m["n_detected_snvs"])
+    if true_counts:
+        ax_dm3.scatter(true_counts, detected_counts, alpha=0.7, s=30,
+                       color=COLOR_PALETTE['accent'], edgecolors=COLOR_PALETTE['primary'], linewidths=0.5)
+        max_count = max(max(true_counts), max(detected_counts))
+        ax_dm3.plot([0, max_count], [0, max_count], color=COLOR_PALETTE['error'], linestyle='--', linewidth=1.2)
+    ax_dm3.set_title("SNV Counts", color=COLOR_PALETTE['primary'])
+    ax_dm3.set_xlabel("True SNVs (detected contigs)", color=COLOR_PALETTE['primary'])
+    ax_dm3.set_ylabel("Detected SNVs", color=COLOR_PALETTE['primary'])
+
+    if validation_result.per_timepoint_metrics:
+        tps = sorted(validation_result.per_timepoint_metrics.keys())
+        recalls = [validation_result.per_timepoint_metrics[tp]['recall'] for tp in tps]
+        precisions = [validation_result.per_timepoint_metrics[tp]['precision'] for tp in tps]
+        x = np.arange(len(tps))
+        width = 0.35
+        ax_dm4.bar(x - width/2, recalls, width, label='Recall', alpha=0.7, color=COLOR_PALETTE['accent'])
+        ax_dm4.bar(x + width/2, precisions, width, label='Precision', alpha=0.7, color=COLOR_PALETTE['muted'])
+        ax_dm4.set_xticks(x)
+        ax_dm4.set_xticklabels(tps, color=COLOR_PALETTE['primary'])
+        ax_dm4.legend(frameon=True, framealpha=0.95, edgecolor=COLOR_PALETTE['neutral'])
+    ax_dm4.set_title("Precision/Recall by Timepoint", color=COLOR_PALETTE['primary'])
+    ax_dm4.set_ylabel("Score", color=COLOR_PALETTE['primary'])
+    ax_dm4.set_ylim(0, 1.1)
+
+    # Panel D: Track regions (per contig)
+    track_gs = gs[1, 1].subgridspec(max(1, int(np.ceil(n_contigs / 2))), min(2, max(1, n_contigs)), wspace=0.3, hspace=0.5)
+    track_axes = track_gs.subplots().flatten() if hasattr(track_gs, "subplots") else []
+    truth_tracks = load_truth_tracks(truth_dir)
+
+    # Build detected tracks from SNV spans
+    detected_tracks: Dict[str, Dict[str, Tuple[int, int]]] = defaultdict(dict)
+    for det_hap in detected_haps:
+        for contig, det_snvs in det_hap.snv_alleles.items():
+            if not det_snvs:
+                continue
+            detected_tracks[det_hap.lineage_id][contig] = (min(det_snvs.keys()), max(det_snvs.keys()))
+
+    track_to_strain = {}
+    for true_hap, det_hap, _ in matches:
+        if det_hap.lineage_id:
+            track_to_strain[det_hap.lineage_id] = true_hap.strain_id
+
+    all_contigs = sorted({c for tracks in list(truth_tracks.values()) + list(detected_tracks.values()) for c in tracks.keys()})
+    for idx, contig in enumerate(all_contigs):
+        if idx >= len(track_axes):
+            break
+        ax = track_axes[idx]
+        max_pos = 0
+        for tracks_dict in list(truth_tracks.values()) + list(detected_tracks.values()):
+            if contig in tracks_dict:
+                _, end = tracks_dict[contig]
+                max_pos = max(max_pos, end)
+        if max_pos == 0:
+            ax.axis("off")
+            continue
+
+        y_offset = 0
+        for strain_id, contig_dict in truth_tracks.items():
+            if contig in contig_dict:
+                start, end = contig_dict[contig]
+                ax.barh(y_offset, end - start, left=start, height=0.6,
+                        color=COLOR_PALETTE['light'], alpha=0.4)
+                y_offset += 1
+
+        for track_id, contig_dict in detected_tracks.items():
+            if contig in contig_dict:
+                start, end = contig_dict[contig]
+                matched_strain = track_to_strain.get(track_id)
+                color = COLOR_PALETTE['neutral']
+                if matched_strain and matched_strain in truth_tracks:
+                    color = COLOR_PALETTE['accent']
+                ax.barh(y_offset, end - start, left=start, height=0.4, color=color, alpha=0.7)
+                y_offset += 1
+
+        ax.set_title(contig, color=COLOR_PALETTE['primary'])
+        ax.set_xlim(0, max_pos * 1.05)
+        ax.set_yticks([])
+        ax.set_xlabel("Position (bp)", color=COLOR_PALETTE['primary'])
+
+    for idx in range(len(all_contigs), len(track_axes)):
+        track_axes[idx].axis("off")
+
+    fig.suptitle(f"Validation Patchwork (best config: {config_name})", fontsize=14, color=COLOR_PALETTE['primary'])
+    out_path = os.path.join(output_dir, "validation_patchwork.png")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+def _safe_metric_list(results: List[Dict], key: str) -> List[float]:
+    vals = []
+    for r in results:
+        v = r.get(key)
+        vals.append(0.0 if v is None else v)
+    return vals
+
+
+def generate_haplotype_accuracy_summary(results: List[Dict], output_dir: str) -> str:
+    """Bar summary (per parameter set) for haplotype precision/recall/F1."""
+    config_names = [r.get("config_name") or _short_name_from_params(r.get("params", {})) or f"cfg_{i+1}"
+                    for i, r in enumerate(results)]
+    precision = _safe_metric_list(results, "haplotype_precision")
+    recall = _safe_metric_list(results, "haplotype_recall")
+    f1 = _safe_metric_list(results, "haplotype_f1")
+
+    fig, axes = plt.subplots(3, 1, figsize=(max(12, len(results) * 0.25), 9), sharex=True)
+    metrics = [("Precision", precision), ("Recall", recall), ("F1", f1)]
+    colors = [COLOR_PALETTE['accent'], COLOR_PALETTE['muted'], COLOR_PALETTE['primary']]
+
+    x = np.arange(len(results))
+    for ax, (label, vals), color in zip(axes, metrics, colors):
+        ax.bar(x, vals, color=color, alpha=0.8)
+        ax.set_ylabel(label, color=COLOR_PALETTE['primary'])
+        ax.set_ylim(0, 1.05)
+        ax.grid(axis='y', alpha=0.15)
+
+    axes[-1].set_xticks(x)
+    axes[-1].set_xticklabels(config_names, rotation=90, fontsize=7, color=COLOR_PALETTE['primary'])
+    axes[0].set_title("Haplotype Accuracy by Parameter Set", color=COLOR_PALETTE['primary'])
+
+    plt.tight_layout()
+    out_path = os.path.join(output_dir, "haplotype_accuracy_summary.png")
+    plt.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close()
+    return out_path
+
+
+def generate_lineage_accuracy_summary(results: List[Dict], output_dir: str) -> str:
+    """Bar summary (per parameter set) for lineage precision/recall/F1."""
+    config_names = [r.get("config_name") or _short_name_from_params(r.get("params", {})) or f"cfg_{i+1}"
+                    for i, r in enumerate(results)]
+    precision = _safe_metric_list(results, "lineage_precision")
+    recall = _safe_metric_list(results, "lineage_recall")
+    f1 = _safe_metric_list(results, "lineage_f1")
+
+    fig, axes = plt.subplots(3, 1, figsize=(max(12, len(results) * 0.25), 9), sharex=True)
+    metrics = [("Precision", precision), ("Recall", recall), ("F1", f1)]
+    colors = [COLOR_PALETTE['accent'], COLOR_PALETTE['muted'], COLOR_PALETTE['primary']]
+
+    x = np.arange(len(results))
+    for ax, (label, vals), color in zip(axes, metrics, colors):
+        ax.bar(x, vals, color=color, alpha=0.8)
+        ax.set_ylabel(label, color=COLOR_PALETTE['primary'])
+        ax.set_ylim(0, 1.05)
+        ax.grid(axis='y', alpha=0.15)
+
+    axes[-1].set_xticks(x)
+    axes[-1].set_xticklabels(config_names, rotation=90, fontsize=7, color=COLOR_PALETTE['primary'])
+    axes[0].set_title("Lineage Accuracy by Parameter Set", color=COLOR_PALETTE['primary'])
+
+    plt.tight_layout()
+    out_path = os.path.join(output_dir, "lineage_accuracy_summary.png")
+    plt.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close()
+    return out_path
+
+
+def generate_linking_errors_summary(results: List[Dict], output_dir: str) -> str:
+    """Bar summary (per parameter set) for linking errors."""
+    config_names = [r.get("config_name") or _short_name_from_params(r.get("params", {})) or f"cfg_{i+1}"
+                    for i, r in enumerate(results)]
+    false_link = _safe_metric_list(results, "false_link_rate")
+    missed_link = _safe_metric_list(results, "missed_link_rate")
+
+    fig, axes = plt.subplots(2, 1, figsize=(max(12, len(results) * 0.25), 7), sharex=True)
+    metrics = [("False Link Rate", false_link), ("Missed Link Rate", missed_link)]
+    colors = [COLOR_PALETTE['error'], COLOR_PALETTE['muted']]
+
+    x = np.arange(len(results))
+    for ax, (label, vals), color in zip(axes, metrics, colors):
+        ax.bar(x, vals, color=color, alpha=0.8)
+        ax.set_ylabel(label, color=COLOR_PALETTE['primary'])
+        ax.set_ylim(0, max(vals) * 1.1 if vals else 1.0)
+        ax.grid(axis='y', alpha=0.15)
+
+    axes[-1].set_xticks(x)
+    axes[-1].set_xticklabels(config_names, rotation=90, fontsize=7, color=COLOR_PALETTE['primary'])
+    axes[0].set_title("Linking Errors by Parameter Set", color=COLOR_PALETTE['primary'])
+
+    plt.tight_layout()
+    out_path = os.path.join(output_dir, "linking_errors_summary.png")
+    plt.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close()
+    return out_path
+
+
+def generate_error_breakdown_summary(results: List[Dict], output_dir: str) -> str:
+    """Bar summary (per parameter set) for false negatives and false positives."""
+    config_names = [r.get("config_name") or _short_name_from_params(r.get("params", {})) or f"cfg_{i+1}"
+                    for i, r in enumerate(results)]
+    fn = []
+    fp = []
+    for r in results:
+        fn.append(r.get("false_negatives_count") or 0)
+        fp.append(r.get("false_positives_count") or 0)
+
+    fig, axes = plt.subplots(2, 1, figsize=(max(12, len(results) * 0.25), 7), sharex=True)
+    metrics = [("False Negatives", fn), ("False Positives", fp)]
+    colors = [COLOR_PALETTE['muted'], COLOR_PALETTE['error']]
+
+    x = np.arange(len(results))
+    for ax, (label, vals), color in zip(axes, metrics, colors):
+        ax.bar(x, vals, color=color, alpha=0.85)
+        ax.set_ylabel(label, color=COLOR_PALETTE['primary'])
+        ax.grid(axis='y', alpha=0.15)
+
+    axes[-1].set_xticks(x)
+    axes[-1].set_xticklabels(config_names, rotation=90, fontsize=7, color=COLOR_PALETTE['primary'])
+    axes[0].set_title("Error Breakdown by Parameter Set", color=COLOR_PALETTE['primary'])
+
+    plt.tight_layout()
+    out_path = os.path.join(output_dir, "error_breakdown_summary.png")
+    plt.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close()
+    return out_path
+
+
 # =============================================================================
 # Figure generation
 # =============================================================================
@@ -1261,6 +1657,10 @@ def generate_html_report(
         'coverage_performance.png': 'Performance vs Coverage',
         'metric_correlation.png': 'Metric Correlation Matrix',
         'error_decomposition.png': 'Error Decomposition',
+        'haplotype_accuracy_summary.png': 'Haplotype Accuracy by Parameter Set',
+        'lineage_accuracy_summary.png': 'Lineage Accuracy by Parameter Set',
+        'linking_errors_summary.png': 'Linking Errors by Parameter Set',
+        'error_breakdown_summary.png': 'Error Breakdown by Parameter Set',
     }
 
     for filename, title in figure_titles.items():
@@ -1457,7 +1857,8 @@ def generate_html_report(
 def generate_report(
     results_dir: str,
     output_dir: str,
-    validation_dir: Optional[str] = None
+    validation_dir: Optional[str] = None,
+    truth_dir: Optional[str] = None
 ) -> str:
     """
     Generate complete benchmark report.
@@ -1496,21 +1897,11 @@ def generate_report(
     if validation_dir:
         validation_metrics = load_validation_metrics(validation_dir)
         validation_files = {
-            "haplotype_accuracy.png": "Haplotype Detection Accuracy",
-            "abundance_correlation.png": "Abundance Correlation",
             "detection_sensitivity.png": "Detection Sensitivity",
             "confusion_matrix.png": "Haplotype Confusion Matrix",
-            "detailed_matching.png": "Detailed Matching Analysis",
             "abundance_trajectories.png": "Abundance Trajectories",
             "track_fragmentation.png": "Track Fragmentation",
-            "linking_errors.png": "Linking Errors",
-            "lineage_accuracy.png": "Lineage Accuracy",
-            "track_regions.png": "Track Regions on Contigs",
-            "per_abundance_performance.png": "Performance by Abundance Range",
-            "divergence_performance.png": "Performance vs Strain Divergence",
             "detection_roc.png": "Detection Performance (ROC-like)",
-            "reference_coverage.png": "Reference Coverage Distribution",
-            "error_breakdown.png": "Error Type Breakdown",
             "scalability_analysis.png": "Scalability Analysis",
         }
         for filename, title in validation_files.items():
@@ -1519,6 +1910,18 @@ def generate_report(
                 dest_path = os.path.join(output_dir, filename)
                 shutil.copy2(src_path, dest_path)
                 validation_figures[dest_path] = title
+
+        patchwork_path = generate_validation_patchwork(results_dir, results, truth_dir, output_dir)
+        if patchwork_path:
+            validation_figures[patchwork_path] = "Validation Patchwork Summary"
+
+        try:
+            figures["haplotype_accuracy_summary.png"] = generate_haplotype_accuracy_summary(results, output_dir)
+            figures["lineage_accuracy_summary.png"] = generate_lineage_accuracy_summary(results, output_dir)
+            figures["linking_errors_summary.png"] = generate_linking_errors_summary(results, output_dir)
+            figures["error_breakdown_summary.png"] = generate_error_breakdown_summary(results, output_dir)
+        except Exception as e:
+            logger.warning(f"Failed to generate summary bar charts: {e}")
 
     logger.info("Generating parameter heatmap...")
     figures['parameter_heatmap.png'] = generate_parameter_heatmap(results, output_dir)
@@ -1572,13 +1975,16 @@ def main():
                         help="Output directory for figures and HTML report")
     parser.add_argument("--validation",
                         help="Optional validation results directory")
+    parser.add_argument("--truth",
+                        help="Truth directory for generating validation patchwork")
 
     args = parser.parse_args()
 
     report_path = generate_report(
         results_dir=args.results,
         output_dir=args.output,
-        validation_dir=args.validation
+        validation_dir=args.validation,
+        truth_dir=args.truth
     )
 
     if report_path:

@@ -30,6 +30,8 @@ Example:
         --log-level INFO
 """
 
+from __future__ import annotations
+
 import argparse
 import logging
 import os
@@ -43,6 +45,7 @@ from strainphase.core import (
     Haplotype,
     HaplotyperConfig,
     LongitudinalIntegrator,
+    RescueStatistic,
     WindowResult,
     link_windows,
     process_contig,
