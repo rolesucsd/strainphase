@@ -1958,11 +1958,17 @@ def run_validation(
                                    f"matches both {lineage_contig_to_strain[key]} and {matched_strain}")
         
         # Now build detected_lineages structure: lineage_id -> {contig -> strain_id}
+        # Include ALL detected lineages; unmatched contigs are labeled "UNMATCHED"
         detected_lineages = {}
-        for (lineage_id, contig), strain_id in lineage_contig_to_strain.items():
-            if lineage_id not in detected_lineages:
-                detected_lineages[lineage_id] = {}
-            detected_lineages[lineage_id][contig] = strain_id
+        for det_hap in detected_haps:
+            if not det_hap.lineage_id:
+                continue
+            if det_hap.lineage_id not in detected_lineages:
+                detected_lineages[det_hap.lineage_id] = {}
+            for contig in det_hap.snv_alleles.keys():
+                key = (det_hap.lineage_id, contig)
+                strain_id = lineage_contig_to_strain.get(key, "UNMATCHED")
+                detected_lineages[det_hap.lineage_id][contig] = strain_id
         
         logger.info(f"Built detected_lineages: {len(detected_lineages)} lineages, "
                    f"{sum(len(c) for c in detected_lineages.values())} (lineage_id, contig) pairs")

@@ -581,57 +581,6 @@ def generate_abundance_correlation_patchwork(
     return out_path
 
 
-def generate_detailed_matching_patchwork(
-    results_dir: str,
-    results: List[Dict],
-    output_dir: str,
-    top_n: int = 8,
-    cols: int = 4,
-    rows: int = 2,
-) -> Optional[str]:
-    top_configs = _top_configs_by_f1(results, top_n)
-    if not top_configs:
-        return None
-    fig, axes = _make_patchwork_axes(len(top_configs), cols, rows, "Detailed Matching (Top F1)")
-    for idx, res in enumerate(top_configs):
-        ax = axes[idx]
-        config_dir = _config_validation_dir(results_dir, res)
-        if not config_dir:
-            ax.text(0.5, 0.5, "missing config", ha="center", va="center")
-            ax.axis("off")
-            continue
-        details_path = config_dir / "lineage_details.tsv"
-        if not details_path.exists():
-            ax.text(0.5, 0.5, "missing lineage_details", ha="center", va="center")
-            ax.axis("off")
-            continue
-        rows_data = _load_lineage_details(details_path)
-        xs = []
-        ys = []
-        for row in rows_data:
-            if row.get("matched_strain") == "UNMATCHED":
-                continue
-            try:
-                xs.append(float(row["snv_distance"]))
-                ys.append(float(row["abundance_diff"]))
-            except (TypeError, ValueError, KeyError):
-                continue
-        if xs and ys:
-            ax.scatter(xs, ys, s=8, alpha=0.7, color=COLOR_PALETTE["secondary"])
-        ax.set_xlabel("SNV distance", fontsize=7)
-        ax.set_ylabel("Abundance diff", fontsize=7)
-        ax.tick_params(labelsize=6)
-        params = res.get("params") or {}
-        name = _short_param_label(params)
-        f1 = res.get("haplotype_f1")
-        f1_str = f"{f1:.2f}" if f1 is not None else "n/a"
-        ax.set_title(f"{name}\nF1={f1_str}", fontsize=7)
-    out_path = os.path.join(output_dir, "detailed_matching.png")
-    fig.savefig(out_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    return out_path
-
-
 def generate_reference_coverage_patchwork(
     results_dir: str,
     results: List[Dict],
@@ -2043,7 +1992,6 @@ def generate_html_report(
         'linking_errors_summary.png': 'Linking Errors by Parameter Set',
         'error_breakdown_summary.png': 'Error Breakdown by Parameter Set',
         'abundance_correlation.png': 'Abundance Correlation (Top F1 Patchwork)',
-        'detailed_matching.png': 'Detailed Matching (Top F1 Patchwork)',
         'reference_coverage.png': 'Reference Coverage (Top F1 Patchwork)',
         'track_regions.png': 'Track Regions (Top F1 Patchwork)',
     }
@@ -2324,9 +2272,6 @@ def generate_report(
             path = generate_abundance_correlation_patchwork(results_dir, results, output_dir)
             if path:
                 figures["abundance_correlation.png"] = path
-            path = generate_detailed_matching_patchwork(results_dir, results, output_dir)
-            if path:
-                figures["detailed_matching.png"] = path
             path = generate_reference_coverage_patchwork(results_dir, results, truth_dir, output_dir)
             if path:
                 figures["reference_coverage.png"] = path
