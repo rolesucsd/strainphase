@@ -23,6 +23,8 @@ Output Format (results_to_dataframe):
 Date: 2025
 """
 
+from __future__ import annotations
+
 import logging
 import warnings
 from collections import defaultdict

@@ -171,6 +171,11 @@ class SweepResult:
     snv_f1: Optional[float] = None
     false_negatives_count: Optional[int] = None
     false_positives_count: Optional[int] = None
+    snv_true_total: Optional[int] = None
+    snv_true_in_span: Optional[int] = None
+    snv_detected_total: Optional[int] = None
+    snv_correct_total: Optional[int] = None
+    snv_span_coverage_frac: Optional[float] = None
     
     # Track/linking metrics (when ground truth available)
     track_fragmentation_mean: Optional[float] = None
@@ -219,6 +224,11 @@ class SweepResult:
             'snv_f1': self.snv_f1,
             'false_negatives_count': self.false_negatives_count,
             'false_positives_count': self.false_positives_count,
+            'snv_true_total': self.snv_true_total,
+            'snv_true_in_span': self.snv_true_in_span,
+            'snv_detected_total': self.snv_detected_total,
+            'snv_correct_total': self.snv_correct_total,
+            'snv_span_coverage_frac': self.snv_span_coverage_frac,
             # Track/linking metrics
             'track_fragmentation_mean': self.track_fragmentation_mean,
             'track_fragmentation_median': self.track_fragmentation_median,
@@ -410,6 +420,11 @@ class CheckpointManager:
                 snv_f1=data.get('snv_f1'),
                 false_negatives_count=data.get('false_negatives_count'),
                 false_positives_count=data.get('false_positives_count'),
+                snv_true_total=data.get('snv_true_total'),
+                snv_true_in_span=data.get('snv_true_in_span'),
+                snv_detected_total=data.get('snv_detected_total'),
+                snv_correct_total=data.get('snv_correct_total'),
+                snv_span_coverage_frac=data.get('snv_span_coverage_frac'),
                 # Track/linking metrics
                 track_fragmentation_mean=data.get('track_fragmentation_mean'),
                 track_fragmentation_median=data.get('track_fragmentation_median'),
@@ -469,6 +484,11 @@ class CheckpointManager:
             snv_f1=data.get('snv_f1'),
             false_negatives_count=data.get('false_negatives_count'),
             false_positives_count=data.get('false_positives_count'),
+            snv_true_total=data.get('snv_true_total'),
+            snv_true_in_span=data.get('snv_true_in_span'),
+            snv_detected_total=data.get('snv_detected_total'),
+            snv_correct_total=data.get('snv_correct_total'),
+            snv_span_coverage_frac=data.get('snv_span_coverage_frac'),
             # Track/linking metrics
             track_fragmentation_mean=data.get('track_fragmentation_mean'),
             track_fragmentation_median=data.get('track_fragmentation_median'),
@@ -1040,7 +1060,8 @@ class ParameterSweep:
                             truth_dir=self.truth_dir,
                             output_dir=validation_output,
                             window_results=all_window_results,  # For track validation
-                            window_size=params.window_size  # For track validation
+                            window_size=params.window_size,  # For track validation
+                            haplotyper_config=params.to_config()
                         )
 
                         # Extract metrics from validation (including track/linking and lineage metrics)
@@ -1052,6 +1073,11 @@ class ParameterSweep:
                                      if (validation_result.snv_precision + validation_result.snv_recall) > 0 else 0.0,
                             "false_negatives_count": len(validation_result.false_negatives or []),
                             "false_positives_count": len(validation_result.false_positives or []),
+                            "snv_true_total": validation_result.snv_true_total,
+                            "snv_true_in_span": validation_result.snv_true_in_span,
+                            "snv_detected_total": validation_result.snv_detected_total,
+                            "snv_correct_total": validation_result.snv_correct_total,
+                            "snv_span_coverage_frac": validation_result.snv_span_coverage_frac,
                             "haplotype_precision": validation_result.precision,
                             "haplotype_recall": validation_result.recall,
                             "haplotype_f1": validation_result.f1,
@@ -1127,6 +1153,11 @@ class ParameterSweep:
                     snv_f1=accuracy_metrics.get("snv_f1"),
                     false_negatives_count=accuracy_metrics.get("false_negatives_count"),
                     false_positives_count=accuracy_metrics.get("false_positives_count"),
+                    snv_true_total=accuracy_metrics.get("snv_true_total"),
+                    snv_true_in_span=accuracy_metrics.get("snv_true_in_span"),
+                    snv_detected_total=accuracy_metrics.get("snv_detected_total"),
+                    snv_correct_total=accuracy_metrics.get("snv_correct_total"),
+                    snv_span_coverage_frac=accuracy_metrics.get("snv_span_coverage_frac"),
                     haplotype_precision=accuracy_metrics.get("haplotype_precision"),
                     haplotype_recall=accuracy_metrics.get("haplotype_recall"),
                     haplotype_f1=accuracy_metrics.get("haplotype_f1"),
@@ -1383,7 +1414,8 @@ class ParameterSweep:
                     truth_dir=self.truth_dir,
                     output_dir=validation_output,
                     window_results=all_window_results,  # For track validation
-                    window_size=params.window_size  # For track validation
+                    window_size=params.window_size,  # For track validation
+                    haplotyper_config=params.to_config()
                 )
 
                 # Extract metrics from validation (including track/linking and lineage metrics)
@@ -1395,6 +1427,11 @@ class ParameterSweep:
                              if (validation_result.snv_precision + validation_result.snv_recall) > 0 else 0.0,
                     "false_negatives_count": len(validation_result.false_negatives or []),
                     "false_positives_count": len(validation_result.false_positives or []),
+                    "snv_true_total": validation_result.snv_true_total,
+                    "snv_true_in_span": validation_result.snv_true_in_span,
+                    "snv_detected_total": validation_result.snv_detected_total,
+                    "snv_correct_total": validation_result.snv_correct_total,
+                    "snv_span_coverage_frac": validation_result.snv_span_coverage_frac,
                     "haplotype_precision": validation_result.precision,
                     "haplotype_recall": validation_result.recall,
                     "haplotype_f1": validation_result.f1,
@@ -1471,6 +1508,11 @@ class ParameterSweep:
             snv_f1=accuracy_metrics.get("snv_f1"),
             false_negatives_count=accuracy_metrics.get("false_negatives_count"),
             false_positives_count=accuracy_metrics.get("false_positives_count"),
+            snv_true_total=accuracy_metrics.get("snv_true_total"),
+            snv_true_in_span=accuracy_metrics.get("snv_true_in_span"),
+            snv_detected_total=accuracy_metrics.get("snv_detected_total"),
+            snv_correct_total=accuracy_metrics.get("snv_correct_total"),
+            snv_span_coverage_frac=accuracy_metrics.get("snv_span_coverage_frac"),
             haplotype_precision=accuracy_metrics.get("haplotype_precision"),
             haplotype_recall=accuracy_metrics.get("haplotype_recall"),
             haplotype_f1=accuracy_metrics.get("haplotype_f1"),
@@ -1904,6 +1946,11 @@ def write_parameter_grid_summary(
             'snv_f1': f"{snv_f1:.6f}",
             'false_negatives_count': result.false_negatives_count if result.false_negatives_count is not None else "NA",
             'false_positives_count': result.false_positives_count if result.false_positives_count is not None else "NA",
+            'snv_true_total': result.snv_true_total if result.snv_true_total is not None else "NA",
+            'snv_true_in_span': result.snv_true_in_span if result.snv_true_in_span is not None else "NA",
+            'snv_detected_total': result.snv_detected_total if result.snv_detected_total is not None else "NA",
+            'snv_correct_total': result.snv_correct_total if result.snv_correct_total is not None else "NA",
+            'snv_span_coverage_frac': f"{result.snv_span_coverage_frac:.6f}" if result.snv_span_coverage_frac is not None else "NA",
             'abundance_pearson_r': f"{result.abundance_pearson_r:.6f}" if result.abundance_pearson_r is not None else "NA",
             'abundance_mae': f"{result.abundance_mae:.6f}" if result.abundance_mae is not None else "NA",
 
@@ -1951,6 +1998,8 @@ def write_parameter_grid_summary(
             'haplotype_precision', 'haplotype_recall', 'haplotype_f1',
             'snv_precision', 'snv_recall', 'snv_f1',
             'false_negatives_count', 'false_positives_count',
+            'snv_true_total', 'snv_true_in_span', 'snv_detected_total',
+            'snv_correct_total', 'snv_span_coverage_frac',
             'abundance_pearson_r', 'abundance_mae',
             # Track/Linking
             'track_fragmentation_mean', 'track_fragmentation_median',
@@ -1979,6 +2028,8 @@ def write_parameter_grid_summary(
                 'haplotype_precision', 'haplotype_recall', 'haplotype_f1',
                 'snv_precision', 'snv_recall', 'snv_f1',
                 'false_negatives_count', 'false_positives_count',
+                'snv_true_total', 'snv_true_in_span', 'snv_detected_total',
+                'snv_correct_total', 'snv_span_coverage_frac',
                 'abundance_pearson_r', 'abundance_mae',
                 'track_fragmentation_mean', 'track_fragmentation_median',
                 'false_link_rate', 'missed_link_rate', 'track_consensus_error',
