@@ -642,12 +642,13 @@ def window_results_to_prelink_lineages_tsv(
         contig_id = wr.window.contig
         for h_idx, hap in enumerate(wr.haplotypes):
             lineage_id = f"W{wr.window.start}_H{h_idx}"
+            sample = wr.window.sample or sample_id
             snv_alleles_str = ','.join(
                 f"{pos}:{allele}" for pos, allele in sorted(hap.consensus.items())
             )
             records.append({
                 'lineage_id': lineage_id,
-                'sample': sample_id,
+                'sample': sample,
                 'contig': contig_id,
                 'track_id': lineage_id,
                 'abundance': hap.weight,

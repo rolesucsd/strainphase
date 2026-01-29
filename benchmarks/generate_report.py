@@ -272,8 +272,7 @@ def generate_validation_patchwork(
     detected_haps = load_detected_haplotypes(str(lineages_path))
     matches = match_haplotypes(true_haps, detected_haps, allow_one_to_many=True)
     validation_result = compute_validation_metrics(
-        true_haps, detected_haps, all_snv_positions,
-        truth_dir=truth_dir
+        true_haps, detected_haps, all_snv_positions
     )
 
     # Build figure
