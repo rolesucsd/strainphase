@@ -491,12 +491,32 @@ def _make_patchwork_axes(n_panels: int, cols: int, rows: int, title: str) -> Tup
     return fig, axes_list
 
 
+def _short_param_label(params: Dict) -> str:
+    """Compact label for patchwork panels."""
+    if not params:
+        return "cfg"
+    ws = params.get("window_size")
+    mm = params.get("max_mismatch_frac")
+    mq = params.get("min_mapq")
+    bq = params.get("min_base_quality")
+    parts = []
+    if ws is not None:
+        parts.append(f"ws{int(ws)}")
+    if mm is not None:
+        parts.append(f"mm{float(mm):.3f}")
+    if mq is not None:
+        parts.append(f"mq{int(mq)}")
+    if bq is not None:
+        parts.append(f"bq{int(bq)}")
+    return " ".join(parts) if parts else "cfg"
+
+
 def generate_abundance_correlation_patchwork(
     results_dir: str,
     results: List[Dict],
     output_dir: str,
     top_n: int = 8,
-    cols: int = 5,
+    cols: int = 4,
     rows: int = 2,
 ) -> Optional[str]:
     top_configs = _top_configs_by_f1(results, top_n)
@@ -535,7 +555,7 @@ def generate_abundance_correlation_patchwork(
         ax.set_ylabel("Detected", fontsize=7)
         ax.tick_params(labelsize=6)
         params = res.get("params") or {}
-        name = _short_name_from_params(params) or f"cfg{idx+1}"
+        name = _short_param_label(params)
         f1 = res.get("haplotype_f1")
         f1_str = f"{f1:.2f}" if f1 is not None else "n/a"
         ax.set_title(f"{name}\nF1={f1_str}", fontsize=7)
@@ -550,7 +570,7 @@ def generate_detailed_matching_patchwork(
     results: List[Dict],
     output_dir: str,
     top_n: int = 8,
-    cols: int = 5,
+    cols: int = 4,
     rows: int = 2,
 ) -> Optional[str]:
     top_configs = _top_configs_by_f1(results, top_n)
@@ -586,7 +606,7 @@ def generate_detailed_matching_patchwork(
         ax.set_ylabel("Abundance diff", fontsize=7)
         ax.tick_params(labelsize=6)
         params = res.get("params") or {}
-        name = _short_name_from_params(params) or f"cfg{idx+1}"
+        name = _short_param_label(params)
         f1 = res.get("haplotype_f1")
         f1_str = f"{f1:.2f}" if f1 is not None else "n/a"
         ax.set_title(f"{name}\nF1={f1_str}", fontsize=7)
@@ -602,7 +622,7 @@ def generate_reference_coverage_patchwork(
     truth_dir: Optional[str],
     output_dir: str,
     top_n: int = 8,
-    cols: int = 5,
+    cols: int = 4,
     rows: int = 2,
 ) -> Optional[str]:
     if not truth_dir:
@@ -654,7 +674,7 @@ def generate_reference_coverage_patchwork(
         ax.set_xticks([])
         ax.set_ylabel("Coverage", fontsize=7)
         params = res.get("params") or {}
-        name = _short_name_from_params(params) or f"cfg{idx+1}"
+        name = _short_param_label(params)
         f1 = res.get("haplotype_f1")
         f1_str = f"{f1:.2f}" if f1 is not None else "n/a"
         ax.set_title(f"{name}\nF1={f1_str}", fontsize=7)
@@ -670,7 +690,7 @@ def generate_track_regions_patchwork(
     truth_dir: Optional[str],
     output_dir: str,
     top_n: int = 8,
-    cols: int = 5,
+    cols: int = 4,
     rows: int = 2,
 ) -> Optional[str]:
     if not truth_dir:
@@ -731,7 +751,7 @@ def generate_track_regions_patchwork(
         ax.set_xlabel("Position", fontsize=7)
         ax.tick_params(axis="x", labelsize=6)
         params = res.get("params") or {}
-        name = _short_name_from_params(params) or f"cfg{idx+1}"
+        name = _short_param_label(params)
         f1 = res.get("haplotype_f1")
         f1_str = f"{f1:.2f}" if f1 is not None else "n/a"
         ax.set_title(f"{name}\nF1={f1_str}", fontsize=7)
@@ -1983,7 +2003,10 @@ def generate_html_report(
     )
     figures['pareto_front.png'] = generate_pareto_front(results, output_dir)
     figures['optimal_params.png'] = generate_optimal_params(stable_params, output_dir)
-    figures['coverage_performance.png'] = generate_coverage_performance(results, output_dir)
+    try:
+        figures['coverage_performance.png'] = generate_coverage_performance(results, output_dir)
+    except Exception as e:
+        logger.warning(f"Skipping coverage performance plot: {e}")
     figures['metric_correlation.png'] = generate_metric_correlation(results, output_dir)
     error_path = generate_error_decomposition(validation_metrics, output_dir)
     if error_path:
