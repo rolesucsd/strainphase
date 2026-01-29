@@ -107,6 +107,48 @@ def generate_abundance_profiles(
     return abundances
 
 
+def generate_sweep_abundance_profiles(
+    n_strains: int,
+    n_timepoints: int,
+    high_start: float = 0.8,
+    low_end: float = 0.05
+) -> Dict[str, Dict[str, float]]:
+    """
+    Generate abundance profiles with one sweep down and one sweep up.
+
+    strain_1: high -> low
+    strain_2: low -> high
+    other strains: stable intermediate (equal share of remaining abundance)
+    """
+    if n_strains < 3:
+        raise ValueError("Sweep abundance profile requires at least 3 strains.")
+    if not (0 < low_end < high_start < 1.0):
+        raise ValueError("Invalid sweep abundance bounds.")
+    if n_timepoints < 2:
+        raise ValueError("Sweep abundance profile requires at least 2 timepoints.")
+
+    timepoints = [f"T{i+1}" for i in range(n_timepoints)]
+    abundances = {tp: {} for tp in timepoints}
+
+    remaining = 1.0 - (high_start + low_end)
+    if remaining <= 0:
+        raise ValueError("Not enough remaining abundance for stable strains.")
+    stable_count = n_strains - 2
+    stable_each = remaining / stable_count
+
+    for tp_idx, tp in enumerate(timepoints):
+        frac = tp_idx / (n_timepoints - 1)
+        down = high_start + (low_end - high_start) * frac
+        up = low_end + (high_start - low_end) * frac
+
+        abundances[tp]["strain_1"] = float(down)
+        abundances[tp]["strain_2"] = float(up)
+        for idx in range(3, n_strains + 1):
+            abundances[tp][f"strain_{idx}"] = float(stable_each)
+
+    return abundances
+
+
 def subsample_bam(
     input_bam: str,
     output_bam: str,
@@ -547,7 +589,8 @@ def prepare_isolate_mix(
     vcf_paths: Optional[List[str]] = None,
     n_timepoints: int = 4,
     target_coverage: int = 30,
-    seed: int = 42
+    seed: int = 42,
+    abundance_profile: str = "random"
 ):
     """
     Main function to prepare isolate BAMs for strainphase benchmarking.
@@ -586,7 +629,10 @@ def prepare_isolate_mix(
 
     # Step 2: Generate abundance profiles
     logger.info("\nStep 2: Generating abundance profiles")
-    abundances = generate_abundance_profiles(n_strains, n_timepoints, seed)
+    if abundance_profile == "sweep":
+        abundances = generate_sweep_abundance_profiles(n_strains, n_timepoints)
+    else:
+        abundances = generate_abundance_profiles(n_strains, n_timepoints, seed)
     for tp, tp_abunds in sorted(abundances.items()):
         logger.info(f"  {tp}: " + ", ".join(f"{s}={a:.2f}" for s, a in tp_abunds.items()))
 
@@ -741,6 +787,9 @@ def main():
                         help="Number of timepoints to create")
     parser.add_argument("--target-coverage", type=int, default=30,
                         help="Target coverage per timepoint")
+    parser.add_argument("--abundance-profile", default="random",
+                        choices=["random", "sweep"],
+                        help="Abundance profile across timepoints")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed")
 
@@ -758,6 +807,7 @@ def main():
         n_timepoints=args.timepoints,
         target_coverage=args.target_coverage,
         seed=args.seed,
+        abundance_profile=args.abundance_profile,
     )
 
 
