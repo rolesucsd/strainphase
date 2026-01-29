@@ -652,20 +652,84 @@ def compute_validation_metrics(
             'is_sweeping': true_hap.is_sweeping,
         })
 
-    # Abundance correlation
+    # Abundance correlation with grouped truth
+    # 
+    # KEY INSIGHT: If multiple true strains have identical sequences within the
+    # detected region, they are INDISTINGUISHABLE and should appear as a single
+    # haplotype with combined abundance. The "effective truth" for comparison
+    # should be the sum of indistinguishable strains' abundances.
+    #
+    # Example: Strains A (25%) and B (25%) are identical in a window →
+    #          Expected detection: one haplotype at 50%
+    #          Effective truth: 50%, not 25%
+    
     true_abundances = []
     detected_abundances = []
+    grouped_true_abundances = []  # For the corrected metric
 
     for true_hap, det_hap, _ in matches:
+        # Get the SNV positions where this detected haplotype has calls
+        detected_positions: Dict[str, set] = {}
+        for contig, snvs in det_hap.snv_alleles.items():
+            detected_positions[contig] = set(snvs.keys())
+        
+        # Find all true strains that are INDISTINGUISHABLE from true_hap
+        # within the detected positions (identical alleles at all shared positions)
+        indistinguishable_strains = [true_hap]  # Always includes self
+        
+        for other_hap in true_haps:
+            if other_hap.strain_id == true_hap.strain_id:
+                continue
+            
+            # Check if other_hap is identical to true_hap at detected positions
+            is_identical = True
+            has_overlap = False
+            
+            for contig, det_positions in detected_positions.items():
+                true_snvs = true_hap.snv_positions.get(contig, {})
+                other_snvs = other_hap.snv_positions.get(contig, {})
+                
+                for pos in det_positions:
+                    true_allele = true_snvs.get(pos)
+                    other_allele = other_snvs.get(pos)
+                    
+                    if true_allele is not None and other_allele is not None:
+                        has_overlap = True
+                        if true_allele != other_allele:
+                            is_identical = False
+                            break
+                
+                if not is_identical:
+                    break
+            
+            # Only consider as indistinguishable if there was actual overlap
+            # and all overlapping positions matched
+            if is_identical and has_overlap:
+                indistinguishable_strains.append(other_hap)
+        
         # Find common timepoints
         common_tps = set(true_hap.abundances.keys()) & set(det_hap.abundances.keys())
+        
         for tp in common_tps:
+            # Original individual abundance (for backward compatibility)
             true_abundances.append(true_hap.abundances[tp])
             detected_abundances.append(det_hap.abundances[tp])
-
+            
+            # Grouped abundance: sum of all indistinguishable strains
+            grouped_abundance = sum(
+                h.abundances.get(tp, 0) for h in indistinguishable_strains
+            )
+            grouped_true_abundances.append(grouped_abundance)
+    
     if len(true_abundances) >= 2:
-        abundance_pearson_r = np.corrcoef(true_abundances, detected_abundances)[0, 1]
-        abundance_mae = np.mean(np.abs(np.array(true_abundances) - np.array(detected_abundances)))
+        # Use GROUPED abundances for the primary metric (more accurate)
+        abundance_pearson_r = np.corrcoef(grouped_true_abundances, detected_abundances)[0, 1]
+        abundance_mae = np.mean(np.abs(np.array(grouped_true_abundances) - np.array(detected_abundances)))
+        
+        # Log the difference for transparency
+        old_mae = np.mean(np.abs(np.array(true_abundances) - np.array(detected_abundances)))
+        if abs(old_mae - abundance_mae) > 0.01:
+            logger.debug(f"Abundance MAE improved from {old_mae:.3f} (individual) to {abundance_mae:.3f} (grouped)")
     else:
         abundance_pearson_r = 0.0
         abundance_mae = 1.0
@@ -674,51 +738,87 @@ def compute_validation_metrics(
     # Aggregate SNVs per true strain to handle fragmentation correctly:
     # If a strain is split into multiple tracks, we should count each true SNV
     # only once, and consider it "recovered" if ANY matching track has it correct.
+    #
+    # IMPORTANT: Only count true SNVs within the detected genomic span.
+    # If there are gaps between windows (e.g., sparse SNV regions), we can't detect
+    # SNVs there, so they shouldn't penalize recall. This gives "SNV recall within
+    # the regions we actually processed."
 
     # Group matches by true strain
     matches_by_strain: Dict[str, List[DetectedHaplotype]] = defaultdict(list)
     for true_hap, det_hap, _ in matches:
         matches_by_strain[true_hap.strain_id].append(det_hap)
 
-    total_true_snvs = 0
+    total_true_snvs_in_span = 0
+    total_true_snvs_global = 0
     total_detected_snvs = 0
     total_correct_snvs = 0
 
     for true_hap in true_haps:
+        # Count global true SNVs (for reference)
+        for contig, true_snvs in true_hap.snv_positions.items():
+            total_true_snvs_global += len(true_snvs)
+        
         # Get all detected tracks matching this true strain
         matching_tracks = matches_by_strain.get(true_hap.strain_id, [])
         if not matching_tracks:
-            # Count true SNVs even for unmatched strains (affects recall denominator)
-            for contig, true_snvs in true_hap.snv_positions.items():
-                total_true_snvs += len(true_snvs)
+            # For unmatched strains, we have no detected span, so these SNVs
+            # don't contribute to the "within-span" recall calculation
             continue
 
-        # Aggregate detected SNVs across all matching tracks
+        # Aggregate detected SNVs across all matching tracks and determine span per contig
         # detected_snvs_union[contig][pos] = allele (from any matching track)
         detected_snvs_union: Dict[str, Dict[int, str]] = defaultdict(dict)
+        detected_span: Dict[str, Tuple[int, int]] = {}  # contig -> (min_pos, max_pos)
+        
         for det_hap in matching_tracks:
             for contig, det_snvs in det_hap.snv_alleles.items():
                 for pos, allele in det_snvs.items():
                     # Keep first allele seen (they should all agree if tracks are correct)
                     if pos not in detected_snvs_union[contig]:
                         detected_snvs_union[contig][pos] = allele
+                
+                # Update span for this contig
+                if det_snvs:
+                    min_pos = min(det_snvs.keys())
+                    max_pos = max(det_snvs.keys())
+                    if contig in detected_span:
+                        curr_min, curr_max = detected_span[contig]
+                        detected_span[contig] = (min(curr_min, min_pos), max(curr_max, max_pos))
+                    else:
+                        detected_span[contig] = (min_pos, max_pos)
 
-        # Count true SNVs and check if they're recovered in union of detected tracks
+        # Count true SNVs WITHIN detected span and check if they're recovered
         for contig, true_snvs in true_hap.snv_positions.items():
-            total_true_snvs += len(true_snvs)
             det_snvs = detected_snvs_union.get(contig, {})
-
+            span = detected_span.get(contig)
+            
+            if not span:
+                # No detected SNVs on this contig for this strain - skip
+                continue
+            
+            span_min, span_max = span
+            
             for pos, true_allele in true_snvs.items():
-                if pos in det_snvs and det_snvs[pos] == true_allele:
-                    total_correct_snvs += 1
+                # Only count SNVs within the detected span
+                if span_min <= pos <= span_max:
+                    total_true_snvs_in_span += 1
+                    if pos in det_snvs and det_snvs[pos] == true_allele:
+                        total_correct_snvs += 1
 
         # Count total detected SNVs (union across all matching tracks, avoid double-counting)
         for contig, det_snvs in detected_snvs_union.items():
             total_detected_snvs += len(det_snvs)
 
     snv_precision = total_correct_snvs / total_detected_snvs if total_detected_snvs > 0 else 0.0
-    snv_recall = total_correct_snvs / total_true_snvs if total_true_snvs > 0 else 0.0
+    snv_recall = total_correct_snvs / total_true_snvs_in_span if total_true_snvs_in_span > 0 else 0.0
     phasing_accuracy = snv_recall
+    
+    # Log the difference between global and within-span counts for transparency
+    if total_true_snvs_global > 0:
+        coverage_fraction = total_true_snvs_in_span / total_true_snvs_global
+        logger.debug(f"SNV recall computed within detected span: {total_true_snvs_in_span}/{total_true_snvs_global} "
+                    f"true SNVs ({coverage_fraction:.1%} of total) in detected regions")
 
     detection_threshold, _ = compute_detection_sensitivity(true_haps, matches)
 
@@ -2039,16 +2139,20 @@ def write_validation_summary(
         f.write(f"  Recall:     {result.recall:.4f}  (fraction of true strains detected)\n")
         f.write(f"  F1 Score:   {result.f1:.4f}  (harmonic mean of precision/recall)\n\n")
 
-        f.write("SNV-Level Metrics:\n")
+        f.write("SNV-Level Metrics (within detected genomic span):\n")
         f.write(f"  Precision:  {result.snv_precision:.4f}  (fraction of called SNVs that are correct)\n")
-        f.write(f"  Recall:     {result.snv_recall:.4f}  (fraction of true SNVs recovered)\n")
+        f.write(f"  Recall:     {result.snv_recall:.4f}  (fraction of true SNVs in detected regions recovered)\n")
         snv_f1 = 2 * result.snv_precision * result.snv_recall / (result.snv_precision + result.snv_recall) \
                  if (result.snv_precision + result.snv_recall) > 0 else 0.0
-        f.write(f"  F1 Score:   {snv_f1:.4f}\n\n")
+        f.write(f"  F1 Score:   {snv_f1:.4f}\n")
+        f.write("  Note: Recall only counts true SNVs within the min-max span of detected SNVs,\n")
+        f.write("        not SNVs in unprocessed regions (gaps between windows).\n\n")
 
-        f.write("Abundance Metrics:\n")
-        f.write(f"  Pearson r:  {result.abundance_pearson_r:.4f}  (correlation with true abundances)\n")
-        f.write(f"  MAE:        {result.abundance_mae:.4f}  (mean absolute error)\n\n")
+        f.write("Abundance Metrics (grouped by indistinguishable strains):\n")
+        f.write(f"  Pearson r:  {result.abundance_pearson_r:.4f}  (correlation with effective truth)\n")
+        f.write(f"  MAE:        {result.abundance_mae:.4f}  (mean absolute error)\n")
+        f.write("  Note: 'Effective truth' sums abundances of strains that are identical\n")
+        f.write("        within the detected region (indistinguishable strains).\n\n")
 
         # Section 3: Track/Linking Metrics
         f.write("3. TRACK & LINKING METRICS\n")
@@ -2247,6 +2351,13 @@ def run_validation(
             result.track_consensus_error = track_result.track_consensus_error
             logger.info(f"Track validation complete: fragmentation={result.track_fragmentation_mean:.3f}, "
                        f"false_link={result.false_link_rate:.3f}, missed_link={result.missed_link_rate:.3f}")
+            
+            # Write linkability report if there's fragmentation to analyze
+            if track_result.linkability_analysis:
+                from validation.validate_tracks import write_linkability_report
+                linkability_path = os.path.join(output_dir, 'track_linkability.txt')
+                write_linkability_report(track_result.linkability_analysis, linkability_path)
+                logger.info(f"Wrote track linkability report to {linkability_path}")
         except Exception as e:
             logger.warning(f"Track validation failed: {e}")
             import traceback
