@@ -1060,8 +1060,7 @@ class ParameterSweep:
                             truth_dir=self.truth_dir,
                             output_dir=validation_output,
                             window_results=all_window_results,  # For track validation
-                            window_size=params.window_size,  # For track validation
-                            haplotyper_config=params.to_config()
+                            window_size=params.window_size  # For track validation
                         )
 
                         # Extract metrics from validation (including track/linking and lineage metrics)
@@ -1414,8 +1413,7 @@ class ParameterSweep:
                     truth_dir=self.truth_dir,
                     output_dir=validation_output,
                     window_results=all_window_results,  # For track validation
-                    window_size=params.window_size,  # For track validation
-                    haplotyper_config=params.to_config()
+                    window_size=params.window_size  # For track validation
                 )
 
                 # Extract metrics from validation (including track/linking and lineage metrics)
