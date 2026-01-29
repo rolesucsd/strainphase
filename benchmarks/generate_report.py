@@ -24,6 +24,7 @@ import json
 import logging
 import os
 import shutil
+import sys
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
@@ -40,6 +41,11 @@ try:
     HAS_MATPLOTLIB = True
 except ImportError:
     HAS_MATPLOTLIB = False
+
+# Ensure local project imports (e.g., validation) work when run as a script
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -866,6 +872,7 @@ COLOR_PALETTE = {
     'primary': '#1F2933',      # Charcoal
     'secondary': '#3E4C59',    # Slate
     'accent': '#4B7F9D',       # Muted blue
+    'muted': '#7A8A9A',        # Muted blue-gray
     'success': '#5B8A72',      # Muted green
     'warning': '#7C8AA5',      # Cool steel
     'error': '#6B7280',        # Cool gray
@@ -2227,6 +2234,18 @@ def generate_report(
     validation_metrics = None
     validation_figures = {}
 
+    # Fallback: redefine "stable" as configs with F1 >= 0.8
+    if not stable_params:
+        stable_params = []
+        for r in results:
+            f1 = r.get("haplotype_f1")
+            if f1 is not None and f1 >= 0.8:
+                params = r.get("params") or {}
+                if params:
+                    stable_params.append(params)
+        if stable_params:
+            logger.info(f"Using {len(stable_params)} configs with haplotype_f1 >= 0.8 as stable parameters")
+
     if validation_dir:
         validation_metrics = load_validation_metrics(validation_dir)
         validation_files = {
@@ -2287,7 +2306,10 @@ def generate_report(
     figures['pareto_front.png'] = generate_pareto_front(results, output_dir)
 
     logger.info("Generating optimal params visualization...")
-    figures['optimal_params.png'] = generate_optimal_params(stable_params, output_dir)
+    if stable_params:
+        figures['optimal_params.png'] = generate_optimal_params(stable_params, output_dir)
+    else:
+        logger.warning("Skipping optimal params visualization (no stable configs with F1 >= 0.8)")
     
     # Additional publication-quality plots
     logger.info("Generating performance vs coverage plot...")
