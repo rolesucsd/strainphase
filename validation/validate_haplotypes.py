@@ -95,6 +95,13 @@ class ValidationResult:
     # Detection threshold
     detection_threshold: float
 
+    # SNV count diagnostics
+    snv_true_total: int = 0
+    snv_true_in_span: int = 0
+    snv_detected_total: int = 0
+    snv_correct_total: int = 0
+    snv_span_coverage_frac: float = 0.0
+
     # Track/linking validation (Strainphase-specific)
     track_fragmentation_mean: float = 0.0
     track_fragmentation_median: float = 0.0
@@ -814,6 +821,7 @@ def compute_validation_metrics(
     snv_recall = total_correct_snvs / total_true_snvs_in_span if total_true_snvs_in_span > 0 else 0.0
     phasing_accuracy = snv_recall
     
+    coverage_fraction = 0.0
     # Log the difference between global and within-span counts for transparency
     if total_true_snvs_global > 0:
         coverage_fraction = total_true_snvs_in_span / total_true_snvs_global
@@ -904,6 +912,11 @@ def compute_validation_metrics(
         snv_precision=snv_precision,
         snv_recall=snv_recall,
         phasing_accuracy=phasing_accuracy,
+        snv_true_total=total_true_snvs_global,
+        snv_true_in_span=total_true_snvs_in_span,
+        snv_detected_total=total_detected_snvs,
+        snv_correct_total=total_correct_snvs,
+        snv_span_coverage_frac=coverage_fraction if total_true_snvs_global > 0 else 0.0,
         detection_threshold=detection_threshold,
         matches=match_details,
         false_negatives=false_negatives,
@@ -2010,6 +2023,11 @@ def run_validation(
             'snv_precision': result.snv_precision,
             'snv_recall': result.snv_recall,
             'phasing_accuracy': result.phasing_accuracy,
+            'snv_true_total': result.snv_true_total,
+            'snv_true_in_span': result.snv_true_in_span,
+            'snv_detected_total': result.snv_detected_total,
+            'snv_correct_total': result.snv_correct_total,
+            'snv_span_coverage_frac': result.snv_span_coverage_frac,
             'detection_threshold': result.detection_threshold,
             # Track/linking metrics
             'track_fragmentation_mean': result.track_fragmentation_mean,
