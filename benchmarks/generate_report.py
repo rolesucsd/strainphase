@@ -170,6 +170,22 @@ def _config_validation_dir(results_dir: str, result: Dict) -> Optional[Path]:
     return config_dir if config_dir.exists() else None
 
 
+def _config_lineages_path(results_dir: str, result: Dict) -> Optional[Path]:
+    params = result.get("params") or {}
+    config_name = _short_name_from_params(params)
+    if not config_name:
+        return None
+    base_dir = Path(results_dir) / "configs" / config_name
+    # Prefer validation/lineages.tsv if present, else fall back to config root.
+    candidate = base_dir / "validation" / "lineages.tsv"
+    if candidate.exists():
+        return candidate
+    candidate = base_dir / "lineages.tsv"
+    if candidate.exists():
+        return candidate
+    return None
+
+
 def _load_lineage_details(path: Path) -> List[Dict]:
     records = []
     with open(path, newline="") as f:
@@ -643,8 +659,8 @@ def generate_reference_coverage_patchwork(
             ax.text(0.5, 0.5, "missing config", ha="center", va="center")
             ax.axis("off")
             continue
-        lineages_path = config_dir / "lineages.tsv"
-        if not lineages_path.exists():
+        lineages_path = _config_lineages_path(results_dir, res)
+        if not lineages_path or not lineages_path.exists():
             ax.text(0.5, 0.5, "missing lineages", ha="center", va="center")
             ax.axis("off")
             continue
@@ -711,8 +727,8 @@ def generate_track_regions_patchwork(
             ax.text(0.5, 0.5, "missing config", ha="center", va="center")
             ax.axis("off")
             continue
-        lineages_path = config_dir / "lineages.tsv"
-        if not lineages_path.exists():
+        lineages_path = _config_lineages_path(results_dir, res)
+        if not lineages_path or not lineages_path.exists():
             ax.text(0.5, 0.5, "missing lineages", ha="center", va="center")
             ax.axis("off")
             continue
