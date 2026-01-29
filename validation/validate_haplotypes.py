@@ -1573,6 +1573,37 @@ def write_linking_quality(
     return output_path
 
 
+def write_linking_diagnostics(window_results: List, output_dir: str):
+    """
+    Write linking_diagnostics.tsv with per-overlap linking decisions.
+    """
+    import csv
+
+    if not window_results:
+        return
+
+    records = []
+    for wr in window_results:
+        debug_entries = getattr(wr, "linking_debug", None)
+        if not debug_entries:
+            continue
+        records.extend(debug_entries)
+
+    if not records:
+        return
+
+    output_path = os.path.join(output_dir, "linking_diagnostics.tsv")
+    fieldnames = sorted({k for rec in records for k in rec.keys()})
+    try:
+        with open(output_path, "w") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames, delimiter="\t")
+            writer.writeheader()
+            for rec in records:
+                writer.writerow(rec)
+        logger.info(f"Wrote {len(records)} linking diagnostics records to {output_path}")
+    except Exception as e:
+        logger.warning(f"Failed to write linking_diagnostics.tsv: {e}")
+
 def write_rescue_statistics(
     window_results: List,  # List of WindowResult
     output_dir: str
@@ -1991,6 +2022,12 @@ def run_validation(
         write_linking_quality(detected_haps, matches, output_dir)
     except Exception as e:
         logger.warning(f"Failed to write linking_quality.tsv: {e}")
+
+    if window_results:
+        try:
+            write_linking_diagnostics(window_results, output_dir)
+        except Exception as e:
+            logger.warning(f"Failed to write linking_diagnostics.tsv: {e}")
 
     if window_results:
         try:

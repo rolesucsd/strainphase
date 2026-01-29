@@ -144,7 +144,7 @@ python "${PROJECT_ROOT}/benchmarks/generate_report.py" \
     --results "${OUTPUT_DIR}/sweep_results" \
     --output "${OUTPUT_DIR}/report" \
     --validation "${OUTPUT_DIR}/sweep_results" \
-    2>/dev/null || echo "Report generation skipped (optional)"
+    --truth "$MIXED_DATA_DIR"
 
 echo ""
 echo "============================================================"
