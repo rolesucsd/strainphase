@@ -2049,10 +2049,11 @@ def run_validation(
         except Exception as e:
             logger.warning(f"Failed to write em_convergence.tsv: {e}")
 
-        try:
-            write_rescue_statistics(window_results, output_dir)
-        except Exception as e:
-            logger.warning(f"Failed to write rescue_statistics.tsv: {e}")
+        # NOTE: rescue_statistics.tsv is written by parameter_sweep.py
+        # via rescue_integrator.write_rescue_statistics() which has access
+        # to the LongitudinalIntegrator's rescue statistics.
+        # We skip writing here to avoid creating an empty file that would
+        # overwrite or confuse the actual rescue statistics.
 
     try:
         write_validation_summary(result, true_haps, detected_haps, matches, output_dir, window_results)

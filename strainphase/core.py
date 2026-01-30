@@ -1571,6 +1571,12 @@ class LongitudinalIntegrator:
         """Write rescue_statistics.tsv with details of rescue events."""
         import csv
 
+        n_rescued = sum(1 for s in self.rescue_statistics if s.was_rescued)
+        logging.info(
+            f"Writing rescue_statistics.tsv: {len(self.rescue_statistics)} records "
+            f"({n_rescued} rescued)"
+        )
+
         fieldnames = [
             "sample",
             "contig",
