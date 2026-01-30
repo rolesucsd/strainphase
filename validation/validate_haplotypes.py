@@ -533,6 +533,13 @@ def match_haplotypes(
             matched_for_strain = []
             for dist, det_h, n_shared in candidate_matches:
                 # Check if this detected lineage overlaps significantly with already-matched ones
+                # Exact matches (distance ~0) should still count as matched, even if redundant.
+                if dist <= 1e-9:
+                    matched_for_strain.append((dist, det_h, n_shared))
+                    matches.append((true_hap, det_h, dist))
+                    used_detected.add(det_h.lineage_id)
+                    continue
+
                 overlaps = False
                 for _, existing_det_h, _ in matched_for_strain:
                     # Check SNV overlap between det_h and existing_det_h

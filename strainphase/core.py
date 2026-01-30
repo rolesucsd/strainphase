@@ -1166,7 +1166,11 @@ class LongitudinalIntegrator:
         self.rescue_statistics: list[RescueStatistic] = []
 
     def build_anchor_panel_for_key(
-        self, sample_results: dict[str, WindowResult]
+        self,
+        sample_results: dict[str, WindowResult],
+        *,
+        include_low_weight: bool = False,
+        exclude_sample: str | None = None,
     ) -> tuple[list[Haplotype], list[str]]:
         """
         Build anchor panel directly from sample_results dict.
@@ -1178,8 +1182,10 @@ class LongitudinalIntegrator:
         anchor_samples = []
 
         for sample_id, wr in sample_results.items():
+            if exclude_sample and sample_id == exclude_sample:
+                continue
             for hap in wr.haplotypes:
-                if hap.weight >= self.config.min_weight_for_anchor:
+                if include_low_weight or hap.weight >= self.config.min_weight_for_anchor:
                     anchor_haps.append(hap)
                     anchor_samples.append(sample_id)
 
@@ -1210,25 +1216,33 @@ class LongitudinalIntegrator:
     ) -> WindowResult:
         """Rescue low-confidence haplotypes using anchors."""
         if not anchor_haps:
-            for k, hap in enumerate(window_result.haplotypes):
-                if hap.weight >= self.config.min_weight_for_anchor:
-                    continue
-                self.rescue_statistics.append(
-                    RescueStatistic(
-                        sample=current_sample,
-                        contig=window_result.window.contig,
-                        window_start=window_result.window.start,
-                        track_id=hap.track_id or f"unlinked_{window_result.window.start}_{k}",
-                        was_rescued=False,
-                        original_weight=hap.weight,
-                        rescued_weight=hap.weight,
-                        donor_timepoint="",
-                        anchor_distance=-1.0,
-                        n_shared_with_anchor=0,
-                        reason="no_anchors",
+            # Fallback: try low-weight anchors from other timepoints so every
+            # below-threshold haplotype still gets evaluated.
+            anchor_haps, anchor_samples = self.build_anchor_panel_for_key(
+                sample_results,
+                include_low_weight=True,
+                exclude_sample=current_sample,
+            )
+            if not anchor_haps:
+                for k, hap in enumerate(window_result.haplotypes):
+                    if hap.weight >= self.config.min_weight_for_anchor:
+                        continue
+                    self.rescue_statistics.append(
+                        RescueStatistic(
+                            sample=current_sample,
+                            contig=window_result.window.contig,
+                            window_start=window_result.window.start,
+                            track_id=hap.track_id or f"unlinked_{window_result.window.start}_{k}",
+                            was_rescued=False,
+                            original_weight=hap.weight,
+                            rescued_weight=hap.weight,
+                            donor_timepoint="",
+                            anchor_distance=-1.0,
+                            n_shared_with_anchor=0,
+                            reason="no_anchors",
+                        )
                     )
-                )
-            return window_result
+                return window_result
 
         window = window_result.window
         haplotypes = window_result.haplotypes
