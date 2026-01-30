@@ -359,6 +359,7 @@ class RescueStatistic:
     donor_timepoint: str  # Timepoint that provided the anchor
     anchor_distance: float  # Distance to matching anchor
     n_shared_with_anchor: int  # Number of shared SNVs with anchor
+    reason: str = ""  # Debug reason for rescue outcome
 
 
 # =============================================================================
@@ -1209,6 +1210,24 @@ class LongitudinalIntegrator:
     ) -> WindowResult:
         """Rescue low-confidence haplotypes using anchors."""
         if not anchor_haps:
+            for k, hap in enumerate(window_result.haplotypes):
+                if hap.weight >= self.config.min_weight_for_anchor:
+                    continue
+                self.rescue_statistics.append(
+                    RescueStatistic(
+                        sample=current_sample,
+                        contig=window_result.window.contig,
+                        window_start=window_result.window.start,
+                        track_id=hap.track_id or f"unlinked_{window_result.window.start}_{k}",
+                        was_rescued=False,
+                        original_weight=hap.weight,
+                        rescued_weight=hap.weight,
+                        donor_timepoint="",
+                        anchor_distance=-1.0,
+                        n_shared_with_anchor=0,
+                        reason="no_anchors",
+                    )
+                )
             return window_result
 
         window = window_result.window
@@ -1268,9 +1287,32 @@ class LongitudinalIntegrator:
                             donor_timepoint=donor_timepoint,
                             anchor_distance=best_dist,
                             n_shared_with_anchor=best_n_shared,
+                            reason="rescued",
+                        )
+                    )
+                else:
+                    self.rescue_statistics.append(
+                        RescueStatistic(
+                            sample=current_sample,
+                            contig=window.contig,
+                            window_start=window.start,
+                            track_id=hap.track_id or f"unlinked_{window.start}_{k}",
+                            was_rescued=False,
+                            original_weight=old_weight,
+                            rescued_weight=new_weight,
+                            donor_timepoint="",
+                            anchor_distance=best_dist,
+                            n_shared_with_anchor=best_n_shared,
+                            reason="rescued_min_weight_not_higher",
                         )
                     )
             else:
+                if best_n_shared < self.config.min_shared_for_rescue:
+                    reason = "min_shared"
+                elif best_dist > self.config.rescue_match_distance:
+                    reason = "distance"
+                else:
+                    reason = "no_match"
                 # Record non-rescued haplotype (below anchor threshold)
                 self.rescue_statistics.append(
                     RescueStatistic(
@@ -1284,6 +1326,7 @@ class LongitudinalIntegrator:
                         donor_timepoint="",
                         anchor_distance=best_dist if best_n_shared > 0 else -1.0,
                         n_shared_with_anchor=best_n_shared,
+                        reason=reason,
                     )
                 )
 
@@ -1416,6 +1459,7 @@ class LongitudinalIntegrator:
             "donor_timepoint",
             "anchor_distance",
             "n_shared_with_anchor",
+            "reason",
         ]
 
         with open(output_path, "w", newline="") as f:
@@ -1437,6 +1481,7 @@ class LongitudinalIntegrator:
                             f"{stat.anchor_distance:.6f}" if stat.anchor_distance >= 0 else "NA"
                         ),
                         "n_shared_with_anchor": stat.n_shared_with_anchor,
+                        "reason": stat.reason,
                     }
                 )
 
