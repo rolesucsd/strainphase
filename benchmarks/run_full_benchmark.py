@@ -384,37 +384,6 @@ def run_parameter_sweep(
     return summary
 
 
-def generate_report(
-    sweep_dir: str,
-    output_dir: str,
-    validation_dir: Optional[str] = None
-) -> bool:
-    """
-    Generate HTML benchmark report.
-    """
-    logger.info("=" * 60)
-    logger.info("STEP 5: Generating benchmark report")
-    logger.info("=" * 60)
-
-    from generate_report import generate_report as report_func
-
-    report_output = Path(output_dir) / "report"
-    report_output.mkdir(parents=True, exist_ok=True)
-
-    report_path = report_func(
-        results_dir=sweep_dir,
-        output_dir=str(report_output),
-        validation_dir=validation_dir
-    )
-
-    if report_path:
-        logger.info(f"Report generated: {report_path}")
-        return True
-    else:
-        logger.warning("Report generation failed or skipped")
-        return False
-
-
 def run_performance_benchmark(
     sim_dir: str,
     output_dir: str,
@@ -653,20 +622,7 @@ def run_full_benchmark(
         except (OSError, json.JSONDecodeError) as e:
             logger.warning(f"Could not update sweep_results.json with coverage: {e}")
 
-    # Step 5: Generate report
-    step_start = time.time()
-    sweep_dir = str(output_path / "sweep_results")
-    success = generate_report(
-        sweep_dir=sweep_dir,
-        output_dir=output_dir,
-        validation_dir=sweep_dir
-    )
-    results["steps"]["generate_report"] = {
-        "success": success,
-        "duration_seconds": time.time() - step_start
-    }
-
-    # Step 6: Performance benchmark (always run)
+    # Step 5: Performance benchmark (always run)
     step_start = time.time()
     success = run_performance_benchmark(
         sim_dir=str(sim_dir),

@@ -309,11 +309,13 @@ def build_lineage_table(
                         lambda: defaultdict(float)
                     )
                     total_weight = 0.0
-                    total_reads = 0
+                    total_supporting_reads = 0
+                    total_window_reads = 0
 
                     for _wr, hap in members:
                         total_weight += hap.weight
-                        total_reads += hap.supporting_reads
+                        total_supporting_reads += hap.supporting_reads
+                        total_window_reads += len(_wr.window.reads)
                         for pos, base in hap.consensus.items():
                             position_votes[pos][base] += hap.weight
 
@@ -330,9 +332,59 @@ def build_lineage_table(
                             n_windows,
                             merged_consensus,
                             total_weight / n_windows,  # mean_weight
-                            total_reads,
+                            total_supporting_reads,
+                            total_window_reads,
                         )
                     )
+
+        # Deduplicate tracks within the same sample that have identical consensus
+        for contig_id in tracks_by_contig:
+            tracks = tracks_by_contig[contig_id]
+            if not tracks:
+                continue
+
+            # Group tracks by (sample_id, consensus_tuple)
+            # Merge tracks with identical consensus within the same sample
+            dedup_key_to_tracks: dict[tuple, list[int]] = defaultdict(list)
+            for i, track in enumerate(tracks):
+                sample_id = track[0]
+                consensus = track[5]  # consensus dict
+                consensus_key = tuple(sorted(consensus.items()))
+                dedup_key_to_tracks[(sample_id, consensus_key)].append(i)
+
+            # Build deduplicated track list
+            deduped_tracks = []
+            for (sample_id, consensus_key), indices in dedup_key_to_tracks.items():
+                if len(indices) == 1:
+                    # No duplicates, keep as-is
+                    deduped_tracks.append(tracks[indices[0]])
+                else:
+                    # Merge duplicate tracks
+                    # Combine: track_ids (use first), spans (union), n_windows (sum),
+                    # consensus (same), mean_weight (average), reads (sum)
+                    first = tracks[indices[0]]
+                    merged_track_id = first[1]  # Keep first track_id
+                    merged_span_start = min(tracks[i][2] for i in indices)
+                    merged_span_end = max(tracks[i][3] for i in indices)
+                    merged_n_windows = sum(tracks[i][4] for i in indices)
+                    merged_consensus = first[5]  # Same consensus
+                    merged_mean_weight = sum(tracks[i][6] for i in indices) / len(indices)
+                    merged_supporting_reads = sum(tracks[i][7] for i in indices)
+                    merged_window_reads = sum(tracks[i][8] for i in indices)
+
+                    deduped_tracks.append((
+                        sample_id,
+                        merged_track_id,
+                        merged_span_start,
+                        merged_span_end,
+                        merged_n_windows,
+                        merged_consensus,
+                        merged_mean_weight,
+                        merged_supporting_reads,
+                        merged_window_reads,
+                    ))
+
+            tracks_by_contig[contig_id] = deduped_tracks
 
         # Cluster tracks across samples by consensus similarity
         # FIXED: Compare each track to ALL existing clusters (not just unassigned tracks)
@@ -348,7 +400,7 @@ def build_lineage_table(
             cluster_spans: list[tuple[int, int]] = []
 
             for i in range(len(tracks)):
-                _, _, span_start_i, span_end_i, _, consensus_i, _, _ = tracks[i]
+                _, _, span_start_i, span_end_i, _, consensus_i, _, _, _ = tracks[i]
                 positions_i = set(consensus_i.keys())
 
                 # Try to find an existing cluster to join
@@ -412,7 +464,8 @@ def build_lineage_table(
                         n_windows,
                         consensus,
                         mean_weight,
-                        total_reads,
+                        total_supporting_reads,
+                        total_window_reads,
                     ) = tracks[idx]
 
                     consensus_str = "|".join(
@@ -431,7 +484,8 @@ def build_lineage_table(
                             "span_bp": span_end - span_start,
                             "n_windows": n_windows,
                             "mean_weight": mean_weight,
-                            "total_supporting_reads": total_reads,
+                            "supporting_reads": total_supporting_reads,
+                            "total_reads": total_window_reads,
                             "n_snvs": len(consensus),
                             "consensus": consensus_str,
                             "n_timepoints": n_timepoints,
@@ -469,7 +523,7 @@ def write_longitudinal_outputs(
             f.write(
                 "lineage_id\tmag\tcontig\tsample\ttrack_id\t"
                 "span_start\tspan_end\tspan_bp\tn_windows\t"
-                "mean_weight\ttotal_supporting_reads\t"
+                "mean_weight\tsupporting_reads\ttotal_reads\t"
                 "n_snvs\tconsensus\tn_timepoints\n"
             )
 

@@ -131,22 +131,6 @@ python "${PROJECT_ROOT}/benchmarks/parameter_sweep.py" \
 
 echo ""
 
-# =============================================================================
-# Step 3: Generate report
-# =============================================================================
-
-echo "============================================================"
-echo "STEP 3: Generating benchmark report"
-echo "============================================================"
-echo ""
-
-python "${PROJECT_ROOT}/benchmarks/generate_report.py" \
-    --results "${OUTPUT_DIR}/sweep_results" \
-    --output "${OUTPUT_DIR}/report" \
-    --validation "${OUTPUT_DIR}/sweep_results" \
-    --truth "$MIXED_DATA_DIR"
-
-echo ""
 echo "============================================================"
 echo "BENCHMARK COMPLETE"
 echo "============================================================"
@@ -156,7 +140,6 @@ echo ""
 echo "Key outputs:"
 echo "  - Mixed samples: ${MIXED_DATA_DIR}/"
 echo "  - Sweep results: ${OUTPUT_DIR}/sweep_results/"
-echo "  - Report: ${OUTPUT_DIR}/report/benchmark_report.html"
 echo ""
 echo "Ground truth files:"
 echo "  - ${MIXED_DATA_DIR}/truth_strains.tsv"
