@@ -1214,165 +1214,250 @@ class LongitudinalIntegrator:
         sample_results: dict[str, WindowResult],
         current_sample: str,
     ) -> WindowResult:
-        """Rescue low-confidence haplotypes using anchors."""
+        """
+        Rescue missing haplotypes by checking if junk reads match anchors from other timepoints.
+
+        This looks at reads currently assigned to the junk model and checks if they
+        match a haplotype that was detected in another timepoint. If so, it creates
+        a new haplotype from those reads.
+        """
         if not anchor_haps:
-            # Fallback: try low-weight anchors from other timepoints so every
-            # below-threshold haplotype still gets evaluated.
+            # Try to get anchors including low-weight ones
             anchor_haps, anchor_samples = self.build_anchor_panel_for_key(
                 sample_results,
                 include_low_weight=True,
                 exclude_sample=current_sample,
             )
             if not anchor_haps:
-                for k, hap in enumerate(window_result.haplotypes):
-                    if hap.weight >= self.config.min_weight_for_anchor:
-                        continue
-                    self.rescue_statistics.append(
-                        RescueStatistic(
-                            sample=current_sample,
-                            contig=window_result.window.contig,
-                            window_start=window_result.window.start,
-                            track_id=hap.track_id or f"unlinked_{window_result.window.start}_{k}",
-                            was_rescued=False,
-                            original_weight=hap.weight,
-                            rescued_weight=hap.weight,
-                            donor_timepoint="",
-                            anchor_distance=-1.0,
-                            n_shared_with_anchor=0,
-                            reason="no_anchors",
-                        )
-                    )
-                return window_result
-
-        window = window_result.window
-        haplotypes = window_result.haplotypes
-        gamma = window_result.gamma.copy()
-        pi = window_result.pi.copy()
-
-        rescued_any = False
-
-        for k, hap in enumerate(haplotypes):
-            if hap.weight >= self.config.min_weight_for_anchor:
-                continue
-
-            # Check for anchor match - only consider anchors with sufficient shared positions
-            best_dist = float("inf")
-            best_n_shared = 0
-            best_anchor_idx = -1
-            for anchor_idx, anchor in enumerate(anchor_haps):
-                dist, _, n_shared = hap.distance_to(anchor, window.snv_pos)
-                if n_shared >= self.config.min_shared_for_rescue and dist < best_dist:
-                    best_dist = dist
-                    best_n_shared = n_shared
-                    best_anchor_idx = anchor_idx
-
-            if (
-                best_n_shared >= self.config.min_shared_for_rescue
-                and best_dist <= self.config.rescue_match_distance
-            ):
-                old_weight = pi[k]
-                new_weight = max(old_weight, self.config.rescued_min_weight)
-
-                if new_weight > old_weight:
-                    excess = new_weight - old_weight
-                    pi[k] = new_weight
-
-                    junk_idx = len(haplotypes)
-                    if pi[junk_idx] > excess:
-                        pi[junk_idx] -= excess
-
-                    pi = pi / pi.sum()
-                    hap.confidence = 1.0
-                    rescued_any = True
-
-                    # Record rescue statistic
-                    donor_timepoint = (
-                        anchor_samples[best_anchor_idx] if best_anchor_idx >= 0 else "unknown"
-                    )
-                    self.rescue_statistics.append(
-                        RescueStatistic(
-                            sample=current_sample,
-                            contig=window.contig,
-                            window_start=window.start,
-                            track_id=hap.track_id or f"unlinked_{window.start}_{k}",
-                            was_rescued=True,
-                            original_weight=old_weight,
-                            rescued_weight=new_weight,
-                            donor_timepoint=donor_timepoint,
-                            anchor_distance=best_dist,
-                            n_shared_with_anchor=best_n_shared,
-                            reason="rescued",
-                        )
-                    )
-                else:
-                    self.rescue_statistics.append(
-                        RescueStatistic(
-                            sample=current_sample,
-                            contig=window.contig,
-                            window_start=window.start,
-                            track_id=hap.track_id or f"unlinked_{window.start}_{k}",
-                            was_rescued=False,
-                            original_weight=old_weight,
-                            rescued_weight=new_weight,
-                            donor_timepoint="",
-                            anchor_distance=best_dist,
-                            n_shared_with_anchor=best_n_shared,
-                            reason="rescued_min_weight_not_higher",
-                        )
-                    )
-            else:
-                if best_n_shared < self.config.min_shared_for_rescue:
-                    reason = "min_shared"
-                elif best_dist > self.config.rescue_match_distance:
-                    reason = "distance"
-                else:
-                    reason = "no_match"
-                # Record non-rescued haplotype (below anchor threshold)
                 self.rescue_statistics.append(
                     RescueStatistic(
                         sample=current_sample,
-                        contig=window.contig,
-                        window_start=window.start,
-                        track_id=hap.track_id or f"unlinked_{window.start}_{k}",
+                        contig=window_result.window.contig,
+                        window_start=window_result.window.start,
+                        track_id="window",
                         was_rescued=False,
-                        original_weight=pi[k],
-                        rescued_weight=pi[k],
+                        original_weight=0.0,
+                        rescued_weight=0.0,
                         donor_timepoint="",
-                        anchor_distance=best_dist if best_n_shared > 0 else -1.0,
-                        n_shared_with_anchor=best_n_shared,
-                        reason=reason,
+                        anchor_distance=-1.0,
+                        n_shared_with_anchor=0,
+                        reason="no_anchors",
                     )
                 )
+                return window_result
 
-        if rescued_any:
-            pi = pi / pi.sum()
+        window = window_result.window
+        haplotypes = list(window_result.haplotypes)  # Make mutable copy
+        gamma = window_result.gamma.copy()
+        pi = window_result.pi.copy()
+        reads = window.reads
 
-            for k, hap in enumerate(haplotypes):
-                hap.weight = pi[k]
+        n_haps = len(haplotypes)
+        junk_idx = n_haps
+        junk_weight = pi[junk_idx] if len(pi) > junk_idx else 0.0
 
-            # Recompute gamma with fixed pi
-            gamma = self._recompute_gamma(window, haplotypes, pi)
+        # Find reads assigned to junk (high probability of being junk)
+        junk_threshold = 0.5  # Read is "junk" if gamma[:, junk_idx] > this
+        junk_read_mask = gamma[:, junk_idx] > junk_threshold
+        n_junk_reads = junk_read_mask.sum()
 
-            post = PostProcessor(self.config)
-            assignments = post.assign_reads(window.reads, gamma, pi)
+        logging.debug(
+            f"    Rescue check: {n_junk_reads}/{len(reads)} junk reads, "
+            f"junk_weight={junk_weight:.3f}, {len(anchor_haps)} anchors"
+        )
 
-            for k, hap in enumerate(haplotypes):
-                hap.supporting_reads = int(
-                    (gamma[:, k] >= self.config.assign_confidence_threshold).sum()
+        if n_junk_reads < self.config.min_reads_per_window:
+            # Not enough junk reads to rescue
+            self.rescue_statistics.append(
+                RescueStatistic(
+                    sample=current_sample,
+                    contig=window.contig,
+                    window_start=window.start,
+                    track_id="window",
+                    was_rescued=False,
+                    original_weight=junk_weight,
+                    rescued_weight=junk_weight,
+                    donor_timepoint="",
+                    anchor_distance=-1.0,
+                    n_shared_with_anchor=0,
+                    reason=f"insufficient_junk_reads({n_junk_reads})",
                 )
+            )
+            return window_result
 
-            return WindowResult(
-                window=window,
-                haplotypes=haplotypes,
-                gamma=gamma,
-                pi=pi,
-                log_likelihood=window_result.log_likelihood,
-                assignments=assignments,
-                converged=window_result.converged,
-                iterations=window_result.iterations,
+        # Check which anchors are NOT already represented in this window's haplotypes
+        # (we only want to rescue haplotypes that are missing, not duplicates)
+        existing_consensuses = [h.consensus for h in haplotypes]
+
+        rescued_any = False
+        new_haplotypes = []
+
+        # Use config thresholds for matching
+        max_distance = self.config.rescue_match_distance  # e.g., 0.005 = 99.5% match required
+        min_shared = self.config.min_shared_for_rescue
+
+        for anchor_idx, anchor in enumerate(anchor_haps):
+            # Check if this anchor is already present as a haplotype
+            anchor_already_present = False
+            for existing in existing_consensuses:
+                # Compare consensus on shared positions
+                n_shared = 0
+                n_match = 0
+                for pos in window.snv_pos:
+                    if pos in anchor.consensus and pos in existing:
+                        n_shared += 1
+                        if anchor.consensus[pos] == existing[pos]:
+                            n_match += 1
+                if n_shared >= min_shared:
+                    distance = 1.0 - (n_match / n_shared) if n_shared > 0 else 1.0
+                    if distance <= max_distance:  # Already have this haplotype
+                        anchor_already_present = True
+                        break
+
+            if anchor_already_present:
+                continue
+
+            # Count how many junk reads match this anchor within sequencing error tolerance
+            # For individual reads, we use a lower shared threshold (reads often cover few SNVs)
+            # but require the collective evidence from many matching reads for confidence
+            n_matching_junk = 0
+            matching_read_indices = []
+            min_shared_for_read = 2  # Lower threshold for individual reads
+
+            for i, read in enumerate(reads):
+                if not junk_read_mask[i]:
+                    continue
+
+                # Check if read matches anchor within sequencing error tolerance
+                n_shared = 0
+                n_match = 0
+                for pos, allele in read.alleles.items():
+                    if pos in anchor.consensus:
+                        n_shared += 1
+                        if anchor.consensus[pos] == allele:
+                            n_match += 1
+
+                # Require sufficient shared positions and distance within error tolerance
+                if n_shared >= min_shared_for_read:
+                    distance = 1.0 - (n_match / n_shared)
+                    if distance <= max_distance:  # Within sequencing error tolerance
+                        n_matching_junk += 1
+                        matching_read_indices.append(i)
+
+            # If enough junk reads match this anchor, create a rescued haplotype
+            min_reads_for_rescue = max(3, int(0.02 * len(reads)))  # At least 3 reads or 2%
+            if n_matching_junk >= min_reads_for_rescue:
+                # Create new haplotype from anchor's consensus (restricted to this window's SNVs)
+                new_consensus = {
+                    pos: anchor.consensus[pos]
+                    for pos in window.snv_pos
+                    if pos in anchor.consensus
+                }
+
+                if len(new_consensus) >= self.config.min_snvs_per_window:
+                    # Estimate weight from junk reads
+                    rescued_weight = max(
+                        n_matching_junk / len(reads),
+                        self.config.rescued_min_weight
+                    )
+
+                    new_hap = Haplotype(
+                        consensus=new_consensus,
+                        weight=rescued_weight,
+                        supporting_reads=n_matching_junk,
+                        confidence=0.8,  # Mark as rescued
+                        track_id=None,  # Will be assigned during linking
+                    )
+                    new_haplotypes.append(new_hap)
+
+                    donor_timepoint = anchor_samples[anchor_idx]
+                    self.rescue_statistics.append(
+                        RescueStatistic(
+                            sample=current_sample,
+                            contig=window.contig,
+                            window_start=window.start,
+                            track_id=f"rescued_from_{donor_timepoint}",
+                            was_rescued=True,
+                            original_weight=0.0,
+                            rescued_weight=rescued_weight,
+                            donor_timepoint=donor_timepoint,
+                            anchor_distance=0.0,
+                            n_shared_with_anchor=len(new_consensus),
+                            reason=f"rescued_from_junk({n_matching_junk}_reads)",
+                        )
+                    )
+                    rescued_any = True
+
+                    logging.debug(
+                        f"    Rescued haplotype from {donor_timepoint}: "
+                        f"{n_matching_junk} junk reads, weight={rescued_weight:.3f}"
+                    )
+
+        if not rescued_any:
+            self.rescue_statistics.append(
+                RescueStatistic(
+                    sample=current_sample,
+                    contig=window.contig,
+                    window_start=window.start,
+                    track_id="window",
+                    was_rescued=False,
+                    original_weight=junk_weight,
+                    rescued_weight=junk_weight,
+                    donor_timepoint="",
+                    anchor_distance=-1.0,
+                    n_shared_with_anchor=0,
+                    reason="no_anchor_matches_junk",
+                )
+            )
+            return window_result
+
+        # Add rescued haplotypes and rebuild gamma/pi
+        haplotypes.extend(new_haplotypes)
+        n_haps_new = len(haplotypes)
+        k_eff_new = n_haps_new + 1
+
+        # Redistribute weight: take from junk, give to rescued
+        total_rescued_weight = sum(h.weight for h in new_haplotypes)
+        old_junk_weight = pi[junk_idx]
+        new_junk_weight = max(0.01, old_junk_weight - total_rescued_weight)
+
+        # Build new pi
+        pi_new = np.zeros(k_eff_new)
+        # Scale down existing haplotype weights proportionally
+        scale = (1.0 - total_rescued_weight - new_junk_weight) / (1.0 - old_junk_weight) if old_junk_weight < 1.0 else 1.0
+        for k in range(n_haps):
+            pi_new[k] = pi[k] * scale
+        for k, new_hap in enumerate(new_haplotypes):
+            pi_new[n_haps + k] = new_hap.weight
+        pi_new[-1] = new_junk_weight
+        pi_new = pi_new / pi_new.sum()
+
+        # Update haplotype weights
+        for k, hap in enumerate(haplotypes):
+            hap.weight = pi_new[k]
+
+        # Recompute gamma with new haplotypes
+        gamma_new = self._recompute_gamma(window, haplotypes, pi_new)
+
+        # Recompute assignments
+        post = PostProcessor(self.config)
+        assignments = post.assign_reads(reads, gamma_new, pi_new)
+
+        for k, hap in enumerate(haplotypes):
+            hap.supporting_reads = int(
+                (gamma_new[:, k] >= self.config.assign_confidence_threshold).sum()
             )
 
-        return window_result
+        return WindowResult(
+            window=window,
+            haplotypes=haplotypes,
+            gamma=gamma_new,
+            pi=pi_new,
+            log_likelihood=window_result.log_likelihood,
+            assignments=assignments,
+            converged=window_result.converged,
+            iterations=window_result.iterations,
+        )
 
     def _recompute_gamma(
         self, window: Window, haplotypes: list[Haplotype], pi: np.ndarray
@@ -1443,23 +1528,28 @@ class LongitudinalIntegrator:
                 key = (wr.window.contig, wr.window.start, wr.window.end)
                 windows_by_position[key][sample_id] = wr
 
-        # Diagnostic: count rescue candidates across all windows
-        n_total_haps = 0
-        n_low_weight_haps = 0
+        # Diagnostic: count junk reads and anchors across all windows
         n_windows_with_multiple_timepoints = 0
+        total_junk_reads = 0
+        total_reads = 0
+        n_anchors = 0
+
         for window_key, sample_results in windows_by_position.items():
             if len(sample_results) >= 2:
                 n_windows_with_multiple_timepoints += 1
             for sample_id, wr in sample_results.items():
-                for hap in wr.haplotypes:
-                    n_total_haps += 1
-                    if hap.weight < self.config.min_weight_for_anchor:
-                        n_low_weight_haps += 1
+                n_reads = wr.gamma.shape[0]
+                junk_idx = wr.gamma.shape[1] - 1
+                junk_reads = (wr.gamma[:, junk_idx] > 0.5).sum()
+                total_reads += n_reads
+                total_junk_reads += junk_reads
+                n_anchors += sum(1 for h in wr.haplotypes if h.weight >= self.config.min_weight_for_anchor)
 
+        junk_pct = 100 * total_junk_reads / total_reads if total_reads > 0 else 0
         logging.info(
-            f"    Rescue diagnostics: {len(windows_by_position)} unique window positions, "
+            f"    Rescue diagnostics: {len(windows_by_position)} window positions, "
             f"{n_windows_with_multiple_timepoints} shared across >=2 timepoints, "
-            f"{n_total_haps} total haplotypes, {n_low_weight_haps} rescue candidates (weight < {self.config.min_weight_for_anchor})"
+            f"{n_anchors} anchors, {total_junk_reads}/{total_reads} junk reads ({junk_pct:.1f}%)"
         )
 
         # Process each position
