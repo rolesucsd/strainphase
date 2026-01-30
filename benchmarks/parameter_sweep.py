@@ -1132,7 +1132,8 @@ class ParameterSweep:
                         prelink_result = run_validation(
                             detected_file=prelink_lineages_path,
                             truth_dir=self.truth_dir,
-                            output_dir=prelink_validation_output
+                            output_dir=prelink_validation_output,
+                            window_results=all_window_results
                         )
 
                         validation_result = run_validation(
@@ -1531,7 +1532,8 @@ class ParameterSweep:
                 prelink_result = run_validation(
                     detected_file=prelink_lineages_path,
                     truth_dir=self.truth_dir,
-                    output_dir=prelink_validation_output
+                    output_dir=prelink_validation_output,
+                    window_results=all_window_results
                 )
 
                 validation_result = run_validation(
