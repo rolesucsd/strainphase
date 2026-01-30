@@ -2722,10 +2722,10 @@ def _write_validation_reports(
                     continue
                 sample, contig, start, end = parsed
                 snv_count, non_ref_abund = compute_span_stats(sample, contig, start, end)
-                if nonref_reads is None:
-                    add(f"  {fn_id}  | snvs_in_span={snv_count} | nonref_reads=n/a")
+                if non_ref_abund is None:
+                    add(f"  {fn_id}  | snvs_in_span={snv_count} | nonref_abund=n/a")
                 else:
-                    add(f"  {fn_id}  | snvs_in_span={snv_count} | nonref_reads={nonref_reads}")
+                    add(f"  {fn_id}  | snvs_in_span={snv_count} | nonref_abund={non_ref_abund:.4f}")
         else:
             add("  None")
         add("")
