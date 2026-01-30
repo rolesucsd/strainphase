@@ -2166,6 +2166,7 @@ def write_parameter_grid_summary(
             # Longitudinal
             'lineage_precision', 'lineage_recall', 'lineage_f1',
             'rescue_delta_recall_rare', 'abundance_trajectory_error',
+            'rescued_haplotypes', 'rescue_total_haplotypes', 'rescue_rate',
             # Speed
             'runtime_seconds', 'memory_peak_mb',
             # Stability
@@ -2194,6 +2195,7 @@ def write_parameter_grid_summary(
                 'false_link_rate', 'missed_link_rate', 'track_consensus_error',
                 'lineage_precision', 'lineage_recall', 'lineage_f1',
                 'rescue_delta_recall_rare', 'abundance_trajectory_error',
+                'rescued_haplotypes', 'rescue_total_haplotypes', 'rescue_rate',
                 'runtime_seconds', 'memory_peak_mb',
                 'converged', 'mean_confidence', 'n_lineages', 'is_stable',
                 'window_size', 'max_mismatch_frac', 'min_shared_snvs_for_edge',
