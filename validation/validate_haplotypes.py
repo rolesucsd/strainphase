@@ -1638,7 +1638,7 @@ def write_rescue_statistics(
     fieldnames = [
         'sample', 'contig', 'window_start', 'track_id',
         'was_rescued', 'original_weight', 'rescued_weight',
-        'donor_timepoint', 'anchor_distance', 'n_shared_with_anchor'
+        'donor_timepoint', 'anchor_distance', 'n_shared_with_anchor', 'reason'
     ]
 
     # Write empty file with headers (rescue stats will be written by parameter_sweep
@@ -1658,6 +1658,7 @@ def write_rescue_statistics(
                 'donor_timepoint': stat.donor_timepoint,
                 'anchor_distance': f"{stat.anchor_distance:.6f}" if stat.anchor_distance >= 0 else "NA",
                 'n_shared_with_anchor': stat.n_shared_with_anchor,
+                'reason': getattr(stat, "reason", ""),
             })
 
     logger.info(f"Wrote {len(rescue_stats)} rescue statistics records to {output_path}")

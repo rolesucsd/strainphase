@@ -190,6 +190,9 @@ class SweepResult:
     lineage_f1: Optional[float] = None
     rescue_delta_recall_rare: Optional[float] = None
     abundance_trajectory_error: Optional[float] = None
+    rescued_haplotypes: Optional[int] = None
+    rescue_total_haplotypes: Optional[int] = None
+    rescue_rate: Optional[float] = None
     
     # Performance metrics
     memory_peak_mb: Optional[float] = None
@@ -241,6 +244,9 @@ class SweepResult:
             'lineage_f1': self.lineage_f1,
             'rescue_delta_recall_rare': self.rescue_delta_recall_rare,
             'abundance_trajectory_error': self.abundance_trajectory_error,
+            'rescued_haplotypes': self.rescued_haplotypes,
+            'rescue_total_haplotypes': self.rescue_total_haplotypes,
+            'rescue_rate': self.rescue_rate,
             # Performance and metadata
             'memory_peak_mb': self.memory_peak_mb,
             'ablation': self.ablation,
@@ -707,33 +713,29 @@ class ParameterSweep:
         # Minimum window_size is 10000 to ensure sufficient shared SNVs for reliable linking.
         # With ~1-2 SNVs/kb, smaller windows have too few SNVs in the 50% overlap region.
         'window_size': [10000, 20000, 50000, 100000],
-        'max_reads_per_window': [100, 500],
+        'max_reads_per_window': [500],
         
         # Clustering parameters
-        'max_mismatch_frac': [0.005, 0.01, 0.02, 0.04],
-        'min_shared_snvs_for_edge': [2, 3, 4, 5],
+        'max_mismatch_frac': [0.005, 0.02],
+        'min_shared_snvs_for_edge': [4],
         
         # Quality filters
-        'min_mapq': [10, 20, 30],
-        'min_base_quality': [20, 30],
+        'min_mapq': [10],
+        'min_base_quality': [20],
         
         # Junk model sensitivity (publication expansion)
         'junk_divergence_rate': [0.05, 0.10, 0.20],
         
         # Merging thresholds
-        'merge_distance_threshold': [0.005, 0.01, 0.02],
+        'merge_distance_threshold': [0.005, 0.02],
         
         # Linking thresholds (publication expansion)
-        'max_link_distance': [0.01, 0.02, 0.04],
-        'min_shared_snvs_for_link': [2, 3, 4, 5],
+        'max_link_distance': [0.01],
+        'min_shared_snvs_for_link': [3, 4],
         
         # Abundance thresholds
-        'min_weight_for_anchor': [0.05, 0.10, 0.15, 0.20],
-        'rescued_min_weight': [0.01, 0.02, 0.05],
-        
-        # Rescue/lineage thresholds (publication expansion)
-        'rescue_match_distance': [0.005, 0.01, 0.02],
-        'lineage_merge_distance': [0.01, 0.02, 0.04],
+        'min_weight_for_anchor': [0.20],
+        'rescued_min_weight': [0.02],
     }
 
     # Parameter order for sequential optimization (most impactful first)
@@ -1141,6 +1143,23 @@ class ParameterSweep:
                             window_size=params.window_size  # For track validation
                         )
 
+                        # Write rescue statistics if available from longitudinal integrator
+                        rescued_haplotypes = None
+                        rescue_total_haplotypes = None
+                        rescue_rate = None
+                        rescue_integrator = getattr(config, "_rescue_integrator", None) if use_longitudinal else None
+                        if rescue_integrator:
+                            try:
+                                rescue_stats_path = str(Path(validation_output) / "rescue_statistics.tsv")
+                                rescue_integrator.write_rescue_statistics(rescue_stats_path)
+                                rescued_haplotypes = sum(1 for s in rescue_integrator.rescue_statistics if s.was_rescued)
+                                rescue_total_haplotypes = len(rescue_integrator.rescue_statistics)
+                                rescue_rate = (
+                                    rescued_haplotypes / rescue_total_haplotypes if rescue_total_haplotypes else 0.0
+                                )
+                            except Exception as e:
+                                logger.warning(f"Failed to write rescue statistics: {e}")
+
                         # Write prelink vs postlink comparison
                         comparison_path = str(Path(validation_output) / "validation_prelink_comparison.tsv")
                         try:
@@ -1179,6 +1198,9 @@ class ParameterSweep:
                             "lineage_f1": validation_result.lineage_f1,
                             "rescue_delta_recall_rare": validation_result.rescue_delta_recall_rare,
                             "abundance_trajectory_error": validation_result.abundance_trajectory_error,
+                            "rescued_haplotypes": rescued_haplotypes,
+                            "rescue_total_haplotypes": rescue_total_haplotypes,
+                            "rescue_rate": rescue_rate,
                         }
                         if verbose:
                             logger.info(f"    Validation complete: F1={accuracy_metrics['haplotype_f1']:.3f}, "
@@ -1259,6 +1281,9 @@ class ParameterSweep:
                     lineage_f1=accuracy_metrics.get("lineage_f1"),
                     rescue_delta_recall_rare=accuracy_metrics.get("rescue_delta_recall_rare"),
                     abundance_trajectory_error=accuracy_metrics.get("abundance_trajectory_error"),
+                    rescued_haplotypes=accuracy_metrics.get("rescued_haplotypes"),
+                    rescue_total_haplotypes=accuracy_metrics.get("rescue_total_haplotypes"),
+                    rescue_rate=accuracy_metrics.get("rescue_rate"),
                     # Metadata
                     ablation=None,  # Can be set by caller for ablation studies
                     vcf_condition="perfect",
@@ -1517,6 +1542,25 @@ class ParameterSweep:
                     window_size=params.window_size  # For track validation
                 )
 
+                # Write rescue statistics if available from longitudinal integrator
+                rescued_haplotypes = None
+                rescue_total_haplotypes = None
+                rescue_rate = None
+                rescue_integrator = getattr(config, "_rescue_integrator", None)
+                if not (hasattr(self, 'use_longitudinal') and self.use_longitudinal):
+                    rescue_integrator = None
+                if rescue_integrator:
+                    try:
+                        rescue_stats_path = str(Path(validation_output) / "rescue_statistics.tsv")
+                        rescue_integrator.write_rescue_statistics(rescue_stats_path)
+                        rescued_haplotypes = sum(1 for s in rescue_integrator.rescue_statistics if s.was_rescued)
+                        rescue_total_haplotypes = len(rescue_integrator.rescue_statistics)
+                        rescue_rate = (
+                            rescued_haplotypes / rescue_total_haplotypes if rescue_total_haplotypes else 0.0
+                        )
+                    except Exception as e:
+                        logger.warning(f"Failed to write rescue statistics: {e}")
+
                 # Write prelink vs postlink comparison
                 comparison_path = str(Path(validation_output) / "validation_prelink_comparison.tsv")
                 try:
@@ -1555,6 +1599,9 @@ class ParameterSweep:
                     "lineage_f1": validation_result.lineage_f1,
                     "rescue_delta_recall_rare": validation_result.rescue_delta_recall_rare,
                     "abundance_trajectory_error": validation_result.abundance_trajectory_error,
+                    "rescued_haplotypes": rescued_haplotypes,
+                    "rescue_total_haplotypes": rescue_total_haplotypes,
+                    "rescue_rate": rescue_rate,
                 }
                 if verbose:
                     logger.info(f"    Validation complete: F1={accuracy_metrics['haplotype_f1']:.3f}, "
@@ -1636,6 +1683,9 @@ class ParameterSweep:
             lineage_f1=accuracy_metrics.get("lineage_f1"),
             rescue_delta_recall_rare=accuracy_metrics.get("rescue_delta_recall_rare"),
             abundance_trajectory_error=accuracy_metrics.get("abundance_trajectory_error"),
+            rescued_haplotypes=accuracy_metrics.get("rescued_haplotypes"),
+            rescue_total_haplotypes=accuracy_metrics.get("rescue_total_haplotypes"),
+            rescue_rate=accuracy_metrics.get("rescue_rate"),
             # Metadata
             ablation=None,  # Can be set by caller for ablation studies
             vcf_condition="perfect",
@@ -2073,6 +2123,9 @@ def write_parameter_grid_summary(
             'lineage_f1': f"{result.lineage_f1:.6f}" if result.lineage_f1 is not None else "NA",
             'rescue_delta_recall_rare': f"{result.rescue_delta_recall_rare:.6f}" if result.rescue_delta_recall_rare is not None else "NA",
             'abundance_trajectory_error': f"{result.abundance_trajectory_error:.6f}" if result.abundance_trajectory_error is not None else "NA",
+            'rescued_haplotypes': result.rescued_haplotypes if result.rescued_haplotypes is not None else "NA",
+            'rescue_total_haplotypes': result.rescue_total_haplotypes if result.rescue_total_haplotypes is not None else "NA",
+            'rescue_rate': f"{result.rescue_rate:.6f}" if result.rescue_rate is not None else "NA",
 
             # Speed metrics
             'runtime_seconds': f"{result.runtime_seconds:.2f}",
