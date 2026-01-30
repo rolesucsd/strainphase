@@ -2352,25 +2352,37 @@ def _validate_tracks_and_lineages(
                 f"{len(strain_matches)} total track->strain mappings")
 
     from validation.validate_tracks import validate_tracks, write_linkability_report
-    logger.info(f"Running track validation with {len(window_results)} window results "
-                f"({len(strain_matches)} strain mappings)")
-    track_result = validate_tracks(
-        window_results, truth_dir, strain_matches, truth_snvs, window_size
-    )
-    result.track_fragmentation_mean = track_result.track_fragmentation_mean
-    result.track_fragmentation_median = track_result.track_fragmentation_median
-    result.false_link_rate = track_result.false_link_rate
-    result.missed_link_rate = track_result.missed_link_rate
-    result.track_consensus_error = track_result.track_consensus_error
-    logger.info(
-        f"Track validation complete: fragmentation={result.track_fragmentation_mean:.3f}, "
-        f"false_link={result.false_link_rate:.3f}, missed_link={result.missed_link_rate:.3f}"
-    )
+    inferred_window_size = window_size
+    if inferred_window_size is None and window_results:
+        first_window = window_results[0].window
+        if hasattr(first_window, "start") and hasattr(first_window, "end"):
+            if first_window.start is not None and first_window.end is not None:
+                inferred_window_size = first_window.end - first_window.start
+        if inferred_window_size is None and hasattr(first_window, "window_size"):
+            inferred_window_size = first_window.window_size
 
-    if track_result.linkability_analysis:
-        linkability_path = os.path.join(output_dir, 'track_linkability.txt')
-        write_linkability_report(track_result.linkability_analysis, linkability_path)
-        logger.info(f"Wrote track linkability report to {linkability_path}")
+    if inferred_window_size is None or inferred_window_size <= 0:
+        logger.warning("Skipping track validation: window_size is not available.")
+    else:
+        logger.info(f"Running track validation with {len(window_results)} window results "
+                    f"({len(strain_matches)} strain mappings)")
+        track_result = validate_tracks(
+            window_results, truth_dir, strain_matches, truth_snvs, inferred_window_size
+        )
+        result.track_fragmentation_mean = track_result.track_fragmentation_mean
+        result.track_fragmentation_median = track_result.track_fragmentation_median
+        result.false_link_rate = track_result.false_link_rate
+        result.missed_link_rate = track_result.missed_link_rate
+        result.track_consensus_error = track_result.track_consensus_error
+        logger.info(
+            f"Track validation complete: fragmentation={result.track_fragmentation_mean:.3f}, "
+            f"false_link={result.false_link_rate:.3f}, missed_link={result.missed_link_rate:.3f}"
+        )
+
+        if track_result.linkability_analysis:
+            linkability_path = os.path.join(output_dir, 'track_linkability.txt')
+            write_linkability_report(track_result.linkability_analysis, linkability_path)
+            logger.info(f"Wrote track linkability report to {linkability_path}")
 
     from validation.validate_lineages import validate_lineages
     detected_lineages: Dict[str, Dict[str, str]] = {}
