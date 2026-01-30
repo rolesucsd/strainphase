@@ -329,7 +329,8 @@ def load_detected_haplotypes(lineages_file: str) -> List[DetectedHaplotype]:
     """
     Load detected haplotypes from strainphase output.
 
-    Expects TSV with columns: lineage_id, sample, contig, track_id, abundance, snv_alleles, ...
+    Expects TSV with columns: lineage_id, sample, contig, track_id, supporting_reads, total_reads, snv_alleles, ...
+    Computes abundance as supporting_reads / total_reads.
     Returns empty list if file doesn't exist or is empty (no haplotypes detected).
     """
     detected = []
@@ -345,7 +346,7 @@ def load_detected_haplotypes(lineages_file: str) -> List[DetectedHaplotype]:
         if not header_line:
             logger.warning(f"Empty lineages file: {lineages_file}")
             return []
-        
+
         header = header_line.split('\t')
 
         for line in f:
@@ -358,10 +359,17 @@ def load_detected_haplotypes(lineages_file: str) -> List[DetectedHaplotype]:
             lineage_id = row.get('lineage_id', row.get('track_id', ''))
             if not lineage_id:
                 continue
-                
+
             sample = row.get('sample', row.get('timepoint', ''))
             contig = row.get('contig', '')
-            abundance = float(row.get('abundance', ''))
+
+            # Compute abundance from read counts, or fall back to abundance column for backwards compatibility
+            if 'supporting_reads' in row and 'total_reads' in row:
+                supporting_reads = int(row.get('supporting_reads', 0))
+                total_reads = int(row.get('total_reads', 1))
+                abundance = supporting_reads / total_reads if total_reads > 0 else 0.0
+            else:
+                abundance = float(row.get('abundance', 0.0))
 
             # Store abundance
             lineage_data[lineage_id]['abundances'][sample] = abundance
@@ -2621,12 +2629,38 @@ def _write_validation_reports(
 
         ref_alleles = build_ref_alleles()
 
+        def build_window_nonref_read_counts() -> Dict[Tuple[str, str, int, int], int]:
+            counts: Dict[Tuple[str, str, int, int], int] = {}
+            if not window_results:
+                return counts
+            for wr in window_results:
+                sample = wr.window.sample or ""
+                contig = wr.window.contig
+                start = wr.window.start
+                end = wr.window.end
+                key = (sample, contig, start, end)
+                ref_contig = ref_alleles.get(contig, {})
+                nonref_reads = 0
+                for read in wr.window.reads:
+                    for pos, allele in read.alleles.items():
+                        if pos < start or pos >= end:
+                            continue
+                        ref = ref_contig.get(pos)
+                        if ref is None:
+                            continue
+                        if allele != ref:
+                            nonref_reads += 1
+                counts[key] = nonref_reads
+            return counts
+
+        window_nonref_reads = build_window_nonref_read_counts()
+
         def compute_span_stats(
             sample: str,
             contig: str,
             start: int,
             end: int,
-        ) -> Tuple[int, Optional[float]]:
+        ) -> Tuple[int, Optional[int]]:
             positions: Set[int] = set()
             for h in true_haps:
                 for pos in h.snv_positions.get(contig, {}):
@@ -2636,32 +2670,8 @@ def _write_validation_reports(
             if not positions:
                 return 0, None
 
-            total_abund = 0.0
-            for h in true_haps:
-                total_abund += h.abundances.get(sample, 0.0)
-
-            if total_abund <= 0:
-                return len(positions), None
-
-            ref_contig = ref_alleles.get(contig, {})
-            non_ref_fractions = []
-            for pos in positions:
-                ref = ref_contig.get(pos)
-                if ref is None:
-                    continue
-                non_ref_abund = 0.0
-                for h in true_haps:
-                    allele = h.snv_positions.get(contig, {}).get(pos)
-                    if allele is None:
-                        continue
-                    if allele != ref:
-                        non_ref_abund += h.abundances.get(sample, 0.0)
-                non_ref_fractions.append(non_ref_abund / total_abund)
-
-            if not non_ref_fractions:
-                return len(positions), None
-
-            return len(positions), float(np.mean(non_ref_fractions))
+            nonref_reads = window_nonref_reads.get((sample, contig, start, end))
+            return len(positions), nonref_reads
 
         add("=" * 80)
         add("DETAILED VALIDATION REPORT")
@@ -2694,9 +2704,8 @@ def _write_validation_reports(
         add("")
         add("(Note: Strainphase splits lineages per-contig, so one strain can produce multiple detected lineages per contig)")
         add(f"Precision:           {result.precision:.3f}")
-        add(f"Recall:              {result.recall:.3f}  (window-level when available)")
+        add(f"Recall:              {result.recall:.3f}")
         add(f"F1 Score:            {result.f1:.3f}")
-        add(f"Window Recall:       {result.window_recall:.3f}")
         add(f"Abundance Pearson r: {result.abundance_pearson_r:.3f}")
         add(f"Abundance MAE:       {result.abundance_mae:.3f}")
         add(f"SNV Precision:       {result.snv_precision:.3f}")
@@ -2713,10 +2722,10 @@ def _write_validation_reports(
                     continue
                 sample, contig, start, end = parsed
                 snv_count, non_ref_abund = compute_span_stats(sample, contig, start, end)
-                if non_ref_abund is None:
-                    add(f"  {fn_id}  | snvs_in_span={snv_count} | nonref_abund=n/a")
+                if nonref_reads is None:
+                    add(f"  {fn_id}  | snvs_in_span={snv_count} | nonref_reads=n/a")
                 else:
-                    add(f"  {fn_id}  | snvs_in_span={snv_count} | nonref_abund={non_ref_abund:.3f}")
+                    add(f"  {fn_id}  | snvs_in_span={snv_count} | nonref_reads={nonref_reads}")
         else:
             add("  None")
         add("")

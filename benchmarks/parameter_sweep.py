@@ -575,59 +575,63 @@ def window_results_to_lineages_tsv(
 ) -> str:
     """
     Convert WindowResults to lineages.tsv format for validation.
-    
+
     Creates a simplified lineages.tsv that aggregates haplotypes by track_id
     across all windows and contigs.
-    
+
     If no haplotypes are detected, creates an empty file with headers.
     """
     import csv
-    
+
     # Aggregate haplotypes by track_id
     track_data = defaultdict(lambda: {
-        'abundances': {},
+        'supporting_reads': 0,
+        'total_reads': 0,
         'snvs': defaultdict(dict),  # contig -> {pos -> allele}
         'contigs': set(),
     })
-    
+
     for wr in all_window_results:
         contig_id = wr.window.contig  # Window uses 'contig', not 'contig_id'
+        window_total_reads = len(wr.window.reads)
         for hap in wr.haplotypes:
             track_id = hap.track_id or f"unlinked_{wr.window.start}"
-            
+
             track_data[track_id]['contigs'].add(contig_id)
-            track_data[track_id]['abundances'][sample_id] = hap.weight
-            
+            track_data[track_id]['supporting_reads'] += hap.supporting_reads
+            track_data[track_id]['total_reads'] += window_total_reads
+
             # Aggregate SNV alleles from consensus
             for pos, allele in hap.consensus.items():
                 track_data[track_id]['snvs'][contig_id][pos] = allele
-    
+
     # Write lineages.tsv (create even if empty)
     records = []
     for track_id, data in track_data.items():
         for contig_id in data['contigs']:
             snv_alleles_str = ','.join(
-                f"{pos}:{allele}" 
+                f"{pos}:{allele}"
                 for pos, allele in sorted(data['snvs'][contig_id].items())
             )
-            
+
             records.append({
                 'lineage_id': track_id,
                 'sample': sample_id,
                 'contig': contig_id,
                 'track_id': track_id,
-                'abundance': data['abundances'].get(sample_id, 0.0),
+                'supporting_reads': data['supporting_reads'],
+                'total_reads': data['total_reads'],
                 'snv_alleles': snv_alleles_str if snv_alleles_str else '.',
             })
-    
+
     # Always create the file, even if empty (for validation)
-    fieldnames = ['lineage_id', 'sample', 'contig', 'track_id', 'abundance', 'snv_alleles']
+    fieldnames = ['lineage_id', 'sample', 'contig', 'track_id', 'supporting_reads', 'total_reads', 'snv_alleles']
     with open(output_path, 'w', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, delimiter='\t')
         writer.writeheader()
         if records:
             writer.writerows(records)
-    
+
     return output_path
 
 
@@ -646,6 +650,7 @@ def window_results_to_prelink_lineages_tsv(
     records = []
     for wr in all_window_results:
         contig_id = wr.window.contig
+        window_total_reads = len(wr.window.reads)
         for h_idx, hap in enumerate(wr.haplotypes):
             lineage_id = f"W{wr.window.start}_H{h_idx}"
             sample = wr.window.sample or sample_id
@@ -657,11 +662,12 @@ def window_results_to_prelink_lineages_tsv(
                 'sample': sample,
                 'contig': contig_id,
                 'track_id': lineage_id,
-                'abundance': hap.weight,
+                'supporting_reads': hap.supporting_reads,
+                'total_reads': window_total_reads,
                 'snv_alleles': snv_alleles_str if snv_alleles_str else '.',
             })
 
-    fieldnames = ['lineage_id', 'sample', 'contig', 'track_id', 'abundance', 'snv_alleles']
+    fieldnames = ['lineage_id', 'sample', 'contig', 'track_id', 'supporting_reads', 'total_reads', 'snv_alleles']
     with open(output_path, 'w', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, delimiter='\t')
         writer.writeheader()
@@ -1067,37 +1073,35 @@ class ParameterSweep:
                                 logger.warning(f"    WARNING: Missing timepoints in lineage records: {sorted(missing_timepoints)}")
                             
                             # Convert records to format expected by validation
-                            # build_lineage_table returns: mean_weight, consensus (pipe-separated)
-                            # Validation expects: abundance, snv_alleles (comma-separated)
+                            # build_lineage_table returns: supporting_reads, total_reads, consensus (pipe-separated)
+                            # Validation expects: supporting_reads, total_reads, snv_alleles (comma-separated)
                             converted_records = []
                             for rec in lineage_records:
-                                # Convert mean_weight -> abundance
-                                abundance = rec.get('mean_weight', 0.0)
-                                
                                 # Convert consensus format: "pos1:base1|pos2:base2" -> "pos1:base1,pos2:base2"
                                 consensus = rec.get('consensus', '')
                                 snv_alleles = consensus.replace('|', ',') if consensus else ''
-                                
+
                                 converted_records.append({
                                     'lineage_id': rec.get('lineage_id', ''),
                                     'sample': rec.get('sample', ''),
                                     'contig': rec.get('contig', ''),
                                     'track_id': rec.get('track_id', ''),
-                                    'abundance': abundance,
+                                    'supporting_reads': rec.get('supporting_reads', 0),
+                                    'total_reads': rec.get('total_reads', 0),
                                     'snv_alleles': snv_alleles,
                                 })
-                            
+
                             # Log per-timepoint counts AFTER conversion
                             sample_counts = Counter(rec['sample'] for rec in converted_records)
                             logger.info(f"    Converted records per timepoint: {dict(sample_counts)}")
-                            
+
                             # Log per-contig breakdown
                             contig_counts = Counter(rec['contig'] for rec in converted_records)
                             logger.info(f"    Records per contig: {dict(contig_counts)}")
-                            
+
                             # Write lineages.tsv from converted records
                             import csv
-                            fieldnames = ['lineage_id', 'sample', 'contig', 'track_id', 'abundance', 'snv_alleles']
+                            fieldnames = ['lineage_id', 'sample', 'contig', 'track_id', 'supporting_reads', 'total_reads', 'snv_alleles']
                             with open(lineages_path, 'w', newline='') as f:
                                 writer = csv.DictWriter(f, fieldnames=fieldnames, delimiter='\t')
                                 writer.writeheader()
@@ -1468,37 +1472,35 @@ class ParameterSweep:
                         logger.warning(f"    WARNING: Missing timepoints in lineage records: {sorted(missing_timepoints)}")
                     
                     # Convert records to format expected by validation
-                    # build_lineage_table returns: mean_weight, consensus (pipe-separated)
-                    # Validation expects: abundance, snv_alleles (comma-separated)
+                    # build_lineage_table returns: supporting_reads, total_reads, consensus (pipe-separated)
+                    # Validation expects: supporting_reads, total_reads, snv_alleles (comma-separated)
                     converted_records = []
                     for rec in lineage_records:
-                        # Convert mean_weight -> abundance
-                        abundance = rec.get('mean_weight', 0.0)
-                        
                         # Convert consensus format: "pos1:base1|pos2:base2" -> "pos1:base1,pos2:base2"
                         consensus = rec.get('consensus', '')
                         snv_alleles = consensus.replace('|', ',') if consensus else ''
-                        
+
                         converted_records.append({
                             'lineage_id': rec.get('lineage_id', ''),
                             'sample': rec.get('sample', ''),
                             'contig': rec.get('contig', ''),
                             'track_id': rec.get('track_id', ''),
-                            'abundance': abundance,
+                            'supporting_reads': rec.get('supporting_reads', 0),
+                            'total_reads': rec.get('total_reads', 0),
                             'snv_alleles': snv_alleles,
                         })
-                    
+
                     # Log per-timepoint counts AFTER conversion
                     sample_counts = Counter(rec['sample'] for rec in converted_records)
                     logger.info(f"    Converted records per timepoint: {dict(sample_counts)}")
-                    
+
                     # Log per-contig breakdown
                     contig_counts = Counter(rec['contig'] for rec in converted_records)
                     logger.info(f"    Records per contig: {dict(contig_counts)}")
-                    
+
                     # Write lineages.tsv from converted records
                     import csv
-                    fieldnames = ['lineage_id', 'sample', 'contig', 'track_id', 'abundance', 'snv_alleles']
+                    fieldnames = ['lineage_id', 'sample', 'contig', 'track_id', 'supporting_reads', 'total_reads', 'snv_alleles']
                     with open(lineages_path, 'w', newline='') as f:
                         writer = csv.DictWriter(f, fieldnames=fieldnames, delimiter='\t')
                         writer.writeheader()
