@@ -1353,47 +1353,6 @@ def write_false_positive_reads(
 
     logger.info(f"Wrote false positive reads report to {output_path}")
     return output_path
-            window_track_ids = {tid for tid in hap_track_ids if tid}
-
-            assignment_by_read = {a["read_id"]: a for a in (wr.assignments or [])}
-
-            for fp_lineage in fp_ids:
-                fp_tracks = lineage_to_tracks.get(fp_lineage, set())
-                fp_tracks_in_window = fp_tracks & window_track_ids
-                if not fp_tracks_in_window:
-                    continue
-
-                for fp_track_id in sorted(fp_tracks_in_window):
-                    for read in wr.window.reads:
-                        assign = assignment_by_read.get(read.id, {})
-                        hap_id = assign.get("hap_id")
-                        assigned_track_id = None
-                        if hap_id is not None and 0 <= hap_id < len(hap_track_ids):
-                            assigned_track_id = hap_track_ids[hap_id]
-                        sample = wr.window.sample or read.sample or ""
-                        snv_alleles = ",".join(
-                            f"{pos}:{base}" for pos, base in sorted(read.alleles.items())
-                        )
-                        writer.writerow(
-                            {
-                                "fp_lineage_id": fp_lineage,
-                                "fp_track_id": fp_track_id,
-                                "contig": wr.window.contig,
-                                "window_start": wr.window.start,
-                                "window_end": wr.window.end,
-                                "sample": sample,
-                                "read_id": read.id,
-                                "assigned_track_id": assigned_track_id or "",
-                                "hap_id": hap_id if hap_id is not None else "",
-                                "prob": f"{assign.get('prob', 0.0):.6f}" if assign else "",
-                                "is_junk": assign.get("is_junk", ""),
-                                "is_ambiguous": assign.get("is_ambiguous", ""),
-                                "snv_alleles": snv_alleles,
-                            }
-                        )
-
-    logger.info(f"Wrote false positive reads report to {output_path}")
-    return output_path
 
 def write_rescue_statistics(
     window_results: List,  # List of WindowResult
