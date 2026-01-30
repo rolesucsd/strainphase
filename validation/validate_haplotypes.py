@@ -120,8 +120,13 @@ class ValidationResult:
     matches: List[Tuple[str, str, float]] = None  # (true_id, detected_id, distance)
     
     # Detailed diagnostics
-    false_negatives: List[str] = None  # True haplotypes not detected
+    false_negatives: List[str] = None  # Informative windows not detected
     false_positives: List[str] = None  # Detected lineages not matching truth
+    window_recall: float = 0.0  # Pooled window-level recall
+    window_informative_total: int = 0  # Total informative windows (pooled)
+    window_detected_total: int = 0  # Detected windows (pooled)
+    window_recall_by_timepoint: Dict[str, float] = None
+    window_recall_by_contig: Dict[str, float] = None
     match_details_full: List[Dict] = None  # Full match details with SNV counts, abundances, etc.
     per_contig_metrics: Dict[str, Dict] = None  # Metrics per contig
     per_timepoint_metrics: Dict[str, Dict] = None  # Metrics per timepoint
@@ -134,6 +139,10 @@ class ValidationResult:
             self.false_negatives = []
         if self.false_positives is None:
             self.false_positives = []
+        if self.window_recall_by_timepoint is None:
+            self.window_recall_by_timepoint = {}
+        if self.window_recall_by_contig is None:
+            self.window_recall_by_contig = {}
         if self.match_details_full is None:
             self.match_details_full = []
         if self.per_contig_metrics is None:
@@ -142,90 +151,6 @@ class ValidationResult:
             self.per_timepoint_metrics = {}
 
 
-# =============================================================================
-# Plot styling
-# =============================================================================
-
-# Professional color palette (shared with generate_report.py)
-COLOR_PALETTE = {
-    'primary': '#2C3E50',      # Dark blue-gray
-    'secondary': '#34495E',    # Medium blue-gray
-    'accent': '#3498DB',       # Bright blue
-    'success': '#27AE60',      # Green
-    'warning': '#F39C12',      # Orange
-    'error': '#E74C3C',        # Red
-    'info': '#9B59B6',         # Purple
-    'neutral': '#95A5A6',      # Gray
-    'light': '#ECF0F1',        # Light gray
-    'dark': '#1A1A1A',         # Near black
-}
-
-# Color palette for scatter plot points
-POINT_COLORS = ['#569667', '#4264a8', '#e6a432', '#8e4aa1']
-
-COLOR_SEQUENCES = {
-    'qualitative': ['#2C3E50', '#3498DB', '#27AE60', '#F39C12', '#9B59B6', '#E74C3C', '#1ABC9C', '#E67E22'],
-}
-
-def set_plot_style():
-    """Set professional, clean figure style for validation plots with Arial font and no grid."""
-    if not HAS_MATPLOTLIB:
-        return
-
-    # Use clean style without grid
-    plt.style.use('default')
-    
-    # Font settings - Arial family
-    plt.rcParams['font.family'] = 'Arial'
-    plt.rcParams['font.sans-serif'] = ['Arial', 'DejaVu Sans', 'Liberation Sans', 'sans-serif']
-    plt.rcParams['font.size'] = 11
-    plt.rcParams['axes.titlesize'] = 12  # Title size 12, not bold
-    plt.rcParams['axes.labelsize'] = 12
-    plt.rcParams['xtick.labelsize'] = 10
-    plt.rcParams['ytick.labelsize'] = 10
-    plt.rcParams['legend.fontsize'] = 10
-    plt.rcParams['figure.titlesize'] = 16
-    
-    # Remove grid completely
-    plt.rcParams['axes.grid'] = False
-    
-    # Clean spines - only show bottom and left
-    plt.rcParams['axes.spines.top'] = False
-    plt.rcParams['axes.spines.right'] = False
-    plt.rcParams['axes.spines.left'] = True
-    plt.rcParams['axes.spines.bottom'] = True
-    
-    # Spine styling
-    plt.rcParams['axes.linewidth'] = 1.2
-    plt.rcParams['axes.edgecolor'] = COLOR_PALETTE['primary']
-    
-    # Figure and axes background
-    plt.rcParams['figure.facecolor'] = 'white'
-    plt.rcParams['axes.facecolor'] = 'white'
-    plt.rcParams['savefig.facecolor'] = 'white'
-    
-    # Tick styling
-    plt.rcParams['xtick.color'] = COLOR_PALETTE['primary']
-    plt.rcParams['ytick.color'] = COLOR_PALETTE['primary']
-    plt.rcParams['xtick.direction'] = 'out'
-    plt.rcParams['ytick.direction'] = 'out'
-    
-    # Line and marker styling
-    plt.rcParams['lines.linewidth'] = 2.0
-    plt.rcParams['lines.markersize'] = 6
-    plt.rcParams['patch.linewidth'] = 1.2
-    
-    # Legend styling
-    plt.rcParams['legend.frameon'] = True
-    plt.rcParams['legend.framealpha'] = 0.95
-    plt.rcParams['legend.edgecolor'] = COLOR_PALETTE['neutral']
-    plt.rcParams['legend.facecolor'] = 'white'
-    
-    # Default figure size
-    plt.rcParams['figure.figsize'] = (9, 5.5)
-    plt.rcParams['figure.dpi'] = 150
-    plt.rcParams['savefig.dpi'] = 300
-    plt.rcParams['savefig.bbox'] = 'tight'
 
 
 # =============================================================================
@@ -599,6 +524,10 @@ def compute_validation_metrics(
     per-contig (e.g., 2 strains × 3 contigs = 6 detected lineages), one true strain
     can match multiple detected lineages (one per contig). This is correct behavior
     and is accounted for in precision/recall calculations.
+
+    Recall definition:
+    - Window-level recall is computed in run_validation() and is REQUIRED.
+    - This function only computes precision (lineage matching) and other metrics.
     """
 
     # Match haplotypes (allow one-to-many to account for per-contig splitting)
@@ -611,18 +540,17 @@ def compute_validation_metrics(
     # Identify matched strains and lineages
     matched_true_ids = {m[0].strain_id for m in matches}
     matched_detected_ids = {m[1].lineage_id for m in matches}
-    
+
     # Precision: fraction of detected lineages that match a true strain
     # (With per-contig splitting, multiple detected lineages can match one true strain)
     precision = len(matched_detected_ids) / n_detected if n_detected > 0 else 0.0
-    
-    # Recall: fraction of true strains that were detected
-    # (A true strain is "detected" if at least one detected lineage matches it)
-    recall = len(matched_true_ids) / n_true if n_true > 0 else 0.0
-    
+
+    # Recall is computed at window-level in run_validation() and enforced there.
+    recall = 0.0
+
     f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
-    
-    false_negatives = [h.strain_id for h in true_haps if h.strain_id not in matched_true_ids]
+
+    false_negatives = []
     false_positives = [h.lineage_id for h in detected_haps if h.lineage_id not in matched_detected_ids]
 
     # Build detailed match information
@@ -973,304 +901,6 @@ def compute_detection_sensitivity(
 
     curve = {"bins": bins.tolist(), "recall": recall_by_bin}
     return threshold, curve
-
-
-# =============================================================================
-# Figure generation
-# =============================================================================
-
-def generate_figures(
-    result: ValidationResult,
-    true_haps: List[TrueHaplotype],
-    detected_haps: List[DetectedHaplotype],
-    matches: List[Tuple[TrueHaplotype, DetectedHaplotype, float]],
-    output_dir: str,
-    window_results: Optional[List] = None,  # Optional WindowResult list for track visualization
-    truth_dir: Optional[str] = None  # Optional truth directory for loading truth tracks
-):
-    """Generate validation figures."""
-    if not HAS_MATPLOTLIB:
-        logger.warning("matplotlib not installed, skipping figures")
-        return
-
-    os.makedirs(output_dir, exist_ok=True)
-    set_plot_style()
-
-    # Figure 1: Accuracy bar plot (removed; now generated in report summary)
-
-    # Figure 2: Abundance correlation (removed; now generated in report patchwork)
-
-    # Figure 3: Detection sensitivity - REMOVED per user request
-
-    # Figure 5: Per-haplotype matching details (removed; now generated in report patchwork)
-
-    # Figure 6: Abundance trajectories - REMOVED per user request
-
-    # Figure 7: Track fragmentation - REMOVED per user request
-
-    # Figure 8: Linking errors (removed; now generated in report summary)
-
-    # Figure 9: Lineage accuracy (removed; now generated in report summary)
-
-    # Figure 10: Track visualization on contigs (removed; now generated in report patchwork)
-
-    # Figure 11: Per-abundance-bin performance (removed by request)
-    # Figure 12: Strain divergence vs performance (removed by request)
-    
-    # Figure 13: ROC-like detection curve - MOVED to generate once per full run
-    # _generate_detection_roc_curve(true_haps, detected_haps, matches, output_dir)
-    
-    # Figure 14: Reference coverage (removed; now generated in report patchwork)
-    
-    # Figure 15: Error type breakdown (removed; now generated in report summary)
-    
-    # Figure 16: Performance vs strain count (scalability) - REMOVED per user request
-
-
-def _generate_per_abundance_performance(
-    true_haps: List[TrueHaplotype],
-    detected_haps: List[DetectedHaplotype],
-    matches: List[Tuple[TrueHaplotype, DetectedHaplotype, float]],
-    output_dir: str
-):
-    """Generate per-abundance-bin performance plot (publication standard)."""
-    if not HAS_MATPLOTLIB or not true_haps:
-        return
-    
-    # Define abundance bins (standard ranges from literature)
-    bins = [(0, 0.01), (0.01, 0.05), (0.05, 0.10), (0.10, 0.50), (0.50, 1.0)]
-    bin_labels = ['0-1%', '1-5%', '5-10%', '10-50%', '50-100%']
-    
-    matched_strain_ids = {m[0].strain_id for m in matches}
-    
-    # Compute metrics per bin
-    bin_precision = []
-    bin_recall = []
-    bin_f1 = []
-    bin_counts = []
-    
-    for low, high in bins:
-        # Get strains in this abundance range (check all timepoints)
-        strains_in_bin = []
-        for true_hap in true_haps:
-            max_abund = max(true_hap.abundances.values()) if true_hap.abundances else 0.0
-            if low <= max_abund < high:
-                strains_in_bin.append(true_hap)
-        
-        if not strains_in_bin:
-            bin_precision.append(0.0)
-            bin_recall.append(0.0)
-            bin_f1.append(0.0)
-            bin_counts.append(0)
-            continue
-        
-        # Count detected strains in this bin (true positives)
-        detected_in_bin = sum(1 for h in strains_in_bin if h.strain_id in matched_strain_ids)
-        
-        # For precision: count detected lineages that match strains in this bin (TP)
-        # vs all detected lineages that match strains in this bin (TP + FP within bin)
-        matched_lineage_ids_in_bin = set()
-        for true_hap, det_hap, _ in matches:
-            if true_hap.strain_id in {h.strain_id for h in strains_in_bin}:
-                matched_lineage_ids_in_bin.add(det_hap.lineage_id)
-        
-        # Count detected lineages in this bin (those matching strains in bin)
-        # This is TP for this bin
-        tp_in_bin = len(matched_lineage_ids_in_bin)
-        
-        # Count all detected lineages that could be in this bin (check their abundance)
-        # This includes both TP and FP
-        all_detected_lineage_ids_in_bin = set()
-        for det_hap in detected_haps:
-            # Check if this detected haplotype has abundance in the bin range
-            max_det_abund = max(det_hap.abundances.values()) if det_hap.abundances else 0.0
-            if low <= max_det_abund < high:
-                all_detected_lineage_ids_in_bin.add(det_hap.lineage_id)
-        
-        # Precision: TP / (TP + FP) = matched lineages in bin / all detected lineages in bin
-        precision = tp_in_bin / len(all_detected_lineage_ids_in_bin) if len(all_detected_lineage_ids_in_bin) > 0 else 0.0
-        # Recall: TP / (TP + FN) = detected strains / total strains in bin
-        recall = detected_in_bin / len(strains_in_bin) if len(strains_in_bin) > 0 else 0.0
-        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
-        
-        bin_precision.append(precision)
-        bin_recall.append(recall)
-        bin_f1.append(f1)
-        bin_counts.append(len(strains_in_bin))
-    
-    # Plot
-    fig, ax = plt.subplots(figsize=(7, 4))
-    x = np.arange(len(bin_labels))
-    width = 0.25
-    
-    bars1 = ax.bar(x - width, bin_precision, width, label='Precision', 
-                   color=POINT_COLORS[0], alpha=0.7)
-    bars2 = ax.bar(x, bin_recall, width, label='Recall',
-                   color=POINT_COLORS[1], alpha=0.7)
-    bars3 = ax.bar(x + width, bin_f1, width, label='F1',
-                   color=POINT_COLORS[2], alpha=0.7)
-    
-    # Add count annotations
-    for i, (bar, count) in enumerate(zip(bars2, bin_counts)):
-        if count > 0:
-            ax.text(bar.get_x() + bar.get_width()/2, -0.05,
-                   f'n={count}', ha='center', va='top', fontsize=9,
-                   color=COLOR_PALETTE['secondary'], style='italic')
-    
-    ax.set_xlabel('Abundance Range', color=COLOR_PALETTE['primary'])
-    ax.set_ylabel('Score', color=COLOR_PALETTE['primary'])
-    ax.set_title('Performance by Abundance Range', fontsize=12, color=COLOR_PALETTE['primary'])
-    ax.set_xticks(x)
-    ax.set_xticklabels(bin_labels, color=COLOR_PALETTE['primary'])
-    ax.set_ylim(0, 1.1)
-    ax.legend(frameon=True, framealpha=0.95, edgecolor=COLOR_PALETTE['neutral'])
-    
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, 'per_abundance_performance.png'), dpi=300, bbox_inches='tight')
-    plt.close()
-
-
-def _generate_divergence_performance(
-    true_haps: List[TrueHaplotype],
-    detected_haps: List[DetectedHaplotype],
-    matches: List[Tuple[TrueHaplotype, DetectedHaplotype, float]],
-    output_dir: str
-):
-    """Generate performance vs strain divergence (SNV density) plot."""
-    if not HAS_MATPLOTLIB or not true_haps:
-        return
-    
-    matched_strain_ids = {m[0].strain_id for m in matches}
-    
-    # Compute SNV density per strain (SNVs per 10kb)
-    strain_divergences = []
-    strain_detected = []
-    
-    for true_hap in true_haps:
-        total_snvs = sum(len(snvs) for snvs in true_hap.snv_positions.values())
-        if total_snvs == 0:
-            continue  # Skip strains with no SNVs
-        
-        # Compute total span across all contigs
-        # Use max position - min position for each contig, sum them
-        total_span = 0
-        for contig, snvs in true_hap.snv_positions.items():
-            if snvs:
-                contig_span = max(snvs.keys()) - min(snvs.keys())
-                # If span is 0 (single SNV), use a minimum span of 1000bp
-                total_span += max(contig_span, 1000)
-        
-        # If no valid span, skip this strain
-        if total_span == 0:
-            continue
-        
-        # SNVs per 10kb
-        snv_density = (total_snvs / total_span) * 10000
-        strain_divergences.append(snv_density)
-        strain_detected.append(1 if true_hap.strain_id in matched_strain_ids else 0)
-    
-    if not strain_divergences:
-        return
-    
-    # Bin by divergence
-    max_div = max(strain_divergences) if strain_divergences else 50
-    bins = np.linspace(0, max_div, 6)
-    bin_labels = [f'{bins[i]:.1f}-{bins[i+1]:.1f}' for i in range(len(bins)-1)]
-    
-    bin_recall = []
-    bin_counts = []
-    
-    for i in range(len(bins) - 1):
-        low, high = bins[i], bins[i+1]
-        in_bin = [j for j, div in enumerate(strain_divergences) if low <= div < high]
-        if not in_bin:
-            bin_recall.append(0.0)
-            bin_counts.append(0)
-            continue
-        
-        detected_count = sum(strain_detected[j] for j in in_bin)
-        recall = detected_count / len(in_bin) if len(in_bin) > 0 else 0.0
-        bin_recall.append(recall)
-        bin_counts.append(len(in_bin))
-    
-    # Plot
-    fig, ax = plt.subplots(figsize=(7, 4))
-    x = np.arange(len(bin_labels))
-    
-    bars = ax.bar(x, bin_recall, color=POINT_COLORS[1], alpha=0.7)
-    
-    # Add count annotations
-    for bar, count in zip(bars, bin_counts):
-        if count > 0:
-            ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.02,
-                   f'n={count}', ha='center', fontsize=9,
-                   color=COLOR_PALETTE['secondary'], style='italic')
-    
-    ax.set_xlabel('SNV Density (SNVs per 10kb)', color=COLOR_PALETTE['primary'])
-    ax.set_ylabel('Recall', color=COLOR_PALETTE['primary'])
-    ax.set_title('Detection Performance vs Strain Divergence', 
-                fontsize=12, color=COLOR_PALETTE['primary'])
-    ax.set_xticks(x)
-    ax.set_xticklabels(bin_labels, rotation=45, ha='right', color=COLOR_PALETTE['primary'])
-    ax.set_ylim(0, 1.1)
-    
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, 'divergence_performance.png'), dpi=300, bbox_inches='tight')
-    plt.close()
-
-
-def _generate_detection_roc_curve(
-    true_haps: List[TrueHaplotype],
-    detected_haps: List[DetectedHaplotype],
-    matches: List[Tuple[TrueHaplotype, DetectedHaplotype, float]],
-    output_dir: str
-):
-    """Generate ROC-like detection curve (detection rate vs false positive rate)."""
-    if not HAS_MATPLOTLIB or not true_haps:
-        return
-    
-    matched_strain_ids = {m[0].strain_id for m in matches}
-    matched_lineage_ids = {m[1].lineage_id for m in matches}
-    
-    # Compute true positives, false positives, false negatives
-    tp = len(matched_strain_ids)
-    fp = len(detected_haps) - len(matched_lineage_ids)
-    fn = len(true_haps) - len(matched_strain_ids)
-    tn = 0  # Not applicable for this context
-    
-    # Detection rate (recall/TPR)
-    tpr = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    
-    # False positive rate
-    fpr = fp / (fp + tn) if (fp + tn) > 0 else fp / len(detected_haps) if detected_haps else 0.0
-    
-    # For a full ROC curve, we'd vary thresholds, but here we show the operating point
-    # and add a diagonal reference line
-    fig, ax = plt.subplots(figsize=(6, 6))
-    
-    # Plot diagonal (random classifier)
-    ax.plot([0, 1], [0, 1], '--', color=COLOR_PALETTE['neutral'], 
-           linewidth=2.0, alpha=0.7, label='Random classifier')
-    
-    # Plot operating point
-    ax.scatter([fpr], [tpr], s=200, color=POINT_COLORS[2], alpha=0.7,
-              edgecolors=COLOR_PALETTE['primary'], linewidths=2.5, zorder=5,
-              label=f'Strainphase (TPR={tpr:.3f}, FPR={fpr:.3f})')
-    
-    ax.set_xlabel('False Positive Rate', color=COLOR_PALETTE['primary'])
-    ax.set_ylabel('True Positive Rate (Recall)', color=COLOR_PALETTE['primary'])
-    ax.set_title('Detection Performance (ROC-like)', fontsize=12, color=COLOR_PALETTE['primary'])
-    ax.set_xlim(-0.05, 1.05)
-    ax.set_ylim(-0.05, 1.05)
-    ax.legend(frameon=True, framealpha=0.95, edgecolor=COLOR_PALETTE['neutral'])
-    
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, 'detection_roc.png'), dpi=300, bbox_inches='tight')
-    plt.close()
-
-
-# _generate_scalability_analysis - REMOVED per user request
-
 
 # =============================================================================
 # Detailed Output Files
@@ -1678,7 +1308,51 @@ def write_false_positive_reads(
         writer.writeheader()
 
         for wr in window_results:
+            # Map hap index -> track_id for this window.
             hap_track_ids = [hap.track_id for hap in wr.haplotypes]
+            window_track_ids = {tid for tid in hap_track_ids if tid}
+
+            # Build read assignment map by read_id.
+            assignment_by_read = {a["read_id"]: a for a in (wr.assignments or [])}
+
+            # Check which false-positive lineages intersect this window.
+            for fp_lineage in fp_ids:
+                fp_tracks = lineage_to_tracks.get(fp_lineage, set())
+                fp_tracks_in_window = fp_tracks & window_track_ids
+                if not fp_tracks_in_window:
+                    continue
+
+                for fp_track_id in sorted(fp_tracks_in_window):
+                    for read in wr.window.reads:
+                        assign = assignment_by_read.get(read.id, {})
+                        hap_id = assign.get("hap_id")
+                        assigned_track_id = None
+                        if hap_id is not None and 0 <= hap_id < len(hap_track_ids):
+                            assigned_track_id = hap_track_ids[hap_id]
+                        sample = wr.window.sample or read.sample or ""
+                        snv_alleles = ",".join(
+                            f"{pos}:{base}" for pos, base in sorted(read.alleles.items())
+                        )
+                        writer.writerow(
+                            {
+                                "fp_lineage_id": fp_lineage,
+                                "fp_track_id": fp_track_id,
+                                "contig": wr.window.contig,
+                                "window_start": wr.window.start,
+                                "window_end": wr.window.end,
+                                "sample": sample,
+                                "read_id": read.id,
+                                "assigned_track_id": assigned_track_id or "",
+                                "hap_id": hap_id if hap_id is not None else "",
+                                "prob": f"{assign.get('prob', 0.0):.6f}" if assign else "",
+                                "is_junk": assign.get("is_junk", ""),
+                                "is_ambiguous": assign.get("is_ambiguous", ""),
+                                "snv_alleles": snv_alleles,
+                            }
+                        )
+
+    logger.info(f"Wrote false positive reads report to {output_path}")
+    return output_path
             window_track_ids = {tid for tid in hap_track_ids if tid}
 
             assignment_by_read = {a["read_id"]: a for a in (wr.assignments or [])}
@@ -1820,7 +1494,7 @@ def write_validation_summary(
         f.write("-" * 80 + "\n")
         f.write("Haplotype-Level Metrics:\n")
         f.write(f"  Precision:  {result.precision:.4f}  (fraction of detected that are correct)\n")
-        f.write(f"  Recall:     {result.recall:.4f}  (fraction of true strains detected)\n")
+        f.write(f"  Recall:     {result.recall:.4f}  (window-level recall when available)\n")
         f.write(f"  F1 Score:   {result.f1:.4f}  (harmonic mean of precision/recall)\n\n")
 
         f.write("SNV-Level Metrics (within detected genomic span):\n")
@@ -1861,6 +1535,22 @@ def write_validation_summary(
         f.write("  - Improvement in recall for rare strains from longitudinal rescue\n")
         f.write(f"Trajectory Error:  {result.abundance_trajectory_error:.4f}\n")
         f.write("  - Error in abundance changes over time\n\n")
+
+        # Section 4b: Window-level recall (informative windows)
+        f.write("4b. WINDOW-LEVEL RECALL (INFORMATIVE WINDOWS)\n")
+        f.write("-" * 80 + "\n")
+        f.write(f"Pooled Window Recall: {result.window_recall:.4f}\n")
+        f.write(f"Total Informative Windows: {result.window_informative_total}\n")
+        f.write(f"Detected Windows:         {result.window_detected_total}\n")
+        if result.window_recall_by_timepoint:
+            f.write("Per-Timepoint Window Recall:\n")
+            for tp, val in sorted(result.window_recall_by_timepoint.items()):
+                f.write(f"  {tp}: {val:.4f}\n")
+        if result.window_recall_by_contig:
+            f.write("Per-Contig Window Recall:\n")
+            for contig, val in sorted(result.window_recall_by_contig.items()):
+                f.write(f"  {contig}: {val:.4f}\n")
+        f.write("\n")
 
         # Section 5: EM Convergence Summary
         if window_results:
@@ -1950,103 +1640,207 @@ def write_low_abundance_report(
     low_abundance_threshold: float = 0.01,
 ) -> str:
     """
-    Write low_abundance.txt - missed true haplotypes likely due to coverage/abundance.
+    Write low_abundance.txt as a missed-SNV report.
 
-    Criteria:
-    - Not detected (in result.false_negatives)
-    - Labeled as LOW_ABUNDANCE if max true abundance < threshold
-    - Labeled as NO_COVERAGE if no detected span overlaps any SNV on its contigs
+    This reports true SNV positions that were not recovered within detected spans,
+    or were never in any detected span due to missing haplotypes/coverage.
     """
     output_path = os.path.join(output_dir, "low_abundance.txt")
 
-    missed_ids = set(result.false_negatives or [])
-    if not missed_ids:
-        with open(output_path, "w") as f:
-            f.write("No missed true haplotypes.\n")
-        return output_path
+    matches = match_haplotypes(true_haps, detected_haps, allow_one_to_many=True)
+    matches_by_strain: Dict[str, List[DetectedHaplotype]] = defaultdict(list)
+    for true_hap, det_hap, _ in matches:
+        matches_by_strain[true_hap.strain_id].append(det_hap)
 
-    # Prefer using window_results to determine coverage; fallback to detected_haps spans.
-    contig_spans: dict[str, list[tuple[int, int]]] = defaultdict(list)
-    if window_results:
-        for wr in window_results:
-            contig_spans[wr.window.contig].append((wr.window.start, wr.window.end))
-    else:
-        for det in detected_haps:
-            for contig, snvs in det.snv_alleles.items():
-                if snvs:
-                    contig_spans[contig].append((min(snvs.keys()), max(snvs.keys())))
+    missed_records = []
+    for true_hap in true_haps:
+        det_tracks = matches_by_strain.get(true_hap.strain_id, [])
 
-    def has_coverage(true_hap: TrueHaplotype) -> bool:
-        for contig, snvs in true_hap.snv_positions.items():
-            if not snvs:
-                continue
-            positions = snvs.keys()
-            spans = contig_spans.get(contig, [])
-            if not spans:
-                continue
-            for pos in positions:
-                for s, e in spans:
-                    if s <= pos <= e:
-                        return True
-        return False
+        # Build detected SNV union and span per contig for this true haplotype.
+        detected_snvs_union: Dict[str, Dict[int, str]] = defaultdict(dict)
+        detected_span: Dict[str, Tuple[int, int]] = {}
+        for det_hap in det_tracks:
+            for contig, det_snvs in det_hap.snv_alleles.items():
+                for pos, allele in det_snvs.items():
+                    if pos not in detected_snvs_union[contig]:
+                        detected_snvs_union[contig][pos] = allele
+                if det_snvs:
+                    min_pos = min(det_snvs.keys())
+                    max_pos = max(det_snvs.keys())
+                    if contig in detected_span:
+                        curr_min, curr_max = detected_span[contig]
+                        detected_span[contig] = (min(curr_min, min_pos), max(curr_max, max_pos))
+                    else:
+                        detected_span[contig] = (min_pos, max_pos)
 
-    # Use detection_threshold if available and > 0, but never below 1%.
-    threshold = low_abundance_threshold
-    if result.detection_threshold and result.detection_threshold > 0:
-        threshold = max(threshold, result.detection_threshold)
+        for contig, true_snvs in true_hap.snv_positions.items():
+            det_snvs = detected_snvs_union.get(contig, {})
+            span = detected_span.get(contig)
+            for pos, true_allele in true_snvs.items():
+                if not det_tracks:
+                    reason = "no_detected_haplotype"
+                    detected_allele = ""
+                elif not span:
+                    reason = "no_detected_span"
+                    detected_allele = ""
+                elif pos < span[0] or pos > span[1]:
+                    reason = "outside_detected_span"
+                    detected_allele = ""
+                else:
+                    detected_allele = det_snvs.get(pos, "")
+                    if pos not in det_snvs:
+                        reason = "missed_snv"
+                    elif detected_allele != true_allele:
+                        reason = "allele_mismatch"
+                    else:
+                        continue  # Recovered SNV
 
-    low_abundance = []
-    no_coverage = []
-    other = []
-
-    for hap in true_haps:
-        if hap.strain_id not in missed_ids:
-            continue
-        max_abund = max(hap.abundances.values()) if hap.abundances else 0.0
-        covered = has_coverage(hap)
-
-        record = {
-            "strain_id": hap.strain_id,
-            "max_abundance": max_abund,
-            "contigs": ",".join(sorted(hap.snv_positions.keys())),
-        }
-
-        if max_abund < threshold:
-            low_abundance.append(record)
-        elif not covered:
-            no_coverage.append(record)
-        else:
-            other.append(record)
+                missed_records.append(
+                    {
+                        "strain_id": true_hap.strain_id,
+                        "contig": contig,
+                        "pos": pos,
+                        "true_allele": true_allele,
+                        "detected_allele": detected_allele,
+                        "reason": reason,
+                    }
+                )
 
     with open(output_path, "w") as f:
-        f.write("MISSED TRUE HAPLOTYPES - LIKELY CAUSES\n")
+        f.write("MISSED SNVs REPORT\n")
         f.write("=" * 80 + "\n")
-        f.write(f"Low abundance threshold: {threshold:.4f}\n\n")
-
-        f.write("LOW_ABUNDANCE (max abundance below threshold):\n")
-        if low_abundance:
-            for r in low_abundance:
-                f.write(f"  {r['strain_id']}: max_abundance={r['max_abundance']:.4f}, contigs={r['contigs']}\n")
+        f.write("Columns: strain_id, contig, pos, true_allele, detected_allele, reason\n\n")
+        if not missed_records:
+            f.write("No missed SNVs.\n")
         else:
-            f.write("  None\n")
-        f.write("\n")
+            for r in missed_records:
+                f.write(
+                    f"{r['strain_id']}\t{r['contig']}\t{r['pos']}\t"
+                    f"{r['true_allele']}\t{r['detected_allele']}\t{r['reason']}\n"
+                )
 
-        f.write("NO_COVERAGE (no detected window/span overlaps SNVs):\n")
-        if no_coverage:
-            for r in no_coverage:
-                f.write(f"  {r['strain_id']}: max_abundance={r['max_abundance']:.4f}, contigs={r['contigs']}\n")
+    logger.info(f"Wrote missed SNVs report to {output_path}")
+    return output_path
+
+
+def compute_window_recall_metrics(
+    true_haps: List[TrueHaplotype],
+    window_results: List,
+) -> Tuple[float, int, int, Dict[str, float], Dict[str, float], List[Dict]]:
+    """
+    Compute window-level recall based on informative SNVs per window.
+
+    A window is "informative" if it contains >=1 SNV position where at least two
+    distinct allele groups exist among strains present at that timepoint.
+
+    A window is "detected" if all informative SNVs in that window are covered by
+    at least one haplotype consensus in that window.
+    """
+    # Build strain -> abundances and contig->pos->allele lookup from truth
+    strain_abundances = {h.strain_id: h.abundances for h in true_haps}
+    truth_alleles = {h.strain_id: h.snv_positions for h in true_haps}
+
+    per_timepoint_totals = defaultdict(lambda: {"informative": 0, "detected": 0})
+    per_contig_totals = defaultdict(lambda: {"informative": 0, "detected": 0})
+    missed_windows = []
+
+    for wr in window_results:
+        sample = wr.window.sample or ""
+        contig = wr.window.contig
+        start = wr.window.start
+        end = wr.window.end
+
+        # Determine strains present at this timepoint (abundance > 0)
+        present_strains = [
+            sid for sid, abunds in strain_abundances.items() if abunds.get(sample, 0.0) > 0.0
+        ]
+        if not present_strains:
+            continue
+
+        # Compute informative SNV positions in this window
+        informative_positions = []
+        for sid in present_strains:
+            for pos, allele in truth_alleles.get(sid, {}).get(contig, {}).items():
+                if start <= pos < end:
+                    informative_positions.append(pos)
+        if not informative_positions:
+            continue
+
+        informative_positions = sorted(set(informative_positions))
+        truly_informative = []
+        for pos in informative_positions:
+            allele_groups = set()
+            for sid in present_strains:
+                allele = truth_alleles.get(sid, {}).get(contig, {}).get(pos)
+                if allele is not None:
+                    allele_groups.add(allele)
+            if len(allele_groups) >= 2:
+                truly_informative.append(pos)
+
+        if not truly_informative:
+            continue
+
+        # Check detected coverage by haplotypes in this window
+        detected_positions = set()
+        for hap in wr.haplotypes:
+            detected_positions.update(hap.consensus.keys())
+
+        missing_positions = [pos for pos in truly_informative if pos not in detected_positions]
+        is_detected = len(missing_positions) == 0
+
+        per_timepoint_totals[sample]["informative"] += 1
+        per_contig_totals[contig]["informative"] += 1
+        if is_detected:
+            per_timepoint_totals[sample]["detected"] += 1
+            per_contig_totals[contig]["detected"] += 1
         else:
-            f.write("  None\n")
-        f.write("\n")
+            missed_windows.append(
+                {
+                    "sample": sample,
+                    "contig": contig,
+                    "window_start": start,
+                    "window_end": end,
+                    "n_informative_snvs": len(truly_informative),
+                    "n_missing_snvs": len(missing_positions),
+                    "missing_positions": ",".join(str(p) for p in missing_positions),
+                }
+            )
 
-        f.write("OTHER (missed but not obviously low abundance or no coverage):\n")
-        if other:
-            for r in other:
-                f.write(f"  {r['strain_id']}: max_abundance={r['max_abundance']:.4f}, contigs={r['contigs']}\n")
+    total_informative = sum(v["informative"] for v in per_timepoint_totals.values())
+    total_detected = sum(v["detected"] for v in per_timepoint_totals.values())
+    pooled_recall = total_detected / total_informative if total_informative > 0 else 0.0
+
+    by_timepoint = {
+        tp: (vals["detected"] / vals["informative"] if vals["informative"] > 0 else 0.0)
+        for tp, vals in per_timepoint_totals.items()
+    }
+    by_contig = {
+        contig: (vals["detected"] / vals["informative"] if vals["informative"] > 0 else 0.0)
+        for contig, vals in per_contig_totals.items()
+    }
+
+    return pooled_recall, total_informative, total_detected, by_timepoint, by_contig, missed_windows
+
+
+def write_missed_windows_report(
+    missed_windows: List[Dict],
+    output_dir: str,
+) -> Optional[str]:
+    """Write missed_windows.txt listing informative windows with missing SNVs."""
+    output_path = os.path.join(output_dir, "missed_windows.txt")
+    with open(output_path, "w") as f:
+        f.write("MISSED INFORMATIVE WINDOWS\n")
+        f.write("=" * 80 + "\n")
+        f.write("Columns: sample, contig, window_start, window_end, n_informative_snvs, n_missing_snvs, missing_positions\n\n")
+        if not missed_windows:
+            f.write("None\n")
         else:
-            f.write("  None\n")
-
-    logger.info(f"Wrote low abundance report to {output_path}")
+            for w in missed_windows:
+                f.write(
+                    f"{w['sample']}\t{w['contig']}\t{w['window_start']}\t{w['window_end']}\t"
+                    f"{w['n_informative_snvs']}\t{w['n_missing_snvs']}\t{w['missing_positions']}\n"
+                )
+    logger.info(f"Wrote missed windows report to {output_path}")
     return output_path
 
 
@@ -2058,13 +1852,15 @@ def run_validation(
     detected_file: str,
     truth_dir: str,
     output_dir: str,
-    window_results: Optional[List] = None,  # Optional WindowResult list for track validation
+    window_results: Optional[List] = None,  # REQUIRED for window-level recall
     window_size: Optional[int] = None,  # Window size for track validation
     detected_without_rescue: Optional[Dict] = None  # Optional abundances without rescue for Δrecall
 ) -> ValidationResult:
     """Run the full validation pipeline."""
 
     os.makedirs(output_dir, exist_ok=True)
+    if window_results is None:
+        raise ValueError("window_results is required for window-level recall.")
 
     # Load data
     true_haps, all_snv_positions = load_ground_truth(truth_dir)
@@ -2238,13 +2034,6 @@ def run_validation(
         import traceback
         logger.debug(traceback.format_exc())
 
-    # Generate figures
-    generate_figures(
-        result, true_haps, detected_haps, matches, output_dir,
-        window_results=window_results,
-        truth_dir=truth_dir
-    )
-
     # Generate detailed TSV output files
     try:
         write_lineage_details(true_haps, detected_haps, matches, output_dir)
@@ -2273,6 +2062,29 @@ def run_validation(
         # to the LongitudinalIntegrator's rescue statistics.
         # We skip writing here to avoid creating an empty file that would
         # overwrite or confuse the actual rescue statistics.
+
+    if window_results:
+        try:
+            (pooled_recall, total_inf, total_det, by_tp, by_contig, missed_windows) = (
+                compute_window_recall_metrics(true_haps, window_results)
+            )
+            result.window_recall = pooled_recall
+            result.window_informative_total = total_inf
+            result.window_detected_total = total_det
+            result.window_recall_by_timepoint = by_tp
+            result.window_recall_by_contig = by_contig
+            write_missed_windows_report(missed_windows, output_dir)
+            # Redefine false negatives as missed informative windows
+            result.false_negatives = [
+                f"{w['sample']}|{w['contig']}:{w['window_start']}-{w['window_end']}"
+                for w in missed_windows
+            ]
+            # Redefine recall to window-level recall and recompute F1 accordingly.
+            result.recall = result.window_recall
+            if (result.precision + result.recall) > 0:
+                result.f1 = 2 * result.precision * result.recall / (result.precision + result.recall)
+        except Exception as e:
+            logger.warning(f"Failed to compute window-level recall: {e}")
 
     try:
         write_validation_summary(result, true_haps, detected_haps, matches, output_dir, window_results)
@@ -2323,6 +2135,12 @@ def run_validation(
             'lineage_f1': result.lineage_f1,
             'rescue_delta_recall_rare': result.rescue_delta_recall_rare,
             'abundance_trajectory_error': result.abundance_trajectory_error,
+            # Window-level recall
+            'window_recall': result.window_recall,
+            'window_informative_total': result.window_informative_total,
+            'window_detected_total': result.window_detected_total,
+            'window_recall_by_timepoint': result.window_recall_by_timepoint,
+            'window_recall_by_contig': result.window_recall_by_contig,
             # Detailed diagnostics
             'false_negatives': result.false_negatives,
             'false_positives': result.false_positives,
@@ -2359,8 +2177,9 @@ def run_validation(
         f.write(f"Matched detected lineages:    {len(matched_detected_ids)}\n")
         f.write("\n(Note: Strainphase splits lineages per-contig, so one strain can produce multiple detected lineages per contig)\n")
         f.write(f"Precision:           {result.precision:.3f}\n")
-        f.write(f"Recall:              {result.recall:.3f}\n")
+        f.write(f"Recall:              {result.recall:.3f}  (window-level when available)\n")
         f.write(f"F1 Score:            {result.f1:.3f}\n")
+        f.write(f"Window Recall:       {result.window_recall:.3f}\n")
         f.write(f"Abundance Pearson r: {result.abundance_pearson_r:.3f}\n")
         f.write(f"Abundance MAE:       {result.abundance_mae:.3f}\n")
         f.write(f"SNV Precision:       {result.snv_precision:.3f}\n")
@@ -2369,16 +2188,11 @@ def run_validation(
         f.write("\n")
         
         # False negatives
-        f.write("FALSE NEGATIVES (True haplotypes not detected)\n")
+        f.write("FALSE NEGATIVES (Informative windows not detected)\n")
         f.write("-" * 80 + "\n")
         if result.false_negatives:
             for fn_id in result.false_negatives:
-                fn_hap = next((h for h in true_haps if h.strain_id == fn_id), None)
-                if fn_hap:
-                    max_abund = max(fn_hap.abundances.values()) if fn_hap.abundances else 0
-                    n_snvs = sum(len(snvs) for snvs in fn_hap.snv_positions.values())
-                    f.write(f"  {fn_id}: max_abundance={max_abund:.4f}, n_snvs={n_snvs}, "
-                           f"sweeping={fn_hap.is_sweeping}\n")
+                f.write(f"  {fn_id}\n")
         else:
             f.write("  None\n")
         f.write("\n")

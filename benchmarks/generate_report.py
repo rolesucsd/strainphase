@@ -56,6 +56,102 @@ logger = logging.getLogger(__name__)
 
 
 # =============================================================================
+# Plot styling
+# =============================================================================
+
+# Professional color palette (used across report figures)
+COLOR_PALETTE = {
+    "primary": "#2C3E50",      # Dark blue-gray
+    "secondary": "#34495E",    # Medium blue-gray
+    "accent": "#3498DB",       # Bright blue
+    "success": "#27AE60",      # Green
+    "warning": "#F39C12",      # Orange
+    "error": "#E74C3C",        # Red
+    "info": "#9B59B6",         # Purple
+    "neutral": "#95A5A6",      # Gray
+    "light": "#ECF0F1",        # Light gray
+    "dark": "#1A1A1A",         # Near black
+}
+
+# Color palette for scatter plot points
+POINT_COLORS = ["#569667", "#4264a8", "#e6a432", "#8e4aa1"]
+
+COLOR_SEQUENCES = {
+    "qualitative": [
+        "#2C3E50",
+        "#3498DB",
+        "#27AE60",
+        "#F39C12",
+        "#9B59B6",
+        "#E74C3C",
+        "#1ABC9C",
+        "#E67E22",
+    ],
+}
+
+
+def set_plot_style():
+    """Set professional, clean figure style for report plots with Arial font and no grid."""
+    if not HAS_MATPLOTLIB:
+        return
+
+    # Use clean style without grid
+    plt.style.use("default")
+
+    # Font settings - Arial family
+    plt.rcParams["font.family"] = "Arial"
+    plt.rcParams["font.sans-serif"] = ["Arial", "DejaVu Sans", "Liberation Sans", "sans-serif"]
+    plt.rcParams["font.size"] = 11
+    plt.rcParams["axes.titlesize"] = 12  # Title size 12, not bold
+    plt.rcParams["axes.labelsize"] = 12
+    plt.rcParams["xtick.labelsize"] = 10
+    plt.rcParams["ytick.labelsize"] = 10
+    plt.rcParams["legend.fontsize"] = 10
+    plt.rcParams["figure.titlesize"] = 16
+
+    # Remove grid completely
+    plt.rcParams["axes.grid"] = False
+
+    # Clean spines - only show bottom and left
+    plt.rcParams["axes.spines.top"] = False
+    plt.rcParams["axes.spines.right"] = False
+    plt.rcParams["axes.spines.left"] = True
+    plt.rcParams["axes.spines.bottom"] = True
+
+    # Spine styling
+    plt.rcParams["axes.linewidth"] = 1.2
+    plt.rcParams["axes.edgecolor"] = COLOR_PALETTE["primary"]
+
+    # Figure and axes background
+    plt.rcParams["figure.facecolor"] = "white"
+    plt.rcParams["axes.facecolor"] = "white"
+    plt.rcParams["savefig.facecolor"] = "white"
+
+    # Tick styling
+    plt.rcParams["xtick.color"] = COLOR_PALETTE["primary"]
+    plt.rcParams["ytick.color"] = COLOR_PALETTE["primary"]
+    plt.rcParams["xtick.direction"] = "out"
+    plt.rcParams["ytick.direction"] = "out"
+
+    # Line and marker styling
+    plt.rcParams["lines.linewidth"] = 2.0
+    plt.rcParams["lines.markersize"] = 6
+    plt.rcParams["patch.linewidth"] = 1.2
+
+    # Legend styling
+    plt.rcParams["legend.frameon"] = True
+    plt.rcParams["legend.framealpha"] = 0.95
+    plt.rcParams["legend.edgecolor"] = COLOR_PALETTE["neutral"]
+    plt.rcParams["legend.facecolor"] = "white"
+
+    # Default figure size
+    plt.rcParams["figure.figsize"] = (9, 5.5)
+    plt.rcParams["figure.dpi"] = 150
+    plt.rcParams["savefig.dpi"] = 300
+    plt.rcParams["savefig.bbox"] = "tight"
+
+
+# =============================================================================
 # Data loading
 # =============================================================================
 
@@ -2204,6 +2300,7 @@ def generate_report(
     Returns:
         Path to generated HTML report
     """
+    set_plot_style()
     if not HAS_MATPLOTLIB:
         logger.warning("matplotlib not installed, figures will be skipped")
 
