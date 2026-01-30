@@ -379,7 +379,7 @@ def generate_validation_patchwork(
             load_detected_haplotypes,
             match_haplotypes,
             compute_haplotype_distance,
-            compute_validation_metrics,
+            _compute_per_timepoint_metrics,
         )
         from validation.validate_tracks import load_truth_tracks
     except Exception as e:
@@ -388,10 +388,8 @@ def generate_validation_patchwork(
 
     true_haps, all_snv_positions = load_ground_truth(truth_dir)
     detected_haps = load_detected_haplotypes(str(lineages_path))
-    matches = match_haplotypes(true_haps, detected_haps, allow_one_to_many=True)
-    validation_result = compute_validation_metrics(
-        true_haps, detected_haps, all_snv_positions
-    )
+    matches = match_haplotypes(true_haps, detected_haps)
+    per_timepoint_metrics = _compute_per_timepoint_metrics(true_haps, detected_haps, matches)
 
     # Build figure
     n_contigs = len({c for h in detected_haps for c in h.snv_alleles.keys()})
@@ -506,10 +504,10 @@ def generate_validation_patchwork(
     ax_dm3.set_xlabel("True SNVs (detected contigs)", color=COLOR_PALETTE['primary'])
     ax_dm3.set_ylabel("Detected SNVs", color=COLOR_PALETTE['primary'])
 
-    if validation_result.per_timepoint_metrics:
-        tps = sorted(validation_result.per_timepoint_metrics.keys())
-        recalls = [validation_result.per_timepoint_metrics[tp]['recall'] for tp in tps]
-        precisions = [validation_result.per_timepoint_metrics[tp]['precision'] for tp in tps]
+    if per_timepoint_metrics:
+        tps = sorted(per_timepoint_metrics.keys())
+        recalls = [per_timepoint_metrics[tp]['recall'] for tp in tps]
+        precisions = [per_timepoint_metrics[tp]['precision'] for tp in tps]
         x = np.arange(len(tps))
         width = 0.35
         ax_dm4.bar(x - width/2, recalls, width, label='Recall', alpha=0.7, color=COLOR_PALETTE['accent'])
