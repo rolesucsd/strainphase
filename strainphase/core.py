@@ -224,15 +224,22 @@ class Read:
 
 @dataclass
 class Window:
-    """Represents a genomic window with associated SNVs and reads."""
+    """
+    Represents a genomic window (contig interval) with associated SNVs and reads.
+
+    Notes:
+    - snv_pos and ref_alleles are populated from the VCF (see load_snvs_from_clair3).
+    - reads are pulled from the BAM and filtered to this window in make_windows_lazy.
+    - sample is optional metadata; reads may also carry their own sample tag.
+    """
 
     contig: str
     start: int  # 1-based, inclusive
     end: int  # 1-based, exclusive
-    snv_pos: list[int] = field(default_factory=list)
-    ref_alleles: dict[int, str] = field(default_factory=dict)
-    reads: list[Read] = field(default_factory=list)
-    sample: str | None = None
+    snv_pos: list[int] = field(default_factory=list)  # SNV positions (from VCF)
+    ref_alleles: dict[int, str] = field(default_factory=dict)  # REF base per SNV (from VCF)
+    reads: list[Read] = field(default_factory=list)  # Reads overlapping this window (from BAM)
+    sample: str | None = None  # Optional timepoint/sample label (redundant with Read.sample)
     window_idx: int = 0  # Position in contig's window sequence
 
     # Cached position sets for graph building (optimization)
@@ -257,12 +264,20 @@ class Window:
 
 @dataclass
 class Haplotype:
-    """A resolved haplotype within a window."""
+    """
+    A resolved haplotype within a window.
+
+    Notes on fields:
+    - weight: mixture weight for this haplotype in the window (pi[k] from EM),
+      i.e., estimated fraction of reads assigned to this haplotype.
+    - confidence: mean posterior assignment probability for reads confidently
+      assigned to this haplotype (computed from gamma with assign_confidence_threshold).
+    """
 
     consensus: dict[int, str]
-    weight: float = 0.0
+    weight: float = 0.0  # Mixture weight (pi) after EM / post-merge / rescue.
     supporting_reads: int = 0
-    confidence: float = 0.0
+    confidence: float = 0.0  # Mean gamma over confident reads for this haplotype.
     track_id: str | None = None  # Assigned after window linking
 
     def distance_to(
@@ -327,17 +342,21 @@ class WindowResult:
         n_reads = len(self.window.reads)
         n_haps = len(self.haplotypes)
         k_eff = n_haps + 1
+        # k_eff = number of haplotypes + 1 junk component.
 
+        # gamma shape must match (n_reads x k_eff).
         assert self.gamma.shape == (
             n_reads,
             k_eff,
         ), f"gamma shape {self.gamma.shape} != expected ({n_reads}, {k_eff})"
 
+        # Each row of gamma is a probability distribution (sums to ~1).
         row_sums = self.gamma.sum(axis=1)
         assert np.allclose(
             row_sums, 1.0, atol=1e-6
         ), f"gamma rows don't sum to 1: min={row_sums.min()}, max={row_sums.max()}"
 
+        # pi is a probability distribution (sums to ~1) with k_eff entries.
         assert np.isclose(self.pi.sum(), 1.0, atol=1e-6), f"pi doesn't sum to 1: {self.pi.sum()}"
 
         assert len(self.pi) == k_eff, f"pi length {len(self.pi)} != k_eff {k_eff}"
@@ -350,6 +369,7 @@ class RescueStatistic:
     """Statistics for a single haplotype rescue event."""
 
     sample: str  # Timepoint where rescue occurred
+    rescued_timepoint: str  # Timepoint label for the rescued read/haplotype (usually same as sample)
     contig: str
     window_start: int
     track_id: str
@@ -359,6 +379,7 @@ class RescueStatistic:
     donor_timepoint: str  # Timepoint that provided the anchor
     anchor_distance: float  # Distance to matching anchor
     n_shared_with_anchor: int  # Number of shared SNVs with anchor
+    n_mismatched_with_anchor: int  # Number of mismatched SNVs with anchor
     reason: str = ""  # Debug reason for rescue outcome
 
 
@@ -630,13 +651,16 @@ class GraphInitializer:
         reads = window.reads
         n_reads = len(reads)
 
+        # Add one node per read (nodes are read indices).
         for i in range(n_reads):
             graph.add_node(i)
 
-        # OPTIMIZATION: Use precomputed position sets
+        # Precompute the set of SNV positions each read covers
+        # (window.get_read_position_sets caches these).
         pos_sets = window.get_read_position_sets()
 
-        # Precompute max allowed mismatches for early exit
+        # Compare read pairs to decide if they should be connected.
+        # We only connect reads that share enough SNVs and agree closely.
         for i in range(n_reads):
             pos_i = pos_sets[i]
             if not pos_i:
@@ -644,13 +668,16 @@ class GraphInitializer:
 
             for j in range(i + 1, n_reads):
                 pos_j = pos_sets[j]
+                # Shared SNV positions between the two reads.
                 shared = pos_i & pos_j
                 n_shared = len(shared)
 
+                # Require a minimum amount of overlap to reduce noise.
                 if n_shared < self.config.min_shared_snvs_for_edge:
                     continue
 
-                # OPTIMIZATION: Early exit mismatch counting
+                # Count mismatches with early exit.
+                # We stop once mismatches exceed the allowed fraction.
                 max_allowed = int(self.config.max_mismatch_frac * n_shared)
                 mismatches = 0
                 exceeded = False
@@ -663,8 +690,10 @@ class GraphInitializer:
                             exceeded = True
                             break
 
+                # Add an edge if reads are sufficiently similar.
                 if not exceeded:
                     mismatch_frac = mismatches / n_shared
+                    # Edge weight = #shared SNVs scaled by agreement (higher is better).
                     weight = (1.0 - mismatch_frac) * n_shared
                     graph.add_edge(i, j, weight=weight)
 
@@ -674,11 +703,13 @@ class GraphInitializer:
         """Derive consensus from cluster reads."""
         allele_counts = defaultdict(lambda: defaultdict(int))
 
+        # Count alleles at each SNV position across reads in this cluster.
         for r in cluster_reads:
             for pos, base in r.alleles.items():
                 if window.start <= pos < window.end and pos in window.snv_pos:
                     allele_counts[pos][base] += 1
 
+        # Consensus = most frequent allele at each SNV position.
         consensus = {}
         for pos in window.snv_pos:
             if pos in allele_counts:
@@ -688,9 +719,11 @@ class GraphInitializer:
 
     def get_initial_haplotypes(self, window: Window) -> tuple[list[Haplotype], list[int]]:
         """Initialize haplotypes using graph clustering."""
+        # Build read overlap graph where edges connect reads that agree on SNVs.
         graph = self.build_overlap_graph(window)
 
         if graph.number_of_edges() == 0:
+            # No edges => no clustering signal; fall back to single consensus haplotype.
             consensus = self.derive_consensus(window.reads, window)
             if consensus:
                 return [Haplotype(consensus=consensus, supporting_reads=len(window.reads))], [
@@ -699,7 +732,6 @@ class GraphInitializer:
             return [], []
 
         # Partition reads into clusters.
-        #
         # Louvain community detection for read clustering.
         partition = community_louvain.best_partition(graph, weight="weight")
 
@@ -708,7 +740,7 @@ class GraphInitializer:
         for node_idx, cluster_id in partition.items():
             clusters[cluster_id].append(window.reads[node_idx])
 
-        # Build haplotypes
+        # Build initial haplotypes: one consensus per cluster.
         initial_haps = []
         cluster_sizes = []
 
@@ -794,6 +826,7 @@ class EMHaplotyper:
         n_haps = len(haplotypes)
 
         if n_haps == 0:
+            # Degenerate case: only junk class.
             gamma = np.ones((n_reads, 1))
             pi = np.array([1.0])
             return [], gamma, pi, -np.inf, True, 0
@@ -801,7 +834,7 @@ class EMHaplotyper:
         k_eff = n_haps + 1
         junk_idx = n_haps
 
-        # Initialize pi
+        # Initialize mixture weights (pi): either from cluster sizes or uniform.
         if self.config.use_cluster_pi_init and self.cluster_sizes:
             cluster_total = sum(self.cluster_sizes)
             junk_init = max(1, n_reads - cluster_total)
@@ -815,7 +848,8 @@ class EMHaplotyper:
         converged = False
 
         for iteration in range(self.config.em_max_iter):
-            # OPTIMIZATION: Cache all log-likelihoods once per iteration
+            # E-STEP prep: cache log P(read | haplotype) and log P(read | junk)
+            # so we do not recompute them in multiple places.
             logl_hap = np.full((n_reads, n_haps), -np.inf)
             logl_junk = np.zeros(n_reads)
 
@@ -826,7 +860,7 @@ class EMHaplotyper:
                         logl_hap[i, k] = lp
                 logl_junk[i] = self._compute_log_prob_read_junk(read)
 
-            # E-STEP using cached values
+            # E-STEP: compute responsibilities gamma[i, k] = P(haplotype k | read i).
             for i in range(n_reads):
                 logp_k = np.full(k_eff, -np.inf)
 
@@ -843,7 +877,7 @@ class EMHaplotyper:
                 else:
                     gamma[i, :] = np.exp(logp_k - log_sum)
 
-            # LOG-LIKELIHOOD using cached values (no recomputation!)
+            # Log-likelihood: sum over reads of log(sum_k pi_k * P(read | k)).
             log_like = 0.0
             for i in range(n_reads):
                 terms = []
@@ -854,11 +888,12 @@ class EMHaplotyper:
                 if terms:
                     log_like += logsumexp(np.array(terms))
 
-            # M-STEP
+            # M-STEP: update mixture weights and haplotype consensuses.
+            # nk = effective counts per component (with Dirichlet smoothing).
             nk = gamma.sum(axis=0) + (self.config.dirichlet_alpha - 1.0)
             pi = nk / nk.sum()
 
-            # Update haplotypes
+            # Rebuild haplotypes by weighted voting over reads.
             new_haps = []
             surviving_indices = []
 
@@ -892,7 +927,7 @@ class EMHaplotyper:
                     new_haps.append(Haplotype(consensus=new_consensus))
                     surviving_indices.append(k)
 
-            # Update structures
+            # Update structures after pruning low-weight haplotypes.
             haplotypes = new_haps
             n_haps = len(haplotypes)
 
@@ -901,7 +936,7 @@ class EMHaplotyper:
                 gamma = np.ones((n_reads, 1))
                 return [], gamma, pi, log_like, True, iteration + 1
 
-            # Rebuild pi and gamma
+            # Rebuild pi and gamma to match the surviving haplotypes.
             junk_mass = nk[-1]
             nk_surv = nk[surviving_indices]
             nk_new = np.concatenate([nk_surv, [junk_mass]])
@@ -920,7 +955,7 @@ class EMHaplotyper:
             row_sums[row_sums == 0] = 1.0
             gamma /= row_sums
 
-            # Convergence check
+            # Convergence check using relative change in log-likelihood.
             # Use relative tolerance for log-likelihood (since log-likelihoods can be large negative numbers)
             if prev_log_like != -np.inf and abs(prev_log_like) > 1e-10:
                 relative_change = abs(log_like - prev_log_like) / abs(prev_log_like)
@@ -934,7 +969,7 @@ class EMHaplotyper:
                     break
             prev_log_like = log_like
 
-        # Update haplotype metadata
+        # Final metadata: weights, read support, and confidence per haplotype.
         for k, hap in enumerate(haplotypes):
             hap.weight = pi[k]
             hap.supporting_reads = int(
@@ -1033,13 +1068,15 @@ class PostProcessor:
         if n_haps <= 1:
             return haplotypes, gamma, pi
 
-        # Precompute max allowed mismatches for early exit
+        # Precompute max allowed mismatches for early exit when comparing haplotypes.
         max_mismatches = int(self.config.merge_distance_threshold * len(window.snv_pos)) + 1
 
         used = set()
         new_haplotypes = []
         old_to_new = [-1] * n_haps
 
+        # Greedy grouping: for each unused haplotype, merge any other haplotype
+        # within the distance threshold (and passing the 1-SNP guard if needed).
         for i in range(n_haps):
             if i in used:
                 continue
@@ -1069,7 +1106,7 @@ class PostProcessor:
 
             used.update(group)
 
-            # Merge consensus
+            # Merge consensus by weighted voting across the group.
             allele_votes = defaultdict(lambda: defaultdict(float))
             for g in group:
                 weight = pi[g]
@@ -1085,7 +1122,7 @@ class PostProcessor:
             for g in group:
                 old_to_new[g] = new_idx
 
-        # Rebuild pi and gamma
+        # Rebuild pi and gamma for the merged haplotypes.
         new_k_count = len(new_haplotypes)
         new_pi = np.zeros(new_k_count + 1)
 
@@ -1105,7 +1142,7 @@ class PostProcessor:
         row_sums[row_sums == 0] = 1.0
         new_gamma /= row_sums
 
-        # Update haplotype metadata (FIX: recompute after merge)
+        # Update haplotype metadata after merging.
         for k, hap in enumerate(new_haplotypes):
             hap.weight = new_pi[k]
             hap.supporting_reads = int(
@@ -1232,6 +1269,7 @@ class LongitudinalIntegrator:
                 self.rescue_statistics.append(
                     RescueStatistic(
                         sample=current_sample,
+                        rescued_timepoint=current_sample,
                         contig=window_result.window.contig,
                         window_start=window_result.window.start,
                         track_id="window",
@@ -1241,11 +1279,13 @@ class LongitudinalIntegrator:
                         donor_timepoint="",
                         anchor_distance=-1.0,
                         n_shared_with_anchor=0,
+                        n_mismatched_with_anchor=0,
                         reason="no_anchors",
                     )
                 )
                 return window_result
 
+        # Local variables for readability.
         window = window_result.window
         haplotypes = list(window_result.haplotypes)  # Make mutable copy
         gamma = window_result.gamma.copy()
@@ -1253,10 +1293,10 @@ class LongitudinalIntegrator:
         reads = window.reads
 
         n_haps = len(haplotypes)
-        junk_idx = n_haps
+        junk_idx = n_haps  # Last column in gamma/pi is the junk component.
         junk_weight = pi[junk_idx] if len(pi) > junk_idx else 0.0
 
-        # Find reads assigned to junk (high probability of being junk)
+        # Identify reads assigned to junk (by posterior probability).
         junk_threshold = 0.5  # Read is "junk" if gamma[:, junk_idx] > this
         junk_read_mask = gamma[:, junk_idx] > junk_threshold
         n_junk_reads = junk_read_mask.sum()
@@ -1271,6 +1311,7 @@ class LongitudinalIntegrator:
             self.rescue_statistics.append(
                 RescueStatistic(
                     sample=current_sample,
+                    rescued_timepoint=current_sample,
                     contig=window.contig,
                     window_start=window.start,
                     track_id="window",
@@ -1280,19 +1321,19 @@ class LongitudinalIntegrator:
                     donor_timepoint="",
                     anchor_distance=-1.0,
                     n_shared_with_anchor=0,
+                    n_mismatched_with_anchor=0,
                     reason=f"insufficient_junk_reads({n_junk_reads})",
                 )
             )
             return window_result
 
-        # Check which anchors are NOT already represented in this window's haplotypes
-        # (we only want to rescue haplotypes that are missing, not duplicates)
+        # Avoid duplicating an already-present haplotype in this window.
         existing_consensuses = [h.consensus for h in haplotypes]
 
         rescued_any = False
         new_haplotypes = []
 
-        # Use config thresholds for matching
+        # Matching thresholds for anchor comparisons.
         max_distance = self.config.rescue_match_distance  # e.g., 0.005 = 99.5% match required
         min_shared = self.config.min_shared_for_rescue
 
@@ -1300,7 +1341,7 @@ class LongitudinalIntegrator:
             # Check if this anchor is already present as a haplotype
             anchor_already_present = False
             for existing in existing_consensuses:
-                # Compare consensus on shared positions
+                # Compare anchor vs existing consensus on shared SNV positions.
                 n_shared = 0
                 n_match = 0
                 for pos in window.snv_pos:
@@ -1317,9 +1358,8 @@ class LongitudinalIntegrator:
             if anchor_already_present:
                 continue
 
-            # Count how many junk reads match this anchor within sequencing error tolerance
-            # For individual reads, we use a lower shared threshold (reads often cover few SNVs)
-            # but require the collective evidence from many matching reads for confidence
+            # Count junk reads that are consistent with this anchor.
+            # Use a lower per-read shared threshold, but require many matching reads.
             n_matching_junk = 0
             matching_read_indices = []
             min_shared_for_read = 2  # Lower threshold for individual reads
@@ -1328,7 +1368,7 @@ class LongitudinalIntegrator:
                 if not junk_read_mask[i]:
                     continue
 
-                # Check if read matches anchor within sequencing error tolerance
+                # Check if this read matches the anchor within error tolerance.
                 n_shared = 0
                 n_match = 0
                 for pos, allele in read.alleles.items():
@@ -1344,10 +1384,10 @@ class LongitudinalIntegrator:
                         n_matching_junk += 1
                         matching_read_indices.append(i)
 
-            # If enough junk reads match this anchor, create a rescued haplotype
+            # If enough junk reads match this anchor, create a rescued haplotype.
             min_reads_for_rescue = max(3, int(0.02 * len(reads)))  # At least 3 reads or 2%
             if n_matching_junk >= min_reads_for_rescue:
-                # Create new haplotype from anchor's consensus (restricted to this window's SNVs)
+                # Create new haplotype from anchor consensus (restricted to this window's SNVs).
                 new_consensus = {
                     pos: anchor.consensus[pos]
                     for pos in window.snv_pos
@@ -1355,7 +1395,7 @@ class LongitudinalIntegrator:
                 }
 
                 if len(new_consensus) >= self.config.min_snvs_per_window:
-                    # Estimate weight from junk reads
+                    # Estimate weight from junk reads; enforce rescued_min_weight.
                     rescued_weight = max(
                         n_matching_junk / len(reads),
                         self.config.rescued_min_weight
@@ -1374,6 +1414,7 @@ class LongitudinalIntegrator:
                     self.rescue_statistics.append(
                         RescueStatistic(
                             sample=current_sample,
+                            rescued_timepoint=current_sample,
                             contig=window.contig,
                             window_start=window.start,
                             track_id=f"rescued_from_{donor_timepoint}",
@@ -1383,6 +1424,7 @@ class LongitudinalIntegrator:
                             donor_timepoint=donor_timepoint,
                             anchor_distance=0.0,
                             n_shared_with_anchor=len(new_consensus),
+                            n_mismatched_with_anchor=0,
                             reason=f"rescued_from_junk({n_matching_junk}_reads)",
                         )
                     )
@@ -1397,6 +1439,7 @@ class LongitudinalIntegrator:
             self.rescue_statistics.append(
                 RescueStatistic(
                     sample=current_sample,
+                    rescued_timepoint=current_sample,
                     contig=window.contig,
                     window_start=window.start,
                     track_id="window",
@@ -1406,6 +1449,7 @@ class LongitudinalIntegrator:
                     donor_timepoint="",
                     anchor_distance=-1.0,
                     n_shared_with_anchor=0,
+                    n_mismatched_with_anchor=0,
                     reason="no_anchor_matches_junk",
                 )
             )
@@ -1520,7 +1564,7 @@ class LongitudinalIntegrator:
         if len(results_by_timepoint) < 2:
             return results_by_timepoint
 
-        # Group by window position
+        # Group WindowResults by genomic window so we can compare across timepoints.
         windows_by_position: dict[tuple, dict[str, WindowResult]] = defaultdict(dict)
 
         for sample_id, window_results in results_by_timepoint.items():
@@ -1528,7 +1572,7 @@ class LongitudinalIntegrator:
                 key = (wr.window.contig, wr.window.start, wr.window.end)
                 windows_by_position[key][sample_id] = wr
 
-        # Diagnostic: count junk reads and anchors across all windows
+        # Diagnostic summary: how many anchors and junk reads exist overall.
         n_windows_with_multiple_timepoints = 0
         total_junk_reads = 0
         total_reads = 0
@@ -1552,11 +1596,11 @@ class LongitudinalIntegrator:
             f"{n_anchors} anchors, {total_junk_reads}/{total_reads} junk reads ({junk_pct:.1f}%)"
         )
 
-        # Process each position
+        # Rescue each window position independently.
         rescued_results: dict[str, list[WindowResult]] = defaultdict(list)
 
         for _window_key, sample_results in windows_by_position.items():
-            # OPTIMIZATION: Build anchor panel from sample_results directly
+            # Anchor panel = haplotypes from other timepoints (potential donors).
             anchor_haps, anchor_samples = self.build_anchor_panel_for_key(sample_results)
 
             for sample_id, wr in sample_results.items():
@@ -1579,6 +1623,7 @@ class LongitudinalIntegrator:
 
         fieldnames = [
             "sample",
+            "rescued_timepoint",
             "contig",
             "window_start",
             "track_id",
@@ -1588,6 +1633,7 @@ class LongitudinalIntegrator:
             "donor_timepoint",
             "anchor_distance",
             "n_shared_with_anchor",
+            "n_mismatched_with_anchor",
             "reason",
         ]
 
@@ -1599,6 +1645,7 @@ class LongitudinalIntegrator:
                 writer.writerow(
                     {
                         "sample": stat.sample,
+                        "rescued_timepoint": stat.rescued_timepoint,
                         "contig": stat.contig,
                         "window_start": stat.window_start,
                         "track_id": stat.track_id,
@@ -1610,6 +1657,7 @@ class LongitudinalIntegrator:
                             f"{stat.anchor_distance:.6f}" if stat.anchor_distance >= 0 else "NA"
                         ),
                         "n_shared_with_anchor": stat.n_shared_with_anchor,
+                        "n_mismatched_with_anchor": stat.n_mismatched_with_anchor,
                         "reason": stat.reason,
                     }
                 )
@@ -1628,11 +1676,12 @@ def process_window(
     """Process a single window through the full pipeline."""
     post = PostProcessor(config)
 
-    # Initialize
+    # 1) Initialize haplotypes via read clustering on the overlap graph.
     initializer = GraphInitializer(config)
     initial_haps, cluster_sizes = initializer.get_initial_haplotypes(window)
 
     if not initial_haps:
+        # No clustering signal -> return junk-only result.
         # FIX: Return proper junk-only result (gamma = ones, not zeros)
         n_reads = len(window.reads)
         gamma = np.ones((n_reads, 1))
@@ -1650,11 +1699,12 @@ def process_window(
             iterations=0,
         )
 
-    # EM
+    # 2) EM haplotyping: refine haplotype consensus and weights.
     em = EMHaplotyper(window, initial_haps, cluster_sizes, config)
     haplotypes, gamma, pi, log_lik, converged, iterations = em.run()
 
     if not haplotypes:
+        # EM pruned all haplotypes; keep the (junk) assignments.
         assignments = post.assign_reads(window.reads, gamma, pi)
         return WindowResult(
             window=window,
@@ -1667,7 +1717,7 @@ def process_window(
             iterations=iterations,
         )
 
-    # Post-processing with 1-SNP validation
+    # 3) Post-processing: merge near-duplicate haplotypes with 1-SNP guard.
     merged_haps, final_gamma, final_pi = post.merge_similar_haplotypes(
         haplotypes, gamma, pi, window, n_timepoints_seen
     )
@@ -1684,7 +1734,7 @@ def process_window(
         iterations=iterations,
     )
 
-    # Optional validation
+    # 4) Optional validation checks on the WindowResult structure.
     if config.validate_results:
         result.validate()
 
@@ -1704,7 +1754,7 @@ def link_windows(
     This modifies haplotypes in-place by setting their track_id field.
     """
     if len(results) < 2:
-        # Single window - each haplotype gets its own track
+        # Single window: each haplotype is its own track.
         track_counter = 0
         for wr in results:
             for hap in wr.haplotypes:
@@ -1712,10 +1762,10 @@ def link_windows(
                 hap.track_id = f"T{track_counter:04d}"
         return results
 
-    # Sort by window start position
+    # Sort by genomic coordinate so adjacent windows are compared in order.
     sorted_results = sorted(results, key=lambda wr: wr.window.start)
 
-    # Build graph: nodes = (window_idx, hap_idx), edges = compatible haplotypes
+    # Build graph: nodes = (window_idx, hap_idx); edges = linkable haplotype pairs.
     graph = nx.Graph()  # Undirected for connected components
 
     # Add all nodes
@@ -1734,7 +1784,7 @@ def link_windows(
         wr.linking_debug.append(entry)
         debug_records += 1
 
-    # Connect haplotypes in overlapping windows
+    # Connect haplotypes in overlapping windows.
     for i in range(len(sorted_results) - 1):
         curr_wr = sorted_results[i]
         curr_snvs = set(curr_wr.window.snv_pos)
@@ -1831,6 +1881,7 @@ def link_windows(
                             },
                         )
 
+            # Link only if the best match is mutual (unique on both sides).
             for hi, (hj, _dist, _n_shared) in unique_i.items():
                 if hj in unique_j and unique_j[hj][0] == hi:
                     graph.add_edge((i, hi), (k, hj))
@@ -1865,10 +1916,10 @@ def link_windows(
                         },
                     )
 
-    # Find connected components - each is a track
+    # Connected components correspond to tracks across windows.
     components = list(nx.connected_components(graph))
 
-    # Assign track_ids
+    # Assign a track_id to each haplotype in a component.
     for track_idx, component in enumerate(components):
         track_id = f"T{track_idx + 1:04d}"
         for w_idx, h_idx in component:
@@ -1897,7 +1948,7 @@ def process_contig(
     Windows overlap by 50% to enable linking haplotypes based on
     consensus similarity in shared SNV positions.
     """
-    # Load SNVs
+    # 1) Load SNVs for this contig from the VCF.
     snv_pos, ref_alleles, depth, af = load_snvs_from_clair3(
         vcf_path, contig_id, vcf_sample_name, config
     )
@@ -1906,7 +1957,7 @@ def process_contig(
         logging.warning(f"No SNVs found for contig {contig_id}")
         return []
 
-    # Create overlapping windows with lazy read loading
+    # 2) Create overlapping windows with lazy read loading.
     windows = make_windows_lazy(
         bam_path, contig_id, contig_length, snv_pos, ref_alleles, config, sample_id
     )
@@ -1915,7 +1966,7 @@ def process_contig(
         logging.warning(f"No valid windows for contig {contig_id}")
         return []
 
-    # Process windows (parallel if n_workers > 1)
+    # 3) Process windows (parallel if n_workers > 1).
     n_workers = config.n_workers
     if n_workers > 1 and len(windows) > 1:
         # Parallel processing using multiprocessing Pool
@@ -1934,7 +1985,7 @@ def process_contig(
             result = process_window(window, config)
             results.append(result)
 
-    # Link haplotypes across overlapping windows
+    # 4) Link haplotypes across overlapping windows into tracks.
     results = link_windows(results, config)
 
     return results

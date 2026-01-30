@@ -1611,6 +1611,116 @@ def write_linking_diagnostics(window_results: List, output_dir: str):
     except Exception as e:
         logger.warning(f"Failed to write linking_diagnostics.tsv: {e}")
 
+
+def write_false_positive_reads(
+    result: ValidationResult,
+    window_results: List,
+    output_dir: str,
+) -> Optional[str]:
+    """
+    Write false_positive_reads.tsv with per-read SNV alleles for windows containing FP lineages.
+
+    Requires lineages.tsv to map lineage_id -> track_id. Emits all reads in any window
+    that contains a track_id belonging to a false positive lineage.
+    """
+    import csv
+
+    if not result.false_positives:
+        return None
+
+    # lineages.tsv may be in output_dir or its parent (if output_dir is 'validation' subdirectory)
+    lineages_file = os.path.join(output_dir, "lineages.tsv")
+    if not os.path.exists(lineages_file):
+        lineages_file = os.path.join(os.path.dirname(output_dir), "lineages.tsv")
+    if not os.path.exists(lineages_file):
+        logger.warning("false_positive_reads.tsv not written: lineages.tsv not found.")
+        return None
+
+    lineage_to_tracks = defaultdict(set)
+    try:
+        with open(lineages_file) as f:
+            header = f.readline().strip().split("\t")
+            if "lineage_id" not in header or "track_id" not in header:
+                logger.warning("false_positive_reads.tsv not written: lineages.tsv missing lineage_id/track_id.")
+                return None
+            lineage_idx = header.index("lineage_id")
+            track_idx = header.index("track_id")
+            for line in f:
+                parts = line.strip().split("\t")
+                if len(parts) <= max(lineage_idx, track_idx):
+                    continue
+                lineage_to_tracks[parts[lineage_idx]].add(parts[track_idx])
+    except Exception as e:
+        logger.warning(f"false_positive_reads.tsv not written: failed to read lineages.tsv ({e}).")
+        return None
+
+    output_path = os.path.join(output_dir, "false_positive_reads.tsv")
+    fp_ids = set(result.false_positives)
+
+    fieldnames = [
+        "fp_lineage_id",
+        "fp_track_id",
+        "contig",
+        "window_start",
+        "window_end",
+        "sample",
+        "read_id",
+        "assigned_track_id",
+        "hap_id",
+        "prob",
+        "is_junk",
+        "is_ambiguous",
+        "snv_alleles",
+    ]
+
+    with open(output_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, delimiter="\t")
+        writer.writeheader()
+
+        for wr in window_results:
+            hap_track_ids = [hap.track_id for hap in wr.haplotypes]
+            window_track_ids = {tid for tid in hap_track_ids if tid}
+
+            assignment_by_read = {a["read_id"]: a for a in (wr.assignments or [])}
+
+            for fp_lineage in fp_ids:
+                fp_tracks = lineage_to_tracks.get(fp_lineage, set())
+                fp_tracks_in_window = fp_tracks & window_track_ids
+                if not fp_tracks_in_window:
+                    continue
+
+                for fp_track_id in sorted(fp_tracks_in_window):
+                    for read in wr.window.reads:
+                        assign = assignment_by_read.get(read.id, {})
+                        hap_id = assign.get("hap_id")
+                        assigned_track_id = None
+                        if hap_id is not None and 0 <= hap_id < len(hap_track_ids):
+                            assigned_track_id = hap_track_ids[hap_id]
+                        sample = wr.window.sample or read.sample or ""
+                        snv_alleles = ",".join(
+                            f"{pos}:{base}" for pos, base in sorted(read.alleles.items())
+                        )
+                        writer.writerow(
+                            {
+                                "fp_lineage_id": fp_lineage,
+                                "fp_track_id": fp_track_id,
+                                "contig": wr.window.contig,
+                                "window_start": wr.window.start,
+                                "window_end": wr.window.end,
+                                "sample": sample,
+                                "read_id": read.id,
+                                "assigned_track_id": assigned_track_id or "",
+                                "hap_id": hap_id if hap_id is not None else "",
+                                "prob": f"{assign.get('prob', 0.0):.6f}" if assign else "",
+                                "is_junk": assign.get("is_junk", ""),
+                                "is_ambiguous": assign.get("is_ambiguous", ""),
+                                "snv_alleles": snv_alleles,
+                            }
+                        )
+
+    logger.info(f"Wrote false positive reads report to {output_path}")
+    return output_path
+
 def write_rescue_statistics(
     window_results: List,  # List of WindowResult
     output_dir: str
@@ -1828,6 +1938,115 @@ def write_validation_summary(
         f.write("=" * 80 + "\n")
 
     logger.info(f"Wrote validation summary to {output_path}")
+    return output_path
+
+
+def write_low_abundance_report(
+    result: ValidationResult,
+    true_haps: List[TrueHaplotype],
+    detected_haps: List[DetectedHaplotype],
+    output_dir: str,
+    window_results: Optional[List] = None,
+    low_abundance_threshold: float = 0.01,
+) -> str:
+    """
+    Write low_abundance.txt - missed true haplotypes likely due to coverage/abundance.
+
+    Criteria:
+    - Not detected (in result.false_negatives)
+    - Labeled as LOW_ABUNDANCE if max true abundance < threshold
+    - Labeled as NO_COVERAGE if no detected span overlaps any SNV on its contigs
+    """
+    output_path = os.path.join(output_dir, "low_abundance.txt")
+
+    missed_ids = set(result.false_negatives or [])
+    if not missed_ids:
+        with open(output_path, "w") as f:
+            f.write("No missed true haplotypes.\n")
+        return output_path
+
+    # Prefer using window_results to determine coverage; fallback to detected_haps spans.
+    contig_spans: dict[str, list[tuple[int, int]]] = defaultdict(list)
+    if window_results:
+        for wr in window_results:
+            contig_spans[wr.window.contig].append((wr.window.start, wr.window.end))
+    else:
+        for det in detected_haps:
+            for contig, snvs in det.snv_alleles.items():
+                if snvs:
+                    contig_spans[contig].append((min(snvs.keys()), max(snvs.keys())))
+
+    def has_coverage(true_hap: TrueHaplotype) -> bool:
+        for contig, snvs in true_hap.snv_positions.items():
+            if not snvs:
+                continue
+            positions = snvs.keys()
+            spans = contig_spans.get(contig, [])
+            if not spans:
+                continue
+            for pos in positions:
+                for s, e in spans:
+                    if s <= pos <= e:
+                        return True
+        return False
+
+    # Use detection_threshold if available and > 0, but never below 1%.
+    threshold = low_abundance_threshold
+    if result.detection_threshold and result.detection_threshold > 0:
+        threshold = max(threshold, result.detection_threshold)
+
+    low_abundance = []
+    no_coverage = []
+    other = []
+
+    for hap in true_haps:
+        if hap.strain_id not in missed_ids:
+            continue
+        max_abund = max(hap.abundances.values()) if hap.abundances else 0.0
+        covered = has_coverage(hap)
+
+        record = {
+            "strain_id": hap.strain_id,
+            "max_abundance": max_abund,
+            "contigs": ",".join(sorted(hap.snv_positions.keys())),
+        }
+
+        if max_abund < threshold:
+            low_abundance.append(record)
+        elif not covered:
+            no_coverage.append(record)
+        else:
+            other.append(record)
+
+    with open(output_path, "w") as f:
+        f.write("MISSED TRUE HAPLOTYPES - LIKELY CAUSES\n")
+        f.write("=" * 80 + "\n")
+        f.write(f"Low abundance threshold: {threshold:.4f}\n\n")
+
+        f.write("LOW_ABUNDANCE (max abundance below threshold):\n")
+        if low_abundance:
+            for r in low_abundance:
+                f.write(f"  {r['strain_id']}: max_abundance={r['max_abundance']:.4f}, contigs={r['contigs']}\n")
+        else:
+            f.write("  None\n")
+        f.write("\n")
+
+        f.write("NO_COVERAGE (no detected window/span overlaps SNVs):\n")
+        if no_coverage:
+            for r in no_coverage:
+                f.write(f"  {r['strain_id']}: max_abundance={r['max_abundance']:.4f}, contigs={r['contigs']}\n")
+        else:
+            f.write("  None\n")
+        f.write("\n")
+
+        f.write("OTHER (missed but not obviously low abundance or no coverage):\n")
+        if other:
+            for r in other:
+                f.write(f"  {r['strain_id']}: max_abundance={r['max_abundance']:.4f}, contigs={r['contigs']}\n")
+        else:
+            f.write("  None\n")
+
+    logger.info(f"Wrote low abundance report to {output_path}")
     return output_path
 
 
@@ -2059,6 +2278,17 @@ def run_validation(
         write_validation_summary(result, true_haps, detected_haps, matches, output_dir, window_results)
     except Exception as e:
         logger.warning(f"Failed to write validation_summary.txt: {e}")
+
+    try:
+        write_low_abundance_report(result, true_haps, detected_haps, output_dir, window_results)
+    except Exception as e:
+        logger.warning(f"Failed to write low_abundance.txt: {e}")
+
+    if window_results:
+        try:
+            write_false_positive_reads(result, window_results, output_dir)
+        except Exception as e:
+            logger.warning(f"Failed to write false_positive_reads.tsv: {e}")
 
     # Save metrics
     metrics_file = os.path.join(output_dir, 'validation_metrics.json')
