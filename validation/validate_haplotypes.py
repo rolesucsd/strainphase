@@ -393,6 +393,35 @@ def load_detected_haplotypes(lineages_file: str) -> List[DetectedHaplotype]:
     return detected
 
 
+def load_lineage_track_ids(lineages_file: str) -> Dict[str, Set[str]]:
+    """
+    Load lineage_id -> {track_id} mappings from a lineages TSV.
+    """
+    lineage_tracks: Dict[str, Set[str]] = defaultdict(set)
+    if not Path(lineages_file).exists():
+        return lineage_tracks
+
+    with open(lineages_file) as f:
+        header_line = f.readline().strip()
+        if not header_line:
+            return lineage_tracks
+        header = header_line.split('\t')
+        if "lineage_id" not in header or "track_id" not in header:
+            return lineage_tracks
+        lineage_idx = header.index("lineage_id")
+        track_idx = header.index("track_id")
+        for line in f:
+            parts = line.strip().split('\t')
+            if len(parts) <= max(lineage_idx, track_idx):
+                continue
+            lineage_id = parts[lineage_idx]
+            track_id = parts[track_idx]
+            if lineage_id and track_id:
+                lineage_tracks[lineage_id].add(track_id)
+
+    return lineage_tracks
+
+
 # =============================================================================
 # Matching algorithm
 # =============================================================================
@@ -2171,6 +2200,7 @@ def run_validation(
         window_results=window_results,
         window_size=window_size,
         detected_without_rescue=detected_without_rescue,
+        lineages_file=detected_file,
         output_dir=output_dir,
     )
 
@@ -2339,14 +2369,19 @@ def _validate_tracks_and_lineages(
     window_results: List,
     window_size: int,
     detected_without_rescue: Optional[Dict],
+    lineages_file: str,
     output_dir: str,
 ) -> None:
     lineage_to_strain = {det_hap.lineage_id: true_hap.strain_id
                          for true_hap, det_hap, _ in matches if det_hap.lineage_id}
     strain_matches = dict(lineage_to_strain)
-    for det_hap in detected_haps:
-        if det_hap.track_id and det_hap.lineage_id in lineage_to_strain:
-            strain_matches[det_hap.track_id] = lineage_to_strain[det_hap.lineage_id]
+    lineage_tracks = load_lineage_track_ids(lineages_file)
+    for lineage_id, track_ids in lineage_tracks.items():
+        true_strain = lineage_to_strain.get(lineage_id)
+        if not true_strain:
+            continue
+        for track_id in track_ids:
+            strain_matches[track_id] = true_strain
 
     logger.info(f"Built track mapping: {len(lineage_to_strain)} lineage->strain, "
                 f"{len(strain_matches)} total track->strain mappings")
