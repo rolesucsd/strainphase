@@ -1153,7 +1153,10 @@ class ParameterSweep:
                         rescue_total_haplotypes = 0
                         rescue_rate = 0.0
                         rescue_integrator = getattr(config, "_rescue_integrator", None) if use_longitudinal else None
+                        logger.info(f"    Rescue stats check: use_longitudinal={use_longitudinal}, "
+                                    f"integrator={'found' if rescue_integrator else 'NOT FOUND'}")
                         if rescue_integrator:
+                            logger.info(f"    Rescue statistics: {len(rescue_integrator.rescue_statistics)} records")
                             try:
                                 rescue_stats_path = str(Path(validation_output) / "rescue_statistics.tsv")
                                 rescue_integrator.write_rescue_statistics(rescue_stats_path)
@@ -1550,10 +1553,14 @@ class ParameterSweep:
                 rescued_haplotypes = 0
                 rescue_total_haplotypes = 0
                 rescue_rate = 0.0
+                use_longitudinal_check = hasattr(self, 'use_longitudinal') and self.use_longitudinal
                 rescue_integrator = getattr(config, "_rescue_integrator", None)
-                if not (hasattr(self, 'use_longitudinal') and self.use_longitudinal):
+                logger.info(f"    Rescue stats check: use_longitudinal={use_longitudinal_check}, "
+                            f"integrator={'found' if rescue_integrator else 'NOT FOUND'}")
+                if not use_longitudinal_check:
                     rescue_integrator = None
                 if rescue_integrator:
+                    logger.info(f"    Rescue statistics: {len(rescue_integrator.rescue_statistics)} records")
                     try:
                         rescue_stats_path = str(Path(validation_output) / "rescue_statistics.tsv")
                         rescue_integrator.write_rescue_statistics(rescue_stats_path)
