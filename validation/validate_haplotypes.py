@@ -450,7 +450,7 @@ def match_haplotypes(
     distances = []
     for true_hap in true_haps:
         for det_hap in detected_haps:
-            dist, n_shared, match_fraction = compute_haplotype_distance(
+            dist, _n_matches, n_shared, match_fraction = compute_haplotype_distance(
                 true_hap, det_hap
             )
             if n_shared < min_shared_snvs:
