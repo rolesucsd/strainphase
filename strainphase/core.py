@@ -142,7 +142,6 @@ class HaplotyperConfig:
     # =========== LINKING DIAGNOSTICS ===========
     linking_debug: bool = False  # Record detailed linking diagnostics
     linking_debug_max_records: int = 5000  # Cap to avoid massive files
-    linking_ambiguity_delta: float = 0.005  # Skip links if multiple near-best matches
     max_span_gap_for_lineage: int = 10000  # Max gap between track spans to consider same locus
 
     # =========== WINDOW LINKING PARAMETERS ===========
@@ -1623,11 +1622,9 @@ def link_windows(
                 for idx, options in matches.items():
                     options.sort(key=lambda x: x[0])
                     best_dist, best_partner, best_shared = options[0]
-                    within_delta = [
-                        opt for opt in options if opt[0] <= best_dist + config.linking_ambiguity_delta
-                    ]
-                    # Skip ambiguous ties or near-ties within delta.
-                    if len(within_delta) == 1:
+                    bests = [opt for opt in options if opt[0] == best_dist]
+                    # Skip ambiguous ties (including multiple perfect matches).
+                    if len(bests) == 1:
                         unique[idx] = (best_partner, best_dist, best_shared)
                 return unique
 
@@ -1639,11 +1636,8 @@ def link_windows(
                     options_sorted = sorted(options, key=lambda x: x[0])
                     best_dist, best_hj, best_shared = options_sorted[0]
                     second_dist = options_sorted[1][0] if len(options_sorted) > 1 else None
-                    near_best = [
-                        opt for opt in options_sorted
-                        if opt[0] <= best_dist + config.linking_ambiguity_delta
-                    ]
-                    if len(near_best) != 1:
+                    bests = [opt for opt in options_sorted if opt[0] == best_dist]
+                    if len(bests) != 1:
                         record_debug(
                             curr_wr,
                             {
@@ -1658,9 +1652,8 @@ def link_windows(
                                 "second_best_dist": round(second_dist, 6) if second_dist is not None else None,
                                 "n_shared_best": best_shared,
                                 "decision": "skip",
-                                "reason": "ambiguous_within_delta",
-                                "near_best_count": len(near_best),
-                                "ambiguity_delta": config.linking_ambiguity_delta,
+                                "reason": "ambiguous_tie",
+                                "tie_count": len(bests),
                             },
                         )
 
