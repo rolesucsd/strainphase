@@ -1443,6 +1443,25 @@ class LongitudinalIntegrator:
                 key = (wr.window.contig, wr.window.start, wr.window.end)
                 windows_by_position[key][sample_id] = wr
 
+        # Diagnostic: count rescue candidates across all windows
+        n_total_haps = 0
+        n_low_weight_haps = 0
+        n_windows_with_multiple_timepoints = 0
+        for window_key, sample_results in windows_by_position.items():
+            if len(sample_results) >= 2:
+                n_windows_with_multiple_timepoints += 1
+            for sample_id, wr in sample_results.items():
+                for hap in wr.haplotypes:
+                    n_total_haps += 1
+                    if hap.weight < self.config.min_weight_for_anchor:
+                        n_low_weight_haps += 1
+
+        logging.info(
+            f"    Rescue diagnostics: {len(windows_by_position)} unique window positions, "
+            f"{n_windows_with_multiple_timepoints} shared across >=2 timepoints, "
+            f"{n_total_haps} total haplotypes, {n_low_weight_haps} rescue candidates (weight < {self.config.min_weight_for_anchor})"
+        )
+
         # Process each position
         rescued_results: dict[str, list[WindowResult]] = defaultdict(list)
 
