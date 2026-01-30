@@ -1145,9 +1145,9 @@ class ParameterSweep:
                         )
 
                         # Write rescue statistics if available from longitudinal integrator
-                        rescued_haplotypes = None
-                        rescue_total_haplotypes = None
-                        rescue_rate = None
+                        rescued_haplotypes = 0
+                        rescue_total_haplotypes = 0
+                        rescue_rate = 0.0
                         rescue_integrator = getattr(config, "_rescue_integrator", None) if use_longitudinal else None
                         if rescue_integrator:
                             try:
@@ -1545,9 +1545,9 @@ class ParameterSweep:
                 )
 
                 # Write rescue statistics if available from longitudinal integrator
-                rescued_haplotypes = None
-                rescue_total_haplotypes = None
-                rescue_rate = None
+                rescued_haplotypes = 0
+                rescue_total_haplotypes = 0
+                rescue_rate = 0.0
                 rescue_integrator = getattr(config, "_rescue_integrator", None)
                 if not (hasattr(self, 'use_longitudinal') and self.use_longitudinal):
                     rescue_integrator = None

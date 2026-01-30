@@ -26,7 +26,7 @@ import os
 import json
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 from collections import defaultdict
 
 import numpy as np
@@ -117,7 +117,7 @@ class ValidationResult:
     abundance_trajectory_error: float = 0.0
 
     # Per-match details
-    matches: List[Tuple[str, str, float]] = None  # (true_id, detected_id, distance)
+    matches: List[Tuple[str, str, float]] = None  # (true_ids_csv, detected_id, min_distance)
     
     # Detailed diagnostics
     false_negatives: List[str] = None  # Informative windows not detected
@@ -127,7 +127,7 @@ class ValidationResult:
     window_detected_total: int = 0  # Detected windows (pooled)
     window_recall_by_timepoint: Dict[str, float] = None
     window_recall_by_contig: Dict[str, float] = None
-    match_details_full: List[Dict] = None  # Full match details with SNV counts, abundances, etc.
+    match_details_full: List[Dict] = None  # Full match details with SNV counts, grouped abundances, etc.
     per_contig_metrics: Dict[str, Dict] = None  # Metrics per contig
     per_timepoint_metrics: Dict[str, Dict] = None  # Metrics per timepoint
     
@@ -151,6 +151,72 @@ class ValidationResult:
             self.per_timepoint_metrics = {}
 
 
+@dataclass
+class StrainGroup:
+    """Group of strains that are indistinguishable within a window."""
+    strain_ids: List[str]
+    consensus: Dict[int, str]  # pos -> allele (shared by all strains in group)
+    total_abundance: float
+
+
+@dataclass
+class WindowMetrics:
+    """Metrics computed for a single genomic window."""
+    # Identification
+    sample: str           # Timepoint
+    contig: str
+    window_start: int
+    window_end: int
+
+    # Haplotype-level (counts based on strain GROUPS, not individual strains)
+    n_strain_groups: int  # Number of distinguishable strain groups in window
+    n_detected: int
+    n_matched: int
+    precision: float      # matched_detected / detected
+    recall: float         # matched_groups / n_strain_groups
+
+    # SNV-level
+    n_snv_positions: int
+    n_informative_snvs: int
+    n_snv_detected: int
+    n_snv_correct: int
+    snv_precision: float
+    snv_recall: float
+
+    # Abundance
+    abundance_pairs: List[Tuple[float, float]]  # (true, detected)
+    abundance_mae: Optional[float]
+
+    # Match details
+    matches: List[Tuple[List[str], int, float]]  # (group_strain_ids, hap_idx, distance)
+    unmatched_true: List[str]  # strain_ids not matched
+    unmatched_detected: List[int]  # hap indices not matched
+
+
+@dataclass
+class AggregatedMetrics:
+    """Aggregated metrics across multiple windows."""
+    n_windows: int
+    n_windows_informative: int
+
+    # Primary metrics (macro-averaged - equal weight per window since all windows same size)
+    precision: float        # mean of per-window precision
+    recall: float           # mean of per-window recall
+    f1: float               # mean of per-window F1
+    snv_precision: float
+    snv_recall: float
+
+    # Abundance (pooled)
+    abundance_pearson_r: float
+    abundance_mae: float
+    n_abundance_pairs: int
+
+    # Totals
+    total_true: int
+    total_detected: int
+    total_matched: int
+    total_snv_detected: int
+    total_snv_correct: int
 
 
 # =============================================================================
@@ -293,13 +359,12 @@ def load_detected_haplotypes(lineages_file: str) -> List[DetectedHaplotype]:
                 
             sample = row.get('sample', row.get('timepoint', ''))
             contig = row.get('contig', '')
-            # Try multiple field names for abundance (mean_weight from build_lineage_table, abundance/weight from other formats)
-            abundance = float(row.get('abundance', row.get('mean_weight', row.get('weight', 0))))
+            abundance = float(row.get('abundance', ''))
 
             # Store abundance
             lineage_data[lineage_id]['abundances'][sample] = abundance
 
-            # Parse SNV alleles if present
+            # Parse SNV alleles
             # Format might be: "pos1:A,pos2:G,pos3:T" (comma-separated) or "pos1:A|pos2:G" (pipe-separated)
             snv_col = row.get('snv_alleles', row.get('consensus', ''))
             if snv_col and snv_col != '.':
@@ -341,6 +406,7 @@ def compute_haplotype_distance(
 
     Returns: (distance, n_matches, n_shared, match_fraction)
     """
+    # Only compare positions present in the detected haplotype; treat missing as unknown.
     n_shared = 0
     n_matches = 0
 
@@ -356,212 +422,177 @@ def compute_haplotype_distance(
     if n_shared == 0:
         return 1.0, 0, 0, 0.0
 
+    # Distance is 1 - match fraction over shared SNVs.
     match_fraction = n_matches / n_shared
     distance = 1.0 - match_fraction
     return distance, n_matches, n_shared, match_fraction
 
 
-def _abundance_within_factor(
-    true_hap: TrueHaplotype,
-    detected_hap: DetectedHaplotype,
-    factor: float = 2.0
-) -> bool:
-    """Check if detected abundance stays within a multiplicative factor."""
-    common_tps = set(true_hap.abundances.keys()) & set(detected_hap.abundances.keys())
-    if not common_tps:
-        return False
-
-    for tp in common_tps:
-        true_val = true_hap.abundances.get(tp, 0.0)
-        det_val = detected_hap.abundances.get(tp, 0.0)
-        if true_val <= 0:
-            continue
-        ratio = det_val / true_val
-        if ratio < 1.0 / factor or ratio > factor:
-            return False
-    return True
-
-
 def match_haplotypes(
     true_haps: List[TrueHaplotype],
     detected_haps: List[DetectedHaplotype],
-    max_distance: float = 0.1,
-    min_shared_snvs: int = 3,
-    min_match_fraction: float = 0.9,
-    allow_one_to_many: bool = True
+    max_distance: float = 0,
+    min_shared_snvs: int = 1,
+    min_match_fraction: float = 1
 ) -> List[Tuple[TrueHaplotype, DetectedHaplotype, float]]:
     """
     Match detected haplotypes to true haplotypes.
-    
+
     Since strainphase may split strains per-contig, one true strain can match
-    multiple detected lineages (one per contig). Set allow_one_to_many=True
-    to account for this.
+    multiple detected lineages (one per contig).
 
     Returns list of (true_hap, detected_hap, distance) tuples.
     """
     if not true_haps or not detected_haps:
         return []
 
-    # Compute distance matrix
+    # Compute distance matrix.
     distances = []
     for true_hap in true_haps:
         for det_hap in detected_haps:
-            dist, n_matches, n_shared, match_fraction = compute_haplotype_distance(
+            dist, n_shared, match_fraction = compute_haplotype_distance(
                 true_hap, det_hap
             )
             if n_shared < min_shared_snvs:
                 continue
             if match_fraction < min_match_fraction:
                 continue
-            # Abundance threshold removed - match based on SNV similarity only
             distances.append((dist, true_hap, det_hap, n_shared))
 
-    # Sort by distance
+    # Sort by distance.
     distances.sort(key=lambda x: x[0])
 
-    if allow_one_to_many:
-        # Allow one true strain to match multiple detected lineages (per-contig splitting)
-        # But ensure each detected lineage only matches one true strain
-        matches = []
-        used_detected = set()
-        
-        # Group detected haplotypes by contig to identify per-contig splits
-        detected_by_contig = defaultdict(list)
-        for det_hap in detected_haps:
-            # Get the contig(s) this detected haplotype spans
-            contigs = set(det_hap.snv_alleles.keys())
-            if contigs:
-                # Use first contig as primary (most detected haps span one contig)
-                primary_contig = sorted(contigs)[0]
-                detected_by_contig[primary_contig].append(det_hap)
-        
-        # Match each true strain to detected lineages
-        # Allow multiple matches per true strain if they cover different SNV positions
-        # (handles fragmentation where one strain is split into multiple detected lineages)
-        for true_hap in true_haps:
-            # Collect all valid matches for this true strain
-            candidate_matches = []
-            for dist, true_h, det_h, n_shared in distances:
-                if true_h.strain_id != true_hap.strain_id:
+    def indistinguishable_at_detected_positions(
+        det_hap: DetectedHaplotype, true_a: TrueHaplotype, true_b: TrueHaplotype
+    ) -> bool:
+        """
+        Return True if true_a and true_b have identical alleles at all positions
+        where det_hap has calls (requires at least one overlapping position).
+        """
+        has_overlap = False
+        for contig, det_snvs in det_hap.snv_alleles.items():
+            a_snvs = true_a.snv_positions.get(contig, {})
+            b_snvs = true_b.snv_positions.get(contig, {})
+            for pos in det_snvs.keys():
+                a_allele = a_snvs.get(pos)
+                b_allele = b_snvs.get(pos)
+                if a_allele is None or b_allele is None:
                     continue
-                if det_h.lineage_id in used_detected:
-                    continue
-                if dist > max_distance:
-                    continue
-                candidate_matches.append((dist, det_h, n_shared))
-            
-            # Sort by distance (best first)
-            candidate_matches.sort(key=lambda x: x[0])
-            
-            # Match greedily: allow multiple matches if they don't overlap significantly
-            # Two detected lineages overlap if they share many SNV positions
-            matched_for_strain = []
-            for dist, det_h, n_shared in candidate_matches:
-                # Check if this detected lineage overlaps significantly with already-matched ones
-                # Exact matches (distance ~0) should still count as matched, even if redundant.
-                if dist <= 1e-9:
-                    matched_for_strain.append((dist, det_h, n_shared))
-                    matches.append((true_hap, det_h, dist))
-                    used_detected.add(det_h.lineage_id)
-                    continue
+                has_overlap = True
+                if a_allele != b_allele:
+                    return False
+        return has_overlap
 
-                overlaps = False
-                for _, existing_det_h, _ in matched_for_strain:
-                    # Check SNV overlap between det_h and existing_det_h
-                    overlap_count = 0
-                    total_positions = 0
-                    for contig in set(det_h.snv_alleles.keys()) | set(existing_det_h.snv_alleles.keys()):
-                        det_positions = set(det_h.snv_alleles.get(contig, {}).keys())
-                        existing_positions = set(existing_det_h.snv_alleles.get(contig, {}).keys())
-                        overlap_count += len(det_positions & existing_positions)
-                        total_positions += len(det_positions | existing_positions)
-                    
-                    # If >50% overlap, consider them duplicates (only match one)
-                    if total_positions > 0 and overlap_count / total_positions > 0.5:
-                        overlaps = True
-                        break
-                
-                if not overlaps:
-                    matched_for_strain.append((dist, det_h, n_shared))
-                    matches.append((true_hap, det_h, dist))
-                    used_detected.add(det_h.lineage_id)
-        
-        return matches
-    else:
-        # Original 1-to-1 matching
-        matches = []
-        used_true = set()
-        used_detected = set()
+    # Allow one true strain to match multiple detected lineages (per-contig splitting)
+    # But ensure each detected lineage only matches one true strain, unless multiple
+    # true strains are indistinguishable at the detected positions.
+    matches = []
+    used_detected = set()
+    detected_to_true: Dict[str, List[TrueHaplotype]] = defaultdict(list)
 
-        for dist, true_hap, det_hap, n_shared in distances:
+    def record_match(true_h: TrueHaplotype, det_h: DetectedHaplotype, dist: float) -> None:
+        matches.append((true_h, det_h, dist))
+        used_detected.add(det_h.lineage_id)
+        detected_to_true[det_h.lineage_id].append(true_h)
+
+    # Match each true strain to detected lineages
+    # Allow multiple matches per true strain if they cover different SNV positions
+    # (handles fragmentation where one strain is split into multiple detected lineages)
+    for true_hap in true_haps:
+        # Collect all valid matches for this true strain
+        candidate_matches = []
+        for dist, true_h, det_h, n_shared in distances:
+            if true_h.strain_id != true_hap.strain_id:
+                continue
+            if det_h.lineage_id in used_detected:
+                # Allow multiple true strains to match the same detected lineage
+                # only if they are indistinguishable at detected positions.
+                existing = detected_to_true.get(det_h.lineage_id, [])
+                if not all(
+                    indistinguishable_at_detected_positions(det_h, true_hap, prev)
+                    for prev in existing
+                ):
+                    continue
             if dist > max_distance:
-                break
-            if true_hap.strain_id in used_true:
                 continue
-            if det_hap.lineage_id in used_detected:
+            candidate_matches.append((dist, det_h, n_shared))
+
+        # Sort by distance (best first)
+        candidate_matches.sort(key=lambda x: x[0])
+
+        # Match greedily: allow multiple matches per true strain.
+        matched_for_strain = []
+        for dist, det_h, n_shared in candidate_matches:
+            # Exact matches (distance ~0) should still count as matched, even if redundant.
+            if dist <= max_distance:
+                matched_for_strain.append((dist, det_h, n_shared))
+                record_match(true_hap, det_h, dist)
                 continue
+            matched_for_strain.append((dist, det_h, n_shared))
+            record_match(true_hap, det_h, dist)
 
-            matches.append((true_hap, det_hap, dist))
-            used_true.add(true_hap.strain_id)
-            used_detected.add(det_hap.lineage_id)
-
-        return matches
+    return matches
 
 
 # =============================================================================
 # Compute metrics
 # =============================================================================
+def _grouped_true_abundances_for_match(
+    *,
+    true_hap: TrueHaplotype,
+    det_hap: DetectedHaplotype,
+    true_haps: Optional[List[TrueHaplotype]],
+) -> Tuple[Dict[str, float], List[str]]:
+    # Find true strains indistinguishable at detected positions, then sum abundances.
+    detected_positions: Dict[str, set] = {}
+    for contig, snvs in det_hap.snv_alleles.items():
+        detected_positions[contig] = set(snvs.keys())
 
-def compute_validation_metrics(
+    indistinguishable_strains = [true_hap]
+    if true_haps is not None:
+        for other_hap in true_haps:
+            if other_hap.strain_id == true_hap.strain_id:
+                continue
+
+            is_identical = True
+            has_overlap = False
+            for contig, det_positions in detected_positions.items():
+                true_snvs = true_hap.snv_positions.get(contig, {})
+                other_snvs = other_hap.snv_positions.get(contig, {})
+                for pos in det_positions:
+                    true_allele = true_snvs.get(pos)
+                    other_allele = other_snvs.get(pos)
+                    if true_allele is not None and other_allele is not None:
+                        has_overlap = True
+                        if true_allele != other_allele:
+                            is_identical = False
+                            break
+                if not is_identical:
+                    break
+
+            if is_identical and has_overlap:
+                indistinguishable_strains.append(other_hap)
+
+    common_tps = list(set(true_hap.abundances.keys()) & set(det_hap.abundances.keys()))
+    grouped_true_abundances = {
+        tp: sum(h.abundances.get(tp, 0.0) for h in indistinguishable_strains)
+        for tp in common_tps
+    }
+
+    return grouped_true_abundances, common_tps
+
+
+def _build_match_details_full(
+    matches: List[Tuple[TrueHaplotype, DetectedHaplotype, float]],
     true_haps: List[TrueHaplotype],
-    detected_haps: List[DetectedHaplotype],
-    all_snv_positions: Dict[str, List[int]]
-) -> ValidationResult:
-    """
-    Compute all validation metrics with detailed diagnostics.
-    
-    Note: This accounts for per-contig splitting. If strainphase detects lineages
-    per-contig (e.g., 2 strains × 3 contigs = 6 detected lineages), one true strain
-    can match multiple detected lineages (one per contig). This is correct behavior
-    and is accounted for in precision/recall calculations.
-
-    Recall definition:
-    - Window-level recall is computed in run_validation() and is REQUIRED.
-    - This function only computes precision (lineage matching) and other metrics.
-    """
-
-    # Match haplotypes (allow one-to-many to account for per-contig splitting)
-    matches = match_haplotypes(true_haps, detected_haps, allow_one_to_many=True)
-
-    n_true = len(true_haps)
-    n_detected = len(detected_haps)
-    n_matches = len(matches)  # Number of match pairs (can be > n_true if per-contig splitting)
-
-    # Identify matched strains and lineages
-    matched_true_ids = {m[0].strain_id for m in matches}
-    matched_detected_ids = {m[1].lineage_id for m in matches}
-
-    # Precision: fraction of detected lineages that match a true strain
-    # (With per-contig splitting, multiple detected lineages can match one true strain)
-    precision = len(matched_detected_ids) / n_detected if n_detected > 0 else 0.0
-
-    # Recall is computed at window-level in run_validation() and enforced there.
-    recall = 0.0
-
-    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
-
-    false_negatives = []
-    false_positives = [h.lineage_id for h in detected_haps if h.lineage_id not in matched_detected_ids]
-
-    # Build detailed match information
+) -> List[Dict[str, Any]]:
     match_details_full = []
     for true_hap, det_hap, distance in matches:
-        # Compute SNV statistics
         n_shared_snvs = 0
         n_matching_snvs = 0
         n_true_snvs = sum(len(snvs) for snvs in true_hap.snv_positions.values())
         n_detected_snvs = sum(len(snvs) for snvs in det_hap.snv_alleles.values())
-        
+
         for contig, true_snvs in true_hap.snv_positions.items():
             det_snvs = det_hap.snv_alleles.get(contig, {})
             for pos, true_allele in true_snvs.items():
@@ -569,15 +600,16 @@ def compute_validation_metrics(
                     n_shared_snvs += 1
                     if det_snvs[pos] == true_allele:
                         n_matching_snvs += 1
-        
-        # Compute abundance statistics
-        common_tps = set(true_hap.abundances.keys()) & set(det_hap.abundances.keys())
+
+        grouped_true_abundances, common_tps = _grouped_true_abundances_for_match(
+            true_hap=true_hap,
+            det_hap=det_hap,
+            true_haps=true_haps,
+        )
         abundance_errors = []
         for tp in common_tps:
-            true_abund = true_hap.abundances[tp]
-            det_abund = det_hap.abundances[tp]
-            abundance_errors.append(abs(true_abund - det_abund))
-        
+            abundance_errors.append(abs(grouped_true_abundances[tp] - det_hap.abundances[tp]))
+
         match_details_full.append({
             'true_strain_id': true_hap.strain_id,
             'detected_lineage_id': det_hap.lineage_id,
@@ -587,140 +619,103 @@ def compute_validation_metrics(
             'n_shared_snvs': n_shared_snvs,
             'n_matching_snvs': n_matching_snvs,
             'snv_match_fraction': n_matching_snvs / n_shared_snvs if n_shared_snvs > 0 else 0.0,
-            'abundance_mae': np.mean(abundance_errors) if abundance_errors else None,
+            'grouped_abundance_mae': np.mean(abundance_errors) if abundance_errors else None,
             'common_timepoints': list(common_tps),
-            'true_abundances': {tp: true_hap.abundances[tp] for tp in common_tps},
+            'grouped_true_abundances': {tp: grouped_true_abundances[tp] for tp in common_tps},
             'detected_abundances': {tp: det_hap.abundances[tp] for tp in common_tps},
             'is_sweeping': true_hap.is_sweeping,
         })
 
-    # Abundance correlation with grouped truth
-    # 
-    # KEY INSIGHT: If multiple true strains have identical sequences within the
-    # detected region, they are INDISTINGUISHABLE and should appear as a single
-    # haplotype with combined abundance. The "effective truth" for comparison
-    # should be the sum of indistinguishable strains' abundances.
-    #
-    # Example: Strains A (25%) and B (25%) are identical in a window →
-    #          Expected detection: one haplotype at 50%
-    #          Effective truth: 50%, not 25%
-    
+    return match_details_full
+
+
+def _compute_grouped_abundance_metrics(
+    true_haps: List[TrueHaplotype],
+    matches: List[Tuple[TrueHaplotype, DetectedHaplotype, float]]
+) -> Tuple[float, float]:
+    """
+    DEPRECATED: Use compute_window_metrics() and aggregate_window_metrics() instead.
+
+    This function computes abundance metrics globally rather than per-window.
+    It is kept for backward compatibility but is no longer used by
+    _compute_haplotype_metrics().
+    """
+    # If multiple true strains are identical within detected positions, group them.
     true_abundances = []
     detected_abundances = []
-    grouped_true_abundances = []  # For the corrected metric
+    grouped_true_abundance_values = []
 
     for true_hap, det_hap, _ in matches:
-        # Get the SNV positions where this detected haplotype has calls
-        detected_positions: Dict[str, set] = {}
-        for contig, snvs in det_hap.snv_alleles.items():
-            detected_positions[contig] = set(snvs.keys())
-        
-        # Find all true strains that are INDISTINGUISHABLE from true_hap
-        # within the detected positions (identical alleles at all shared positions)
-        indistinguishable_strains = [true_hap]  # Always includes self
-        
-        for other_hap in true_haps:
-            if other_hap.strain_id == true_hap.strain_id:
-                continue
-            
-            # Check if other_hap is identical to true_hap at detected positions
-            is_identical = True
-            has_overlap = False
-            
-            for contig, det_positions in detected_positions.items():
-                true_snvs = true_hap.snv_positions.get(contig, {})
-                other_snvs = other_hap.snv_positions.get(contig, {})
-                
-                for pos in det_positions:
-                    true_allele = true_snvs.get(pos)
-                    other_allele = other_snvs.get(pos)
-                    
-                    if true_allele is not None and other_allele is not None:
-                        has_overlap = True
-                        if true_allele != other_allele:
-                            is_identical = False
-                            break
-                
-                if not is_identical:
-                    break
-            
-            # Only consider as indistinguishable if there was actual overlap
-            # and all overlapping positions matched
-            if is_identical and has_overlap:
-                indistinguishable_strains.append(other_hap)
-        
-        # Find common timepoints
-        common_tps = set(true_hap.abundances.keys()) & set(det_hap.abundances.keys())
-        
+        # Build grouped true abundance by summing indistinguishable strains at detected positions.
+        grouped_true_abundances, common_tps = _grouped_true_abundances_for_match(
+            true_hap=true_hap,
+            det_hap=det_hap,
+            true_haps=true_haps,
+        )
+        # Collect paired abundance values at shared timepoints.
         for tp in common_tps:
-            # Original individual abundance (for backward compatibility)
             true_abundances.append(true_hap.abundances[tp])
             detected_abundances.append(det_hap.abundances[tp])
-            
-            # Grouped abundance: sum of all indistinguishable strains
-            grouped_abundance = sum(
-                h.abundances.get(tp, 0) for h in indistinguishable_strains
-            )
-            grouped_true_abundances.append(grouped_abundance)
-    
+            grouped_true_abundance_values.append(grouped_true_abundances[tp])
+
+    # Compute summary metrics only when there is enough paired data.
     if len(true_abundances) >= 2:
-        # Use GROUPED abundances for the primary metric (more accurate)
-        abundance_pearson_r = np.corrcoef(grouped_true_abundances, detected_abundances)[0, 1]
-        abundance_mae = np.mean(np.abs(np.array(grouped_true_abundances) - np.array(detected_abundances)))
-        
-        # Log the difference for transparency
-        old_mae = np.mean(np.abs(np.array(true_abundances) - np.array(detected_abundances)))
-        if abs(old_mae - abundance_mae) > 0.01:
-            logger.debug(f"Abundance MAE improved from {old_mae:.3f} (individual) to {abundance_mae:.3f} (grouped)")
-    else:
-        abundance_pearson_r = 0.0
-        abundance_mae = 1.0
+        abundance_pearson_r = np.corrcoef(grouped_true_abundance_values, detected_abundances)[0, 1]
+        abundance_mae = np.mean(np.abs(np.array(grouped_true_abundance_values) - np.array(detected_abundances)))
+        return abundance_pearson_r, abundance_mae
 
-    # SNV accuracy (for matched haplotypes)
-    # Aggregate SNVs per true strain to handle fragmentation correctly:
-    # If a strain is split into multiple tracks, we should count each true SNV
-    # only once, and consider it "recovered" if ANY matching track has it correct.
-    #
-    # IMPORTANT: Only count true SNVs within the detected genomic span.
-    # If there are gaps between windows (e.g., sparse SNV regions), we can't detect
-    # SNVs there, so they shouldn't penalize recall. This gives "SNV recall within
-    # the regions we actually processed."
+    return 0.0, 1.0
 
-    # Group matches by true strain
+
+def _compute_snv_metrics(
+    true_haps: List[TrueHaplotype],
+    matches: List[Tuple[TrueHaplotype, DetectedHaplotype, float]],
+    snv_coverage: Optional[Dict[str, Dict[int, int]]],
+    min_snv_coverage: int
+) -> Dict[str, Any]:
+    """
+    DEPRECATED: Use compute_window_metrics() and aggregate_window_metrics() instead.
+
+    This function computes SNV metrics globally rather than per-window.
+    It is kept for backward compatibility but is no longer used by
+    _compute_haplotype_metrics().
+    """
+    # Group detected tracks by true strain to aggregate spans and SNVs.
     matches_by_strain: Dict[str, List[DetectedHaplotype]] = defaultdict(list)
     for true_hap, det_hap, _ in matches:
         matches_by_strain[true_hap.strain_id].append(det_hap)
 
+    # Track totals for precision/recall and span-aware diagnostics.
     total_true_snvs_in_span = 0
     total_true_snvs_global = 0
     total_detected_snvs = 0
     total_correct_snvs = 0
 
     for true_hap in true_haps:
-        # Count global true SNVs (for reference)
+        # Count true SNVs, optionally filtered by coverage (if provided).
         for contig, true_snvs in true_hap.snv_positions.items():
-            total_true_snvs_global += len(true_snvs)
-        
-        # Get all detected tracks matching this true strain
+            if snv_coverage is None:
+                total_true_snvs_global += len(true_snvs)
+            else:
+                for pos in true_snvs.keys():
+                    cov = snv_coverage.get(contig, {}).get(pos, 0)
+                    if cov >= min_snv_coverage:
+                        total_true_snvs_global += 1
+
         matching_tracks = matches_by_strain.get(true_hap.strain_id, [])
         if not matching_tracks:
-            # For unmatched strains, we have no detected span, so these SNVs
-            # don't contribute to the "within-span" recall calculation
             continue
 
-        # Aggregate detected SNVs across all matching tracks and determine span per contig
-        # detected_snvs_union[contig][pos] = allele (from any matching track)
+        # Union detected SNVs and spans across all matched tracks for this strain.
         detected_snvs_union: Dict[str, Dict[int, str]] = defaultdict(dict)
-        detected_span: Dict[str, Tuple[int, int]] = {}  # contig -> (min_pos, max_pos)
-        
+        detected_span: Dict[str, Tuple[int, int]] = {}
+
         for det_hap in matching_tracks:
             for contig, det_snvs in det_hap.snv_alleles.items():
                 for pos, allele in det_snvs.items():
-                    # Keep first allele seen (they should all agree if tracks are correct)
                     if pos not in detected_snvs_union[contig]:
                         detected_snvs_union[contig][pos] = allele
-                
-                # Update span for this contig
+
                 if det_snvs:
                     min_pos = min(det_snvs.keys())
                     max_pos = max(det_snvs.keys())
@@ -730,90 +725,154 @@ def compute_validation_metrics(
                     else:
                         detected_span[contig] = (min_pos, max_pos)
 
-        # Count true SNVs WITHIN detected span and check if they're recovered
+        # Evaluate correctness within the detected span (span-aware recall).
         for contig, true_snvs in true_hap.snv_positions.items():
             det_snvs = detected_snvs_union.get(contig, {})
             span = detected_span.get(contig)
-            
             if not span:
-                # No detected SNVs on this contig for this strain - skip
                 continue
-            
             span_min, span_max = span
-            
             for pos, true_allele in true_snvs.items():
-                # Only count SNVs within the detected span
                 if span_min <= pos <= span_max:
-                    total_true_snvs_in_span += 1
-                    if pos in det_snvs and det_snvs[pos] == true_allele:
-                        total_correct_snvs += 1
+                    if snv_coverage is None:
+                        total_true_snvs_in_span += 1
+                        if pos in det_snvs and det_snvs[pos] == true_allele:
+                            total_correct_snvs += 1
+                    else:
+                        cov = snv_coverage.get(contig, {}).get(pos, 0)
+                        if cov >= min_snv_coverage:
+                            total_true_snvs_in_span += 1
+                            if pos in det_snvs and det_snvs[pos] == true_allele:
+                                total_correct_snvs += 1
 
-        # Count total detected SNVs (union across all matching tracks, avoid double-counting)
         for contig, det_snvs in detected_snvs_union.items():
             total_detected_snvs += len(det_snvs)
 
+    # Compute global precision/recall and phasing accuracy.
     snv_precision = total_correct_snvs / total_detected_snvs if total_detected_snvs > 0 else 0.0
     snv_recall = total_correct_snvs / total_true_snvs_in_span if total_true_snvs_in_span > 0 else 0.0
     phasing_accuracy = snv_recall
-    
+
     coverage_fraction = 0.0
-    # Log the difference between global and within-span counts for transparency
     if total_true_snvs_global > 0:
         coverage_fraction = total_true_snvs_in_span / total_true_snvs_global
-        logger.debug(f"SNV recall computed within detected span: {total_true_snvs_in_span}/{total_true_snvs_global} "
-                    f"true SNVs ({coverage_fraction:.1%} of total) in detected regions")
+        logger.debug(
+            f"SNV recall computed within detected span: {total_true_snvs_in_span}/{total_true_snvs_global} "
+            f"true SNVs ({coverage_fraction:.1%} of total) in detected regions"
+        )
 
-    detection_threshold, _ = compute_detection_sensitivity(true_haps, matches)
+    return {
+        "snv_precision": snv_precision,
+        "snv_recall": snv_recall,
+        "phasing_accuracy": phasing_accuracy,
+        "snv_true_total": total_true_snvs_global,
+        "snv_true_in_span": total_true_snvs_in_span,
+        "snv_detected_total": total_detected_snvs,
+        "snv_correct_total": total_correct_snvs,
+        "snv_span_coverage_frac": coverage_fraction if total_true_snvs_global > 0 else 0.0,
+    }
 
-    match_details = [(m[0].strain_id, m[1].lineage_id, m[2]) for m in matches]
 
-    # Per-contig metrics
+def _dedup_match_details(
+    matches: List[Tuple[TrueHaplotype, DetectedHaplotype, float]]
+) -> List[Tuple[str, str, float]]:
+    dedup_by_detected: Dict[str, Dict[str, Any]] = {}
+    for true_hap, det_hap, dist in matches:
+        entry = dedup_by_detected.get(det_hap.lineage_id)
+        if entry is None:
+            dedup_by_detected[det_hap.lineage_id] = {
+                "true_ids": {true_hap.strain_id},
+                "detected_id": det_hap.lineage_id,
+                "min_distance": dist,
+            }
+        else:
+            entry["true_ids"].add(true_hap.strain_id)
+            if dist < entry["min_distance"]:
+                entry["min_distance"] = dist
+
+    match_details = []
+    for entry in dedup_by_detected.values():
+        true_ids_csv = ",".join(sorted(entry["true_ids"]))
+        match_details.append((true_ids_csv, entry["detected_id"], entry["min_distance"]))
+    return match_details
+
+
+def _compute_per_contig_metrics(
+    all_snv_positions: Dict[str, List[int]],
+    true_haps: List[TrueHaplotype],
+    detected_haps: List[DetectedHaplotype],
+    matches: List[Tuple[TrueHaplotype, DetectedHaplotype, float]]
+) -> Dict[str, Dict[str, Any]]:
+    """
+    DEPRECATED: Use aggregate_by_contig() instead.
+
+    This function computes per-contig metrics by filtering global matches.
+    It is kept for backward compatibility but is no longer used by
+    _compute_haplotype_metrics().
+    """
+    # Summarize detection metrics independently per contig.
     per_contig_metrics = {}
     for contig in all_snv_positions.keys():
+        # Filter to haplotypes and matches that include this contig.
         contig_true_haps = [h for h in true_haps if contig in h.snv_positions]
         contig_detected_haps = [h for h in detected_haps if contig in h.snv_alleles]
         contig_matches = [m for m in matches if contig in m[0].snv_positions and contig in m[1].snv_alleles]
-        
+
         n_true_contig = len(contig_true_haps)
         n_detected_contig = len(contig_detected_haps)
-        # Count unique matched true haplotypes (not match pairs, since allow_one_to_many=True)
         matched_true_ids_contig = {m[0].strain_id for m in contig_matches}
         matched_detected_ids_contig = {m[1].lineage_id for m in contig_matches}
         n_matched_true_contig = len(matched_true_ids_contig)
         n_matched_detected_contig = len(matched_detected_ids_contig)
-        
+
+        # Record simple precision/recall counts for this contig.
         per_contig_metrics[contig] = {
             'n_true': n_true_contig,
             'n_detected': n_detected_contig,
-            'n_matched': len(contig_matches),  # Total match pairs (for reference)
-            'n_matched_true': n_matched_true_contig,  # Unique true haplotypes matched
-            'n_matched_detected': n_matched_detected_contig,  # Unique detected lineages matched
+            'n_matched': len(contig_matches),
+            'n_matched_true': n_matched_true_contig,
+            'n_matched_detected': n_matched_detected_contig,
             'precision': n_matched_detected_contig / n_detected_contig if n_detected_contig > 0 else 0.0,
             'recall': n_matched_true_contig / n_true_contig if n_true_contig > 0 else 0.0,
         }
 
-    # Per-timepoint metrics
+    return per_contig_metrics
+
+
+def _compute_per_timepoint_metrics(
+    true_haps: List[TrueHaplotype],
+    detected_haps: List[DetectedHaplotype],
+    matches: List[Tuple[TrueHaplotype, DetectedHaplotype, float]]
+) -> Dict[str, Dict[str, Any]]:
+    """
+    DEPRECATED: Use aggregate_by_timepoint() instead.
+
+    This function computes per-timepoint metrics by filtering global matches.
+    It is kept for backward compatibility but is no longer used by
+    _compute_haplotype_metrics().
+    """
+    # Summarize metrics independently per timepoint.
     all_timepoints = set()
     for h in true_haps:
         all_timepoints.update(h.abundances.keys())
     for h in detected_haps:
         all_timepoints.update(h.abundances.keys())
-    
+
     per_timepoint_metrics = {}
     for tp in sorted(all_timepoints):
+        # Filter haplotypes present above the minimum abundance threshold.
         tp_true_haps = [h for h in true_haps if tp in h.abundances and h.abundances[tp] > 0.01]
         tp_detected_haps = [h for h in detected_haps if tp in h.abundances and h.abundances[tp] > 0.01]
         tp_matches = [m for m in matches if tp in m[0].abundances and tp in m[1].abundances]
-        
+
         n_true_tp = len(tp_true_haps)
         n_detected_tp = len(tp_detected_haps)
-        # Count unique matched true haplotypes (not match pairs, since allow_one_to_many=True)
         matched_true_ids_tp = {m[0].strain_id for m in tp_matches}
         matched_detected_ids_tp = {m[1].lineage_id for m in tp_matches}
         n_matched_true_tp = len(matched_true_ids_tp)
         n_matched_detected_tp = len(matched_detected_ids_tp)
-        
-        # Abundance correlation for this timepoint
+
+        # Compute abundance correlation/MAE on matched pairs at this timepoint.
         tp_true_abunds = [m[0].abundances[tp] for m in tp_matches]
         tp_detected_abunds = [m[1].abundances[tp] for m in tp_matches]
         if len(tp_true_abunds) >= 2:
@@ -822,44 +881,548 @@ def compute_validation_metrics(
         else:
             tp_abund_r = None
             tp_abund_mae = None
-        
+
         per_timepoint_metrics[tp] = {
             'n_true': n_true_tp,
             'n_detected': n_detected_tp,
-            'n_matched': len(tp_matches),  # Total match pairs (for reference)
-            'n_matched_true': n_matched_true_tp,  # Unique true haplotypes matched
-            'n_matched_detected': n_matched_detected_tp,  # Unique detected lineages matched
+            'n_matched': len(tp_matches),
+            'n_matched_true': n_matched_true_tp,
+            'n_matched_detected': n_matched_detected_tp,
             'precision': n_matched_detected_tp / n_detected_tp if n_detected_tp > 0 else 0.0,
             'recall': n_matched_true_tp / n_true_tp if n_true_tp > 0 else 0.0,
             'abundance_pearson_r': tp_abund_r,
             'abundance_mae': tp_abund_mae,
         }
 
-    return ValidationResult(
-        n_true=n_true,
+    return per_timepoint_metrics
+
+
+# =============================================================================
+# Per-window metrics computation (new architecture)
+# =============================================================================
+
+def _group_indistinguishable_strains(
+    present_strains: List[str],
+    truth_alleles: Dict[str, Dict[str, Dict[int, str]]],
+    strain_abundances: Dict[str, Dict[str, float]],
+    contig: str,
+    window_start: int,
+    window_end: int,
+    sample: str,
+) -> List[StrainGroup]:
+    """
+    Group strains that have identical alleles at all window positions.
+
+    Strains are indistinguishable if they have the same allele at every
+    SNV position within the window. Returns a list of StrainGroup objects.
+    """
+    # Build window-local allele signatures for each present strain
+    strain_signatures: Dict[str, Dict[int, str]] = {}
+    for sid in present_strains:
+        contig_snvs = truth_alleles.get(sid, {}).get(contig, {})
+        window_alleles = {
+            pos: allele
+            for pos, allele in contig_snvs.items()
+            if window_start <= pos < window_end
+        }
+        strain_signatures[sid] = window_alleles
+
+    # Group strains by their signature (tuple of sorted (pos, allele) pairs)
+    signature_to_strains: Dict[tuple, List[str]] = defaultdict(list)
+    for sid, alleles in strain_signatures.items():
+        sig = tuple(sorted(alleles.items()))
+        signature_to_strains[sig].append(sid)
+
+    # Build StrainGroup objects
+    groups = []
+    for sig, strain_ids in signature_to_strains.items():
+        consensus = dict(sig)
+        total_abundance = sum(
+            strain_abundances.get(sid, {}).get(sample, 0.0)
+            for sid in strain_ids
+        )
+        groups.append(StrainGroup(
+            strain_ids=strain_ids,
+            consensus=consensus,
+            total_abundance=total_abundance
+        ))
+
+    return groups
+
+
+def _match_window_haplotypes(
+    detected_haps: List,  # List of haplotype objects with .consensus dict
+    strain_groups: List[StrainGroup],
+    window_positions: Set[int],
+) -> Tuple[List[Tuple[List[str], int, float]], List[int], List[int]]:
+    """
+    Match detected haplotypes to strain groups within a window.
+
+    Uses greedy assignment: sort by distance, each detected haplotype
+    matches at most one strain group.
+
+    Returns:
+        matches: List of (group_strain_ids, hap_idx, distance)
+        unmatched_group_indices: List of group indices not matched
+        unmatched_hap_indices: List of hap indices not matched
+    """
+    if not detected_haps or not strain_groups:
+        unmatched_groups = list(range(len(strain_groups)))
+        unmatched_haps = list(range(len(detected_haps)))
+        return [], unmatched_groups, unmatched_haps
+
+    # Compute distances between each detected haplotype and strain group
+    # Only compare at positions within the window
+    distance_candidates = []
+    for hap_idx, hap in enumerate(detected_haps):
+        hap_alleles = hap.consensus  # Dict[int, str]
+        for group_idx, group in enumerate(strain_groups):
+            n_shared = 0
+            n_matches = 0
+            for pos in window_positions:
+                hap_allele = hap_alleles.get(pos)
+                group_allele = group.consensus.get(pos)
+                if hap_allele is not None and group_allele is not None:
+                    n_shared += 1
+                    if hap_allele == group_allele:
+                        n_matches += 1
+
+            if n_shared > 0:
+                distance = 1.0 - (n_matches / n_shared)
+                distance_candidates.append((distance, hap_idx, group_idx, n_shared))
+
+    # Sort by distance (best first)
+    distance_candidates.sort(key=lambda x: (x[0], -x[3]))  # Lower distance, more shared SNVs
+
+    # Greedy matching
+    matched_groups = set()
+    matched_haps = set()
+    matches = []
+
+    for distance, hap_idx, group_idx, n_shared in distance_candidates:
+        if hap_idx in matched_haps or group_idx in matched_groups:
+            continue
+        # Only match if distance is reasonable (exact or near-exact match)
+        if distance <= 0.1:  # Allow 10% mismatch for sequencing errors
+            group = strain_groups[group_idx]
+            matches.append((group.strain_ids, hap_idx, distance))
+            matched_groups.add(group_idx)
+            matched_haps.add(hap_idx)
+
+    unmatched_group_indices = [i for i in range(len(strain_groups)) if i not in matched_groups]
+    unmatched_hap_indices = [i for i in range(len(detected_haps)) if i not in matched_haps]
+
+    return matches, unmatched_group_indices, unmatched_hap_indices
+
+
+def compute_window_metrics(
+    window_result,  # WindowResult object
+    true_haps: List[TrueHaplotype],
+) -> Optional[WindowMetrics]:
+    """
+    Compute all metrics for a single genomic window.
+
+    Returns None if the window has no informative SNVs (no strains present
+    or all strains identical within window).
+    """
+    sample = window_result.window.sample or ""
+    contig = window_result.window.contig
+    window_start = window_result.window.start
+    window_end = window_result.window.end
+
+    # Build lookups
+    strain_abundances = {h.strain_id: h.abundances for h in true_haps}
+    truth_alleles = {h.strain_id: h.snv_positions for h in true_haps}
+
+    # Identify strains present at this timepoint (abundance > 0)
+    present_strains = [
+        h.strain_id for h in true_haps
+        if h.abundances.get(sample, 0.0) > 0.0
+    ]
+
+    if not present_strains:
+        return None
+
+    # Find all SNV positions in window across present strains
+    window_positions = set()
+    for sid in present_strains:
+        contig_snvs = truth_alleles.get(sid, {}).get(contig, {})
+        for pos in contig_snvs.keys():
+            if window_start <= pos < window_end:
+                window_positions.add(pos)
+
+    if not window_positions:
+        return None
+
+    # Group indistinguishable strains
+    strain_groups = _group_indistinguishable_strains(
+        present_strains, truth_alleles, strain_abundances,
+        contig, window_start, window_end, sample
+    )
+
+    # Find informative positions (where strain groups differ)
+    informative_positions = set()
+    for pos in window_positions:
+        alleles_at_pos = set()
+        for group in strain_groups:
+            allele = group.consensus.get(pos)
+            if allele is not None:
+                alleles_at_pos.add(allele)
+        if len(alleles_at_pos) >= 2:
+            informative_positions.add(pos)
+
+    n_informative_snvs = len(informative_positions)
+
+    # If no informative SNVs, all strains are identical within this window
+    # Still compute metrics but with n_strain_groups based on non-empty groups
+    if n_informative_snvs == 0:
+        # All present strains are identical at these positions
+        # Treat as single group
+        pass
+
+    # Get detected haplotypes from window result
+    detected_haps = window_result.haplotypes
+    n_detected = len(detected_haps)
+
+    # Match detected haplotypes to strain groups
+    matches, unmatched_group_indices, unmatched_hap_indices = _match_window_haplotypes(
+        detected_haps, strain_groups, window_positions
+    )
+    n_matched = len(matches)
+
+    # Get unmatched strain IDs
+    unmatched_true = []
+    for idx in unmatched_group_indices:
+        unmatched_true.extend(strain_groups[idx].strain_ids)
+
+    # Compute haplotype-level precision/recall
+    # Precision: fraction of detected haplotypes that matched a group
+    precision = n_matched / n_detected if n_detected > 0 else 0.0
+    # Recall: fraction of strain groups that were matched
+    n_strain_groups = len(strain_groups)
+    recall = n_matched / n_strain_groups if n_strain_groups > 0 else 0.0
+
+    # Compute SNV-level metrics
+    # For each matched pair, count SNVs detected and correct
+    n_snv_detected = 0
+    n_snv_correct = 0
+
+    for group_strain_ids, hap_idx, distance in matches:
+        hap = detected_haps[hap_idx]
+        hap_alleles = hap.consensus
+        # Find the group
+        matching_group = None
+        for g in strain_groups:
+            if set(g.strain_ids) == set(group_strain_ids):
+                matching_group = g
+                break
+        if matching_group is None:
+            continue
+
+        for pos in window_positions:
+            hap_allele = hap_alleles.get(pos)
+            true_allele = matching_group.consensus.get(pos)
+            if hap_allele is not None:
+                n_snv_detected += 1
+                if true_allele is not None and hap_allele == true_allele:
+                    n_snv_correct += 1
+
+    # Also count detected SNVs from unmatched haplotypes (false positives)
+    for hap_idx in unmatched_hap_indices:
+        hap = detected_haps[hap_idx]
+        for pos in window_positions:
+            if pos in hap.consensus:
+                n_snv_detected += 1
+
+    # SNV precision/recall
+    snv_precision = n_snv_correct / n_snv_detected if n_snv_detected > 0 else 0.0
+    # SNV recall: correct SNVs / total true SNV positions across matched groups
+    # Expected = (window SNV positions) * (number of matched groups)
+    expected_snv_count = len(window_positions) * n_matched if n_matched > 0 else len(window_positions)
+    snv_recall = n_snv_correct / expected_snv_count if expected_snv_count > 0 else 0.0
+
+    # Compute abundance pairs (true_group_abundance, detected_weight)
+    abundance_pairs = []
+    for group_strain_ids, hap_idx, distance in matches:
+        hap = detected_haps[hap_idx]
+        hap_weight = hap.weight if hasattr(hap, 'weight') else 0.0
+        # Find group abundance
+        for g in strain_groups:
+            if set(g.strain_ids) == set(group_strain_ids):
+                abundance_pairs.append((g.total_abundance, hap_weight))
+                break
+
+    abundance_mae = None
+    if abundance_pairs:
+        abundance_mae = np.mean([abs(t - d) for t, d in abundance_pairs])
+
+    return WindowMetrics(
+        sample=sample,
+        contig=contig,
+        window_start=window_start,
+        window_end=window_end,
+        n_strain_groups=n_strain_groups,
         n_detected=n_detected,
-        n_matched=len(matched_true_ids),  # Number of unique true strains matched
+        n_matched=n_matched,
+        precision=precision,
+        recall=recall,
+        n_snv_positions=len(window_positions),
+        n_informative_snvs=n_informative_snvs,
+        n_snv_detected=n_snv_detected,
+        n_snv_correct=n_snv_correct,
+        snv_precision=snv_precision,
+        snv_recall=snv_recall,
+        abundance_pairs=abundance_pairs,
+        abundance_mae=abundance_mae,
+        matches=matches,
+        unmatched_true=unmatched_true,
+        unmatched_detected=unmatched_hap_indices,
+    )
+
+
+def aggregate_window_metrics(
+    window_metrics_list: List[WindowMetrics],
+) -> AggregatedMetrics:
+    """
+    Aggregate metrics across windows using macro-averaging.
+
+    All windows have equal weight (same size), so we take simple means
+    of per-window metrics. Abundance pairs are pooled for correlation.
+    """
+    if not window_metrics_list:
+        return AggregatedMetrics(
+            n_windows=0,
+            n_windows_informative=0,
+            precision=0.0,
+            recall=0.0,
+            f1=0.0,
+            snv_precision=0.0,
+            snv_recall=0.0,
+            abundance_pearson_r=0.0,
+            abundance_mae=0.0,
+            n_abundance_pairs=0,
+            total_true=0,
+            total_detected=0,
+            total_matched=0,
+            total_snv_detected=0,
+            total_snv_correct=0,
+        )
+
+    n_windows = len(window_metrics_list)
+    n_windows_informative = sum(1 for w in window_metrics_list if w.n_informative_snvs > 0)
+
+    # Macro-averaged metrics (mean across windows)
+    precisions = [w.precision for w in window_metrics_list]
+    recalls = [w.recall for w in window_metrics_list]
+    f1s = [
+        2 * w.precision * w.recall / (w.precision + w.recall)
+        if (w.precision + w.recall) > 0 else 0.0
+        for w in window_metrics_list
+    ]
+    snv_precisions = [w.snv_precision for w in window_metrics_list]
+    snv_recalls = [w.snv_recall for w in window_metrics_list]
+
+    precision = np.mean(precisions) if precisions else 0.0
+    recall = np.mean(recalls) if recalls else 0.0
+    f1 = np.mean(f1s) if f1s else 0.0
+    snv_precision = np.mean(snv_precisions) if snv_precisions else 0.0
+    snv_recall = np.mean(snv_recalls) if snv_recalls else 0.0
+
+    # Pool abundance pairs for correlation
+    all_abundance_pairs = []
+    for w in window_metrics_list:
+        all_abundance_pairs.extend(w.abundance_pairs)
+
+    abundance_pearson_r = 0.0
+    abundance_mae = 0.0
+    if len(all_abundance_pairs) >= 2:
+        true_abunds = [p[0] for p in all_abundance_pairs]
+        det_abunds = [p[1] for p in all_abundance_pairs]
+        abundance_pearson_r = np.corrcoef(true_abunds, det_abunds)[0, 1]
+        if np.isnan(abundance_pearson_r):
+            abundance_pearson_r = 0.0
+        abundance_mae = np.mean([abs(t - d) for t, d in all_abundance_pairs])
+
+    # Totals
+    total_true = sum(w.n_strain_groups for w in window_metrics_list)
+    total_detected = sum(w.n_detected for w in window_metrics_list)
+    total_matched = sum(w.n_matched for w in window_metrics_list)
+    total_snv_detected = sum(w.n_snv_detected for w in window_metrics_list)
+    total_snv_correct = sum(w.n_snv_correct for w in window_metrics_list)
+
+    return AggregatedMetrics(
+        n_windows=n_windows,
+        n_windows_informative=n_windows_informative,
         precision=precision,
         recall=recall,
         f1=f1,
-        abundance_pearson_r=abundance_pearson_r,
-        abundance_mae=abundance_mae,
         snv_precision=snv_precision,
         snv_recall=snv_recall,
-        phasing_accuracy=phasing_accuracy,
-        snv_true_total=total_true_snvs_global,
-        snv_true_in_span=total_true_snvs_in_span,
-        snv_detected_total=total_detected_snvs,
-        snv_correct_total=total_correct_snvs,
-        snv_span_coverage_frac=coverage_fraction if total_true_snvs_global > 0 else 0.0,
-        detection_threshold=detection_threshold,
-        matches=match_details,
-        false_negatives=false_negatives,
-        false_positives=false_positives,
-        match_details_full=match_details_full,
-        per_contig_metrics=per_contig_metrics,
-        per_timepoint_metrics=per_timepoint_metrics,
+        abundance_pearson_r=abundance_pearson_r,
+        abundance_mae=abundance_mae,
+        n_abundance_pairs=len(all_abundance_pairs),
+        total_true=total_true,
+        total_detected=total_detected,
+        total_matched=total_matched,
+        total_snv_detected=total_snv_detected,
+        total_snv_correct=total_snv_correct,
     )
+
+
+def aggregate_by_contig(
+    window_metrics_list: List[WindowMetrics],
+) -> Dict[str, AggregatedMetrics]:
+    """Group windows by contig and aggregate each group."""
+    by_contig: Dict[str, List[WindowMetrics]] = defaultdict(list)
+    for w in window_metrics_list:
+        by_contig[w.contig].append(w)
+
+    return {
+        contig: aggregate_window_metrics(windows)
+        for contig, windows in by_contig.items()
+    }
+
+
+def aggregate_by_timepoint(
+    window_metrics_list: List[WindowMetrics],
+) -> Dict[str, AggregatedMetrics]:
+    """Group windows by timepoint/sample and aggregate each group."""
+    by_timepoint: Dict[str, List[WindowMetrics]] = defaultdict(list)
+    for w in window_metrics_list:
+        by_timepoint[w.sample].append(w)
+
+    return {
+        sample: aggregate_window_metrics(windows)
+        for sample, windows in by_timepoint.items()
+    }
+
+
+def compute_all_window_metrics(
+    window_results: List,
+    true_haps: List[TrueHaplotype],
+) -> Tuple[List[WindowMetrics], AggregatedMetrics, Dict[str, AggregatedMetrics], Dict[str, AggregatedMetrics]]:
+    """
+    Main orchestrator: compute per-window metrics then aggregate.
+
+    Returns:
+        all_metrics: List of WindowMetrics for each window
+        overall: AggregatedMetrics across all windows
+        by_contig: Dict mapping contig -> AggregatedMetrics
+        by_timepoint: Dict mapping sample/timepoint -> AggregatedMetrics
+    """
+    all_metrics = []
+
+    for wr in window_results:
+        metrics = compute_window_metrics(wr, true_haps)
+        if metrics is not None:
+            all_metrics.append(metrics)
+
+    overall = aggregate_window_metrics(all_metrics)
+    by_contig = aggregate_by_contig(all_metrics)
+    by_timepoint = aggregate_by_timepoint(all_metrics)
+
+    return all_metrics, overall, by_contig, by_timepoint
+
+
+def compute_window_recall_metrics(
+    true_haps: List[TrueHaplotype],
+    window_results: List,
+) -> Tuple[float, int, int, Dict[str, float], Dict[str, float], List[Dict]]:
+    """
+    Compute window-level recall based on informative SNVs per window.
+
+    A window is "informative" if it contains >=1 SNV position where at least two
+    distinct allele groups exist among strains present at that timepoint.
+
+    A window is "detected" if all informative SNVs in that window are covered by
+    at least one haplotype consensus in that window.
+    """
+    # Build strain -> abundances and contig->pos->allele lookup from truth.
+    strain_abundances = {h.strain_id: h.abundances for h in true_haps}
+    truth_alleles = {h.strain_id: h.snv_positions for h in true_haps}
+
+    per_timepoint_totals = defaultdict(lambda: {"informative": 0, "detected": 0})
+    per_contig_totals = defaultdict(lambda: {"informative": 0, "detected": 0})
+    missed_windows = []
+
+    # Scan each window to compute informative and detected windows.
+    for wr in window_results:
+        sample = wr.window.sample or ""
+        contig = wr.window.contig
+        start = wr.window.start
+        end = wr.window.end
+
+        # Determine strains present at this timepoint (abundance > 0).
+        present_strains = [
+            sid for sid, abunds in strain_abundances.items() if abunds.get(sample, 0.0) > 0.0
+        ]
+        if not present_strains:
+            continue
+
+        # Compute informative SNV positions in this window.
+        informative_positions = []
+        for sid in present_strains:
+            for pos, allele in truth_alleles.get(sid, {}).get(contig, {}).items():
+                if start <= pos < end:
+                    informative_positions.append(pos)
+        if not informative_positions:
+            continue
+
+        informative_positions = sorted(set(informative_positions))
+        truly_informative = []
+        for pos in informative_positions:
+            allele_groups = set()
+            for sid in present_strains:
+                allele = truth_alleles.get(sid, {}).get(contig, {}).get(pos)
+                if allele is not None:
+                    allele_groups.add(allele)
+            if len(allele_groups) >= 2:
+                truly_informative.append(pos)
+
+        if not truly_informative:
+            continue
+
+        # Check detected coverage by haplotypes in this window
+        detected_positions = set()
+        for hap in wr.haplotypes:
+            detected_positions.update(hap.consensus.keys())
+
+        missing_positions = [pos for pos in truly_informative if pos not in detected_positions]
+        is_detected = len(missing_positions) == 0
+
+        per_timepoint_totals[sample]["informative"] += 1
+        per_contig_totals[contig]["informative"] += 1
+        if is_detected:
+            per_timepoint_totals[sample]["detected"] += 1
+            per_contig_totals[contig]["detected"] += 1
+        else:
+            missed_windows.append(
+                {
+                    "sample": sample,
+                    "contig": contig,
+                    "window_start": start,
+                    "window_end": end,
+                    "n_informative_snvs": len(truly_informative),
+                    "n_missing_snvs": len(missing_positions),
+                    "missing_positions": ",".join(str(p) for p in missing_positions),
+                }
+            )
+
+    total_informative = sum(v["informative"] for v in per_timepoint_totals.values())
+    total_detected = sum(v["detected"] for v in per_timepoint_totals.values())
+    pooled_recall = total_detected / total_informative if total_informative > 0 else 0.0
+
+    by_timepoint = {
+        tp: (vals["detected"] / vals["informative"] if vals["informative"] > 0 else 0.0)
+        for tp, vals in per_timepoint_totals.items()
+    }
+    by_contig = {
+        contig: (vals["detected"] / vals["informative"] if vals["informative"] > 0 else 0.0)
+        for contig, vals in per_contig_totals.items()
+    }
+
+    return pooled_recall, total_informative, total_detected, by_timepoint, by_contig, missed_windows
+
 
 
 def compute_detection_sensitivity(
@@ -872,6 +1435,7 @@ def compute_detection_sensitivity(
 
     Returns: (detection_threshold, curve_dict)
     """
+    # Build (abundance, matched?) points across all timepoints.
     matched_ids = {true_hap.strain_id for true_hap, _, _ in matches}
     abundance_points = []
     for true_hap in true_haps:
@@ -881,6 +1445,7 @@ def compute_detection_sensitivity(
     if not abundance_points:
         return 0.0, {"bins": [], "recall": []}
 
+    # Bin abundances and compute recall per bin.
     max_abund = max(a for a, _ in abundance_points) or 1.0
     bins = np.linspace(0, max_abund, n_bins + 1)
     recall_by_bin = []
@@ -893,6 +1458,7 @@ def compute_detection_sensitivity(
             continue
         recall_by_bin.append(sum(in_bin) / len(in_bin))
 
+    # Define detection threshold as the first bin with >=50% recall.
     threshold = 0.0
     for i, recall in enumerate(recall_by_bin):
         if recall >= 0.5:
@@ -1441,19 +2007,13 @@ def write_validation_summary(
         f.write("-" * 80 + "\n")
         f.write(f"True strains in reference:  {result.n_true}\n")
         f.write(f"Detected lineages:          {result.n_detected}\n")
-        f.write(f"Successfully matched:       {result.n_matched}\n\n")
-
-        matched_true_ids = {m[0].strain_id for m in matches} if matches else set()
-        matched_det_ids = {m[1].lineage_id for m in matches} if matches else set()
-        f.write(f"Unique true strains matched:   {len(matched_true_ids)}\n")
-        f.write(f"Unique detected lineages used: {len(matched_det_ids)}\n\n")
 
         # Section 2: Accuracy Metrics
         f.write("2. ACCURACY METRICS\n")
         f.write("-" * 80 + "\n")
         f.write("Haplotype-Level Metrics:\n")
         f.write(f"  Precision:  {result.precision:.4f}  (fraction of detected that are correct)\n")
-        f.write(f"  Recall:     {result.recall:.4f}  (window-level recall when available)\n")
+        f.write(f"  Recall:     {result.recall:.4f}  (fraction of true variation covered by haplotypes)\n")
         f.write(f"  F1 Score:   {result.f1:.4f}  (harmonic mean of precision/recall)\n\n")
 
         f.write("SNV-Level Metrics (within detected genomic span):\n")
@@ -1606,7 +2166,7 @@ def write_low_abundance_report(
     """
     output_path = os.path.join(output_dir, "low_abundance.txt")
 
-    matches = match_haplotypes(true_haps, detected_haps, allow_one_to_many=True)
+    matches = match_haplotypes(true_haps, detected_haps)
     matches_by_strain: Dict[str, List[DetectedHaplotype]] = defaultdict(list)
     for true_hap, det_hap, _ in matches:
         matches_by_strain[true_hap.strain_id].append(det_hap)
@@ -1682,105 +2242,6 @@ def write_low_abundance_report(
     return output_path
 
 
-def compute_window_recall_metrics(
-    true_haps: List[TrueHaplotype],
-    window_results: List,
-) -> Tuple[float, int, int, Dict[str, float], Dict[str, float], List[Dict]]:
-    """
-    Compute window-level recall based on informative SNVs per window.
-
-    A window is "informative" if it contains >=1 SNV position where at least two
-    distinct allele groups exist among strains present at that timepoint.
-
-    A window is "detected" if all informative SNVs in that window are covered by
-    at least one haplotype consensus in that window.
-    """
-    # Build strain -> abundances and contig->pos->allele lookup from truth
-    strain_abundances = {h.strain_id: h.abundances for h in true_haps}
-    truth_alleles = {h.strain_id: h.snv_positions for h in true_haps}
-
-    per_timepoint_totals = defaultdict(lambda: {"informative": 0, "detected": 0})
-    per_contig_totals = defaultdict(lambda: {"informative": 0, "detected": 0})
-    missed_windows = []
-
-    for wr in window_results:
-        sample = wr.window.sample or ""
-        contig = wr.window.contig
-        start = wr.window.start
-        end = wr.window.end
-
-        # Determine strains present at this timepoint (abundance > 0)
-        present_strains = [
-            sid for sid, abunds in strain_abundances.items() if abunds.get(sample, 0.0) > 0.0
-        ]
-        if not present_strains:
-            continue
-
-        # Compute informative SNV positions in this window
-        informative_positions = []
-        for sid in present_strains:
-            for pos, allele in truth_alleles.get(sid, {}).get(contig, {}).items():
-                if start <= pos < end:
-                    informative_positions.append(pos)
-        if not informative_positions:
-            continue
-
-        informative_positions = sorted(set(informative_positions))
-        truly_informative = []
-        for pos in informative_positions:
-            allele_groups = set()
-            for sid in present_strains:
-                allele = truth_alleles.get(sid, {}).get(contig, {}).get(pos)
-                if allele is not None:
-                    allele_groups.add(allele)
-            if len(allele_groups) >= 2:
-                truly_informative.append(pos)
-
-        if not truly_informative:
-            continue
-
-        # Check detected coverage by haplotypes in this window
-        detected_positions = set()
-        for hap in wr.haplotypes:
-            detected_positions.update(hap.consensus.keys())
-
-        missing_positions = [pos for pos in truly_informative if pos not in detected_positions]
-        is_detected = len(missing_positions) == 0
-
-        per_timepoint_totals[sample]["informative"] += 1
-        per_contig_totals[contig]["informative"] += 1
-        if is_detected:
-            per_timepoint_totals[sample]["detected"] += 1
-            per_contig_totals[contig]["detected"] += 1
-        else:
-            missed_windows.append(
-                {
-                    "sample": sample,
-                    "contig": contig,
-                    "window_start": start,
-                    "window_end": end,
-                    "n_informative_snvs": len(truly_informative),
-                    "n_missing_snvs": len(missing_positions),
-                    "missing_positions": ",".join(str(p) for p in missing_positions),
-                }
-            )
-
-    total_informative = sum(v["informative"] for v in per_timepoint_totals.values())
-    total_detected = sum(v["detected"] for v in per_timepoint_totals.values())
-    pooled_recall = total_detected / total_informative if total_informative > 0 else 0.0
-
-    by_timepoint = {
-        tp: (vals["detected"] / vals["informative"] if vals["informative"] > 0 else 0.0)
-        for tp, vals in per_timepoint_totals.items()
-    }
-    by_contig = {
-        contig: (vals["detected"] / vals["informative"] if vals["informative"] > 0 else 0.0)
-        for contig, vals in per_contig_totals.items()
-    }
-
-    return pooled_recall, total_informative, total_detected, by_timepoint, by_contig, missed_windows
-
-
 def write_missed_windows_report(
     missed_windows: List[Dict],
     output_dir: str,
@@ -1818,250 +2279,276 @@ def run_validation(
     """Run the full validation pipeline."""
 
     os.makedirs(output_dir, exist_ok=True)
-    if window_results is None:
-        raise ValueError("window_results is required for window-level recall.")
-
-    # Load data
     true_haps, all_snv_positions = load_ground_truth(truth_dir)
     detected_haps = load_detected_haplotypes(detected_file)
 
-    # Compute basic metrics
-    result = compute_validation_metrics(true_haps, detected_haps, all_snv_positions)
+    matches = match_haplotypes(true_haps, detected_haps)
+    truth_snvs = {true_hap.strain_id: true_hap.snv_positions for true_hap in true_haps}
 
-    # Match for figures and track validation
-    matches = match_haplotypes(true_haps, detected_haps, allow_one_to_many=True)
-    
-    # Build strain matches for track validation: detected_track_id -> true_strain_id
-    # We need two mappings:
-    # 1. lineage_id -> strain_id (for lineage validation - from matches)
-    # 2. track_id -> strain_id (for track validation - need to map through lineage_id)
-    
-    lineage_to_strain = {}
-    for true_hap, det_hap, _ in matches:
-        if det_hap.lineage_id:
-            lineage_to_strain[det_hap.lineage_id] = true_hap.strain_id
-    
-    # Now build track_id -> strain_id mapping by reading the lineages.tsv file
-    # which contains the mapping from original track_ids to lineage_ids
-    strain_matches = {}
-    
-    # First, copy the lineage_id -> strain_id mapping (some code expects this)
-    strain_matches.update(lineage_to_strain)
-    
-    # Then, read the lineages.tsv to get track_id -> lineage_id mapping
-    # lineages.tsv may be in output_dir or its parent (if output_dir is 'validation' subdirectory)
-    lineages_file = os.path.join(output_dir, 'lineages.tsv')
-    if not os.path.exists(lineages_file):
-        lineages_file = os.path.join(os.path.dirname(output_dir), 'lineages.tsv')
-    if os.path.exists(lineages_file):
-        try:
-            with open(lineages_file) as f:
-                header = f.readline().strip().split('\t')
-                if 'track_id' in header and 'lineage_id' in header:
-                    track_idx = header.index('track_id')
-                    lineage_idx = header.index('lineage_id')
-                    for line in f:
-                        parts = line.strip().split('\t')
-                        if len(parts) > max(track_idx, lineage_idx):
-                            track_id = parts[track_idx]
-                            lineage_id = parts[lineage_idx]
-                            # Map track_id to the same strain_id as its lineage_id
-                            if lineage_id in lineage_to_strain and track_id != lineage_id:
-                                strain_matches[track_id] = lineage_to_strain[lineage_id]
-            logger.info(f"Built track mapping: {len(lineage_to_strain)} lineage->strain, "
-                       f"{len(strain_matches)} total track->strain mappings")
-        except Exception as e:
-            logger.warning(f"Failed to read track_id mapping from lineages.tsv: {e}")
-    
-    # Build truth SNVs: strain_id -> {contig -> {pos -> allele}}
-    truth_snvs = {}
-    for true_hap in true_haps:
-        truth_snvs[true_hap.strain_id] = true_hap.snv_positions
+    result, missed_windows = _compute_haplotype_metrics(
+        true_haps=true_haps,
+        detected_haps=detected_haps,
+        all_snv_positions=all_snv_positions,
+        window_results=window_results,
+        matches=matches,
+    )
 
-    # Track/linking validation (if window_results provided)
-    if window_results and window_size:
-        try:
-            from validation.validate_tracks import validate_tracks
-            logger.info(f"Running track validation with {len(window_results)} window results")
-            logger.info(f"Strain matches: {len(strain_matches)} mappings")
-            track_result = validate_tracks(
-                window_results, truth_dir, strain_matches, truth_snvs, window_size
-            )
-            result.track_fragmentation_mean = track_result.track_fragmentation_mean
-            result.track_fragmentation_median = track_result.track_fragmentation_median
-            result.false_link_rate = track_result.false_link_rate
-            result.missed_link_rate = track_result.missed_link_rate
-            result.track_consensus_error = track_result.track_consensus_error
-            logger.info(f"Track validation complete: fragmentation={result.track_fragmentation_mean:.3f}, "
-                       f"false_link={result.false_link_rate:.3f}, missed_link={result.missed_link_rate:.3f}")
-            
-            # Write linkability report if there's fragmentation to analyze
-            if track_result.linkability_analysis:
-                from validation.validate_tracks import write_linkability_report
-                linkability_path = os.path.join(output_dir, 'track_linkability.txt')
-                write_linkability_report(track_result.linkability_analysis, linkability_path)
-                logger.info(f"Wrote track linkability report to {linkability_path}")
-        except Exception as e:
-            logger.warning(f"Track validation failed: {e}")
-            import traceback
-            logger.debug(traceback.format_exc())
+    _validate_tracks_and_lineages(
+        result=result,
+        matches=matches,
+        truth_dir=truth_dir,
+        truth_snvs=truth_snvs,
+        detected_haps=detected_haps,
+        true_haps=true_haps,
+        window_results=window_results,
+        window_size=window_size,
+        detected_without_rescue=detected_without_rescue,
+        output_dir=output_dir,
+    )
 
-    # Lineage validation
-    try:
-        from validation.validate_lineages import validate_lineages
-        
-        # Build detected lineages: lineage_id -> {contig -> strain_id}
-        # We need to map each (lineage_id, contig) pair to a strain_id
-        # Use the matches to determine which strain each detected lineage belongs to on each contig
-        
-        # The matches list contains (true_hap, det_hap, distance) tuples
-        # For each match, map the detected haplotype's (lineage_id, contig) pairs to the matched strain_id
-        lineage_contig_to_strain = {}
-        
-        # Process matches to build the mapping
-        for true_hap, det_match, _ in matches:
-            if not det_match.lineage_id:
+    _write_validation_outputs(
+        result=result,
+        true_haps=true_haps,
+        detected_haps=detected_haps,
+        matches=matches,
+        window_results=window_results,
+        missed_windows=missed_windows,
+        output_dir=output_dir,
+    )
+
+    _write_validation_reports(
+        result=result,
+        detected_haps=detected_haps,
+        true_haps=true_haps,
+        output_dir=output_dir,
+    )
+
+    return result
+
+
+def _compute_haplotype_metrics(
+    *,
+    true_haps: List[TrueHaplotype],
+    detected_haps: List[DetectedHaplotype],
+    all_snv_positions: Dict[str, List[int]],
+    window_results: List,
+    matches: List[Tuple[TrueHaplotype, DetectedHaplotype, float]],
+) -> Tuple[ValidationResult, List[Dict[str, Any]]]:
+    """
+    Compute all haplotype validation metrics using per-window computation.
+
+    Uses the new architecture where all metrics (precision, recall, abundance,
+    SNV metrics) are computed per-window first, then aggregated.
+    """
+    n_true = len(true_haps)
+    n_detected = len(detected_haps)
+
+    # Compute per-window metrics and aggregate
+    all_window_metrics, overall_agg, by_contig_agg, by_timepoint_agg = compute_all_window_metrics(
+        window_results, true_haps
+    )
+
+    # Use aggregated metrics for primary validation metrics
+    precision = overall_agg.precision
+    recall = overall_agg.recall
+    f1 = overall_agg.f1
+    snv_precision = overall_agg.snv_precision
+    snv_recall = overall_agg.snv_recall
+    abundance_pearson_r = overall_agg.abundance_pearson_r
+    abundance_mae = overall_agg.abundance_mae
+
+    # Convert per-contig aggregated metrics to the expected dict format
+    per_contig_metrics = {}
+    for contig, agg in by_contig_agg.items():
+        per_contig_metrics[contig] = {
+            'n_true': agg.total_true,
+            'n_detected': agg.total_detected,
+            'n_matched': agg.total_matched,
+            'n_matched_true': agg.total_matched,  # Same as n_matched in new model
+            'n_matched_detected': agg.total_matched,
+            'precision': agg.precision,
+            'recall': agg.recall,
+            'n_windows': agg.n_windows,
+            'n_windows_informative': agg.n_windows_informative,
+        }
+
+    # Convert per-timepoint aggregated metrics to the expected dict format
+    per_timepoint_metrics = {}
+    for sample, agg in by_timepoint_agg.items():
+        per_timepoint_metrics[sample] = {
+            'n_true': agg.total_true,
+            'n_detected': agg.total_detected,
+            'n_matched': agg.total_matched,
+            'n_matched_true': agg.total_matched,
+            'n_matched_detected': agg.total_matched,
+            'precision': agg.precision,
+            'recall': agg.recall,
+            'abundance_pearson_r': agg.abundance_pearson_r if agg.n_abundance_pairs >= 2 else None,
+            'abundance_mae': agg.abundance_mae if agg.n_abundance_pairs >= 2 else None,
+            'n_windows': agg.n_windows,
+            'n_windows_informative': agg.n_windows_informative,
+        }
+
+    # Build window recall by timepoint/contig (for backward compatibility)
+    window_recall_by_timepoint = {
+        sample: agg.recall for sample, agg in by_timepoint_agg.items()
+    }
+    window_recall_by_contig = {
+        contig: agg.recall for contig, agg in by_contig_agg.items()
+    }
+
+    # Build missed_windows list from window metrics with recall < 1
+    missed_windows = []
+    for wm in all_window_metrics:
+        if wm.recall < 1.0 and wm.n_strain_groups > 0:
+            missed_windows.append({
+                'sample': wm.sample,
+                'contig': wm.contig,
+                'window_start': wm.window_start,
+                'window_end': wm.window_end,
+                'n_informative_snvs': wm.n_informative_snvs,
+                'n_missing_snvs': len(wm.unmatched_true),
+                'missing_positions': ','.join(wm.unmatched_true),
+            })
+
+    false_negatives = [
+        f"{w['sample']}|{w['contig']}:{w['window_start']}-{w['window_end']}"
+        for w in missed_windows
+    ]
+
+    # False positives: detected lineages not matching any truth (from global matches)
+    matched_detected_ids = {m[1].lineage_id for m in matches}
+    false_positives = [h.lineage_id for h in detected_haps if h.lineage_id not in matched_detected_ids]
+
+    # Per-match diagnostics from global matching (still needed for detailed reports)
+    match_details_full = _build_match_details_full(matches, true_haps)
+    detection_threshold, _ = compute_detection_sensitivity(true_haps, matches)
+    match_details = _dedup_match_details(matches)
+
+    # Build result using window-aggregated metrics
+    result = ValidationResult(
+        n_true=n_true,
+        n_detected=n_detected,
+        n_matched=overall_agg.total_matched,
+        precision=precision,
+        recall=recall,
+        f1=f1,
+        abundance_pearson_r=abundance_pearson_r,
+        abundance_mae=abundance_mae,
+        snv_precision=snv_precision,
+        snv_recall=snv_recall,
+        phasing_accuracy=snv_recall,  # Use SNV recall as phasing accuracy
+        snv_true_total=overall_agg.total_true,
+        snv_true_in_span=overall_agg.total_snv_correct + (overall_agg.total_snv_detected - overall_agg.total_snv_correct),
+        snv_detected_total=overall_agg.total_snv_detected,
+        snv_correct_total=overall_agg.total_snv_correct,
+        snv_span_coverage_frac=1.0 if overall_agg.n_windows > 0 else 0.0,  # All windows are in span
+        detection_threshold=detection_threshold,
+        matches=match_details,
+        false_negatives=false_negatives,
+        false_positives=false_positives,
+        match_details_full=match_details_full,
+        per_contig_metrics=per_contig_metrics,
+        per_timepoint_metrics=per_timepoint_metrics,
+        window_recall=recall,  # Same as overall recall in new model
+        window_informative_total=overall_agg.n_windows_informative,
+        window_detected_total=overall_agg.total_matched,
+        window_recall_by_timepoint=window_recall_by_timepoint,
+        window_recall_by_contig=window_recall_by_contig,
+    )
+
+    return result, missed_windows
+
+
+def _validate_tracks_and_lineages(
+    *,
+    result: ValidationResult,
+    matches: List[Tuple[TrueHaplotype, DetectedHaplotype, float]],
+    truth_dir: str,
+    truth_snvs: Dict[str, Dict[str, Dict[int, str]]],
+    detected_haps: List[DetectedHaplotype],
+    true_haps: List[TrueHaplotype],
+    window_results: List,
+    window_size: int,
+    detected_without_rescue: Optional[Dict],
+    output_dir: str,
+) -> None:
+    lineage_to_strain = {det_hap.lineage_id: true_hap.strain_id
+                         for true_hap, det_hap, _ in matches if det_hap.lineage_id}
+    strain_matches = dict(lineage_to_strain)
+    for det_hap in detected_haps:
+        if det_hap.track_id and det_hap.lineage_id in lineage_to_strain:
+            strain_matches[det_hap.track_id] = lineage_to_strain[det_hap.lineage_id]
+
+    logger.info(f"Built track mapping: {len(lineage_to_strain)} lineage->strain, "
+                f"{len(strain_matches)} total track->strain mappings")
+
+    from validation.validate_tracks import validate_tracks, write_linkability_report
+    logger.info(f"Running track validation with {len(window_results)} window results "
+                f"({len(strain_matches)} strain mappings)")
+    track_result = validate_tracks(
+        window_results, truth_dir, strain_matches, truth_snvs, window_size
+    )
+    result.track_fragmentation_mean = track_result.track_fragmentation_mean
+    result.track_fragmentation_median = track_result.track_fragmentation_median
+    result.false_link_rate = track_result.false_link_rate
+    result.missed_link_rate = track_result.missed_link_rate
+    result.track_consensus_error = track_result.track_consensus_error
+    logger.info(
+        f"Track validation complete: fragmentation={result.track_fragmentation_mean:.3f}, "
+        f"false_link={result.false_link_rate:.3f}, missed_link={result.missed_link_rate:.3f}"
+    )
+
+    if track_result.linkability_analysis:
+        linkability_path = os.path.join(output_dir, 'track_linkability.txt')
+        write_linkability_report(track_result.linkability_analysis, linkability_path)
+        logger.info(f"Wrote track linkability report to {linkability_path}")
+
+    from validation.validate_lineages import validate_lineages
+    detected_lineages: Dict[str, Dict[str, str]] = {}
+    for true_hap, det_match, _ in matches:
+        if not det_match.lineage_id:
+            continue
+        for contig in det_match.snv_alleles.keys():
+            if contig not in true_hap.snv_positions:
                 continue
-            matched_strain = true_hap.strain_id
-            
-            # For each contig where this detected haplotype has SNVs
-            for contig in det_match.snv_alleles.keys():
-                # Check if this contig exists in the true haplotype (to ensure it's a valid match)
-                if contig in true_hap.snv_positions:
-                    key = (det_match.lineage_id, contig)
-                    # Only add if we haven't seen this (lineage_id, contig) pair before
-                    # or if it matches the same strain (to avoid conflicts)
-                    if key not in lineage_contig_to_strain:
-                        lineage_contig_to_strain[key] = matched_strain
-                    elif lineage_contig_to_strain[key] != matched_strain:
-                        # Conflict: same lineage_id+contig matches different strains
-                        # This can happen if a detected lineage is incorrectly linked across strains
-                        logger.debug(f"Conflict: lineage {det_match.lineage_id} on contig {contig} "
-                                   f"matches both {lineage_contig_to_strain[key]} and {matched_strain}")
-        
-        # Now build detected_lineages structure: lineage_id -> {contig -> strain_id}
-        # Include ALL detected lineages; unmatched contigs are labeled "UNMATCHED"
-        detected_lineages = {}
-        for det_hap in detected_haps:
-            if not det_hap.lineage_id:
-                continue
-            if det_hap.lineage_id not in detected_lineages:
-                detected_lineages[det_hap.lineage_id] = {}
-            for contig in det_hap.snv_alleles.keys():
-                key = (det_hap.lineage_id, contig)
-                strain_id = lineage_contig_to_strain.get(key, "UNMATCHED")
-                detected_lineages[det_hap.lineage_id][contig] = strain_id
-        
-        logger.info(f"Built detected_lineages: {len(detected_lineages)} lineages, "
-                   f"{sum(len(c) for c in detected_lineages.values())} (lineage_id, contig) pairs")
-        if not detected_lineages:
-            logger.warning("WARNING: detected_lineages is empty! This will cause zero lineage metrics.")
-            logger.warning(f"  Number of matches: {len(matches)}")
-            logger.warning(f"  Number of detected haplotypes: {len(detected_haps)}")
-            if matches:
-                sample_match = matches[0]
-                logger.warning(f"  Sample match: true_strain={sample_match[0].strain_id}, "
-                             f"det_lineage={sample_match[1].lineage_id}, "
-                             f"det_contigs={list(sample_match[1].snv_alleles.keys())}")
-        
-        # Build abundance dictionaries
-        true_abundances = {h.strain_id: h.abundances for h in true_haps}
-        detected_abundances = {h.lineage_id: h.abundances for h in detected_haps if h.lineage_id}
-        
-        logger.info(f"Running lineage validation with {len(detected_lineages)} detected lineages")
-        if detected_lineages:
-            total_contigs = sum(len(contigs) for contigs in detected_lineages.values())
-            logger.info(f"  Total (lineage_id, contig) pairs: {total_contigs}")
-            sample = list(detected_lineages.items())[0]
-            logger.info(f"  Sample: lineage {sample[0]} appears on contigs: {list(sample[1].keys())}")
-        logger.info(f"True abundances: {len(true_abundances)} strains")
-        logger.info(f"Detected abundances: {len(detected_abundances)} lineages")
-        
-        lineage_result = validate_lineages(
-            detected_lineages, truth_dir, true_abundances, detected_abundances,
-            detected_without_rescue=detected_without_rescue
-        )
-        result.lineage_precision = lineage_result.lineage_precision
-        result.lineage_recall = lineage_result.lineage_recall
-        result.lineage_f1 = lineage_result.lineage_f1
-        result.rescue_delta_recall_rare = lineage_result.rescue_delta_recall_rare
-        result.abundance_trajectory_error = lineage_result.abundance_trajectory_error
-        logger.info(f"Lineage validation complete: precision={result.lineage_precision:.3f}, "
-                   f"recall={result.lineage_recall:.3f}, f1={result.lineage_f1:.3f}")
-    except Exception as e:
-        logger.warning(f"Lineage validation failed: {e}")
-        import traceback
-        logger.debug(traceback.format_exc())
+            detected_lineages.setdefault(det_match.lineage_id, {})[contig] = true_hap.strain_id
 
-    # Generate detailed TSV output files
-    try:
-        write_lineage_details(true_haps, detected_haps, matches, output_dir)
-    except Exception as e:
-        logger.warning(f"Failed to write lineage_details.tsv: {e}")
+    n_pairs = sum(len(c) for c in detected_lineages.values())
+    logger.info(f"Built detected_lineages: {len(detected_lineages)} lineages, {n_pairs} pairs")
 
-    try:
-        write_linking_quality(detected_haps, matches, output_dir)
-    except Exception as e:
-        logger.warning(f"Failed to write linking_quality.tsv: {e}")
+    true_abundances = {h.strain_id: h.abundances for h in true_haps}
+    detected_abundances = {h.lineage_id: h.abundances for h in detected_haps if h.lineage_id}
 
-    if window_results:
-        try:
-            write_linking_diagnostics(window_results, output_dir)
-        except Exception as e:
-            logger.warning(f"Failed to write linking_diagnostics.tsv: {e}")
+    logger.info(f"Running lineage validation with {len(detected_lineages)} detected lineages")
+    if detected_lineages:
+        total_contigs = sum(len(contigs) for contigs in detected_lineages.values())
+        logger.info(f"  Total (lineage_id, contig) pairs: {total_contigs}")
+        sample = list(detected_lineages.items())[0]
+        logger.info(f"  Sample: lineage {sample[0]} appears on contigs: {list(sample[1].keys())}")
+    logger.info(f"True abundances: {len(true_abundances)} strains")
+    logger.info(f"Detected abundances: {len(detected_abundances)} lineages")
 
-    if window_results:
-        try:
-            write_em_convergence(window_results, output_dir)
-        except Exception as e:
-            logger.warning(f"Failed to write em_convergence.tsv: {e}")
+    lineage_result = validate_lineages(
+        detected_lineages, truth_dir, true_abundances, detected_abundances,
+        detected_without_rescue=detected_without_rescue
+    )
+    result.lineage_precision = lineage_result.lineage_precision
+    result.lineage_recall = lineage_result.lineage_recall
+    result.lineage_f1 = lineage_result.lineage_f1
+    result.rescue_delta_recall_rare = lineage_result.rescue_delta_recall_rare
+    result.abundance_trajectory_error = lineage_result.abundance_trajectory_error
+    logger.info(f"Lineage validation complete: precision={result.lineage_precision:.3f}, "
+                f"recall={result.lineage_recall:.3f}, f1={result.lineage_f1:.3f}")
 
-        # NOTE: rescue_statistics.tsv is written by parameter_sweep.py
-        # via rescue_integrator.write_rescue_statistics() which has access
-        # to the LongitudinalIntegrator's rescue statistics.
-        # We skip writing here to avoid creating an empty file that would
-        # overwrite or confuse the actual rescue statistics.
 
-    if window_results:
-        try:
-            (pooled_recall, total_inf, total_det, by_tp, by_contig, missed_windows) = (
-                compute_window_recall_metrics(true_haps, window_results)
-            )
-            result.window_recall = pooled_recall
-            result.window_informative_total = total_inf
-            result.window_detected_total = total_det
-            result.window_recall_by_timepoint = by_tp
-            result.window_recall_by_contig = by_contig
-            write_missed_windows_report(missed_windows, output_dir)
-            # Redefine false negatives as missed informative windows
-            result.false_negatives = [
-                f"{w['sample']}|{w['contig']}:{w['window_start']}-{w['window_end']}"
-                for w in missed_windows
-            ]
-            # Redefine recall to window-level recall and recompute F1 accordingly.
-            result.recall = result.window_recall
-            if (result.precision + result.recall) > 0:
-                result.f1 = 2 * result.precision * result.recall / (result.precision + result.recall)
-        except Exception as e:
-            logger.warning(f"Failed to compute window-level recall: {e}")
-
-    try:
-        write_validation_summary(result, true_haps, detected_haps, matches, output_dir, window_results)
-    except Exception as e:
-        logger.warning(f"Failed to write validation_summary.txt: {e}")
-
-    try:
-        write_low_abundance_report(result, true_haps, detected_haps, output_dir, window_results)
-    except Exception as e:
-        logger.warning(f"Failed to write low_abundance.txt: {e}")
-
-    if window_results:
-        try:
-            write_false_positive_reads(result, window_results, output_dir)
-        except Exception as e:
-            logger.warning(f"Failed to write false_positive_reads.tsv: {e}")
-
-    # Save metrics
+def _write_validation_reports(
+    *,
+    result: ValidationResult,
+    detected_haps: List[DetectedHaplotype],
+    true_haps: List[TrueHaplotype],
+    output_dir: str,
+) -> None:
     metrics_file = os.path.join(output_dir, 'validation_metrics.json')
     with open(metrics_file, 'w') as f:
         json.dump({
@@ -2082,83 +2569,83 @@ def run_validation(
             'snv_correct_total': result.snv_correct_total,
             'snv_span_coverage_frac': result.snv_span_coverage_frac,
             'detection_threshold': result.detection_threshold,
-            # Track/linking metrics
             'track_fragmentation_mean': result.track_fragmentation_mean,
             'track_fragmentation_median': result.track_fragmentation_median,
             'false_link_rate': result.false_link_rate,
             'missed_link_rate': result.missed_link_rate,
             'track_consensus_error': result.track_consensus_error,
-            # Lineage metrics
             'lineage_precision': result.lineage_precision,
             'lineage_recall': result.lineage_recall,
             'lineage_f1': result.lineage_f1,
             'rescue_delta_recall_rare': result.rescue_delta_recall_rare,
             'abundance_trajectory_error': result.abundance_trajectory_error,
-            # Window-level recall
             'window_recall': result.window_recall,
             'window_informative_total': result.window_informative_total,
             'window_detected_total': result.window_detected_total,
             'window_recall_by_timepoint': result.window_recall_by_timepoint,
             'window_recall_by_contig': result.window_recall_by_contig,
-            # Detailed diagnostics
             'false_negatives': result.false_negatives,
             'false_positives': result.false_positives,
             'per_contig_metrics': result.per_contig_metrics,
             'per_timepoint_metrics': result.per_timepoint_metrics,
         }, f, indent=2)
-    
-    # Generate detailed text report
+
     report_file = os.path.join(output_dir, 'detailed_report.txt')
     with open(report_file, 'w') as f:
-        f.write("=" * 80 + "\n")
-        f.write("DETAILED VALIDATION REPORT\n")
-        f.write("=" * 80 + "\n\n")
-        
-        # Summary metrics
-        f.write("SUMMARY METRICS\n")
-        f.write("-" * 80 + "\n")
+        lines = []
+        def add(line: str = "") -> None:
+            lines.append(line)
+
+        add("=" * 80)
+        add("DETAILED VALIDATION REPORT")
+        add("=" * 80)
+        add("")
+        add("SUMMARY METRICS")
+        add("-" * 80)
         n_contigs = len(result.per_contig_metrics) if result.per_contig_metrics else 1
         all_timepoints_list = sorted(result.per_timepoint_metrics.keys()) if result.per_timepoint_metrics else []
         n_timepoints = len(all_timepoints_list)
         total_contig_timepoint_pairs = n_contigs * n_timepoints if n_timepoints > 0 else n_contigs
-        
-        # Compute matched IDs from result.matches (tuples of (true_id, detected_id, distance))
-        matched_true_ids = {m[0] for m in result.matches} if result.matches else set()
-        matched_detected_ids = {m[1] for m in result.matches} if result.matches else set()
 
-        f.write(f"True strains (per genome):     {result.n_true}\n")
-        f.write(f"Contigs evaluated:            {n_contigs}\n")
-        f.write(f"Timepoints evaluated:         {n_timepoints}\n")
-        f.write(f"Total contig-timepoint pairs: {total_contig_timepoint_pairs}\n")
-        f.write(f"Detected lineages (total):    {result.n_detected}\n")
-        f.write(f"Matched lineages:             {result.n_matched}\n")
-        f.write(f"Matched true strains:         {len(matched_true_ids)}\n")
-        f.write(f"Matched detected lineages:    {len(matched_detected_ids)}\n")
-        f.write("\n(Note: Strainphase splits lineages per-contig, so one strain can produce multiple detected lineages per contig)\n")
-        f.write(f"Precision:           {result.precision:.3f}\n")
-        f.write(f"Recall:              {result.recall:.3f}  (window-level when available)\n")
-        f.write(f"F1 Score:            {result.f1:.3f}\n")
-        f.write(f"Window Recall:       {result.window_recall:.3f}\n")
-        f.write(f"Abundance Pearson r: {result.abundance_pearson_r:.3f}\n")
-        f.write(f"Abundance MAE:       {result.abundance_mae:.3f}\n")
-        f.write(f"SNV Precision:       {result.snv_precision:.3f}\n")
-        f.write(f"SNV Recall:          {result.snv_recall:.3f}\n")
-        f.write(f"Detection Threshold: {result.detection_threshold:.4f}\n")
-        f.write("\n")
-        
-        # False negatives
-        f.write("FALSE NEGATIVES (Informative windows not detected)\n")
-        f.write("-" * 80 + "\n")
+        matched_true_ids = set()
+        matched_detected_ids = set()
+        if result.matches:
+            for true_ids_csv, detected_id, _ in result.matches:
+                matched_detected_ids.add(detected_id)
+                for true_id in true_ids_csv.split(","):
+                    if true_id:
+                        matched_true_ids.add(true_id)
+
+        add(f"True strains (per genome):     {result.n_true}")
+        add(f"Contigs evaluated:            {n_contigs}")
+        add(f"Timepoints evaluated:         {n_timepoints}")
+        add(f"Total contig-timepoint pairs: {total_contig_timepoint_pairs}")
+        add(f"Detected lineages (total):    {result.n_detected}")
+        add(f"Matched lineages:             {result.n_matched}")
+        add(f"Matched true strains:         {len(matched_true_ids)}")
+        add(f"Matched detected lineages:    {len(matched_detected_ids)}")
+        add("")
+        add("(Note: Strainphase splits lineages per-contig, so one strain can produce multiple detected lineages per contig)")
+        add(f"Precision:           {result.precision:.3f}")
+        add(f"Recall:              {result.recall:.3f}  (window-level when available)")
+        add(f"F1 Score:            {result.f1:.3f}")
+        add(f"Window Recall:       {result.window_recall:.3f}")
+        add(f"Abundance Pearson r: {result.abundance_pearson_r:.3f}")
+        add(f"Abundance MAE:       {result.abundance_mae:.3f}")
+        add(f"SNV Precision:       {result.snv_precision:.3f}")
+        add(f"SNV Recall:          {result.snv_recall:.3f}")
+        add(f"Detection Threshold: {result.detection_threshold:.4f}")
+        add("")
+        add("FALSE NEGATIVES (Informative windows not detected)")
+        add("-" * 80)
         if result.false_negatives:
             for fn_id in result.false_negatives:
-                f.write(f"  {fn_id}\n")
+                add(f"  {fn_id}")
         else:
-            f.write("  None\n")
-        f.write("\n")
-        
-        # False positives with diagnostic information
-        f.write("FALSE POSITIVES (Detected lineages not matching truth)\n")
-        f.write("-" * 80 + "\n")
+            add("  None")
+        add("")
+        add("FALSE POSITIVES (Detected lineages not matching truth)")
+        add("-" * 80)
         if result.false_positives:
             for fp_id in result.false_positives:
                 fp_hap = next((h for h in detected_haps if h.lineage_id == fp_id), None)
@@ -2166,16 +2653,12 @@ def run_validation(
                     max_abund = max(fp_hap.abundances.values()) if fp_hap.abundances else 0
                     n_snvs = sum(len(snvs) for snvs in fp_hap.snv_alleles.values())
                     contigs = list(fp_hap.snv_alleles.keys())
-                    f.write(f"\n  {fp_id}: max_abundance={max_abund:.4f}, n_snvs={n_snvs}, contigs={contigs}\n")
-                    
-                    # Show why it doesn't match each true strain
-                    f.write(f"    Why it doesn't match:\n")
+                    add("")
+                    add(f"  {fp_id}: max_abundance={max_abund:.4f}, n_snvs={n_snvs}, contigs={contigs}")
+                    add("    Why it doesn't match:")
                     for true_hap in true_haps:
                         dist, n_matches, n_shared, match_fraction = compute_haplotype_distance(true_hap, fp_hap)
                         n_mismatches = n_shared - n_matches
-                        common_tps = set(true_hap.abundances.keys()) & set(fp_hap.abundances.keys())
-                        abundance_ok = _abundance_within_factor(true_hap, fp_hap, factor=2.0) if common_tps else False
-                        
                         reasons = []
                         if n_shared < 3:
                             reasons.append(f"too few shared SNVs ({n_shared} < 3)")
@@ -2183,83 +2666,78 @@ def run_validation(
                             reasons.append(f"low match fraction ({match_fraction:.3f} < 0.9)")
                         if dist > 0.1:
                             reasons.append(f"distance too high ({dist:.3f} > 0.1)")
-                        if not abundance_ok:
-                            true_abund = true_hap.abundances.get(list(common_tps)[0] if common_tps else '', 0)
-                            det_abund = fp_hap.abundances.get(list(common_tps)[0] if common_tps else '', 0)
-                            reasons.append(f"abundance mismatch (true={true_abund:.3f}, det={det_abund:.3f}, not within 2x)")
-                        
-                        f.write(f"      vs {true_hap.strain_id}: ")
+
+                        line = f"      vs {true_hap.strain_id}: "
                         if reasons:
-                            f.write("; ".join(reasons))
-                            f.write(f"; distance={dist:.3f}, shared={n_shared}, matches={n_matches}, mismatches={n_mismatches}")
+                            line += "; ".join(reasons)
+                            line += f"; distance={dist:.3f}, shared={n_shared}, matches={n_matches}, mismatches={n_mismatches}"
                         else:
-                            f.write(f"distance={dist:.3f}, shared={n_shared}, matches={n_matches}, mismatches={n_mismatches}, "
-                                  f"match_frac={match_fraction:.3f}, abund_ok={abundance_ok}")
-                        f.write("\n")
+                            line += (f"distance={dist:.3f}, shared={n_shared}, matches={n_matches}, "
+                                     f"mismatches={n_mismatches}, match_frac={match_fraction:.3f}")
+                        add(line)
         else:
-            f.write("  None\n")
-        f.write("\n")
-        
-        # Detailed matches
-        f.write("DETAILED MATCH INFORMATION\n")
-        f.write("-" * 80 + "\n")
+            add("  None")
+        add("")
+        add("DETAILED MATCH INFORMATION")
+        add("-" * 80)
         for match in result.match_details_full:
-            f.write(f"\nTrue Strain: {match['true_strain_id']}\n")
-            f.write(f"  → Detected Lineage: {match['detected_lineage_id']}\n")
-            f.write(f"  Distance: {match['distance']:.4f}\n")
-            f.write(f"  SNVs: true={match['n_true_snvs']}, detected={match['n_detected_snvs']}, "
-                   f"shared={match['n_shared_snvs']}, matching={match['n_matching_snvs']}\n")
-            f.write(f"  SNV Match Fraction: {match['snv_match_fraction']:.3f}\n")
-            if match['abundance_mae'] is not None:
-                f.write(f"  Abundance MAE: {match['abundance_mae']:.4f}\n")
-            f.write(f"  Timepoints: {', '.join(match['common_timepoints'])}\n")
-            if match['true_abundances']:
-                f.write(f"  True abundances: {match['true_abundances']}\n")
-                f.write(f"  Detected abundances: {match['detected_abundances']}\n")
-            f.write(f"  Is sweeping: {match['is_sweeping']}\n")
-        f.write("\n")
-        
-        # Per-contig breakdown
-        f.write("PER-CONTIG METRICS\n")
-        f.write("-" * 80 + "\n")
+            add("")
+            add(f"True Strain: {match['true_strain_id']}")
+            add(f"  → Detected Lineage: {match['detected_lineage_id']}")
+            add(f"  Distance: {match['distance']:.4f}")
+            add(f"  SNVs: true={match['n_true_snvs']}, detected={match['n_detected_snvs']}, "
+                f"shared={match['n_shared_snvs']}, matching={match['n_matching_snvs']}")
+            add(f"  SNV Match Fraction: {match['snv_match_fraction']:.3f}")
+            if match['grouped_abundance_mae'] is not None:
+                add(f"  Grouped Abundance MAE: {match['grouped_abundance_mae']:.4f}")
+            add(f"  Timepoints: {', '.join(match['common_timepoints'])}")
+            if match['grouped_true_abundances']:
+                add(f"  Grouped true abundances: {match['grouped_true_abundances']}")
+                add(f"  Detected abundances: {match['detected_abundances']}")
+            add(f"  Is sweeping: {match['is_sweeping']}")
+        add("")
+        add("PER-CONTIG METRICS")
+        add("-" * 80)
         for contig, metrics in sorted(result.per_contig_metrics.items()):
-            f.write(f"{contig}:\n")
-            f.write(f"  True: {metrics['n_true']}, Detected: {metrics['n_detected']}, "
-                   f"Matched: {metrics['n_matched']}\n")
-            f.write(f"  Precision: {metrics['precision']:.3f}, "
-                   f"Recall: {metrics['recall']:.3f}\n")
-        f.write("\n")
-        
-        # Per-timepoint breakdown
-        f.write("PER-TIMEPOINT METRICS\n")
-        f.write("-" * 80 + "\n")
+            add(f"{contig}:")
+            add(f"  True: {metrics['n_true']}, Detected: {metrics['n_detected']}, "
+                f"Matched: {metrics['n_matched']}")
+            add(f"  Precision: {metrics['precision']:.3f}, "
+                f"Recall: {metrics['recall']:.3f}")
+        add("")
+        add("PER-TIMEPOINT METRICS")
+        add("-" * 80)
         for tp, metrics in sorted(result.per_timepoint_metrics.items()):
-            f.write(f"{tp}:\n")
-            f.write(f"  True: {metrics['n_true']}, Detected: {metrics['n_detected']}, "
-                   f"Matched: {metrics['n_matched']}\n")
-            f.write(f"  Precision: {metrics['precision']:.3f}, "
-                   f"Recall: {metrics['recall']:.3f}\n")
+            add(f"{tp}:")
+            add(f"  True: {metrics['n_true']}, Detected: {metrics['n_detected']}, "
+                f"Matched: {metrics['n_matched']}")
+            add(f"  Precision: {metrics['precision']:.3f}, "
+                f"Recall: {metrics['recall']:.3f}")
             if metrics['abundance_pearson_r'] is not None:
-                f.write(f"  Abundance r: {metrics['abundance_pearson_r']:.3f}, "
-                       f"MAE: {metrics['abundance_mae']:.4f}\n")
-        f.write("\n")
-        
-        f.write("=" * 80 + "\n")
-    
-    # Print summary
-    print("\n" + "=" * 60)
+                add(f"  Abundance r: {metrics['abundance_pearson_r']:.3f}, "
+                    f"MAE: {metrics['abundance_mae']:.4f}")
+        add("")
+        add("=" * 80)
+        f.write("\n".join(lines) + "\n")
+
+    print("")
+    print("=" * 60)
     print("VALIDATION RESULTS")
     print("=" * 60)
-    
-    # Summary with explicit denominators
+
     n_contigs = len(result.per_contig_metrics) if result.per_contig_metrics else 1
     all_timepoints_list = sorted(result.per_timepoint_metrics.keys()) if result.per_timepoint_metrics else []
     n_timepoints = len(all_timepoints_list)
     total_contig_timepoint_pairs = n_contigs * n_timepoints if n_timepoints > 0 else n_contigs
-    
-    # Compute matched IDs from result.matches (tuples of (true_id, detected_id, distance))
-    matched_true_ids = {m[0] for m in result.matches} if result.matches else set()
-    matched_detected_ids = {m[1] for m in result.matches} if result.matches else set()
+
+    matched_true_ids = set()
+    matched_detected_ids = set()
+    if result.matches:
+        for true_ids_csv, detected_id, _ in result.matches:
+            matched_detected_ids.add(detected_id)
+            for true_id in true_ids_csv.split(","):
+                if true_id:
+                    matched_true_ids.add(true_id)
 
     print(f"True strains (per genome):     {result.n_true}")
     print(f"Contigs evaluated:            {n_contigs}")
@@ -2270,31 +2748,27 @@ def run_validation(
     print(f"Matched true strains:         {len(matched_true_ids)}")
     print(f"Matched detected lineages:    {len(matched_detected_ids)}")
     print("-" * 60)
-    
-    # Unified breakdown: timepoint → contig
+
     if result.per_timepoint_metrics and result.per_contig_metrics:
-        print("\nBREAKDOWN BY TIMEPOINT → CONTIG:")
+        print("")
+        print("BREAKDOWN BY TIMEPOINT → CONTIG:")
         print("-" * 60)
         for tp in sorted(result.per_timepoint_metrics.keys()):
             tp_metrics = result.per_timepoint_metrics[tp]
-            print(f"\n{tp}:")
+            print("")
+            print(f"{tp}:")
             print(f"  Overall: {tp_metrics['n_true']} true, {tp_metrics['n_detected']} detected, "
                   f"{tp_metrics['n_matched_true']} matched true, {tp_metrics['n_matched_detected']} matched detected")
             print(f"  Precision: {tp_metrics['precision']:.3f}, Recall: {tp_metrics['recall']:.3f}")
-            
-            # Show per-contig breakdown for this timepoint
-            print(f"  Per-contig:")
+            print("  Per-contig:")
             for contig, contig_metrics in sorted(result.per_contig_metrics.items()):
                 contig_short = contig.split('.')[-1] if '.' in contig else contig
-                # Check if this contig has data for this timepoint
-                # (we can't easily check per-contig-per-timepoint, so show all contigs)
                 print(f"    {contig_short}: {contig_metrics['n_true']} true, "
                       f"{contig_metrics['n_detected']} detected, "
                       f"{contig_metrics['n_matched_true']} matched true")
-    
-    # Fallback: if no timepoint metrics, show contig breakdown
     elif result.per_contig_metrics:
-        print("\nBREAKDOWN BY CONTIG:")
+        print("")
+        print("BREAKDOWN BY CONTIG:")
         print("-" * 60)
         for contig, metrics in sorted(result.per_contig_metrics.items()):
             contig_short = contig.split('.')[-1] if '.' in contig else contig
@@ -2304,28 +2778,31 @@ def run_validation(
             print(f"  Matched true:      {metrics['n_matched_true']}")
             print(f"  Matched detected:  {metrics['n_matched_detected']}")
             print(f"  Precision:         {metrics['precision']:.3f}, Recall: {metrics['recall']:.3f}")
-    
-    print("\nOVERALL METRICS:")
+
+    print("")
+    print("OVERALL METRICS:")
     print("-" * 60)
     print(f"Precision:           {result.precision:.3f}")
     print(f"Recall:              {result.recall:.3f}")
     print(f"F1 Score:            {result.f1:.3f}")
     print("-" * 60)
-    print(f"\nABUNDANCE METRICS:")
+    print("")
+    print("ABUNDANCE METRICS:")
     print("-" * 60)
     print(f"Abundance Pearson r: {result.abundance_pearson_r:.3f}")
     print(f"Abundance MAE:       {result.abundance_mae:.3f}")
-    print(f"\nSNV METRICS:")
+    print("")
+    print("SNV METRICS:")
     print("-" * 60)
     print(f"SNV Precision:       {result.snv_precision:.3f}")
     print(f"SNV Recall:          {result.snv_recall:.3f}")
     print(f"Phasing Accuracy:    {result.phasing_accuracy:.3f}")
     print(f"Detection Threshold: {result.detection_threshold:.4f}")
     print("=" * 60)
-    
-    # Print error breakdown with diagnostics
+
     if result.false_negatives or result.false_positives:
-        print("\nERROR BREAKDOWN:")
+        print("")
+        print("ERROR BREAKDOWN:")
         print("-" * 60)
         if result.false_negatives:
             print(f"False Negatives ({len(result.false_negatives)} missing):")
@@ -2342,14 +2819,12 @@ def run_validation(
                     n_snvs = sum(len(snvs) for snvs in fp_hap.snv_alleles.values())
                     contigs = list(fp_hap.snv_alleles.keys())
                     print(f"  - {fp_id}: abund={max_abund:.3f}, snvs={n_snvs}, contigs={len(contigs)}")
-                    
-                    # Show closest match with detailed SNV breakdown
                     best_dist = 1.0
                     best_strain = None
                     best_n_matches = 0
                     best_n_shared = 0
                     for true_hap in true_haps:
-                        dist, n_matches, n_shared, match_fraction = compute_haplotype_distance(true_hap, fp_hap)
+                        dist, n_matches, n_shared, _ = compute_haplotype_distance(true_hap, fp_hap)
                         if dist < best_dist:
                             best_dist = dist
                             best_strain = true_hap.strain_id
@@ -2359,16 +2834,66 @@ def run_validation(
                         n_mismatches = best_n_shared - best_n_matches
                         print(f"    Closest to {best_strain}: distance={best_dist:.3f}, "
                               f"shared_snvs={best_n_shared}, matches={best_n_matches}, mismatches={n_mismatches}")
-            if len(result.false_positives) > 5:
-                print(f"  ... and {len(result.false_positives) - 5} more")
-        print("-" * 60)
-    
-    print(f"\nResults saved to: {output_dir}")
-    print(f"  - Metrics: {metrics_file}")
-    print(f"  - Detailed report: {report_file}")
-    print(f"  - Figures: {output_dir}/*.png")
 
-    return result
+
+def _write_validation_outputs(
+    *,
+    result: ValidationResult,
+    true_haps: List[TrueHaplotype],
+    detected_haps: List[DetectedHaplotype],
+    matches: List[Tuple[TrueHaplotype, DetectedHaplotype, float]],
+    window_results: List,
+    missed_windows: List[Dict[str, Any]],
+    output_dir: str,
+) -> None:
+    """Write validation TSV/text outputs."""
+    # Generate detailed TSV output files
+    try:
+        write_lineage_details(true_haps, detected_haps, matches, output_dir)
+    except Exception as e:
+        logger.warning(f"Failed to write lineage_details.tsv: {e}")
+
+    try:
+        write_linking_quality(detected_haps, matches, output_dir)
+    except Exception as e:
+        logger.warning(f"Failed to write linking_quality.tsv: {e}")
+
+    try:
+        write_linking_diagnostics(window_results, output_dir)
+    except Exception as e:
+        logger.warning(f"Failed to write linking_diagnostics.tsv: {e}")
+
+    try:
+        write_em_convergence(window_results, output_dir)
+    except Exception as e:
+        logger.warning(f"Failed to write em_convergence.tsv: {e}")
+
+    # NOTE: rescue_statistics.tsv is written by parameter_sweep.py
+    # via rescue_integrator.write_rescue_statistics() which has access
+    # to the LongitudinalIntegrator's rescue statistics.
+    # We skip writing here to avoid creating an empty file that would
+    # overwrite or confuse the actual rescue statistics.
+
+    if missed_windows:
+        try:
+            write_missed_windows_report(missed_windows, output_dir)
+        except Exception as e:
+            logger.warning(f"Failed to write missed_windows.txt: {e}")
+
+    try:
+        write_validation_summary(result, true_haps, detected_haps, matches, output_dir, window_results)
+    except Exception as e:
+        logger.warning(f"Failed to write validation_summary.txt: {e}")
+
+    try:
+        write_low_abundance_report(result, true_haps, detected_haps, output_dir, window_results)
+    except Exception as e:
+        logger.warning(f"Failed to write low_abundance.txt: {e}")
+
+    try:
+        write_false_positive_reads(result, window_results, output_dir)
+    except Exception as e:
+        logger.warning(f"Failed to write false_positive_reads.tsv: {e}")
 
 
 # =============================================================================
