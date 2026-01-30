@@ -250,6 +250,9 @@ def process_mag_longitudinal(
     # This allows downstream code to access and write rescue statistics
     if integrator:
         config._rescue_integrator = integrator
+        logging.info(f"  Stored rescue integrator on config: {len(integrator.rescue_statistics)} statistics records")
+    else:
+        logging.info(f"  No rescue integrator to store (len(samples)={len(samples)})")
 
     return all_results
 
