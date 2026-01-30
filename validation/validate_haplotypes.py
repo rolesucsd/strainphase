@@ -61,6 +61,7 @@ class TrueHaplotype:
     snv_positions: Dict[str, Dict[int, str]]  # contig -> {pos -> allele}
     abundances: Dict[str, float]  # timepoint -> abundance
     is_sweeping: bool = False
+    snv_count: int = 0
 
 
 @dataclass
@@ -302,7 +303,8 @@ def load_ground_truth(truth_dir: str) -> Tuple[List[TrueHaplotype], Dict[str, Li
             strain_id=strain_id,
             snv_positions=dict(strain_snvs.get(strain_id, {})),
             abundances=dict(strain_abundances.get(strain_id, {})),
-            is_sweeping=info['is_sweeping']
+            is_sweeping=info['is_sweeping'],
+            snv_count=info.get('snv_count', 0),
         )
         haplotypes.append(hap)
 
@@ -644,7 +646,17 @@ def _build_match_details_full(
         # Count SNVs for true and detected haplotypes.
         n_shared_snvs = 0
         n_matching_snvs = 0
-        n_true_snvs = sum(len(snvs) for snvs in true_hap.snv_positions.values())
+        # True SNVs are counted only within the detected haplotype's span per contig.
+        n_true_snvs = 0
+        for contig, det_snvs in det_hap.snv_alleles.items():
+            if not det_snvs:
+                continue
+            min_pos = min(det_snvs.keys())
+            max_pos = max(det_snvs.keys())
+            true_snvs = true_hap.snv_positions.get(contig, {})
+            for pos in true_snvs.keys():
+                if min_pos <= pos <= max_pos:
+                    n_true_snvs += 1
         n_detected_snvs = sum(len(snvs) for snvs in det_hap.snv_alleles.values())
 
         # Compare alleles only at positions called by the detected haplotype.
@@ -904,6 +916,15 @@ def compute_window_metrics(
     detected_haps = window_result.haplotypes
     n_detected = len(detected_haps)
 
+    # SNV recall: fraction of true SNVs in the window covered by any haplotype.
+    # Coverage is defined as having a consensus call at that position.
+    covered_true_positions = set()
+    for hap in detected_haps:
+        for pos in hap.consensus.keys():
+            if pos in window_positions:
+                covered_true_positions.add(pos)
+    snv_recall = len(covered_true_positions) / len(window_positions) if window_positions else 0.0
+
     # Match detected haplotypes to strain groups
     matches, unmatched_group_indices, unmatched_hap_indices = _match_window_haplotypes(
         detected_haps, strain_groups, window_positions
@@ -954,12 +975,8 @@ def compute_window_metrics(
             if pos in hap.consensus:
                 n_snv_detected += 1
 
-    # SNV precision/recall
+    # SNV precision uses correctness; SNV recall uses coverage of true SNVs.
     snv_precision = n_snv_correct / n_snv_detected if n_snv_detected > 0 else 0.0
-    # SNV recall: correct SNVs / total true SNV positions across matched groups
-    # Expected = (window SNV positions) * (number of matched groups)
-    expected_snv_count = len(window_positions) * n_matched if n_matched > 0 else len(window_positions)
-    snv_recall = n_snv_correct / expected_snv_count if expected_snv_count > 0 else 0.0
 
     # Compute abundance pairs (true_group_abundance, detected_weight)
     abundance_pairs = []
@@ -1297,7 +1314,7 @@ def write_lineage_details(
     detected_haps: List[DetectedHaplotype],
     matches: List[Tuple[TrueHaplotype, DetectedHaplotype, float]],
     output_dir: str
-) -> str:
+) -> Tuple[str, Dict[str, Dict[str, Any]]]:
     """
     Write lineage_details.tsv - per-lineage raw data table.
 
@@ -1307,7 +1324,6 @@ def write_lineage_details(
     import csv
 
     output_path = os.path.join(output_dir, 'lineage_details.tsv')
-    summary_path = os.path.join(output_dir, 'lineage_summary_by_track.tsv')
 
     # Build match lookup: detected_lineage_id -> (true_hap, distance)
     match_lookup = {}
@@ -1446,47 +1462,8 @@ def write_lineage_details(
                 'abundance_diff', 'track_id'
             ]) + '\n')
 
-    # Write per-track summary
-    summary_records = []
-    for track_id, summary in summary_by_track.items():
-        n_records = summary['n_records']
-        if n_records == 0:
-            continue
-        summary_records.append({
-            'track_id': track_id,
-            'matched_strain': summary['matched_strain'],
-            'lineage_ids': ",".join(sorted(summary['lineage_ids'])),
-            'n_lineages': len(summary['lineage_ids']),
-            'n_contigs': len(summary['contigs']),
-            'n_timepoints': len(summary['timepoints']),
-            'n_records': n_records,
-            'n_snvs_detected_total': summary['n_snvs_detected_total'],
-            'n_snvs_true_total': summary['n_snvs_true_total'],
-            'n_shared_snvs_total': summary['n_shared_snvs_total'],
-            'n_matching_snvs_total': summary['n_matching_snvs_total'],
-            'n_different_snvs_total': summary['n_different_snvs_total'],
-            'snv_distance_mean': summary['snv_distance_sum'] / n_records,
-            'abundance_diff_mean': summary['abundance_diff_sum'] / n_records,
-            'detected_abundance_mean': summary['detected_abundance_sum'] / n_records,
-            'true_abundance_mean': summary['true_abundance_sum'] / n_records,
-        })
-
-    summary_fieldnames = [
-        'track_id', 'matched_strain', 'lineage_ids', 'n_lineages',
-        'n_contigs', 'n_timepoints', 'n_records',
-        'n_snvs_detected_total', 'n_snvs_true_total', 'n_shared_snvs_total',
-        'n_matching_snvs_total', 'n_different_snvs_total',
-        'snv_distance_mean', 'abundance_diff_mean',
-        'detected_abundance_mean', 'true_abundance_mean',
-    ]
-    with open(summary_path, 'w', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=summary_fieldnames, delimiter='\t')
-        writer.writeheader()
-        writer.writerows(summary_records)
-
     logger.info(f"Wrote {len(records)} lineage detail records to {output_path}")
-    logger.info(f"Wrote {len(summary_records)} track summaries to {summary_path}")
-    return output_path
+    return output_path, summary_by_track
 
 
 def write_em_convergence(
@@ -1572,13 +1549,14 @@ def write_em_convergence(
 def write_linking_quality(
     detected_haps: List[DetectedHaplotype],
     matches: List[Tuple[TrueHaplotype, DetectedHaplotype, float]],
+    track_summaries: Optional[Dict[str, Dict[str, Any]]],
     output_dir: str
 ) -> str:
     """
-    Write linking_quality.tsv - cross-timepoint linking analysis.
+    Write linking_quality.tsv - cross-timepoint linking analysis with per-lineage summary.
 
-    Analyzes how tracks/lineages link across timepoints and their
-    consistency.
+    Combines linking consistency metrics with aggregated per-track SNV/abundance
+    summaries (collapsed to lineage_id).
     """
     import csv
 
@@ -1597,6 +1575,49 @@ def write_linking_quality(
     for true_hap, det_hap, dist in matches:
         if det_hap.lineage_id:
             match_lookup[det_hap.lineage_id] = true_hap.strain_id
+
+    # Aggregate per-track summaries to lineage-level if provided.
+    summary_by_lineage: Dict[str, Dict[str, Any]] = {}
+    if track_summaries:
+        for track_id, summary in track_summaries.items():
+            lineage_ids = summary.get('lineage_ids', set())
+            if not lineage_ids:
+                continue
+            for lineage_id in lineage_ids:
+                agg = summary_by_lineage.get(lineage_id)
+                if agg is None:
+                    agg = {
+                        'n_tracks': 0,
+                        'n_records': 0,
+                        'n_snvs_detected_total': 0,
+                        'n_snvs_true_total': 0,
+                        'n_shared_snvs_total': 0,
+                        'n_matching_snvs_total': 0,
+                        'n_different_snvs_total': 0,
+                        'snv_distance_sum': 0.0,
+                        'abundance_diff_sum': 0.0,
+                        'detected_abundance_sum': 0.0,
+                        'true_abundance_sum': 0.0,
+                        'track_ids': set(),
+                        'contigs': set(),
+                        'timepoints': set(),
+                    }
+                    summary_by_lineage[lineage_id] = agg
+
+                agg['n_tracks'] += 1
+                agg['n_records'] += summary['n_records']
+                agg['n_snvs_detected_total'] += summary['n_snvs_detected_total']
+                agg['n_snvs_true_total'] += summary['n_snvs_true_total']
+                agg['n_shared_snvs_total'] += summary['n_shared_snvs_total']
+                agg['n_matching_snvs_total'] += summary['n_matching_snvs_total']
+                agg['n_different_snvs_total'] += summary['n_different_snvs_total']
+                agg['snv_distance_sum'] += summary['snv_distance_sum']
+                agg['abundance_diff_sum'] += summary['abundance_diff_sum']
+                agg['detected_abundance_sum'] += summary['detected_abundance_sum']
+                agg['true_abundance_sum'] += summary['true_abundance_sum']
+                agg['track_ids'].add(track_id)
+                agg['contigs'].update(summary.get('contigs', set()))
+                agg['timepoints'].update(summary.get('timepoints', set()))
 
     for lineage_id, group in lineage_groups.items():
         # Collect all timepoints and track_ids for this lineage
@@ -1636,6 +1657,8 @@ def write_linking_quality(
         # For now, we use 0 since we don't have track-level distance info here
         # This would require access to consensus sequences
 
+        summary = summary_by_lineage.get(lineage_id)
+        n_records = summary['n_records'] if summary else 0
         records.append({
             'lineage_id': lineage_id,
             'n_timepoints': n_timepoints,
@@ -1647,6 +1670,24 @@ def write_linking_quality(
             'timepoints': ','.join(sorted_tps),
             'abundance_trajectory': ','.join(f"{a:.4f}" for a in abundance_trajectory),
             'trajectory_smoothness': f"{trajectory_smoothness:.6f}",
+            'n_records': n_records,
+            'n_snvs_detected_total': summary['n_snvs_detected_total'] if summary else 0,
+            'n_snvs_true_total': summary['n_snvs_true_total'] if summary else 0,
+            'n_shared_snvs_total': summary['n_shared_snvs_total'] if summary else 0,
+            'n_matching_snvs_total': summary['n_matching_snvs_total'] if summary else 0,
+            'n_different_snvs_total': summary['n_different_snvs_total'] if summary else 0,
+            'snv_distance_mean': (
+                summary['snv_distance_sum'] / n_records if summary and n_records > 0 else 0.0
+            ),
+            'abundance_diff_mean': (
+                summary['abundance_diff_sum'] / n_records if summary and n_records > 0 else 0.0
+            ),
+            'detected_abundance_mean': (
+                summary['detected_abundance_sum'] / n_records if summary and n_records > 0 else 0.0
+            ),
+            'true_abundance_mean': (
+                summary['true_abundance_sum'] / n_records if summary and n_records > 0 else 0.0
+            ),
         })
 
     # Write TSV
@@ -1654,7 +1695,11 @@ def write_linking_quality(
         fieldnames = [
             'lineage_id', 'n_timepoints', 'n_tracks', 'linking_consistent',
             'min_track_distance', 'max_track_distance', 'track_ids',
-            'timepoints', 'abundance_trajectory', 'trajectory_smoothness'
+            'timepoints', 'abundance_trajectory', 'trajectory_smoothness',
+            'n_records', 'n_snvs_detected_total', 'n_snvs_true_total',
+            'n_shared_snvs_total', 'n_matching_snvs_total', 'n_different_snvs_total',
+            'snv_distance_mean', 'abundance_diff_mean',
+            'detected_abundance_mean', 'true_abundance_mean',
         ]
         with open(output_path, 'w', newline='') as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames, delimiter='\t')
@@ -1666,7 +1711,11 @@ def write_linking_quality(
             f.write('\t'.join([
                 'lineage_id', 'n_timepoints', 'n_tracks', 'linking_consistent',
                 'min_track_distance', 'max_track_distance', 'track_ids',
-                'timepoints', 'abundance_trajectory', 'trajectory_smoothness'
+                'timepoints', 'abundance_trajectory', 'trajectory_smoothness',
+                'n_records', 'n_snvs_detected_total', 'n_snvs_true_total',
+                'n_shared_snvs_total', 'n_matching_snvs_total', 'n_different_snvs_total',
+                'snv_distance_mean', 'abundance_diff_mean',
+                'detected_abundance_mean', 'true_abundance_mean',
             ]) + '\n')
 
     logger.info(f"Wrote {len(records)} linking quality records to {output_path}")
@@ -1915,7 +1964,7 @@ def write_validation_summary(
 
         f.write("SNV-Level Metrics (within detected genomic span):\n")
         f.write(f"  Precision:  {result.snv_precision:.4f}  (fraction of called SNVs that are correct)\n")
-        f.write(f"  Recall:     {result.snv_recall:.4f}  (fraction of true SNVs in detected regions recovered)\n")
+        f.write(f"  Recall:     {result.snv_recall:.4f}  (fraction of all truth SNVs covered by any haplotype)\n")
         snv_f1 = 2 * result.snv_precision * result.snv_recall / (result.snv_precision + result.snv_recall) \
                  if (result.snv_precision + result.snv_recall) > 0 else 0.0
         f.write(f"  F1 Score:   {snv_f1:.4f}\n")
@@ -2056,12 +2105,24 @@ def write_low_abundance_report(
     low_abundance_threshold: float = 0.01,
 ) -> str:
     """
-    Write low_abundance.txt as a missed-SNV report.
+    Write missed_snvs_report.txt as a missed-SNV report.
 
     This reports true SNV positions that were not recovered within detected spans,
     or were never in any detected span due to missing haplotypes/coverage.
     """
-    output_path = os.path.join(output_dir, "low_abundance.txt")
+    output_path = os.path.join(output_dir, "missed_snvs_report.txt")
+
+    # Build per-timepoint SNV coverage: sample -> contig -> pos -> count.
+    coverage_by_tp: Dict[str, Dict[str, Dict[int, int]]] = defaultdict(lambda: defaultdict(dict))
+    if window_results:
+        for wr in window_results:
+            sample = wr.window.sample or ""
+            contig = wr.window.contig
+            for read in wr.window.reads:
+                for pos in read.alleles.keys():
+                    coverage_by_tp[sample][contig][pos] = (
+                        coverage_by_tp[sample][contig].get(pos, 0) + 1
+                    )
 
     matches = match_haplotypes(true_haps, detected_haps)
     matches_by_strain: Dict[str, List[DetectedHaplotype]] = defaultdict(list)
@@ -2122,18 +2183,22 @@ def write_low_abundance_report(
                     }
                 )
 
+    true_hap_lookup = {h.strain_id: h for h in true_haps}
     with open(output_path, "w") as f:
-        f.write("MISSED SNVs REPORT\n")
-        f.write("=" * 80 + "\n")
-        f.write("Columns: strain_id, contig, pos, true_allele, detected_allele, reason\n\n")
-        if not missed_records:
-            f.write("No missed SNVs.\n")
-        else:
+        if missed_records:
             for r in missed_records:
-                f.write(
-                    f"{r['strain_id']}\t{r['contig']}\t{r['pos']}\t"
-                    f"{r['true_allele']}\t{r['detected_allele']}\t{r['reason']}\n"
-                )
+                true_hap = true_hap_lookup.get(r["strain_id"])
+                if not true_hap:
+                    continue
+                for tp, abund in true_hap.abundances.items():
+                    if abund <= 0.0:
+                        continue
+                    cov = coverage_by_tp.get(tp, {}).get(r["contig"], {}).get(r["pos"], 0)
+                    f.write(
+                        f"{r['strain_id']}\t{r['contig']}\t{r['pos']}\t"
+                        f"{r['true_allele']}\t{r['detected_allele']}\t{r['reason']}\t"
+                        f"{tp}\t{cov}\n"
+                    )
 
     logger.info(f"Wrote missed SNVs report to {output_path}")
     return output_path
@@ -2146,17 +2211,15 @@ def write_missed_windows_report(
     """Write missed_windows.txt listing informative windows with missing SNVs."""
     output_path = os.path.join(output_dir, "missed_windows.txt")
     with open(output_path, "w") as f:
-        f.write("MISSED INFORMATIVE WINDOWS\n")
-        f.write("=" * 80 + "\n")
-        f.write("Columns: sample, contig, window_start, window_end, n_informative_snvs, n_missing_snvs, missing_positions\n\n")
-        if not missed_windows:
-            f.write("None\n")
-        else:
-            for w in missed_windows:
-                f.write(
-                    f"{w['sample']}\t{w['contig']}\t{w['window_start']}\t{w['window_end']}\t"
-                    f"{w['n_informative_snvs']}\t{w['n_missing_snvs']}\t{w['missing_positions']}\n"
-                )
+        f.write(
+            "sample\tcontig\twindow_start\twindow_end\t"
+            "n_informative_snvs\tn_missing_snvs\tmissing_positions\n"
+        )
+        for w in missed_windows:
+            f.write(
+                f"{w['sample']}\t{w['contig']}\t{w['window_start']}\t{w['window_end']}\t"
+                f"{w['n_informative_snvs']}\t{w['n_missing_snvs']}\t{w['missing_positions']}\n"
+            )
     logger.info(f"Wrote missed windows report to {output_path}")
     return output_path
 
@@ -2218,6 +2281,7 @@ def run_validation(
         result=result,
         detected_haps=detected_haps,
         true_haps=true_haps,
+        window_results=window_results,
         output_dir=output_dir,
     )
 
@@ -2295,6 +2359,29 @@ def _compute_haplotype_metrics(
         contig: agg.recall for contig, agg in by_contig_agg.items()
     }
 
+    # SNV recall: fraction of all truth SNVs covered by any haplotype call.
+    truth_positions_by_contig: Dict[str, Set[int]] = defaultdict(set)
+    for h in true_haps:
+        for contig, snvs in h.snv_positions.items():
+            truth_positions_by_contig[contig].update(snvs.keys())
+    total_true_snv_positions = sum(len(pos_set) for pos_set in truth_positions_by_contig.values())
+
+    covered_positions_by_contig: Dict[str, Set[int]] = defaultdict(set)
+    if window_results:
+        for wr in window_results:
+            contig = wr.window.contig
+            for hap in wr.haplotypes:
+                covered_positions_by_contig[contig].update(hap.consensus.keys())
+
+    covered_true_snv_positions = 0
+    for contig, truth_positions in truth_positions_by_contig.items():
+        covered_true_snv_positions += len(truth_positions & covered_positions_by_contig.get(contig, set()))
+
+    global_snv_recall = (
+        covered_true_snv_positions / total_true_snv_positions
+        if total_true_snv_positions > 0 else 0.0
+    )
+
     # Build missed_windows list from window metrics with recall < 1
     missed_windows = []
     for wm in all_window_metrics:
@@ -2334,10 +2421,10 @@ def _compute_haplotype_metrics(
         abundance_pearson_r=abundance_pearson_r,
         abundance_mae=abundance_mae,
         snv_precision=snv_precision,
-        snv_recall=snv_recall,
-        phasing_accuracy=snv_recall,  # Use SNV recall as phasing accuracy
-        snv_true_total=overall_agg.total_true,
-        snv_true_in_span=overall_agg.total_snv_correct + (overall_agg.total_snv_detected - overall_agg.total_snv_correct),
+        snv_recall=global_snv_recall,
+        phasing_accuracy=global_snv_recall,  # Use SNV recall as phasing accuracy
+        snv_true_total=total_true_snv_positions,
+        snv_true_in_span=covered_true_snv_positions,
         snv_detected_total=overall_agg.total_snv_detected,
         snv_correct_total=overall_agg.total_snv_correct,
         snv_span_coverage_frac=1.0 if overall_agg.n_windows > 0 else 0.0,  # All windows are in span
@@ -2462,6 +2549,7 @@ def _write_validation_reports(
     result: ValidationResult,
     detected_haps: List[DetectedHaplotype],
     true_haps: List[TrueHaplotype],
+    window_results: Optional[List],
     output_dir: str,
 ) -> None:
     metrics_file = os.path.join(output_dir, 'validation_metrics.json')
@@ -2511,6 +2599,70 @@ def _write_validation_reports(
         def add(line: str = "") -> None:
             lines.append(line)
 
+        def parse_window_id(window_id: str) -> Optional[Tuple[str, str, int, int]]:
+            try:
+                sample_part, rest = window_id.split("|", 1)
+                contig_part, span = rest.split(":", 1)
+                start_str, end_str = span.split("-", 1)
+                return sample_part, contig_part, int(start_str), int(end_str)
+            except ValueError:
+                return None
+
+        def build_ref_alleles() -> Dict[str, Dict[int, str]]:
+            ref_strains = [h for h in true_haps if h.snv_count == 0]
+            if not ref_strains:
+                return {}
+            ref_alleles: Dict[str, Dict[int, str]] = defaultdict(dict)
+            for ref in ref_strains:
+                for contig, snvs in ref.snv_positions.items():
+                    for pos, allele in snvs.items():
+                        ref_alleles[contig].setdefault(pos, allele)
+            return ref_alleles
+
+        ref_alleles = build_ref_alleles()
+
+        def compute_span_stats(
+            sample: str,
+            contig: str,
+            start: int,
+            end: int,
+        ) -> Tuple[int, Optional[float]]:
+            positions: Set[int] = set()
+            for h in true_haps:
+                for pos in h.snv_positions.get(contig, {}):
+                    if start <= pos < end:
+                        positions.add(pos)
+
+            if not positions:
+                return 0, None
+
+            total_abund = 0.0
+            for h in true_haps:
+                total_abund += h.abundances.get(sample, 0.0)
+
+            if total_abund <= 0:
+                return len(positions), None
+
+            ref_contig = ref_alleles.get(contig, {})
+            non_ref_fractions = []
+            for pos in positions:
+                ref = ref_contig.get(pos)
+                if ref is None:
+                    continue
+                non_ref_abund = 0.0
+                for h in true_haps:
+                    allele = h.snv_positions.get(contig, {}).get(pos)
+                    if allele is None:
+                        continue
+                    if allele != ref:
+                        non_ref_abund += h.abundances.get(sample, 0.0)
+                non_ref_fractions.append(non_ref_abund / total_abund)
+
+            if not non_ref_fractions:
+                return len(positions), None
+
+            return len(positions), float(np.mean(non_ref_fractions))
+
         add("=" * 80)
         add("DETAILED VALIDATION REPORT")
         add("=" * 80)
@@ -2555,7 +2707,16 @@ def _write_validation_reports(
         add("-" * 80)
         if result.false_negatives:
             for fn_id in result.false_negatives:
-                add(f"  {fn_id}")
+                parsed = parse_window_id(fn_id)
+                if parsed is None:
+                    add(f"  {fn_id}")
+                    continue
+                sample, contig, start, end = parsed
+                snv_count, non_ref_abund = compute_span_stats(sample, contig, start, end)
+                if non_ref_abund is None:
+                    add(f"  {fn_id}  | snvs_in_span={snv_count} | nonref_abund=n/a")
+                else:
+                    add(f"  {fn_id}  | snvs_in_span={snv_count} | nonref_abund={non_ref_abund:.3f}")
         else:
             add("  None")
         add("")
@@ -2631,6 +2792,64 @@ def _write_validation_reports(
             if metrics['abundance_pearson_r'] is not None:
                 add(f"  Abundance r: {metrics['abundance_pearson_r']:.3f}, "
                     f"MAE: {metrics['abundance_mae']:.4f}")
+        add("")
+        add("TRACK & LINKING METRICS")
+        add("-" * 80)
+        add(f"Track Fragmentation (mean):   {result.track_fragmentation_mean:.4f}")
+        add(f"Track Fragmentation (median): {result.track_fragmentation_median:.4f}")
+        add(f"False Link Rate:              {result.false_link_rate:.4f}")
+        add(f"Missed Link Rate:             {result.missed_link_rate:.4f}")
+        add(f"Track Consensus Error:        {result.track_consensus_error:.4f}")
+        add("")
+        add("LONGITUDINAL METRICS")
+        add("-" * 80)
+        add(f"Lineage Precision: {result.lineage_precision:.4f}")
+        add(f"Lineage Recall:    {result.lineage_recall:.4f}")
+        add(f"Lineage F1:        {result.lineage_f1:.4f}")
+        add(f"Rescue ΔRecall:    {result.rescue_delta_recall_rare:.4f}")
+        add(f"Trajectory Error:  {result.abundance_trajectory_error:.4f}")
+        add("")
+        add("WINDOW-LEVEL RECALL (INFORMATIVE WINDOWS)")
+        add("-" * 80)
+        add(f"Pooled Window Recall:   {result.window_recall:.4f}")
+        add(f"Informative Windows:    {result.window_informative_total}")
+        add(f"Detected Windows:       {result.window_detected_total}")
+        if result.window_recall_by_timepoint:
+            add("Per-Timepoint Window Recall:")
+            for tp, val in sorted(result.window_recall_by_timepoint.items()):
+                add(f"  {tp}: {val:.4f}")
+        if result.window_recall_by_contig:
+            add("Per-Contig Window Recall:")
+            for contig, val in sorted(result.window_recall_by_contig.items()):
+                add(f"  {contig}: {val:.4f}")
+        add("")
+        if window_results:
+            add("EM CONVERGENCE SUMMARY")
+            add("-" * 80)
+            n_windows = len(window_results)
+            n_converged = sum(1 for wr in window_results if wr.converged)
+            convergence_rate = n_converged / n_windows if n_windows > 0 else 0.0
+            avg_iterations = np.mean([wr.iterations for wr in window_results]) if window_results else 0.0
+            avg_haplotypes = np.mean([len(wr.haplotypes) for wr in window_results]) if window_results else 0.0
+            junk_weights = []
+            for wr in window_results:
+                if wr.pi is not None and len(wr.pi) > 0:
+                    junk_weights.append(float(wr.pi[-1]))
+            avg_junk_weight = np.mean(junk_weights) if junk_weights else 0.0
+            add(f"Total windows:       {n_windows}")
+            add(f"Converged windows:   {n_converged} ({convergence_rate:.1%})")
+            add(f"Avg iterations:      {avg_iterations:.1f}")
+            add(f"Avg haplotypes/win:  {avg_haplotypes:.1f}")
+            add(f"Avg junk weight:     {avg_junk_weight:.4f}")
+            add("")
+        add("OUTPUT FILES GENERATED")
+        add("-" * 80)
+        add("lineage_details.tsv")
+        add("linking_quality.tsv")
+        add("em_convergence.tsv")
+        add("missed_snvs_report.txt")
+        add("missed_windows.txt")
+        add("validation_metrics.json")
         add("")
         add("=" * 80)
         f.write("\n".join(lines) + "\n")
@@ -2763,13 +2982,14 @@ def _write_validation_outputs(
 ) -> None:
     """Write validation TSV/text outputs."""
     # Generate detailed TSV output files
+    track_summaries = None
     try:
-        write_lineage_details(true_haps, detected_haps, matches, output_dir)
+        _, track_summaries = write_lineage_details(true_haps, detected_haps, matches, output_dir)
     except Exception as e:
         logger.warning(f"Failed to write lineage_details.tsv: {e}")
 
     try:
-        write_linking_quality(detected_haps, matches, output_dir)
+        write_linking_quality(detected_haps, matches, track_summaries, output_dir)
     except Exception as e:
         logger.warning(f"Failed to write linking_quality.tsv: {e}")
 
@@ -2795,15 +3015,12 @@ def _write_validation_outputs(
         except Exception as e:
             logger.warning(f"Failed to write missed_windows.txt: {e}")
 
-    try:
-        write_validation_summary(result, true_haps, detected_haps, matches, output_dir, window_results)
-    except Exception as e:
-        logger.warning(f"Failed to write validation_summary.txt: {e}")
+    # validation_summary.txt merged into detailed_report.txt
 
     try:
         write_low_abundance_report(result, true_haps, detected_haps, output_dir, window_results)
     except Exception as e:
-        logger.warning(f"Failed to write low_abundance.txt: {e}")
+        logger.warning(f"Failed to write missed_snvs_report.txt: {e}")
 
     try:
         write_false_positive_reads(result, window_results, output_dir)
