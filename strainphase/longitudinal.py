@@ -212,6 +212,15 @@ def process_mag_longitudinal(
                     results_by_timepoint[sample_id] = sample_contigs[contig_id]
 
             if len(results_by_timepoint) >= 2:
+                # Diagnostic: log window counts and weight distribution before rescue
+                n_windows_per_sample = {s: len(wrs) for s, wrs in results_by_timepoint.items()}
+                all_weights = [h.weight for wrs in results_by_timepoint.values() for wr in wrs for h in wr.haplotypes]
+                n_low_weight = sum(1 for w in all_weights if w < config.min_weight_for_anchor)
+                logging.info(
+                    f"    Contig {contig_id}: windows per sample={n_windows_per_sample}, "
+                    f"total haplotypes={len(all_weights)}, low-weight (< {config.min_weight_for_anchor})={n_low_weight}"
+                )
+
                 # Apply rescue
                 rescued = integrator.rescue_low_abundance(results_by_timepoint)
 
