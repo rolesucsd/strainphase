@@ -1160,7 +1160,7 @@ class ParameterSweep:
                         rescue_rate = 0.0
                         rescue_integrator = getattr(config, "_rescue_integrator", None) if use_longitudinal else None
                         logger.info(f"    Rescue stats check: use_longitudinal={use_longitudinal}, "
-                                    f"integrator={'found' if rescue_integrator else 'NOT FOUND'}")
+                                    f"integrator={'found' if rescue_integrator else 'NOT FOUND'} [config id={id(config)}]")
                         if rescue_integrator:
                             logger.info(f"    Rescue statistics: {len(rescue_integrator.rescue_statistics)} records")
                             try:
