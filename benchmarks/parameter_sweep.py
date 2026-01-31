@@ -722,22 +722,22 @@ class ParameterSweep:
         'max_reads_per_window': [500],
         
         # Clustering parameters
-        'max_mismatch_frac': [0.005, 0.02],
-        'min_shared_snvs_for_edge': [4],
+        'max_mismatch_frac': [0.005, 0.01, 0.02, 0.05, 0.1],
+        'min_shared_snvs_for_edge': [1, 2, 3, 4, 5, 6],
         
         # Quality filters
-        'min_mapq': [10],
+        'min_mapq': [10, 20, 30],
         'min_base_quality': [20],
         
         # Junk model sensitivity (publication expansion)
-        'junk_divergence_rate': [0.05, 0.10, 0.20],
+        'junk_divergence_rate': [0.05],
         
         # Merging thresholds
-        'merge_distance_threshold': [0.005, 0.02],
+        'merge_distance_threshold': [0.02],
         
         # Linking thresholds (publication expansion)
         'max_link_distance': [0.01],
-        'min_shared_snvs_for_link': [3, 4],
+        'min_shared_snvs_for_link': [3],
         
         # Abundance thresholds
         'min_weight_for_anchor': [0.20],
