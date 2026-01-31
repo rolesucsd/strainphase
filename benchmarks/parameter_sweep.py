@@ -1372,6 +1372,12 @@ class ParameterSweep:
                 config=config,
             )
             
+            # Verify integrator was stored on config
+            _integrator_check = getattr(config, "_rescue_integrator", None)
+            logger.info(f"    After process_mag_longitudinal: integrator={'FOUND' if _integrator_check else 'NOT FOUND'}"
+                        f"{f' ({len(_integrator_check.rescue_statistics)} records)' if _integrator_check else ''}"
+                        f" [config id={id(config)}]")
+
             # Log per-timepoint results from process_mag_longitudinal
             logger.info(f"    process_mag_longitudinal returned results for {len(mag_results)} timepoints")
             for sample_id in self.timepoints:
@@ -1556,7 +1562,7 @@ class ParameterSweep:
                 use_longitudinal_check = hasattr(self, 'use_longitudinal') and self.use_longitudinal
                 rescue_integrator = getattr(config, "_rescue_integrator", None)
                 logger.info(f"    Rescue stats check: use_longitudinal={use_longitudinal_check}, "
-                            f"integrator={'found' if rescue_integrator else 'NOT FOUND'}")
+                            f"integrator={'found' if rescue_integrator else 'NOT FOUND'} [config id={id(config)}]")
                 if not use_longitudinal_check:
                     rescue_integrator = None
                 if rescue_integrator:
