@@ -142,10 +142,11 @@ def cmd_longitudinal(args: argparse.Namespace) -> int:
 
     # Process each MAG
     all_results = {}
+    all_integrators = []
     for mag_name, mag_contigs in mags.items():
         logging.info(f"Processing MAG {mag_name}")
 
-        results = process_mag_longitudinal(
+        results, integrator = process_mag_longitudinal(
             mag_name=mag_name,
             mag_contigs=mag_contigs,
             samples=samples,
@@ -154,6 +155,8 @@ def cmd_longitudinal(args: argparse.Namespace) -> int:
             config=config,
         )
         all_results[mag_name] = results
+        if integrator:
+            all_integrators.append(integrator)
 
     # Build lineage table
     lineage_records = build_lineage_table(all_results, config)
