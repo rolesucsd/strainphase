@@ -962,7 +962,8 @@ class ParameterSweep:
             try:
                 # Process all contigs with this parameter set
                 all_window_results: List[WindowResult] = []
-                
+                rescue_integrator = None  # Will be set by process_mag_longitudinal in longitudinal mode
+
                 if use_longitudinal:
                     # Longitudinal mode: use process_mag_longitudinal
                     from strainphase.longitudinal import process_mag_longitudinal
@@ -972,7 +973,7 @@ class ParameterSweep:
                     
                     # Process MAG with longitudinal integration
                     # mag_contigs should be {contig_id: length}, not nested
-                    mag_results = process_mag_longitudinal(
+                    mag_results, rescue_integrator = process_mag_longitudinal(
                         mag_name="MAG_01",
                         mag_contigs=contigs,  # Pass contigs directly, not nested dict
                         samples=timepoints,
@@ -980,12 +981,10 @@ class ParameterSweep:
                         vcf_paths=vcf_paths,
                         config=config,
                     )
-                    
-                    # Verify integrator was stored on config
-                    _integrator_check = getattr(config, "_rescue_integrator", None)
-                    logger.info(f"    After process_mag_longitudinal: integrator={'FOUND' if _integrator_check else 'NOT FOUND'}"
-                                f"{f' ({len(_integrator_check.rescue_statistics)} records)' if _integrator_check else ''}"
-                                f" [config id={id(config)}]")
+
+                    # Log integrator status
+                    logger.info(f"    After process_mag_longitudinal: integrator={'FOUND' if rescue_integrator else 'NOT FOUND'}"
+                                f"{f' ({len(rescue_integrator.rescue_statistics)} records)' if rescue_integrator else ''}")
 
                     # Log per-timepoint results from process_mag_longitudinal
                     logger.info(f"    process_mag_longitudinal returned results for {len(mag_results)} timepoints")
@@ -1158,14 +1157,18 @@ class ParameterSweep:
                         rescued_haplotypes = 0
                         rescue_total_haplotypes = 0
                         rescue_rate = 0.0
-                        rescue_integrator = getattr(config, "_rescue_integrator", None) if use_longitudinal else None
+                        # rescue_integrator is already set from process_mag_longitudinal return value
                         logger.info(f"    Rescue stats check: use_longitudinal={use_longitudinal}, "
-                                    f"integrator={'found' if rescue_integrator else 'NOT FOUND'} [config id={id(config)}]")
+                                    f"integrator={'found' if rescue_integrator else 'NOT FOUND'}")
                         if rescue_integrator:
-                            logger.info(f"    Rescue statistics: {len(rescue_integrator.rescue_statistics)} records")
+                            logger.info(f"    Rescue statistics: {len(rescue_integrator.rescue_statistics)} records, "
+                                        f"{len(rescue_integrator.rescued_reads)} rescued reads")
                             try:
                                 rescue_stats_path = str(Path(validation_output) / "rescue_statistics.tsv")
                                 rescue_integrator.write_rescue_statistics(rescue_stats_path)
+                                # Write per-read rescue details
+                                rescued_reads_path = str(Path(validation_output) / "rescued_reads.tsv")
+                                rescue_integrator.write_rescued_reads(rescued_reads_path)
                                 rescued_haplotypes = sum(1 for s in rescue_integrator.rescue_statistics if s.was_rescued)
                                 rescue_total_haplotypes = len(rescue_integrator.rescue_statistics)
                                 rescue_rate = (
@@ -1359,17 +1362,18 @@ class ParameterSweep:
         start_time = time.time()
 
         all_window_results: List[WindowResult] = []
-        
+        rescue_integrator = None  # Will be set by process_mag_longitudinal in longitudinal mode
+
         if hasattr(self, 'use_longitudinal') and self.use_longitudinal:
             # Longitudinal mode: use process_mag_longitudinal
             from strainphase.longitudinal import process_mag_longitudinal
             from strainphase.core import HaplotyperConfig
-            
+
             config = params.to_config(n_workers=n_workers)
 
             # Process MAG with longitudinal integration
             # mag_contigs should be {contig_id: length}, not nested
-            mag_results = process_mag_longitudinal(
+            mag_results, rescue_integrator = process_mag_longitudinal(
                 mag_name="MAG_01",
                 mag_contigs=contigs,  # Pass contigs directly, not nested dict
                 samples=self.timepoints,
@@ -1377,12 +1381,10 @@ class ParameterSweep:
                 vcf_paths=self.vcf_paths,
                 config=config,
             )
-            
-            # Verify integrator was stored on config
-            _integrator_check = getattr(config, "_rescue_integrator", None)
-            logger.info(f"    After process_mag_longitudinal: integrator={'FOUND' if _integrator_check else 'NOT FOUND'}"
-                        f"{f' ({len(_integrator_check.rescue_statistics)} records)' if _integrator_check else ''}"
-                        f" [config id={id(config)}]")
+
+            # Log integrator status
+            logger.info(f"    After process_mag_longitudinal: integrator={'FOUND' if rescue_integrator else 'NOT FOUND'}"
+                        f"{f' ({len(rescue_integrator.rescue_statistics)} records)' if rescue_integrator else ''}")
 
             # Log per-timepoint results from process_mag_longitudinal
             logger.info(f"    process_mag_longitudinal returned results for {len(mag_results)} timepoints")
@@ -1566,16 +1568,18 @@ class ParameterSweep:
                 rescue_total_haplotypes = 0
                 rescue_rate = 0.0
                 use_longitudinal_check = hasattr(self, 'use_longitudinal') and self.use_longitudinal
-                rescue_integrator = getattr(config, "_rescue_integrator", None)
+                # rescue_integrator is already set from process_mag_longitudinal return value
                 logger.info(f"    Rescue stats check: use_longitudinal={use_longitudinal_check}, "
-                            f"integrator={'found' if rescue_integrator else 'NOT FOUND'} [config id={id(config)}]")
-                if not use_longitudinal_check:
-                    rescue_integrator = None
+                            f"integrator={'found' if rescue_integrator else 'NOT FOUND'}")
                 if rescue_integrator:
-                    logger.info(f"    Rescue statistics: {len(rescue_integrator.rescue_statistics)} records")
+                    logger.info(f"    Rescue statistics: {len(rescue_integrator.rescue_statistics)} records, "
+                                f"{len(rescue_integrator.rescued_reads)} rescued reads")
                     try:
                         rescue_stats_path = str(Path(validation_output) / "rescue_statistics.tsv")
                         rescue_integrator.write_rescue_statistics(rescue_stats_path)
+                        # Write per-read rescue details
+                        rescued_reads_path = str(Path(validation_output) / "rescued_reads.tsv")
+                        rescue_integrator.write_rescued_reads(rescued_reads_path)
                         rescued_haplotypes = sum(1 for s in rescue_integrator.rescue_statistics if s.was_rescued)
                         rescue_total_haplotypes = len(rescue_integrator.rescue_statistics)
                         rescue_rate = (

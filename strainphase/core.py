@@ -383,6 +383,22 @@ class RescueStatistic:
     reason: str = ""  # Debug reason for rescue outcome
 
 
+@dataclass
+class RescuedReadInfo:
+    """Per-read information for rescue events."""
+
+    read_name: str  # Read identifier
+    sample: str  # Timepoint where rescue occurred
+    contig: str
+    window_start: int
+    window_end: int
+    donor_timepoint: str  # Timepoint that provided the anchor haplotype
+    n_snps_agree: int  # Number of SNPs where read agrees with rescued haplotype
+    n_snps_disagree: int  # Number of SNPs where read disagrees with rescued haplotype
+    n_snps_total: int  # Total SNPs in the comparison (agree + disagree)
+    rescued_haplotype_weight: float  # Weight of the rescued haplotype
+
+
 # =============================================================================
 # LOG-PROBABILITY CACHE
 # =============================================================================
@@ -1201,6 +1217,7 @@ class LongitudinalIntegrator:
     def __init__(self, config: HaplotyperConfig = DEFAULT_CONFIG):
         self.config = config
         self.rescue_statistics: list[RescueStatistic] = []
+        self.rescued_reads: list[RescuedReadInfo] = []
 
     def build_anchor_panel_for_key(
         self,
@@ -1362,6 +1379,7 @@ class LongitudinalIntegrator:
             # Use a lower per-read shared threshold, but require many matching reads.
             n_matching_junk = 0
             matching_read_indices = []
+            matching_read_info = []  # Store (read_idx, n_agree, n_disagree, n_total) for rescued reads
             min_shared_for_read = 2  # Lower threshold for individual reads
 
             for i, read in enumerate(reads):
@@ -1383,6 +1401,8 @@ class LongitudinalIntegrator:
                     if distance <= max_distance:  # Within sequencing error tolerance
                         n_matching_junk += 1
                         matching_read_indices.append(i)
+                        # Store SNP agreement info: (read_idx, n_agree, n_disagree, n_total)
+                        matching_read_info.append((i, n_match, n_shared - n_match, n_shared))
 
             # If enough junk reads match this anchor, create a rescued haplotype.
             min_reads_for_rescue = max(3, int(0.02 * len(reads)))  # At least 3 reads or 2%
@@ -1429,6 +1449,25 @@ class LongitudinalIntegrator:
                         )
                     )
                     rescued_any = True
+
+                    # Track each rescued read with SNP agreement/disagreement info
+                    for read_idx, n_agree, n_disagree, n_total in matching_read_info:
+                        read = reads[read_idx]
+                        read_name = getattr(read, 'name', f"read_{read_idx}")
+                        self.rescued_reads.append(
+                            RescuedReadInfo(
+                                read_name=read_name,
+                                sample=current_sample,
+                                contig=window.contig,
+                                window_start=window.start,
+                                window_end=window.end,
+                                donor_timepoint=donor_timepoint,
+                                n_snps_agree=n_agree,
+                                n_snps_disagree=n_disagree,
+                                n_snps_total=n_total,
+                                rescued_haplotype_weight=rescued_weight,
+                            )
+                        )
 
                     logging.debug(
                         f"    Rescued haplotype from {donor_timepoint}: "
@@ -1659,6 +1698,56 @@ class LongitudinalIntegrator:
                         "n_shared_with_anchor": stat.n_shared_with_anchor,
                         "n_mismatched_with_anchor": stat.n_mismatched_with_anchor,
                         "reason": stat.reason,
+                    }
+                )
+
+        return output_path
+
+    def write_rescued_reads(self, output_path: str) -> str:
+        """Write rescued_reads.tsv with per-read details of rescue events."""
+        import csv
+
+        logging.info(
+            f"Writing rescued_reads.tsv: {len(self.rescued_reads)} reads"
+        )
+
+        fieldnames = [
+            "read_name",
+            "sample",
+            "contig",
+            "window_start",
+            "window_end",
+            "donor_timepoint",
+            "n_snps_agree",
+            "n_snps_disagree",
+            "n_snps_total",
+            "agreement_rate",
+            "rescued_haplotype_weight",
+        ]
+
+        with open(output_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames, delimiter="\t")
+            writer.writeheader()
+
+            for read_info in self.rescued_reads:
+                agreement_rate = (
+                    read_info.n_snps_agree / read_info.n_snps_total
+                    if read_info.n_snps_total > 0
+                    else 0.0
+                )
+                writer.writerow(
+                    {
+                        "read_name": read_info.read_name,
+                        "sample": read_info.sample,
+                        "contig": read_info.contig,
+                        "window_start": read_info.window_start,
+                        "window_end": read_info.window_end,
+                        "donor_timepoint": read_info.donor_timepoint,
+                        "n_snps_agree": read_info.n_snps_agree,
+                        "n_snps_disagree": read_info.n_snps_disagree,
+                        "n_snps_total": read_info.n_snps_total,
+                        "agreement_rate": f"{agreement_rate:.4f}",
+                        "rescued_haplotype_weight": f"{read_info.rescued_haplotype_weight:.6f}",
                     }
                 )
 

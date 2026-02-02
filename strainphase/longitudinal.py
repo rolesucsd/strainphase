@@ -151,14 +151,16 @@ def process_mag_longitudinal(
     bam_paths: dict[str, str],
     vcf_paths: dict[str, str],
     config: HaplotyperConfig,
-) -> dict[str, dict[str, list[WindowResult]]]:
+) -> tuple[dict[str, dict[str, list[WindowResult]]], "LongitudinalIntegrator | None"]:
     """
     Process a single MAG across all samples with longitudinal rescue.
 
     Haplotypes are linked across windows after processing and after rescue.
 
     Returns:
-        {sample_id: {contig_id: [WindowResult, ...]}}
+        Tuple of:
+        - {sample_id: {contig_id: [WindowResult, ...]}}
+        - LongitudinalIntegrator instance (or None if single timepoint)
     """
     mag_label = mag_name or "<unknown>"
     logging.info(
@@ -246,15 +248,13 @@ def process_mag_longitudinal(
         n_total = len(integrator.rescue_statistics)
         logging.info(f"  Rescue completed: {n_rescued}/{n_total} haplotypes rescued")
 
-    # Store integrator on the config for later retrieval (rescue_statistics)
-    # This allows downstream code to access and write rescue statistics
+    # Log integrator status for debugging
     if integrator:
-        config._rescue_integrator = integrator
-        logging.info(f"  Stored rescue integrator on config: {len(integrator.rescue_statistics)} statistics records [config id={id(config)}]")
+        logging.info(f"  Returning integrator with {len(integrator.rescue_statistics)} statistics records")
     else:
-        logging.info(f"  No rescue integrator to store (len(samples)={len(samples)})")
+        logging.info(f"  No integrator (len(samples)={len(samples)})")
 
-    return all_results
+    return all_results, integrator
 
 
 def build_lineage_table(
@@ -725,9 +725,10 @@ def main():
 
     # Process each MAG with longitudinal integration
     all_results: dict[str, dict[str, dict[str, list[WindowResult]]]] = {}
+    all_integrators = []
 
     for mag_name, mag_contigs in mags_to_process.items():
-        mag_results = process_mag_longitudinal(
+        mag_results, integrator = process_mag_longitudinal(
             mag_name=mag_name,
             mag_contigs=mag_contigs,
             samples=samples,
@@ -736,6 +737,8 @@ def main():
             config=config,
         )
         all_results[mag_name] = mag_results
+        if integrator:
+            all_integrators.append(integrator)
 
     # Build lineage table
     logging.info("Building lineage table across processed MAGs")
