@@ -567,9 +567,9 @@ def make_windows_lazy(
     for start in range(1, contig_length + 1, step_size):
         end = min(start + config.window_size, contig_length + 1)
 
-        # Skip very short final windows
-        if end - start < step_size:
-            continue
+        # Note: no size-based window skipping. Small windows (including
+        # trailing windows and contigs shorter than window_size) are kept
+        # and filtered downstream by min_snvs_per_window / min_reads_per_window.
 
         # Collect SNVs in this window
         window_snvs = [p for p in snv_pos_sorted if start <= p < end]
