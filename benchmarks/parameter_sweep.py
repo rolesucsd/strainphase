@@ -687,7 +687,7 @@ class ParameterSweep:
         # Windowing / subsampling
         # Minimum window_size is 10000 to ensure sufficient shared SNVs for reliable linking.
         # With ~1-2 SNVs/kb, smaller windows have too few SNVs in the 50% overlap region.
-        'window_size': [5000, 10000, 20000, 50000, 100000],
+        'window_size': [500, 1000, 2000, 5000, 10000, 20000, 50000, 100000],
         
         # Clustering parameters
         'max_mismatch_frac': [0.005, 0.01, 0.02, 0.05, 0.1],
@@ -1523,13 +1523,6 @@ class ParameterSweep:
                     except Exception as e:
                         logger.warning(f"Failed to write rescue statistics: {e}")
 
-                # Write prelink vs postlink comparison
-                comparison_path = str(Path(validation_output) / "validation_prelink_comparison.tsv")
-                try:
-                    write_validation_comparison_tsv(comparison_path, prelink_result, validation_result)
-                except Exception as e:
-                    logger.warning(f"Failed to write prelink comparison TSV: {e}")
-
                 # Extract metrics from validation (including track/linking and lineage metrics)
                 accuracy_metrics = {
                     "snv_precision": validation_result.snv_precision,
@@ -2306,9 +2299,41 @@ def run_parameter_sweep(
         with open(params_file) as f:
             grid = json.load(f)
 
+    if mode == "default":
+        if params_file:
+            logger.warning("Ignoring --params in default mode (using core.py defaults).")
+        base_config = HaplotyperConfig()
+        grid = {
+            'window_size': [base_config.window_size],
+            'max_mismatch_frac': [base_config.max_mismatch_frac],
+            'min_shared_snvs_for_edge': [base_config.min_shared_snvs_for_edge],
+            'junk_divergence_rate': [base_config.junk_divergence_rate],
+            'merge_distance_threshold': [base_config.merge_distance_threshold],
+            'min_shared_for_merge': [base_config.min_shared_for_merge],
+            'max_link_distance': [base_config.max_link_distance],
+            'min_shared_snvs_for_link': [base_config.min_shared_snvs_for_link],
+            'min_depth_site': [base_config.min_depth_site],
+        }
+
     sweep = ParameterSweep(seed=42, grid=grid)
 
-    if mode == "sequential":
+    if mode == "default":
+        logger.info("Starting default parameter run (single config)")
+        results = sweep.run_sweep(
+            bam_paths=bam_paths,
+            vcf_paths=vcf_paths,
+            reference_path=reference_path,
+            timepoints=timepoints,
+            truth_dir=truth_dir,
+            max_configs=1,
+            max_contigs=max_contigs,
+            verbose=verbose,
+            resume=resume,
+            checkpoint_interval=checkpoint_interval,
+            output_dir=output_dir,
+            n_workers=n_workers,
+        )
+    elif mode == "sequential":
         logger.info(f"Starting sequential parameter optimization")
         results, best_params = sweep.run_sequential_sweep(
             bam_paths=bam_paths,
@@ -2462,8 +2487,9 @@ def main():
                         help="Output directory for results")
 
     # Mode selection
-    parser.add_argument("--mode", choices=["grid", "sequential"], default="sequential",
-                        help="Optimization mode: 'sequential' for coordinate descent (~27 configs), "
+    parser.add_argument("--mode", choices=["grid", "sequential", "default"], default="sequential",
+                        help="Optimization mode: 'default' for core.py defaults (single config), "
+                             "'sequential' for coordinate descent (~27 configs), "
                              "'grid' for full sweep (many configs)")
 
     # Limits
