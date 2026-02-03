@@ -111,7 +111,18 @@ def parse_vartig_info(vartig_info_path: str) -> list[dict]:
                 if len(parts) >= 2 and ":" in parts[0]:
                     snp_pos_str = parts[0]
                     snp_idx, base_pos_0idx = snp_pos_str.split(":")
-                    allele_index = int(parts[1])
+                    allele_str = parts[1].strip()
+                    # Skip ambiguous alleles marked as '?' by Floria
+                    if allele_str == "?":
+                        continue
+                    try:
+                        allele_index = int(allele_str)
+                    except ValueError:
+                        logger.warning(
+                            f"Skipping non-numeric allele '{allele_str}' "
+                            f"at position {base_pos_0idx}"
+                        )
+                        continue
                     support = parts[2] if len(parts) > 2 else ""
 
                     current_hap["snps"].append(
