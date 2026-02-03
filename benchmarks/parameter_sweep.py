@@ -63,13 +63,14 @@ logger = logging.getLogger(__name__)
 class ParameterSet:
     """A single parameter configuration to test."""
     max_mismatch_frac: float
-    min_mapq: int
-    min_base_quality: int
     min_shared_snvs_for_edge: int
     merge_distance_threshold: float
-    min_weight_for_anchor: float
-    rescued_min_weight: float
     window_size: int
+    # Parameters that may be omitted from the sweep (use core defaults)
+    min_mapq: Optional[int] = None
+    min_base_quality: Optional[int] = None
+    min_weight_for_anchor: Optional[float] = None
+    rescued_min_weight: Optional[float] = None
     # New parameters (optional, with defaults)
     min_shared_for_merge: Optional[int] = None
     max_reads_per_window: Optional[int] = None
@@ -84,6 +85,14 @@ class ParameterSet:
         if base_config is None:
             base_config = HaplotyperConfig()
 
+        min_mapq = self.min_mapq if self.min_mapq is not None else base_config.min_mapq
+        min_base_quality = self.min_base_quality if self.min_base_quality is not None else base_config.min_base_quality
+        min_weight_for_anchor = (
+            self.min_weight_for_anchor if self.min_weight_for_anchor is not None else base_config.min_weight_for_anchor
+        )
+        rescued_min_weight = (
+            self.rescued_min_weight if self.rescued_min_weight is not None else base_config.rescued_min_weight
+        )
         # Get values for new parameters (with defaults if not in ParameterSet)
         max_reads_per_window = self.max_reads_per_window if self.max_reads_per_window is not None else base_config.max_reads_per_window
         junk_divergence_rate = self.junk_divergence_rate if self.junk_divergence_rate is not None else base_config.junk_divergence_rate
@@ -95,12 +104,12 @@ class ParameterSet:
         return HaplotyperConfig(
             # Parameters we're varying
             max_mismatch_frac=self.max_mismatch_frac,
-            min_mapq=self.min_mapq,
-            min_base_quality=self.min_base_quality,
+            min_mapq=min_mapq,
+            min_base_quality=min_base_quality,
             min_shared_snvs_for_edge=self.min_shared_snvs_for_edge,
             merge_distance_threshold=self.merge_distance_threshold,
-            min_weight_for_anchor=self.min_weight_for_anchor,
-            rescued_min_weight=self.rescued_min_weight,
+            min_weight_for_anchor=min_weight_for_anchor,
+            rescued_min_weight=rescued_min_weight,
             window_size=self.window_size,
             max_reads_per_window=max_reads_per_window,
             junk_divergence_rate=junk_divergence_rate,
@@ -126,13 +135,22 @@ class ParameterSet:
         return asdict(self)
 
     def short_name(self) -> str:
+        base_config = HaplotyperConfig()
+        min_mapq = self.min_mapq if self.min_mapq is not None else base_config.min_mapq
+        min_base_quality = self.min_base_quality if self.min_base_quality is not None else base_config.min_base_quality
+        min_weight_for_anchor = (
+            self.min_weight_for_anchor if self.min_weight_for_anchor is not None else base_config.min_weight_for_anchor
+        )
+        rescued_min_weight = (
+            self.rescued_min_weight if self.rescued_min_weight is not None else base_config.rescued_min_weight
+        )
         return (f"mm{self.max_mismatch_frac:.3f}_"
-                f"mq{self.min_mapq}_"
-                f"bq{self.min_base_quality}_"
+                f"mq{min_mapq}_"
+                f"bq{min_base_quality}_"
                 f"snv{self.min_shared_snvs_for_edge}_"
                 f"md{self.merge_distance_threshold:.3f}_"
-                f"aw{self.min_weight_for_anchor:.2f}_"
-                f"rw{self.rescued_min_weight:.2f}_"
+                f"aw{min_weight_for_anchor:.2f}_"
+                f"rw{rescued_min_weight:.2f}_"
                 f"ws{self.window_size}")
 
 
