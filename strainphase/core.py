@@ -101,7 +101,7 @@ class HaplotyperConfig:
 
     # =========== GRAPH CONSTRUCTION ===========
     min_shared_snvs_for_edge: int = 1
-    max_mismatch_frac: float = 0.01
+    max_mismatch_frac: float = 0.005
     min_reads_per_cluster: int = 3
 
     # =========== EM PARAMETERS ===========
@@ -116,7 +116,7 @@ class HaplotyperConfig:
     junk_divergence_rate: float = 0.10
 
     # =========== POST-PROCESSING ===========
-    merge_distance_threshold: float = 0.005
+    merge_distance_threshold: float = 0.02
     min_shared_for_merge: int = 3  # Min shared SNVs with actual calls to consider merging
     assign_confidence_threshold: float = 0.90
 
@@ -129,10 +129,10 @@ class HaplotyperConfig:
     binomial_alpha: float = 0.05
 
     # =========== LONGITUDINAL PARAMETERS ===========
-    min_weight_for_anchor: float = 0.1
+    min_weight_for_anchor: float = 0.2
     rescue_match_distance: float = 0.01  # 0.1% error rate — near-exact match required
     min_shared_for_rescue: int = 3  # Min shared SNVs with actual calls for rescue matching
-    rescued_min_weight: float = 0.01
+    rescued_min_weight: float = 0.02
 
     # =========== LINEAGE CLUSTERING PARAMETERS ===========
     # Controls how tracks are clustered into lineages across samples
