@@ -2330,8 +2330,9 @@ def _compute_global_fallback_metrics(
     n_matched_detected = len(matched_detected_ids)
 
     precision = n_matched_detected / n_detected if n_detected > 0 else 0.0
-    recall = n_matched_true / n_true if n_true > 0 else 0.0
-    f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
+    # NOTE: recall is set below after SNV coverage is computed, since for the
+    # global fallback recall = fraction of true SNV positions represented in
+    # any detected haplotype (SNV coverage recall).
 
     # ── SNV metrics ──
     # Build best match per detected haplotype (lowest distance) to avoid
@@ -2371,13 +2372,22 @@ def _compute_global_fallback_metrics(
 
     snv_precision = total_snv_correct / total_snv_detected if total_snv_detected > 0 else 0.0
 
-    # SNV recall: unique true SNV positions covered correctly by any matched
-    # detected haplotype.  Count each (contig, pos) once across all strains.
+    # Only evaluate truth SNV positions on contigs where the tool produced output.
+    # Contigs the tool skipped entirely are excluded from recall denominators.
+    detected_contigs: Set[str] = set()
+    for det_hap in detected_haps:
+        detected_contigs.update(det_hap.snv_alleles.keys())
+
     truth_positions_by_contig: Dict[str, Set[int]] = defaultdict(set)
     for h in true_haps:
         for contig, snvs in h.snv_positions.items():
-            truth_positions_by_contig[contig].update(snvs.keys())
+            if contig in detected_contigs:
+                truth_positions_by_contig[contig].update(snvs.keys())
     total_true_snv_positions = sum(len(s) for s in truth_positions_by_contig.values())
+
+    if detected_contigs < {c for h in true_haps for c in h.snv_positions}:
+        skipped = {c for h in true_haps for c in h.snv_positions} - detected_contigs
+        logger.info(f"Excluding contigs not covered by any detected haplotype from SNV recall: {skipped}")
 
     # Positions where at least one matched detected hap has the correct allele
     correct_positions_by_contig: Dict[str, Set[int]] = defaultdict(set)
@@ -2394,6 +2404,27 @@ def _compute_global_fallback_metrics(
 
     total_correct_positions = sum(len(s) for s in correct_positions_by_contig.values())
     snv_recall = total_correct_positions / total_true_snv_positions if total_true_snv_positions > 0 else 0.0
+
+    # Coverage-based SNV recall: fraction of true SNV positions (on detected
+    # contigs) that appear in ANY detected haplotype.  Used as headline
+    # "recall" for the global fallback.
+    covered_positions_by_contig: Dict[str, Set[int]] = defaultdict(set)
+    for det_hap in detected_haps:
+        for contig, snvs in det_hap.snv_alleles.items():
+            covered_positions_by_contig[contig].update(snvs.keys())
+
+    total_covered_true = 0
+    for contig, truth_pos in truth_positions_by_contig.items():
+        total_covered_true += len(truth_pos & covered_positions_by_contig.get(contig, set()))
+
+    recall = total_covered_true / total_true_snv_positions if total_true_snv_positions > 0 else 0.0
+    f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
+
+    # Per-contig coverage recall
+    contig_coverage_recall: Dict[str, float] = {}
+    for contig, truth_pos in truth_positions_by_contig.items():
+        n_covered = len(truth_pos & covered_positions_by_contig.get(contig, set()))
+        contig_coverage_recall[contig] = n_covered / len(truth_pos) if truth_pos else 0.0
 
     # ── Abundance ──
     # Build one pair per unique (true_strain, timepoint) using the best-matching
@@ -2467,7 +2498,7 @@ def _compute_global_fallback_metrics(
                 c_matched_det.add(det_hap.lineage_id)
 
         c_prec = len(c_matched_det) / c_n_det if c_n_det > 0 else 0.0
-        c_rec = len(c_matched_true) / c_n_true if c_n_true > 0 else 0.0
+        c_rec = contig_coverage_recall.get(contig, 0.0)
         c_f1 = (2 * c_prec * c_rec / (c_prec + c_rec)) if (c_prec + c_rec) > 0 else 0.0
 
         c_snv_det = contig_snv_detected.get(contig, 0)
@@ -2600,7 +2631,7 @@ def _compute_haplotype_metrics(
             'n_true': agg.total_true,
             'n_detected': agg.total_detected,
             'n_matched': agg.total_matched,
-            'n_matched_true': agg.total_matched,  # Same as n_matched in new model
+            'n_matched_true': agg.total_matched,
             'n_matched_detected': agg.total_matched,
             'precision': agg.precision,
             'recall': agg.recall,
@@ -2633,12 +2664,28 @@ def _compute_haplotype_metrics(
         contig: agg.recall for contig, agg in by_contig_agg.items()
     }
 
-    # SNV recall: fraction of all truth SNVs covered by any haplotype call.
+    # SNV recall: fraction of truth SNVs covered by any haplotype call.
+    # Only count truth positions on contigs where the tool produced output;
+    # contigs skipped entirely by the tool are excluded from the denominator.
+    detected_contigs: Set[str] = set()
+    if window_results:
+        for wr in window_results:
+            detected_contigs.add(wr.window.contig)
+    else:
+        for det_hap in detected_haps:
+            detected_contigs.update(det_hap.snv_alleles.keys())
+
     truth_positions_by_contig: Dict[str, Set[int]] = defaultdict(set)
     for h in true_haps:
         for contig, snvs in h.snv_positions.items():
-            truth_positions_by_contig[contig].update(snvs.keys())
+            if contig in detected_contigs:
+                truth_positions_by_contig[contig].update(snvs.keys())
     total_true_snv_positions = sum(len(pos_set) for pos_set in truth_positions_by_contig.values())
+
+    all_truth_contigs = {c for h in true_haps for c in h.snv_positions}
+    if detected_contigs < all_truth_contigs:
+        skipped = all_truth_contigs - detected_contigs
+        logger.info(f"Excluding contigs not covered by any detected haplotype from SNV recall: {skipped}")
 
     covered_positions_by_contig: Dict[str, Set[int]] = defaultdict(set)
     if window_results:
@@ -2647,7 +2694,6 @@ def _compute_haplotype_metrics(
             for hap in wr.haplotypes:
                 covered_positions_by_contig[contig].update(hap.consensus.keys())
     else:
-        # Fallback: use detected haplotype SNV positions directly
         for det_hap in detected_haps:
             for contig, snvs in det_hap.snv_alleles.items():
                 covered_positions_by_contig[contig].update(snvs.keys())
@@ -2660,6 +2706,13 @@ def _compute_haplotype_metrics(
         covered_true_snv_positions / total_true_snv_positions
         if total_true_snv_positions > 0 else 0.0
     )
+
+    # For global fallback (no windows), override recall with SNV coverage recall
+    # so that recall = "fraction of true SNV positions represented in any
+    # detected haplotype".  Window-based recall is left unchanged.
+    if window_results is None:
+        recall = global_snv_recall
+        f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
 
     # Build missed_windows list from window metrics with recall < 1
     missed_windows = []
