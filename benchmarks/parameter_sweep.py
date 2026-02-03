@@ -725,11 +725,11 @@ class ParameterSweep:
         'min_shared_snvs_for_edge': [1, 2, 3, 4, 5, 6],
         
         # Junk model sensitivity (publication expansion)
-        "junk_divergence_rate": [0.05, 0.10, 0.2],                     # default=0.10
+        "junk_divergence_rate": [0.05, 0.10, 0.2],
         
         # Merging thresholds
-        'merge_distance_threshold': [0.005, 0.01, 0.02, 0.05, 0.1],    # default=0.005
-        "min_shared_for_merge": [1, 2, 3, 4, 5, 6],                         # default=3
+        'merge_distance_threshold': [0.005, 0.01, 0.02, 0.05, 0.1],
+        "min_shared_for_merge": [1, 2, 3, 4, 5, 6],
         
         # Linking thresholds (publication expansion)
         'max_link_distance': [0.005, 0.01, 0.02, 0.05, 0.1],
@@ -741,11 +741,11 @@ class ParameterSweep:
         'window_size',           # Most fundamental, affects all downstream
         'max_mismatch_frac',     # Core clustering parameter
         'min_shared_snvs_for_edge',  # Graph construction sensitivity
+        'junk_divergence_rate',     # Junk model sensitivity
+        'min_shared_for_merge',     # Post-processing clustering
         'merge_distance_threshold',  # Post-processing clustering
-        'min_mapq',              # Read quality filter
-        'min_base_quality',      # SNV call quality
-        'min_weight_for_anchor', # Longitudinal linking
-        'rescued_min_weight',    # Recovery threshold
+        'max_link_distance',         # Longitudinal linking
+        'min_shared_snvs_for_link',  # Longitudinal linking
     ]
 
     # Default/intermediate starting values for sequential optimization
@@ -754,11 +754,11 @@ class ParameterSweep:
         'window_size': 20000,
         'max_mismatch_frac': 0.02,
         'min_shared_snvs_for_edge': 3,
+        'junk_divergence_rate': 0.10,
+        'min_shared_for_merge': 3,
         'merge_distance_threshold': 0.02,
-        'min_mapq': 20, 
-        'min_base_quality': 20,
-        'min_weight_for_anchor': 0.10,
-        'rescued_min_weight': 0.02,
+        'max_link_distance': 0.02,
+        'min_shared_snvs_for_link': 3,
     }
 
     def __init__(
