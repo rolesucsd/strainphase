@@ -671,73 +671,6 @@ def window_results_to_lineages_tsv(
     return output_path
 
 
-def window_results_to_prelink_lineages_tsv(
-    all_window_results: List[WindowResult],
-    output_path: str,
-    sample_id: str = "sample"
-) -> str:
-    """
-    Convert WindowResults to a pre-linking lineages.tsv format for validation.
-
-    Each haplotype is kept distinct per window (no linking across windows).
-    """
-    import csv
-
-    records = []
-    for wr in all_window_results:
-        contig_id = wr.window.contig
-        window_total_reads = len(wr.window.reads)
-        for h_idx, hap in enumerate(wr.haplotypes):
-            lineage_id = f"W{wr.window.start}_H{h_idx}"
-            sample = wr.window.sample or sample_id
-            snv_alleles_str = ','.join(
-                f"{pos}:{allele}" for pos, allele in sorted(hap.consensus.items())
-            )
-            records.append({
-                'lineage_id': lineage_id,
-                'sample': sample,
-                'contig': contig_id,
-                'track_id': lineage_id,
-                'supporting_reads': hap.supporting_reads,
-                'total_reads': window_total_reads,
-                'snv_alleles': snv_alleles_str if snv_alleles_str else '.',
-            })
-
-    fieldnames = ['lineage_id', 'sample', 'contig', 'track_id', 'supporting_reads', 'total_reads', 'snv_alleles']
-    with open(output_path, 'w', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames, delimiter='\t')
-        writer.writeheader()
-        if records:
-            writer.writerows(records)
-
-    return output_path
-
-
-def write_validation_comparison_tsv(
-    output_path: str,
-    prelink: 'ValidationResult',
-    postlink: 'ValidationResult'
-) -> None:
-    import csv
-
-    rows = [
-        ("haplotype_precision", prelink.precision, postlink.precision),
-        ("haplotype_recall", prelink.recall, postlink.recall),
-        ("haplotype_f1", prelink.f1, postlink.f1),
-        ("snv_precision", prelink.snv_precision, postlink.snv_precision),
-        ("snv_recall", prelink.snv_recall, postlink.snv_recall),
-        ("abundance_pearson_r", prelink.abundance_pearson_r, postlink.abundance_pearson_r),
-        ("abundance_mae", prelink.abundance_mae, postlink.abundance_mae),
-        ("detection_threshold", prelink.detection_threshold, postlink.detection_threshold),
-    ]
-
-    with open(output_path, 'w', newline='') as f:
-        writer = csv.writer(f, delimiter='\t')
-        writer.writerow(["metric", "prelink", "postlink"])
-        for metric, pre, post in rows:
-            writer.writerow([metric, pre, post])
-
-
 # =============================================================================
 # Parameter sweep class
 # =============================================================================
@@ -792,7 +725,7 @@ class ParameterSweep:
     DEFAULT_START_VALUES = {
         'window_size': 10000,
         'max_mismatch_frac': 0.01,
-        'min_shared_snvs_for_edge': 1,
+        'min_shared_snvs_for_edge': 3,
         'junk_divergence_rate': 0.10,
         'min_shared_for_merge': 3,
         'merge_distance_threshold': 0.01,
@@ -1157,24 +1090,9 @@ class ParameterSweep:
                         # Run detailed validation (handles empty files gracefully)
                         from validation.validate_haplotypes import run_validation
                         validation_output = str(config_output_dir / "validation")
-                        prelink_validation_output = str(config_output_dir / "validation_prelink")
-
                         if verbose:
                             mode_str = "longitudinal" if use_longitudinal else "single-timepoint"
                             logger.info(f"    Running validation ({mode_str} mode)...")
-
-                        # Pre-link validation (per-window haplotypes, no linking)
-                        prelink_lineages_path = str(config_output_dir / "prelink_lineages.tsv")
-                        prelink_sample_id = timepoints[0] if use_longitudinal else first_timepoint
-                        window_results_to_prelink_lineages_tsv(
-                            all_window_results, prelink_lineages_path, sample_id=prelink_sample_id
-                        )
-                        prelink_result = run_validation(
-                            detected_file=prelink_lineages_path,
-                            truth_dir=self.truth_dir,
-                            output_dir=prelink_validation_output,
-                            window_results=all_window_results
-                        )
 
                         validation_result = run_validation(
                             detected_file=lineages_path,
@@ -1213,13 +1131,6 @@ class ParameterSweep:
                                 )
                             except Exception as e:
                                 logger.warning(f"Failed to write rescue statistics: {e}")
-
-                        # Write prelink vs postlink comparison
-                        comparison_path = str(Path(validation_output) / "validation_prelink_comparison.tsv")
-                        try:
-                            write_validation_comparison_tsv(comparison_path, prelink_result, validation_result)
-                        except Exception as e:
-                            logger.warning(f"Failed to write prelink comparison TSV: {e}")
 
                         # Extract metrics from validation (including track/linking and lineage metrics)
                         accuracy_metrics = {
@@ -1570,27 +1481,9 @@ class ParameterSweep:
                 # Run detailed validation (with track/linking support)
                 from validation.validate_haplotypes import run_validation
                 validation_output = str(config_output_dir / "validation")
-                prelink_validation_output = str(config_output_dir / "validation_prelink")
-
                 if verbose:
                     mode_str = "longitudinal" if hasattr(self, 'use_longitudinal') and self.use_longitudinal else "single-timepoint"
                     logger.info(f"    Running validation ({mode_str} mode)...")
-
-                # Pre-link validation (per-window haplotypes, no linking)
-                prelink_lineages_path = str(config_output_dir / "prelink_lineages.tsv")
-                if hasattr(self, 'use_longitudinal') and self.use_longitudinal and hasattr(self, 'timepoints') and self.timepoints:
-                    prelink_sample_id = self.timepoints[0]
-                else:
-                    prelink_sample_id = first_timepoint
-                window_results_to_prelink_lineages_tsv(
-                    all_window_results, prelink_lineages_path, sample_id=prelink_sample_id
-                )
-                prelink_result = run_validation(
-                    detected_file=prelink_lineages_path,
-                    truth_dir=self.truth_dir,
-                    output_dir=prelink_validation_output,
-                    window_results=all_window_results
-                )
 
                 validation_result = run_validation(
                     detected_file=lineages_path,

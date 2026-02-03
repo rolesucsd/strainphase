@@ -84,7 +84,7 @@ class HaplotyperConfig:
 
     # =========== WINDOW PARAMETERS ===========
     window_size: int = 10000
-    min_snvs_per_window: int = 1
+    min_snvs_per_window: int = 3
     min_reads_per_window: int = 5
 
     # =========== READ FILTERING ===========
