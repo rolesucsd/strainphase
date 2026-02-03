@@ -976,14 +976,7 @@ def compute_window_metrics(
                 if true_allele is not None and hap_allele == true_allele:
                     n_snv_correct += 1
 
-    # Also count detected SNVs from unmatched haplotypes (false positives)
-    for hap_idx in unmatched_hap_indices:
-        hap = detected_haps[hap_idx]
-        for pos in window_positions:
-            if pos in hap.consensus:
-                n_snv_detected += 1
-
-    # SNV precision uses correctness; SNV recall uses coverage of true SNVs.
+    # SNV precision: only count SNVs from matched pairs (not unmatched haplotypes).
     snv_precision = n_snv_correct / n_snv_detected if n_snv_detected > 0 else 0.0
 
     # Compute abundance pairs (true_group_abundance, detected_weight)
@@ -2259,6 +2252,7 @@ def run_validation(
         all_snv_positions=all_snv_positions,
         window_results=window_results,
         matches=matches,
+        window_size=window_size or 10000,
     )
 
     _validate_tracks_and_lineages(
@@ -2300,288 +2294,130 @@ def _compute_global_fallback_metrics(
     true_haps: List[TrueHaplotype],
     detected_haps: List[DetectedHaplotype],
     matches: List[Tuple[TrueHaplotype, DetectedHaplotype, float]],
+    all_snv_positions: Dict[str, List[int]],
+    window_size: int = 10000,
 ) -> Tuple[List[WindowMetrics], AggregatedMetrics, Dict[str, AggregatedMetrics], Dict[str, AggregatedMetrics]]:
     """
-    Compute metrics from global matches when window_results is not available.
+    Compute metrics by evaluating detected haplotypes in windows.
 
     Used for external tools (e.g. Floria) that don't produce strainphase
-    WindowResult objects. Designed to produce comparable metrics to the
-    window-based approach:
+    WindowResult objects.  Instead of computing metrics globally, this
+    function creates virtual windows from the truth SNV positions and
+    evaluates detected haplotypes within each window using the same
+    per-window logic as the strainphase path (compute_window_metrics).
 
-    - Precision/recall use unique matched IDs (no double-counting from
-      many-to-one matches).
-    - SNV metrics are computed per unique detected haplotype using its best
-      matching true strain, avoiding double-counting when one detected hap
-      matches multiple indistinguishable true strains.
-    - SNV recall uses unique true SNV *positions* (not summed across strains).
-    - Abundance pairs are built per unique (true_strain, timepoint), using
-      the best-matching detected haplotype for each.
+    This ensures identical metric definitions (precision, recall, SNV
+    precision/recall, strain grouping, matching) regardless of which
+    tool produced the haplotypes.
     """
-    # ── Unique matched IDs (deduplicated) ──
-    matched_true_ids: Set[str] = set()
-    matched_detected_ids: Set[str] = set()
-    for true_hap, det_hap, _dist in matches:
-        matched_true_ids.add(true_hap.strain_id)
-        matched_detected_ids.add(det_hap.lineage_id)
-
-    n_true = len(true_haps)
-    n_detected = len(detected_haps)
-    n_matched_true = len(matched_true_ids)
-    n_matched_detected = len(matched_detected_ids)
-
-    precision = n_matched_detected / n_detected if n_detected > 0 else 0.0
-    # NOTE: recall is set below after SNV coverage is computed, since for the
-    # global fallback recall = fraction of true SNV positions represented in
-    # any detected haplotype (SNV coverage recall).
-
-    # ── SNV metrics ──
-    # Build best match per detected haplotype (lowest distance) to avoid
-    # double-counting when one detected hap matches multiple true strains.
-    best_match_for_detected: Dict[str, Tuple[TrueHaplotype, float]] = {}
-    for true_hap, det_hap, dist in matches:
-        lid = det_hap.lineage_id
-        if lid not in best_match_for_detected or dist < best_match_for_detected[lid][1]:
-            best_match_for_detected[lid] = (true_hap, dist)
-
-    total_snv_detected = 0
-    total_snv_correct = 0
-    # Per-contig SNV counters
-    contig_snv_detected: Dict[str, int] = defaultdict(int)
-    contig_snv_correct: Dict[str, int] = defaultdict(int)
-
-    for det_hap in detected_haps:
-        best = best_match_for_detected.get(det_hap.lineage_id)
-        if best is None:
-            # Unmatched detected hap: all its SNVs count as detected but not correct
-            for contig, det_snvs in det_hap.snv_alleles.items():
-                n = len(det_snvs)
-                total_snv_detected += n
-                contig_snv_detected[contig] += n
-            continue
-
-        true_hap = best[0]
-        for contig, det_snvs in det_hap.snv_alleles.items():
-            true_snvs = true_hap.snv_positions.get(contig, {})
-            for pos, det_allele in det_snvs.items():
-                if pos in true_snvs:
-                    total_snv_detected += 1
-                    contig_snv_detected[contig] += 1
-                    if det_allele == true_snvs[pos]:
-                        total_snv_correct += 1
-                        contig_snv_correct[contig] += 1
-
-    snv_precision = total_snv_correct / total_snv_detected if total_snv_detected > 0 else 0.0
-
-    # Only evaluate truth SNV positions on contigs where the tool produced output.
-    # Contigs the tool skipped entirely are excluded from recall denominators.
+    # Only evaluate on contigs where the tool produced output.
     detected_contigs: Set[str] = set()
     for det_hap in detected_haps:
         detected_contigs.update(det_hap.snv_alleles.keys())
 
-    truth_positions_by_contig: Dict[str, Set[int]] = defaultdict(set)
-    for h in true_haps:
-        for contig, snvs in h.snv_positions.items():
-            if contig in detected_contigs:
-                truth_positions_by_contig[contig].update(snvs.keys())
-    total_true_snv_positions = sum(len(s) for s in truth_positions_by_contig.values())
+    all_truth_contigs = {c for h in true_haps for c in h.snv_positions}
+    if detected_contigs < all_truth_contigs:
+        skipped = all_truth_contigs - detected_contigs
+        logger.info(f"Excluding contigs not covered by any detected haplotype: {skipped}")
 
-    if detected_contigs < {c for h in true_haps for c in h.snv_positions}:
-        skipped = {c for h in true_haps for c in h.snv_positions} - detected_contigs
-        logger.info(f"Excluding contigs not covered by any detected haplotype from SNV recall: {skipped}")
-
-    # Positions where at least one matched detected hap has the correct allele
-    correct_positions_by_contig: Dict[str, Set[int]] = defaultdict(set)
-    for det_hap in detected_haps:
-        best = best_match_for_detected.get(det_hap.lineage_id)
-        if best is None:
-            continue
-        true_hap = best[0]
-        for contig, det_snvs in det_hap.snv_alleles.items():
-            true_snvs = true_hap.snv_positions.get(contig, {})
-            for pos, det_allele in det_snvs.items():
-                if pos in true_snvs and det_allele == true_snvs[pos]:
-                    correct_positions_by_contig[contig].add(pos)
-
-    total_correct_positions = sum(len(s) for s in correct_positions_by_contig.values())
-    snv_recall = total_correct_positions / total_true_snv_positions if total_true_snv_positions > 0 else 0.0
-
-    # Coverage-based SNV recall: fraction of true SNV positions (on detected
-    # contigs) that appear in ANY detected haplotype.  Used as headline
-    # "recall" for the global fallback.
-    covered_positions_by_contig: Dict[str, Set[int]] = defaultdict(set)
-    for det_hap in detected_haps:
-        for contig, snvs in det_hap.snv_alleles.items():
-            covered_positions_by_contig[contig].update(snvs.keys())
-
-    total_covered_true = 0
-    for contig, truth_pos in truth_positions_by_contig.items():
-        total_covered_true += len(truth_pos & covered_positions_by_contig.get(contig, set()))
-
-    recall = total_covered_true / total_true_snv_positions if total_true_snv_positions > 0 else 0.0
-    f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
-
-    # Per-contig coverage recall
-    contig_coverage_recall: Dict[str, float] = {}
-    for contig, truth_pos in truth_positions_by_contig.items():
-        n_covered = len(truth_pos & covered_positions_by_contig.get(contig, set()))
-        contig_coverage_recall[contig] = n_covered / len(truth_pos) if truth_pos else 0.0
-
-    # ── Abundance ──
-    # Build one pair per unique (true_strain, timepoint) using the best-matching
-    # detected haplotype.  "Best" = lowest distance; ties broken by first seen.
-    best_det_for_true: Dict[str, Tuple[DetectedHaplotype, float]] = {}
-    for true_hap, det_hap, dist in matches:
-        sid = true_hap.strain_id
-        if sid not in best_det_for_true or dist < best_det_for_true[sid][1]:
-            best_det_for_true[sid] = (det_hap, dist)
-
-    abundance_pairs: List[Tuple[float, float]] = []
-    for true_hap in true_haps:
-        best = best_det_for_true.get(true_hap.strain_id)
-        if best is None:
-            continue
-        det_hap = best[0]
-        for tp, true_abund in true_hap.abundances.items():
-            if true_abund <= 0.0:
-                continue
-            det_abund = det_hap.abundances.get(tp, 0.0)
-            abundance_pairs.append((true_abund, det_abund))
-
-    abundance_pearson_r = 0.0
-    abundance_mae = 0.0
-    if len(abundance_pairs) >= 2:
-        true_abunds = [p[0] for p in abundance_pairs]
-        det_abunds = [p[1] for p in abundance_pairs]
-        abundance_pearson_r = float(np.corrcoef(true_abunds, det_abunds)[0, 1])
-        if np.isnan(abundance_pearson_r):
-            abundance_pearson_r = 0.0
-        abundance_mae = float(np.mean([abs(t - d) for t, d in abundance_pairs]))
-
-    # ── Overall aggregated metrics ──
-    overall_agg = AggregatedMetrics(
-        n_windows=0,
-        n_windows_informative=0,
-        precision=precision,
-        recall=recall,
-        f1=f1,
-        snv_precision=snv_precision,
-        snv_recall=snv_recall,
-        abundance_pearson_r=abundance_pearson_r,
-        abundance_mae=abundance_mae,
-        n_abundance_pairs=len(abundance_pairs),
-        total_true=n_true,
-        total_detected=n_detected,
-        total_matched=n_matched_detected,
-        total_snv_detected=total_snv_detected,
-        total_snv_correct=total_snv_correct,
-    )
-
-    # ── Per-contig metrics ──
-    # Collect all contigs from both truth and detected
-    all_contigs = set()
-    for h in true_haps:
-        all_contigs.update(h.snv_positions.keys())
-    for h in detected_haps:
-        all_contigs.update(h.snv_alleles.keys())
-
-    by_contig_agg: Dict[str, AggregatedMetrics] = {}
-    for contig in all_contigs:
-        c_n_true = len({h.strain_id for h in true_haps if contig in h.snv_positions})
-        c_n_det = len({h.lineage_id for h in detected_haps if contig in h.snv_alleles})
-
-        # Unique matched IDs on this contig
-        c_matched_true: Set[str] = set()
-        c_matched_det: Set[str] = set()
-        for true_hap, det_hap, _dist in matches:
-            if contig in det_hap.snv_alleles and contig in true_hap.snv_positions:
-                c_matched_true.add(true_hap.strain_id)
-                c_matched_det.add(det_hap.lineage_id)
-
-        c_prec = len(c_matched_det) / c_n_det if c_n_det > 0 else 0.0
-        c_rec = contig_coverage_recall.get(contig, 0.0)
-        c_f1 = (2 * c_prec * c_rec / (c_prec + c_rec)) if (c_prec + c_rec) > 0 else 0.0
-
-        c_snv_det = contig_snv_detected.get(contig, 0)
-        c_snv_cor = contig_snv_correct.get(contig, 0)
-        c_snv_prec = c_snv_cor / c_snv_det if c_snv_det > 0 else 0.0
-        c_true_positions = len(truth_positions_by_contig.get(contig, set()))
-        c_correct_positions = len(correct_positions_by_contig.get(contig, set()))
-        c_snv_rec = c_correct_positions / c_true_positions if c_true_positions > 0 else 0.0
-
-        by_contig_agg[contig] = AggregatedMetrics(
-            n_windows=0, n_windows_informative=0,
-            precision=c_prec, recall=c_rec, f1=c_f1,
-            snv_precision=c_snv_prec, snv_recall=c_snv_rec,
-            abundance_pearson_r=0.0, abundance_mae=0.0, n_abundance_pairs=0,
-            total_true=c_n_true, total_detected=c_n_det,
-            total_matched=len(c_matched_det),
-            total_snv_detected=c_snv_det, total_snv_correct=c_snv_cor,
-        )
-
-    # ── Per-timepoint metrics ──
-    # Build from detected haplotype abundances keyed by sample
+    # Get all timepoints from detected haplotypes
     all_timepoints: Set[str] = set()
     for h in detected_haps:
         all_timepoints.update(h.abundances.keys())
+    timepoints = sorted(all_timepoints)
 
-    by_timepoint_agg: Dict[str, AggregatedMetrics] = {}
-    for tp in sorted(all_timepoints):
-        # True strains present at this timepoint
-        tp_true = [h for h in true_haps if h.abundances.get(tp, 0.0) > 0.0]
-        # Detected haplotypes with abundance at this timepoint
-        tp_det = [h for h in detected_haps if h.abundances.get(tp, 0.0) > 0.0]
+    if not timepoints:
+        timepoints = [""]
 
-        tp_true_ids = {h.strain_id for h in tp_true}
-        tp_det_ids = {h.lineage_id for h in tp_det}
+    # Build contig lengths from truth SNV positions
+    contig_max_pos: Dict[str, int] = {}
+    for contig, positions in all_snv_positions.items():
+        if contig in detected_contigs and positions:
+            contig_max_pos[contig] = max(positions)
 
-        # Matched at this timepoint
-        tp_matched_true: Set[str] = set()
-        tp_matched_det: Set[str] = set()
-        for true_hap, det_hap, _dist in matches:
-            if true_hap.strain_id in tp_true_ids and det_hap.lineage_id in tp_det_ids:
-                tp_matched_true.add(true_hap.strain_id)
-                tp_matched_det.add(det_hap.lineage_id)
+    step_size = window_size // 2
 
-        tp_n_true = len(tp_true_ids)
-        tp_n_det = len(tp_det_ids)
-        tp_prec = len(tp_matched_det) / tp_n_det if tp_n_det > 0 else 0.0
-        tp_rec = len(tp_matched_true) / tp_n_true if tp_n_true > 0 else 0.0
-        tp_f1 = (2 * tp_prec * tp_rec / (tp_prec + tp_rec)) if (tp_prec + tp_rec) > 0 else 0.0
+    # Create a lightweight adapter so compute_window_metrics can consume
+    # DetectedHaplotype objects through the same interface as Haplotype.
+    class _VirtualHaplotype:
+        """Adapter wrapping a DetectedHaplotype's SNVs within a window."""
+        __slots__ = ('consensus', 'weight')
+        def __init__(self, consensus: Dict[int, str], weight: float):
+            self.consensus = consensus
+            self.weight = weight
 
-        # Abundance pairs for this timepoint
-        tp_abund_pairs = [(t, d) for t, d in abundance_pairs
-                          if any(
-                              h.abundances.get(tp, 0.0) == t
-                              for h in tp_true
-                          )]
-        tp_pearson = 0.0
-        tp_mae = 0.0
-        if len(tp_abund_pairs) >= 2:
-            t_a = [p[0] for p in tp_abund_pairs]
-            d_a = [p[1] for p in tp_abund_pairs]
-            tp_pearson = float(np.corrcoef(t_a, d_a)[0, 1])
-            if np.isnan(tp_pearson):
-                tp_pearson = 0.0
-            tp_mae = float(np.mean([abs(t - d) for t, d in tp_abund_pairs]))
+    class _VirtualWindow:
+        """Adapter matching the Window interface for compute_window_metrics."""
+        __slots__ = ('contig', 'start', 'end', 'sample')
+        def __init__(self, contig: str, start: int, end: int, sample: str):
+            self.contig = contig
+            self.start = start
+            self.end = end
+            self.sample = sample
 
-        by_timepoint_agg[tp] = AggregatedMetrics(
-            n_windows=0, n_windows_informative=0,
-            precision=tp_prec, recall=tp_rec, f1=tp_f1,
-            snv_precision=snv_precision, snv_recall=snv_recall,
-            abundance_pearson_r=tp_pearson, abundance_mae=tp_mae,
-            n_abundance_pairs=len(tp_abund_pairs),
-            total_true=tp_n_true, total_detected=tp_n_det,
-            total_matched=len(tp_matched_det),
-            total_snv_detected=0, total_snv_correct=0,
-        )
+    class _VirtualWindowResult:
+        """Adapter matching the WindowResult interface."""
+        __slots__ = ('window', 'haplotypes')
+        def __init__(self, window, haplotypes):
+            self.window = window
+            self.haplotypes = haplotypes
 
     logger.info(
-        f"Global fallback metrics: precision={precision:.3f}, recall={recall:.3f}, "
-        f"f1={f1:.3f}, snv_precision={snv_precision:.3f}, snv_recall={snv_recall:.3f}, "
-        f"abundance_r={abundance_pearson_r:.3f}"
+        f"Evaluating {len(detected_haps)} detected haplotypes in virtual windows "
+        f"(size={window_size}, step={step_size}) across {len(contig_max_pos)} contigs, "
+        f"{len(timepoints)} timepoints"
     )
 
-    return [], overall_agg, by_contig_agg, by_timepoint_agg
+    all_metrics: List[WindowMetrics] = []
+
+    for contig, max_pos in sorted(contig_max_pos.items()):
+        for start in range(1, max_pos + 1, step_size):
+            end = min(start + window_size, max_pos + 1)
+
+            for sample in timepoints:
+                # Build virtual haplotypes: detected haplotype SNVs within window
+                virtual_haps = []
+                for det_hap in detected_haps:
+                    det_abund = det_hap.abundances.get(sample, 0.0)
+                    if det_abund <= 0:
+                        continue
+                    contig_snvs = det_hap.snv_alleles.get(contig, {})
+                    window_consensus = {
+                        pos: allele for pos, allele in contig_snvs.items()
+                        if start <= pos < end
+                    }
+                    if window_consensus:
+                        virtual_haps.append(
+                            _VirtualHaplotype(consensus=window_consensus, weight=det_abund)
+                        )
+
+                if not virtual_haps:
+                    continue
+
+                vwr = _VirtualWindowResult(
+                    window=_VirtualWindow(contig=contig, start=start, end=end, sample=sample),
+                    haplotypes=virtual_haps,
+                )
+
+                metrics = compute_window_metrics(vwr, true_haps)
+                if metrics is not None:
+                    all_metrics.append(metrics)
+
+    logger.info(f"Computed metrics for {len(all_metrics)} virtual windows")
+
+    overall = aggregate_window_metrics(all_metrics)
+    by_contig = aggregate_by_contig(all_metrics)
+    by_timepoint = aggregate_by_timepoint(all_metrics)
+
+    logger.info(
+        f"Global fallback metrics: precision={overall.precision:.3f}, "
+        f"recall={overall.recall:.3f}, f1={overall.f1:.3f}, "
+        f"snv_precision={overall.snv_precision:.3f}, "
+        f"snv_recall={overall.snv_recall:.3f}, "
+        f"abundance_r={overall.abundance_pearson_r:.3f}"
+    )
+
+    return all_metrics, overall, by_contig, by_timepoint
 
 
 def _compute_haplotype_metrics(
@@ -2591,6 +2427,7 @@ def _compute_haplotype_metrics(
     all_snv_positions: Dict[str, List[int]],
     window_results: List,
     matches: List[Tuple[TrueHaplotype, DetectedHaplotype, float]],
+    window_size: int = 10000,
 ) -> Tuple[ValidationResult, List[Dict[str, Any]]]:
     """
     Compute all haplotype validation metrics using per-window computation.
@@ -2598,21 +2435,22 @@ def _compute_haplotype_metrics(
     Uses the new architecture where all metrics (precision, recall, abundance,
     SNV metrics) are computed per-window first, then aggregated.
 
-    Falls back to global matching when window_results is None (e.g. for
-    external tools like Floria).
+    When window_results is None (external tools like Floria), creates virtual
+    windows from truth SNV positions and evaluates detected haplotypes within
+    them using the same per-window logic.
     """
     n_true = len(true_haps)
     n_detected = len(detected_haps)
 
-    # Compute per-window metrics and aggregate (or fallback to global)
+    # Compute per-window metrics and aggregate
     if window_results is not None:
         all_window_metrics, overall_agg, by_contig_agg, by_timepoint_agg = compute_all_window_metrics(
             window_results, true_haps
         )
     else:
-        logger.info("No window results available; using global fallback metrics")
+        logger.info("No window results available; evaluating detected haplotypes in virtual windows")
         all_window_metrics, overall_agg, by_contig_agg, by_timepoint_agg = _compute_global_fallback_metrics(
-            true_haps, detected_haps, matches
+            true_haps, detected_haps, matches, all_snv_positions, window_size
         )
 
     # Use aggregated metrics for primary validation metrics
@@ -2706,13 +2544,6 @@ def _compute_haplotype_metrics(
         covered_true_snv_positions / total_true_snv_positions
         if total_true_snv_positions > 0 else 0.0
     )
-
-    # For global fallback (no windows), override recall with SNV coverage recall
-    # so that recall = "fraction of true SNV positions represented in any
-    # detected haplotype".  Window-based recall is left unchanged.
-    if window_results is None:
-        recall = global_snv_recall
-        f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
 
     # Build missed_windows list from window metrics with recall < 1
     missed_windows = []
