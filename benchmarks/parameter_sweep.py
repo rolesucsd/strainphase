@@ -71,6 +71,7 @@ class ParameterSet:
     rescued_min_weight: float
     window_size: int
     # New parameters (optional, with defaults)
+    min_shared_for_merge: Optional[int] = None
     max_reads_per_window: Optional[int] = None
     junk_divergence_rate: Optional[float] = None
     max_link_distance: Optional[float] = None
@@ -86,8 +87,8 @@ class ParameterSet:
         # Get values for new parameters (with defaults if not in ParameterSet)
         max_reads_per_window = self.max_reads_per_window if self.max_reads_per_window is not None else base_config.max_reads_per_window
         junk_divergence_rate = self.junk_divergence_rate if self.junk_divergence_rate is not None else base_config.junk_divergence_rate
-        max_link_distance = self.max_link_distance if self.max_link_distance is not None else self.max_mismatch_frac
-        min_shared_snvs_for_link = self.min_shared_snvs_for_link if self.min_shared_snvs_for_link is not None else self.min_shared_snvs_for_edge
+        max_link_distance = self.max_link_distance if self.max_link_distance is not None else base_config.max_link_distance
+        min_shared_snvs_for_link = self.min_shared_snvs_for_link if self.min_shared_snvs_for_link is not None else base_config.min_shared_snvs_for_link
         rescue_match_distance = self.rescue_match_distance if self.rescue_match_distance is not None else base_config.rescue_match_distance
         lineage_merge_distance = self.lineage_merge_distance if self.lineage_merge_distance is not None else base_config.lineage_merge_distance
 
@@ -107,11 +108,11 @@ class ParameterSet:
             # Related parameters (keep consistent)
             max_link_distance=max_link_distance,
             min_shared_snvs_for_link=min_shared_snvs_for_link,
-            min_shared_for_merge=self.min_shared_snvs_for_edge,
-            min_shared_for_rescue=self.min_shared_snvs_for_edge,
+            min_shared_for_merge=self.min_shared_for_merge if self.min_shared_for_merge is not None else base_config.min_shared_for_merge,
+            min_shared_for_rescue=base_config.min_shared_for_rescue,
             rescue_match_distance=rescue_match_distance,
             lineage_merge_distance=lineage_merge_distance,
-            min_shared_for_lineage=self.min_shared_snvs_for_edge,
+            min_shared_for_lineage=base_config.min_shared_for_lineage,
 
             # Fixed parameters
             min_snvs_per_window=base_config.min_snvs_per_window,
