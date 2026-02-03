@@ -79,6 +79,7 @@ class ParameterSet:
     min_shared_snvs_for_link: Optional[int] = None
     rescue_match_distance: Optional[float] = None
     lineage_merge_distance: Optional[float] = None
+    min_depth_site: Optional[int] = None
 
     def to_config(self, base_config: Optional[HaplotyperConfig] = None, n_workers: int = 1) -> HaplotyperConfig:
         """Convert to HaplotyperConfig."""
@@ -93,6 +94,7 @@ class ParameterSet:
         rescued_min_weight = (
             self.rescued_min_weight if self.rescued_min_weight is not None else base_config.rescued_min_weight
         )
+        min_depth_site = self.min_depth_site if self.min_depth_site is not None else base_config.min_depth_site
         # Get values for new parameters (with defaults if not in ParameterSet)
         max_reads_per_window = self.max_reads_per_window if self.max_reads_per_window is not None else base_config.max_reads_per_window
         junk_divergence_rate = self.junk_divergence_rate if self.junk_divergence_rate is not None else base_config.junk_divergence_rate
@@ -111,6 +113,7 @@ class ParameterSet:
             min_weight_for_anchor=min_weight_for_anchor,
             rescued_min_weight=rescued_min_weight,
             window_size=self.window_size,
+            min_depth_site=min_depth_site,
             max_reads_per_window=max_reads_per_window,
             junk_divergence_rate=junk_divergence_rate,
 
@@ -144,11 +147,25 @@ class ParameterSet:
         rescued_min_weight = (
             self.rescued_min_weight if self.rescued_min_weight is not None else base_config.rescued_min_weight
         )
+        min_depth_site = self.min_depth_site if self.min_depth_site is not None else base_config.min_depth_site
+        junk_divergence_rate = self.junk_divergence_rate if self.junk_divergence_rate is not None else base_config.junk_divergence_rate
+        max_link_distance = self.max_link_distance if self.max_link_distance is not None else base_config.max_link_distance
+        min_shared_snvs_for_link = (
+            self.min_shared_snvs_for_link if self.min_shared_snvs_for_link is not None else base_config.min_shared_snvs_for_link
+        )
+        min_shared_for_merge = (
+            self.min_shared_for_merge if self.min_shared_for_merge is not None else base_config.min_shared_for_merge
+        )
         return (f"mm{self.max_mismatch_frac:.3f}_"
+                f"snv{self.min_shared_snvs_for_edge}_"
+                f"jd{junk_divergence_rate:.2f}_"
+                f"md{self.merge_distance_threshold:.3f}_"
+                f"msm{min_shared_for_merge}_"
+                f"ld{max_link_distance:.3f}_"
+                f"snvl{min_shared_snvs_for_link}_"
+                f"mdp{min_depth_site}_"
                 f"mq{min_mapq}_"
                 f"bq{min_base_quality}_"
-                f"snv{self.min_shared_snvs_for_edge}_"
-                f"md{self.merge_distance_threshold:.3f}_"
                 f"aw{min_weight_for_anchor:.2f}_"
                 f"rw{rescued_min_weight:.2f}_"
                 f"ws{self.window_size}")
@@ -737,7 +754,7 @@ class ParameterSweep:
         # Windowing / subsampling
         # Minimum window_size is 10000 to ensure sufficient shared SNVs for reliable linking.
         # With ~1-2 SNVs/kb, smaller windows have too few SNVs in the 50% overlap region.
-        'window_size': [2000, 5000, 10000, 20000, 50000, 100000],
+        'window_size': [5000, 10000, 20000, 50000, 100000],
         
         # Clustering parameters
         'max_mismatch_frac': [0.005, 0.01, 0.02, 0.05, 0.1],
@@ -753,6 +770,9 @@ class ParameterSweep:
         # Linking thresholds (publication expansion)
         'max_link_distance': [0.005, 0.01, 0.02, 0.05, 0.1],
         'min_shared_snvs_for_link': [1, 2, 3, 4, 5, 6],
+
+        # Clair3 params 
+        'min_depth_site': [3, 5, 10, 20, 50],
     }
 
     # Parameter order for sequential optimization (most impactful first)
@@ -770,13 +790,13 @@ class ParameterSweep:
     # Default/intermediate starting values for sequential optimization
     # These match the best parameters found in benchmarking
     DEFAULT_START_VALUES = {
-        'window_size': 20000,
-        'max_mismatch_frac': 0.02,
-        'min_shared_snvs_for_edge': 3,
+        'window_size': 10000,
+        'max_mismatch_frac': 0.01,
+        'min_shared_snvs_for_edge': 1,
         'junk_divergence_rate': 0.10,
         'min_shared_for_merge': 3,
-        'merge_distance_threshold': 0.02,
-        'max_link_distance': 0.02,
+        'merge_distance_threshold': 0.01,
+        'max_link_distance': 0.005,
         'min_shared_snvs_for_link': 3,
     }
 
@@ -1794,7 +1814,19 @@ class ParameterSweep:
         if param_order is None:
             param_order = list(self.DEFAULT_PARAM_ORDER)
         if start_values is None:
-            start_values = dict(self.DEFAULT_START_VALUES)
+            base_config = HaplotyperConfig()
+            default_map = {
+                'window_size': base_config.window_size,
+                'max_mismatch_frac': base_config.max_mismatch_frac,
+                'min_shared_snvs_for_edge': base_config.min_shared_snvs_for_edge,
+                'junk_divergence_rate': base_config.junk_divergence_rate,
+                'min_shared_for_merge': base_config.min_shared_for_merge,
+                'merge_distance_threshold': base_config.merge_distance_threshold,
+                'max_link_distance': base_config.max_link_distance,
+                'min_shared_snvs_for_link': base_config.min_shared_snvs_for_link,
+                'min_depth_site': base_config.min_depth_site,
+            }
+            start_values = {k: default_map[k] for k in param_order}
 
         # Determine if longitudinal mode (multiple timepoints)
         use_longitudinal = (reference_path is not None and
@@ -1848,6 +1880,9 @@ class ParameterSweep:
         current_pass = 1
         current_param_idx = 0
         optimization_history: List[Dict[str, Any]] = []
+        baseline_values = dict(start_values)
+        pass1_best_values: Dict[str, Any] = {}
+        first_pass_complete = False
 
         if resume:
             existing_progress = checkpoint_mgr.load_progress()
@@ -1858,6 +1893,9 @@ class ParameterSweep:
                 current_pass = seq_state.get('current_pass', 1)
                 current_param_idx = seq_state.get('current_param_idx', 0)
                 optimization_history = seq_state.get('optimization_history', [])
+                baseline_values = seq_state.get('baseline_values', baseline_values)
+                pass1_best_values = seq_state.get('pass1_best_values', pass1_best_values)
+                first_pass_complete = seq_state.get('first_pass_complete', first_pass_complete)
                 self.results = checkpoint_mgr.load_completed_results()
                 logger.info(f"Resuming sequential optimization from pass {current_pass}, "
                            f"parameter {current_param_idx} ({param_order[current_param_idx] if current_param_idx < len(param_order) else 'done'})")
@@ -1880,6 +1918,9 @@ class ParameterSweep:
                 logger.info(f"=== Pass {pass_num}/{max_passes} ===")
 
             start_idx = current_param_idx if pass_num == current_pass else 0
+            use_baseline = (pass_num == 1 and not first_pass_complete)
+            base_values_for_pass = dict(baseline_values if use_baseline else best_values)
+            temp_best_values = pass1_best_values if use_baseline else {}
 
             for param_idx in range(start_idx, len(param_order)):
                 param_name = param_order[param_idx]
@@ -1893,7 +1934,7 @@ class ParameterSweep:
 
                 for value in param_values:
                     # Build parameter set with current best values + this test value
-                    test_params_dict = dict(best_values)
+                    test_params_dict = dict(base_values_for_pass)
                     test_params_dict[param_name] = value
                     params = ParameterSet(**test_params_dict)
 
@@ -1939,7 +1980,10 @@ class ParameterSweep:
                     })
 
                 # Update best value for this parameter
-                best_values[param_name] = best_value_for_param
+                if use_baseline:
+                    temp_best_values[param_name] = best_value_for_param
+                else:
+                    best_values[param_name] = best_value_for_param
                 if best_score_for_param > best_score:
                     best_score = best_score_for_param
 
@@ -1961,12 +2005,19 @@ class ParameterSweep:
                         'current_pass': pass_num,
                         'current_param_idx': param_idx + 1,
                         'optimization_history': optimization_history,
+                        'baseline_values': baseline_values,
+                        'pass1_best_values': temp_best_values if use_baseline else pass1_best_values,
+                        'first_pass_complete': first_pass_complete,
                     }
                 )
                 checkpoint_mgr.save_progress(progress, force=True)
 
             # Reset param_idx for next pass
             current_param_idx = 0
+            if use_baseline:
+                best_values.update(temp_best_values)
+                pass1_best_values = dict(temp_best_values)
+                first_pass_complete = True
 
         # Save best params
         best_params_file = Path(output_dir) / "best_params.json"
@@ -2124,10 +2175,35 @@ def write_parameter_grid_summary(
 
     # Build set of stable config names for is_stable lookup
     stable_config_names = {p.short_name() for p in stable_params}
+    base_config = HaplotyperConfig()
 
     records = []
     for result in results:
         params = result.params
+        # Resolve defaults for optional parameters
+        min_mapq = params.min_mapq if params.min_mapq is not None else base_config.min_mapq
+        min_base_quality = params.min_base_quality if params.min_base_quality is not None else base_config.min_base_quality
+        min_weight_for_anchor = (
+            params.min_weight_for_anchor if params.min_weight_for_anchor is not None else base_config.min_weight_for_anchor
+        )
+        rescued_min_weight = (
+            params.rescued_min_weight if params.rescued_min_weight is not None else base_config.rescued_min_weight
+        )
+        junk_divergence_rate = (
+            params.junk_divergence_rate if params.junk_divergence_rate is not None else base_config.junk_divergence_rate
+        )
+        min_shared_for_merge = (
+            params.min_shared_for_merge if params.min_shared_for_merge is not None else base_config.min_shared_for_merge
+        )
+        max_link_distance = (
+            params.max_link_distance if params.max_link_distance is not None else base_config.max_link_distance
+        )
+        min_shared_snvs_for_link = (
+            params.min_shared_snvs_for_link if params.min_shared_snvs_for_link is not None else base_config.min_shared_snvs_for_link
+        )
+        min_depth_site = (
+            params.min_depth_site if params.min_depth_site is not None else base_config.min_depth_site
+        )
 
         # Compute SNV F1 from precision/recall
         snv_f1 = 0.0
@@ -2190,11 +2266,16 @@ def write_parameter_grid_summary(
             'window_size': params.window_size,
             'max_mismatch_frac': params.max_mismatch_frac,
             'min_shared_snvs_for_edge': params.min_shared_snvs_for_edge,
+            'junk_divergence_rate': junk_divergence_rate,
             'merge_distance_threshold': params.merge_distance_threshold,
-            'min_mapq': params.min_mapq,
-            'min_base_quality': params.min_base_quality,
-            'min_weight_for_anchor': params.min_weight_for_anchor,
-            'rescued_min_weight': params.rescued_min_weight,
+            'min_shared_for_merge': min_shared_for_merge,
+            'max_link_distance': max_link_distance,
+            'min_shared_snvs_for_link': min_shared_snvs_for_link,
+            'min_depth_site': min_depth_site,
+            'min_mapq': min_mapq,
+            'min_base_quality': min_base_quality,
+            'min_weight_for_anchor': min_weight_for_anchor,
+            'rescued_min_weight': rescued_min_weight,
         })
 
     # Write TSV
@@ -2222,7 +2303,9 @@ def write_parameter_grid_summary(
             'converged', 'mean_confidence', 'n_lineages', 'is_stable',
             # Parameters
             'window_size', 'max_mismatch_frac', 'min_shared_snvs_for_edge',
-            'merge_distance_threshold', 'min_mapq', 'min_base_quality',
+            'junk_divergence_rate', 'merge_distance_threshold',
+            'min_shared_for_merge', 'max_link_distance', 'min_shared_snvs_for_link',
+            'min_depth_site', 'min_mapq', 'min_base_quality',
             'min_weight_for_anchor', 'rescued_min_weight',
         ]
         with open(output_path, 'w', newline='') as f:
@@ -2248,7 +2331,9 @@ def write_parameter_grid_summary(
                 'runtime_seconds', 'memory_peak_mb',
                 'converged', 'mean_confidence', 'n_lineages', 'is_stable',
                 'window_size', 'max_mismatch_frac', 'min_shared_snvs_for_edge',
-                'merge_distance_threshold', 'min_mapq', 'min_base_quality',
+                'junk_divergence_rate', 'merge_distance_threshold',
+                'min_shared_for_merge', 'max_link_distance', 'min_shared_snvs_for_link',
+                'min_depth_site', 'min_mapq', 'min_base_quality',
                 'min_weight_for_anchor', 'rescued_min_weight',
             ]) + '\n')
 
