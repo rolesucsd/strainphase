@@ -3061,25 +3061,37 @@ def _write_validation_reports(
                     contigs = list(fp_hap.snv_alleles.keys())
                     add("")
                     add(f"  {fp_id}: max_abundance={max_abund:.4f}, n_snvs={n_snvs}, contigs={contigs}")
-                    add("    Why it doesn't match:")
+                    add("    Closest true strain:")
+                    best = None
                     for true_hap in true_haps:
                         dist, n_matches, n_shared, match_fraction = compute_haplotype_distance(true_hap, fp_hap)
-                        n_mismatches = n_shared - n_matches
+                        if best is None or dist < best["dist"]:
+                            best = {
+                                "true_hap": true_hap,
+                                "dist": dist,
+                                "n_matches": n_matches,
+                                "n_shared": n_shared,
+                                "match_fraction": match_fraction,
+                            }
+                    if best is not None:
+                        n_mismatches = best["n_shared"] - best["n_matches"]
                         reasons = []
-                        if n_shared < 3:
-                            reasons.append(f"too few shared SNVs ({n_shared} < 3)")
-                        if match_fraction < 0.9:
-                            reasons.append(f"low match fraction ({match_fraction:.3f} < 0.9)")
-                        if dist > 0.1:
-                            reasons.append(f"distance too high ({dist:.3f} > 0.1)")
+                        if best["n_shared"] < 3:
+                            reasons.append(f"too few shared SNVs ({best['n_shared']} < 3)")
+                        if best["match_fraction"] < 0.9:
+                            reasons.append(f"low match fraction ({best['match_fraction']:.3f} < 0.9)")
+                        if best["dist"] > 0.1:
+                            reasons.append(f"distance too high ({best['dist']:.3f} > 0.1)")
 
-                        line = f"      vs {true_hap.strain_id}: "
+                        line = f"      vs {best['true_hap'].strain_id}: "
                         if reasons:
                             line += "; ".join(reasons)
-                            line += f"; distance={dist:.3f}, shared={n_shared}, matches={n_matches}, mismatches={n_mismatches}"
+                            line += (f"; distance={best['dist']:.3f}, shared={best['n_shared']}, "
+                                     f"matches={best['n_matches']}, mismatches={n_mismatches}")
                         else:
-                            line += (f"distance={dist:.3f}, shared={n_shared}, matches={n_matches}, "
-                                     f"mismatches={n_mismatches}, match_frac={match_fraction:.3f}")
+                            line += (f"distance={best['dist']:.3f}, shared={best['n_shared']}, "
+                                     f"matches={best['n_matches']}, mismatches={n_mismatches}, "
+                                     f"match_frac={best['match_fraction']:.3f}")
                         add(line)
         else:
             add("  None")

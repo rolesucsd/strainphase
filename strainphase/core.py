@@ -83,25 +83,25 @@ class HaplotyperConfig:
     """
 
     # =========== WINDOW PARAMETERS ===========
-    window_size: int = 20000
-    min_snvs_per_window: int = 3
-    min_reads_per_window: int = 10
+    window_size: int = 10000
+    min_snvs_per_window: int = 1
+    min_reads_per_window: int = 5
 
     # =========== READ FILTERING ===========
-    min_mapq: int = 10
+    min_mapq: int = 20
     min_base_quality: int = 20
     default_base_quality: int = 20
-    max_reads_per_window: int = 100
+    max_reads_per_window: int = 1000
 
     # =========== SNV FILTERING (Clair3) ===========
-    min_depth_site: int = 10
+    min_depth_site: int = 3
     af_range: tuple[float, float] = (0.05, 0.95)
     require_biallelic: bool = True
     skip_af_filter_if_missing: bool = True
 
     # =========== GRAPH CONSTRUCTION ===========
-    min_shared_snvs_for_edge: int = 3
-    max_mismatch_frac: float = 0.04
+    min_shared_snvs_for_edge: int = 1
+    max_mismatch_frac: float = 0.01
     min_reads_per_cluster: int = 3
 
     # =========== EM PARAMETERS ===========
@@ -129,8 +129,8 @@ class HaplotyperConfig:
     binomial_alpha: float = 0.05
 
     # =========== LONGITUDINAL PARAMETERS ===========
-    min_weight_for_anchor: float = 0.05
-    rescue_match_distance: float = 0.0005  # 0.05% error rate — near-exact match required
+    min_weight_for_anchor: float = 0.1
+    rescue_match_distance: float = 0.01  # 0.1% error rate — near-exact match required
     min_shared_for_rescue: int = 3  # Min shared SNVs with actual calls for rescue matching
     rescued_min_weight: float = 0.01
 
@@ -147,7 +147,7 @@ class HaplotyperConfig:
     # =========== WINDOW LINKING PARAMETERS ===========
     # Haplotypes in adjacent overlapping windows are linked if their
     # consensus agrees on shared SNVs (Hamming distance <= max_link_distance)
-    max_link_distance: float = 0.02  # Max mismatch fraction to link
+    max_link_distance: float = 0.005  # Max mismatch fraction to link
     min_shared_snvs_for_link: int = (
         3  # Min shared SNVs with ACTUAL CALLS to link (not just window overlap)
     )

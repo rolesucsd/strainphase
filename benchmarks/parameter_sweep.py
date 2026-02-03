@@ -718,30 +718,22 @@ class ParameterSweep:
         # Windowing / subsampling
         # Minimum window_size is 10000 to ensure sufficient shared SNVs for reliable linking.
         # With ~1-2 SNVs/kb, smaller windows have too few SNVs in the 50% overlap region.
-        'window_size': [10000, 20000, 50000, 100000],
-        'max_reads_per_window': [500],
+        'window_size': [2000, 5000, 10000, 20000, 50000, 100000],
         
         # Clustering parameters
         'max_mismatch_frac': [0.005, 0.01, 0.02, 0.05, 0.1],
         'min_shared_snvs_for_edge': [1, 2, 3, 4, 5, 6],
         
-        # Quality filters
-        'min_mapq': [10, 20, 30],
-        'min_base_quality': [20],
-        
         # Junk model sensitivity (publication expansion)
-        'junk_divergence_rate': [0.05],
+        "junk_divergence_rate": [0.05, 0.10, 0.2],                     # default=0.10
         
         # Merging thresholds
-        'merge_distance_threshold': [0.02],
+        'merge_distance_threshold': [0.005, 0.01, 0.02, 0.05, 0.1],    # default=0.005
+        "min_shared_for_merge": [1, 2, 3, 4, 5, 6],                         # default=3
         
         # Linking thresholds (publication expansion)
-        'max_link_distance': [0.01],
-        'min_shared_snvs_for_link': [3],
-        
-        # Abundance thresholds
-        'min_weight_for_anchor': [0.20],
-        'rescued_min_weight': [0.02],
+        'max_link_distance': [0.005, 0.01, 0.02, 0.05, 0.1],
+        'min_shared_snvs_for_link': [1, 2, 3, 4, 5, 6],
     }
 
     # Parameter order for sequential optimization (most impactful first)
