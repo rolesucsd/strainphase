@@ -952,9 +952,11 @@ def compute_window_metrics(
     recall = n_matched / n_strain_groups if n_strain_groups > 0 else 0.0
 
     # Compute SNV-level metrics
-    # For each matched pair, count SNVs detected and correct
-    n_snv_detected = 0
+    # Numerator (n_snv_correct): alleles in matched haplotypes that agree with truth.
+    # Denominator (n_snv_detected): ALL SNV calls across ALL haplotypes in window.
     n_snv_correct = 0
+
+    matched_hap_indices = {hap_idx for _, hap_idx, _ in matches}
 
     for group_strain_ids, hap_idx, distance in matches:
         hap = detected_haps[hap_idx]
@@ -971,12 +973,17 @@ def compute_window_metrics(
         for pos in window_positions:
             hap_allele = hap_alleles.get(pos)
             true_allele = matching_group.consensus.get(pos)
-            if hap_allele is not None:
-                n_snv_detected += 1
-                if true_allele is not None and hap_allele == true_allele:
-                    n_snv_correct += 1
+            if hap_allele is not None and true_allele is not None and hap_allele == true_allele:
+                n_snv_correct += 1
 
-    # SNV precision: only count SNVs from matched pairs (not unmatched haplotypes).
+    # Count total SNV calls across ALL haplotypes (matched + unmatched)
+    n_snv_detected = 0
+    for hi, hap in enumerate(detected_haps):
+        for pos in window_positions:
+            if pos in hap.consensus:
+                n_snv_detected += 1
+
+    # SNV precision: correct calls / all calls.
     snv_precision = n_snv_correct / n_snv_detected if n_snv_detected > 0 else 0.0
 
     # Compute abundance pairs (true_group_abundance, detected_weight)
