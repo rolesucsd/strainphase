@@ -191,7 +191,7 @@ class SweepResult:
     rescue_delta_recall_rare: Optional[float] = None
     abundance_trajectory_error: Optional[float] = None
     rescued_haplotypes: Optional[int] = None
-    rescue_total_haplotypes: Optional[int] = None
+    rescue_windows_eligible: Optional[int] = None  # Windows where rescue was actually attempted (had junk reads + anchors)
     rescue_rate: Optional[float] = None
     
     # Performance metrics
@@ -245,7 +245,7 @@ class SweepResult:
             'rescue_delta_recall_rare': self.rescue_delta_recall_rare,
             'abundance_trajectory_error': self.abundance_trajectory_error,
             'rescued_haplotypes': self.rescued_haplotypes,
-            'rescue_total_haplotypes': self.rescue_total_haplotypes,
+            'rescue_windows_eligible': self.rescue_windows_eligible,
             'rescue_rate': self.rescue_rate,
             # Performance and metadata
             'memory_peak_mb': self.memory_peak_mb,
@@ -1155,7 +1155,7 @@ class ParameterSweep:
 
                         # Write rescue statistics if available from longitudinal integrator
                         rescued_haplotypes = 0
-                        rescue_total_haplotypes = 0
+                        rescue_windows_eligible = 0
                         rescue_rate = 0.0
                         # rescue_integrator is already set from process_mag_longitudinal return value
                         logger.info(f"    Rescue stats check: use_longitudinal={use_longitudinal}, "
@@ -1170,9 +1170,15 @@ class ParameterSweep:
                                 rescued_reads_path = str(Path(validation_output) / "rescued_reads.tsv")
                                 rescue_integrator.write_rescued_reads(rescued_reads_path)
                                 rescued_haplotypes = sum(1 for s in rescue_integrator.rescue_statistics if s.was_rescued)
-                                rescue_total_haplotypes = len(rescue_integrator.rescue_statistics)
+                                # Only count windows where rescue was actually attempted
+                                # (had junk reads AND anchors — skip no_junk_reads and no_anchors)
+                                skipped_reasons = {"no_junk_reads", "no_anchors"}
+                                rescue_windows_eligible = sum(
+                                    1 for s in rescue_integrator.rescue_statistics
+                                    if s.reason not in skipped_reasons
+                                )
                                 rescue_rate = (
-                                    rescued_haplotypes / rescue_total_haplotypes if rescue_total_haplotypes else 0.0
+                                    rescued_haplotypes / rescue_windows_eligible if rescue_windows_eligible else 0.0
                                 )
                             except Exception as e:
                                 logger.warning(f"Failed to write rescue statistics: {e}")
@@ -1216,7 +1222,7 @@ class ParameterSweep:
                             "rescue_delta_recall_rare": validation_result.rescue_delta_recall_rare,
                             "abundance_trajectory_error": validation_result.abundance_trajectory_error,
                             "rescued_haplotypes": rescued_haplotypes,
-                            "rescue_total_haplotypes": rescue_total_haplotypes,
+                            "rescue_windows_eligible": rescue_windows_eligible,
                             "rescue_rate": rescue_rate,
                         }
                         if verbose:
@@ -1299,7 +1305,7 @@ class ParameterSweep:
                     rescue_delta_recall_rare=accuracy_metrics.get("rescue_delta_recall_rare"),
                     abundance_trajectory_error=accuracy_metrics.get("abundance_trajectory_error"),
                     rescued_haplotypes=accuracy_metrics.get("rescued_haplotypes"),
-                    rescue_total_haplotypes=accuracy_metrics.get("rescue_total_haplotypes"),
+                    rescue_windows_eligible=accuracy_metrics.get("rescue_windows_eligible"),
                     rescue_rate=accuracy_metrics.get("rescue_rate"),
                     # Metadata
                     ablation=None,  # Can be set by caller for ablation studies
@@ -1565,7 +1571,7 @@ class ParameterSweep:
 
                 # Write rescue statistics if available from longitudinal integrator
                 rescued_haplotypes = 0
-                rescue_total_haplotypes = 0
+                rescue_windows_eligible = 0
                 rescue_rate = 0.0
                 use_longitudinal_check = hasattr(self, 'use_longitudinal') and self.use_longitudinal
                 # rescue_integrator is already set from process_mag_longitudinal return value
@@ -1581,9 +1587,14 @@ class ParameterSweep:
                         rescued_reads_path = str(Path(validation_output) / "rescued_reads.tsv")
                         rescue_integrator.write_rescued_reads(rescued_reads_path)
                         rescued_haplotypes = sum(1 for s in rescue_integrator.rescue_statistics if s.was_rescued)
-                        rescue_total_haplotypes = len(rescue_integrator.rescue_statistics)
+                        # Only count windows where rescue was actually attempted
+                        skipped_reasons = {"no_junk_reads", "no_anchors"}
+                        rescue_windows_eligible = sum(
+                            1 for s in rescue_integrator.rescue_statistics
+                            if s.reason not in skipped_reasons
+                        )
                         rescue_rate = (
-                            rescued_haplotypes / rescue_total_haplotypes if rescue_total_haplotypes else 0.0
+                            rescued_haplotypes / rescue_windows_eligible if rescue_windows_eligible else 0.0
                         )
                     except Exception as e:
                         logger.warning(f"Failed to write rescue statistics: {e}")
@@ -1627,7 +1638,7 @@ class ParameterSweep:
                     "rescue_delta_recall_rare": validation_result.rescue_delta_recall_rare,
                     "abundance_trajectory_error": validation_result.abundance_trajectory_error,
                     "rescued_haplotypes": rescued_haplotypes,
-                    "rescue_total_haplotypes": rescue_total_haplotypes,
+                    "rescue_windows_eligible": rescue_windows_eligible,
                     "rescue_rate": rescue_rate,
                 }
                 if verbose:
@@ -1711,7 +1722,7 @@ class ParameterSweep:
             rescue_delta_recall_rare=accuracy_metrics.get("rescue_delta_recall_rare"),
             abundance_trajectory_error=accuracy_metrics.get("abundance_trajectory_error"),
             rescued_haplotypes=accuracy_metrics.get("rescued_haplotypes"),
-            rescue_total_haplotypes=accuracy_metrics.get("rescue_total_haplotypes"),
+            rescue_windows_eligible=accuracy_metrics.get("rescue_windows_eligible"),
             rescue_rate=accuracy_metrics.get("rescue_rate"),
             # Metadata
             ablation=None,  # Can be set by caller for ablation studies
@@ -2151,7 +2162,7 @@ def write_parameter_grid_summary(
             'rescue_delta_recall_rare': f"{result.rescue_delta_recall_rare:.6f}" if result.rescue_delta_recall_rare is not None else "NA",
             'abundance_trajectory_error': f"{result.abundance_trajectory_error:.6f}" if result.abundance_trajectory_error is not None else "NA",
             'rescued_haplotypes': result.rescued_haplotypes if result.rescued_haplotypes is not None else "NA",
-            'rescue_total_haplotypes': result.rescue_total_haplotypes if result.rescue_total_haplotypes is not None else "NA",
+            'rescue_windows_eligible': result.rescue_windows_eligible if result.rescue_windows_eligible is not None else "NA",
             'rescue_rate': f"{result.rescue_rate:.6f}" if result.rescue_rate is not None else "NA",
 
             # Speed metrics
@@ -2193,7 +2204,7 @@ def write_parameter_grid_summary(
             # Longitudinal
             'lineage_precision', 'lineage_recall', 'lineage_f1',
             'rescue_delta_recall_rare', 'abundance_trajectory_error',
-            'rescued_haplotypes', 'rescue_total_haplotypes', 'rescue_rate',
+            'rescued_haplotypes', 'rescue_windows_eligible', 'rescue_rate',
             # Speed
             'runtime_seconds', 'memory_peak_mb',
             # Stability
@@ -2222,7 +2233,7 @@ def write_parameter_grid_summary(
                 'false_link_rate', 'missed_link_rate', 'track_consensus_error',
                 'lineage_precision', 'lineage_recall', 'lineage_f1',
                 'rescue_delta_recall_rare', 'abundance_trajectory_error',
-                'rescued_haplotypes', 'rescue_total_haplotypes', 'rescue_rate',
+                'rescued_haplotypes', 'rescue_windows_eligible', 'rescue_rate',
                 'runtime_seconds', 'memory_peak_mb',
                 'converged', 'mean_confidence', 'n_lineages', 'is_stable',
                 'window_size', 'max_mismatch_frac', 'min_shared_snvs_for_edge',
