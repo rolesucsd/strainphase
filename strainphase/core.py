@@ -130,7 +130,7 @@ class HaplotyperConfig:
 
     # =========== LONGITUDINAL PARAMETERS ===========
     min_weight_for_anchor: float = 0.05
-    rescue_match_distance: float = 0.005
+    rescue_match_distance: float = 0.0005  # 0.05% error rate — near-exact match required
     min_shared_for_rescue: int = 3  # Min shared SNVs with actual calls for rescue matching
     rescued_min_weight: float = 0.01
 
@@ -1323,7 +1323,9 @@ class LongitudinalIntegrator:
             f"junk_weight={junk_weight:.3f}, {len(anchor_haps)} anchors"
         )
 
-        if n_junk_reads < self.config.min_reads_per_window:
+        # Even a single junk read matching an anchor from another timepoint is meaningful,
+        # as long as the match is near-exact (controlled by rescue_match_distance).
+        if n_junk_reads < 1:
             # Not enough junk reads to rescue
             self.rescue_statistics.append(
                 RescueStatistic(
@@ -1339,7 +1341,7 @@ class LongitudinalIntegrator:
                     anchor_distance=-1.0,
                     n_shared_with_anchor=0,
                     n_mismatched_with_anchor=0,
-                    reason=f"insufficient_junk_reads({n_junk_reads})",
+                    reason=f"no_junk_reads",
                 )
             )
             return window_result
@@ -1351,7 +1353,7 @@ class LongitudinalIntegrator:
         new_haplotypes = []
 
         # Matching thresholds for anchor comparisons.
-        max_distance = self.config.rescue_match_distance  # e.g., 0.005 = 99.5% match required
+        max_distance = self.config.rescue_match_distance  # default 0.0005 = 99.95% match required
         min_shared = self.config.min_shared_for_rescue
 
         for anchor_idx, anchor in enumerate(anchor_haps):
@@ -1376,7 +1378,6 @@ class LongitudinalIntegrator:
                 continue
 
             # Count junk reads that are consistent with this anchor.
-            # Use a lower per-read shared threshold, but require many matching reads.
             n_matching_junk = 0
             matching_read_indices = []
             matching_read_info = []  # Store (read_idx, n_agree, n_disagree, n_total) for rescued reads
@@ -1404,9 +1405,9 @@ class LongitudinalIntegrator:
                         # Store SNP agreement info: (read_idx, n_agree, n_disagree, n_total)
                         matching_read_info.append((i, n_match, n_shared - n_match, n_shared))
 
-            # If enough junk reads match this anchor, create a rescued haplotype.
-            min_reads_for_rescue = max(3, int(0.02 * len(reads)))  # At least 3 reads or 2%
-            if n_matching_junk >= min_reads_for_rescue:
+            # If any junk reads match this anchor near-exactly, create a rescued haplotype.
+            # The strict rescue_match_distance (0.05%) ensures only truly matching reads pass.
+            if n_matching_junk >= 1:
                 # Create new haplotype from anchor consensus (restricted to this window's SNVs).
                 new_consensus = {
                     pos: anchor.consensus[pos]
@@ -1639,10 +1640,11 @@ class LongitudinalIntegrator:
         rescued_results: dict[str, list[WindowResult]] = defaultdict(list)
 
         for _window_key, sample_results in windows_by_position.items():
-            # Anchor panel = haplotypes from other timepoints (potential donors).
-            anchor_haps, anchor_samples = self.build_anchor_panel_for_key(sample_results)
-
             for sample_id, wr in sample_results.items():
+                # Build anchor panel excluding the current sample to avoid self-rescue.
+                anchor_haps, anchor_samples = self.build_anchor_panel_for_key(
+                    sample_results, exclude_sample=sample_id
+                )
                 rescued_wr = self.rescue_window_result(
                     wr, anchor_haps, anchor_samples, sample_results, sample_id
                 )
