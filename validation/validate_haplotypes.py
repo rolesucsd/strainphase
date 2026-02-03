@@ -2296,6 +2296,132 @@ def run_validation(
     return result
 
 
+def _compute_global_fallback_metrics(
+    true_haps: List[TrueHaplotype],
+    detected_haps: List[DetectedHaplotype],
+    matches: List[Tuple[TrueHaplotype, DetectedHaplotype, float]],
+) -> Tuple[List[WindowMetrics], AggregatedMetrics, Dict[str, AggregatedMetrics], Dict[str, AggregatedMetrics]]:
+    """
+    Compute metrics from global matches when window_results is not available.
+
+    Used for external tools (e.g. Floria) that don't produce strainphase
+    WindowResult objects. Computes precision, recall, SNV accuracy, and
+    abundance correlation directly from the global match list.
+    """
+    # Count unique matched true strains and detected haplotypes
+    matched_true_ids = set()
+    matched_detected_ids = set()
+    for true_hap, det_hap, _dist in matches:
+        matched_true_ids.add(true_hap.strain_id)
+        matched_detected_ids.add(det_hap.lineage_id)
+
+    n_true = len(true_haps)
+    n_detected = len(detected_haps)
+    n_matched_true = len(matched_true_ids)
+    n_matched_detected = len(matched_detected_ids)
+
+    precision = n_matched_detected / n_detected if n_detected > 0 else 0.0
+    recall = n_matched_true / n_true if n_true > 0 else 0.0
+    f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
+
+    # SNV metrics from matches: count correct/total across all match pairs
+    total_snv_detected = 0
+    total_snv_correct = 0
+    for true_hap, det_hap, _dist in matches:
+        for contig, det_snvs in det_hap.snv_alleles.items():
+            true_snvs = true_hap.snv_positions.get(contig, {})
+            for pos, det_allele in det_snvs.items():
+                if pos in true_snvs:
+                    total_snv_detected += 1
+                    if det_allele == true_snvs[pos]:
+                        total_snv_correct += 1
+
+    snv_precision = total_snv_correct / total_snv_detected if total_snv_detected > 0 else 0.0
+
+    # SNV recall: how many true SNV positions are covered by any detected haplotype
+    total_true_snv = sum(
+        sum(len(snvs) for snvs in h.snv_positions.values())
+        for h in true_haps
+    )
+    snv_recall = total_snv_correct / total_true_snv if total_true_snv > 0 else 0.0
+
+    # Abundance: pair matched true/detected abundances
+    # For each match, pair the true strain's abundance with detected haplotype's abundance
+    # across all timepoints
+    abundance_pairs = []
+    for true_hap, det_hap, _dist in matches:
+        for tp, true_abund in true_hap.abundances.items():
+            if true_abund <= 0.0:
+                continue
+            det_abund = det_hap.abundances.get(tp, 0.0)
+            abundance_pairs.append((true_abund, det_abund))
+
+    abundance_pearson_r = 0.0
+    abundance_mae = 0.0
+    if len(abundance_pairs) >= 2:
+        true_abunds = [p[0] for p in abundance_pairs]
+        det_abunds = [p[1] for p in abundance_pairs]
+        abundance_pearson_r = float(np.corrcoef(true_abunds, det_abunds)[0, 1])
+        if np.isnan(abundance_pearson_r):
+            abundance_pearson_r = 0.0
+        abundance_mae = float(np.mean([abs(t - d) for t, d in abundance_pairs]))
+
+    overall_agg = AggregatedMetrics(
+        n_windows=0,
+        n_windows_informative=0,
+        precision=precision,
+        recall=recall,
+        f1=f1,
+        snv_precision=snv_precision,
+        snv_recall=snv_recall,
+        abundance_pearson_r=abundance_pearson_r,
+        abundance_mae=abundance_mae,
+        n_abundance_pairs=len(abundance_pairs),
+        total_true=n_true,
+        total_detected=n_detected,
+        total_matched=max(n_matched_true, n_matched_detected),
+        total_snv_detected=total_snv_detected,
+        total_snv_correct=total_snv_correct,
+    )
+
+    # Build per-contig metrics from matches
+    contig_matches: Dict[str, List[Tuple[TrueHaplotype, DetectedHaplotype, float]]] = defaultdict(list)
+    for true_hap, det_hap, dist in matches:
+        for contig in det_hap.snv_alleles:
+            contig_matches[contig].append((true_hap, det_hap, dist))
+
+    by_contig_agg = {}
+    for contig, c_matches in contig_matches.items():
+        c_true_ids = {m[0].strain_id for m in c_matches}
+        c_det_ids = {m[1].lineage_id for m in c_matches}
+        c_n_true = len({h.strain_id for h in true_haps if contig in h.snv_positions})
+        c_n_det = len({h.lineage_id for h in detected_haps if contig in h.snv_alleles})
+        c_prec = len(c_det_ids) / c_n_det if c_n_det > 0 else 0.0
+        c_rec = len(c_true_ids) / c_n_true if c_n_true > 0 else 0.0
+        c_f1 = (2 * c_prec * c_rec / (c_prec + c_rec)) if (c_prec + c_rec) > 0 else 0.0
+        by_contig_agg[contig] = AggregatedMetrics(
+            n_windows=0, n_windows_informative=0,
+            precision=c_prec, recall=c_rec, f1=c_f1,
+            snv_precision=snv_precision, snv_recall=snv_recall,
+            abundance_pearson_r=0.0, abundance_mae=0.0, n_abundance_pairs=0,
+            total_true=c_n_true, total_detected=c_n_det,
+            total_matched=len(c_det_ids),
+            total_snv_detected=0, total_snv_correct=0,
+        )
+
+    # No per-timepoint breakdown without window results (detected haps may only
+    # have a single sample), but build from detected_haps.abundances if available
+    by_timepoint_agg: Dict[str, AggregatedMetrics] = {}
+
+    logger.info(
+        f"Global fallback metrics: precision={precision:.3f}, recall={recall:.3f}, "
+        f"f1={f1:.3f}, snv_precision={snv_precision:.3f}, snv_recall={snv_recall:.3f}, "
+        f"abundance_r={abundance_pearson_r:.3f}"
+    )
+
+    return [], overall_agg, by_contig_agg, by_timepoint_agg
+
+
 def _compute_haplotype_metrics(
     *,
     true_haps: List[TrueHaplotype],
@@ -2309,14 +2435,23 @@ def _compute_haplotype_metrics(
 
     Uses the new architecture where all metrics (precision, recall, abundance,
     SNV metrics) are computed per-window first, then aggregated.
+
+    Falls back to global matching when window_results is None (e.g. for
+    external tools like Floria).
     """
     n_true = len(true_haps)
     n_detected = len(detected_haps)
 
-    # Compute per-window metrics and aggregate
-    all_window_metrics, overall_agg, by_contig_agg, by_timepoint_agg = compute_all_window_metrics(
-        window_results, true_haps
-    )
+    # Compute per-window metrics and aggregate (or fallback to global)
+    if window_results is not None:
+        all_window_metrics, overall_agg, by_contig_agg, by_timepoint_agg = compute_all_window_metrics(
+            window_results, true_haps
+        )
+    else:
+        logger.info("No window results available; using global fallback metrics")
+        all_window_metrics, overall_agg, by_contig_agg, by_timepoint_agg = _compute_global_fallback_metrics(
+            true_haps, detected_haps, matches
+        )
 
     # Use aggregated metrics for primary validation metrics
     precision = overall_agg.precision
@@ -2380,6 +2515,11 @@ def _compute_haplotype_metrics(
             contig = wr.window.contig
             for hap in wr.haplotypes:
                 covered_positions_by_contig[contig].update(hap.consensus.keys())
+    else:
+        # Fallback: use detected haplotype SNV positions directly
+        for det_hap in detected_haps:
+            for contig, snvs in det_hap.snv_alleles.items():
+                covered_positions_by_contig[contig].update(snvs.keys())
 
     covered_true_snv_positions = 0
     for contig, truth_positions in truth_positions_by_contig.items():
