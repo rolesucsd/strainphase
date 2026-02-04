@@ -1321,7 +1321,9 @@ def write_lineage_details(
     true_haps: List[TrueHaplotype],
     detected_haps: List[DetectedHaplotype],
     matches: List[Tuple[TrueHaplotype, DetectedHaplotype, float]],
-    output_dir: str
+    output_dir: str,
+    lineages_file: Optional[str] = None,
+    window_results: Optional[List] = None,
 ) -> Tuple[str, Dict[str, Dict[str, Any]]]:
     """
     Write lineage_details.tsv - per-lineage raw data table.
@@ -1332,6 +1334,39 @@ def write_lineage_details(
     import csv
 
     output_path = os.path.join(output_dir, 'lineage_details.tsv')
+
+    # Build (lineage_id, timepoint, contig) -> supporting_reads map from lineages.tsv
+    read_counts: Dict[Tuple[str, str, str], int] = {}
+    if lineages_file and Path(lineages_file).exists():
+        with open(lineages_file) as f:
+            header_line = f.readline().strip()
+            if header_line:
+                header = header_line.split('\t')
+                for line in f:
+                    parts = line.strip().split('\t')
+                    if len(parts) < len(header):
+                        continue
+                    row = dict(zip(header, parts))
+                    lineage_id = row.get('lineage_id', row.get('track_id', ''))
+                    sample = row.get('sample', row.get('timepoint', ''))
+                    contig = row.get('contig', '')
+                    if not lineage_id or not contig:
+                        continue
+                    supporting_reads = int(row.get('supporting_reads', 0))
+                    read_counts[(lineage_id, sample, contig)] = supporting_reads
+
+    # Build (lineage_id, timepoint, contig) -> n_windows from window_results
+    n_windows_map: Dict[Tuple[str, str, str], int] = {}
+    if window_results:
+        windows_by_key: Dict[Tuple[str, str, str], set] = defaultdict(set)
+        for wr in window_results:
+            sample = wr.window.sample or ""
+            contig = wr.window.contig
+            window_id = (contig, wr.window.start, wr.window.end, sample)
+            for hap in wr.haplotypes:
+                lineage_id = hap.track_id or f"unlinked_{wr.window.start}"
+                windows_by_key[(lineage_id, sample, contig)].add(window_id)
+        n_windows_map = {k: len(v) for k, v in windows_by_key.items()}
 
     # Build match lookup: detected_lineage_id -> {true_strain_ids}, min_distance
     match_lookup: Dict[str, Dict[str, Any]] = {}
@@ -1415,6 +1450,10 @@ def write_lineage_details(
                             true_abund += true_hap.abundances.get(timepoint, 0.0)
                     abundance_diff = abs(det_abund - true_abund)
 
+                key = (lineage_id, timepoint, contig)
+                n_reads = read_counts.get(key, 0)
+                n_windows = n_windows_map.get(key, 0)
+
                 records.append({
                     'lineage_id': lineage_id,
                     'matched_strain': matched_strains_csv,
@@ -1423,7 +1462,7 @@ def write_lineage_details(
                     'start_pos': start_pos,
                     'end_pos': end_pos,
                     'window_length': end_pos - start_pos,
-                    'n_windows': det_hap.n_windows if hasattr(det_hap, "n_windows") and det_hap.n_windows is not None else 1,
+                    'n_windows': n_windows,
                     'n_snvs_detected': n_snvs_detected,
                     'n_snvs_true': n_snvs_true,
                     'n_shared_snvs': n_shared_snvs,
@@ -1434,7 +1473,7 @@ def write_lineage_details(
                     'true_abundance': f"{true_abund:.6f}",
                     'abundance_diff': f"{abundance_diff:.6f}",
                     'track_id': det_hap.track_id or lineage_id,
-                    'n_reads': int(round(det_abund * 1.0, 0)) if det_abund is not None else 0,
+                    'n_reads': n_reads,
                 })
 
                 track_id = det_hap.track_id or lineage_id
@@ -2311,6 +2350,7 @@ def run_validation(
         window_results=window_results,
         missed_windows=missed_windows,
         output_dir=output_dir,
+        lineages_file=detected_file,
     )
 
     _write_validation_reports(
@@ -3181,12 +3221,17 @@ def _write_validation_outputs(
     window_results: List,
     missed_windows: List[Dict[str, Any]],
     output_dir: str,
+    lineages_file: Optional[str] = None,
 ) -> None:
     """Write validation TSV/text outputs."""
     # Generate detailed TSV output files
     track_summaries = None
     try:
-        _, track_summaries = write_lineage_details(true_haps, detected_haps, matches, output_dir)
+        _, track_summaries = write_lineage_details(
+            true_haps, detected_haps, matches, output_dir,
+            lineages_file=lineages_file,
+            window_results=window_results,
+        )
     except Exception as e:
         logger.warning(f"Failed to write lineage_details.tsv: {e}")
 
