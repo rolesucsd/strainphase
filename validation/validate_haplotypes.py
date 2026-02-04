@@ -365,8 +365,8 @@ def load_detected_haplotypes(lineages_file: str) -> List[DetectedHaplotype]:
 
             # Compute abundance from read counts, or fall back to abundance column for backwards compatibility
             if 'supporting_reads' in row and 'total_reads' in row:
-                supporting_reads = int(row.get('supporting_reads', 0))
-                total_reads = int(row.get('total_reads', 1))
+                supporting_reads = float(row.get('supporting_reads', 0))
+                total_reads = float(row.get('total_reads', 1))
                 abundance = supporting_reads / total_reads if total_reads > 0 else 0.0
             else:
                 abundance = float(row.get('abundance', 0.0))
@@ -1352,7 +1352,7 @@ def write_lineage_details(
                     contig = row.get('contig', '')
                     if not lineage_id or not contig:
                         continue
-                    supporting_reads = int(row.get('supporting_reads', 0))
+                    supporting_reads = float(row.get('supporting_reads', 0))
                     read_counts[(lineage_id, sample, contig)] = supporting_reads
 
     # Build (lineage_id, timepoint, contig) -> n_windows from window_results
