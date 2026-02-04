@@ -43,17 +43,25 @@ COVERAGES=(5 10 20 50)
 # =============================================================================
 
 echo "Project root: $PROJECT_ROOT"
-echo "Coverage levels: ${COVERAGES[*]}"
+echo "PYTHONPATH: $PYTHONPATH"
 
 for COV in "${COVERAGES[@]}"; do
-    echo "============================================================"
-    echo "COVERAGE ${COV}x - DEFAULT PARAMS"
-    echo "============================================================"
-
     OUTPUT_DIR="${OUTPUT_ROOT}/test_real_strains_${COV}x"
     MIXED_DATA_DIR="${OUTPUT_DIR}/mixed_samples"
 
     mkdir -p "$OUTPUT_DIR"
+
+    echo "============================================================"
+    echo "REAL STRAINS BENCHMARK - ISOLATE MIX MODE"
+    echo "============================================================"
+    echo ""
+    echo "Input strains directory: $STRAINS_DIR"
+    echo "Output directory: $OUTPUT_DIR"
+    echo "Number of isolates: ${#BAMS[@]}"
+    echo "Timepoints: $N_TIMEPOINTS"
+    echo "Target coverage: ${COV}x per timepoint"
+    echo "Workers: $N_WORKERS"
+    echo ""
 
     echo "Preparing mixed samples (coverage ${COV}x)..."
     python "${PROJECT_ROOT}/benchmarks/prepare_isolate_mix.py" \

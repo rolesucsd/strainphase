@@ -42,6 +42,13 @@ def find_best_config_dir(sweep_dir: str) -> str:
         with open(metrics_file) as f:
             metrics = json.load(f)
         f1 = metrics.get("f1", metrics.get("haplotype_f1", -1))
+        # Enforce minimum window size of 5000 based on config naming convention
+        try:
+            ws = int(name.split("_ws")[-1])
+        except Exception:
+            ws = None
+        if ws is None or ws < 5000:
+            continue
         if f1 is not None and f1 > best_f1:
             best_f1 = f1
             best_dir = config_path
@@ -90,8 +97,10 @@ def determine_rescue_status(details: pd.DataFrame,
                             rescued_reads: pd.DataFrame) -> pd.DataFrame:
     """Add was_rescued and donor_timepoint columns to lineage details.
 
-    A lineage is marked as rescued if there are rescued reads overlapping
-    its genomic region at the same timepoint.
+    A lineage is marked as rescued only if rescued reads at its position
+    match its detected_abundance (via rescued_haplotype_weight). This avoids
+    incorrectly marking high-abundance lineages as rescued when a different
+    low-abundance lineage at the same position was the actual rescue target.
     """
     details = details.copy()
     details["was_rescued"] = False
@@ -100,12 +109,14 @@ def determine_rescue_status(details: pd.DataFrame,
     if rescued_reads.empty:
         return details
 
-    # For each lineage-timepoint, check if any rescued reads overlap
+    # For each (timepoint, contig, window) group of rescued reads, find the
+    # lineage whose detected_abundance best matches rescued_haplotype_weight
     for idx, row in details.iterrows():
         tp = row["timepoint"]
         contig = row["contig"]
         start = row["start_pos"]
         end = row["end_pos"]
+        det_abund = row["detected_abundance"]
 
         # Find rescued reads at this timepoint+contig that overlap
         mask = (
@@ -115,10 +126,35 @@ def determine_rescue_status(details: pd.DataFrame,
             (rescued_reads["window_end"] > start)
         )
         matching = rescued_reads[mask]
-        if not matching.empty:
+        if matching.empty:
+            continue
+
+        # Check if the rescued_haplotype_weight matches this lineage's
+        # detected_abundance. Multiple lineages can overlap the same window;
+        # only the one whose abundance matches the rescue weight is the
+        # actual rescue target.
+        rescue_weight = matching["rescued_haplotype_weight"].iloc[0]
+
+        # Find all lineages overlapping this same window at this timepoint
+        candidates = details[
+            (details["timepoint"] == tp) &
+            (details["contig"] == contig) &
+            (details["start_pos"] <= end) &
+            (details["end_pos"] >= start)
+        ]
+
+        if len(candidates) <= 1:
+            # Only one lineage here, it must be the rescued one
             details.at[idx, "was_rescued"] = True
             donors = matching["donor_timepoint"].unique()
             details.at[idx, "donor_timepoint"] = ",".join(sorted(donors))
+        else:
+            # Multiple lineages overlap -- pick the one closest to rescue weight
+            best_idx = (candidates["detected_abundance"] - rescue_weight).abs().idxmin()
+            if best_idx == idx:
+                details.at[idx, "was_rescued"] = True
+                donors = matching["donor_timepoint"].unique()
+                details.at[idx, "donor_timepoint"] = ",".join(sorted(donors))
 
     return details
 
@@ -141,9 +177,15 @@ def build_comparison_df(tool: str,
     # lineages columns: lineage_id, sample, contig, track_id, supporting_reads,
     #   total_reads, snv_alleles
 
-    # Join to get supporting_reads and total_reads
-    lineages_slim = lineages[["lineage_id", "sample", "contig",
-                              "supporting_reads", "total_reads"]].copy()
+    # Aggregate lineages.tsv per (lineage_id, sample, contig) since a lineage
+    # can have multiple tracks (fragments) producing multiple rows.
+    lineages_slim = lineages.groupby(
+        ["lineage_id", "sample", "contig"], as_index=False
+    ).agg(
+        supporting_reads=("supporting_reads", "sum"),
+        total_reads=("total_reads", "sum"),
+        n_tracks=("track_id", "count"),
+    )
     lineages_slim = lineages_slim.rename(columns={"sample": "timepoint"})
 
     merged = details.merge(

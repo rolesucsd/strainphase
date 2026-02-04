@@ -118,7 +118,7 @@ class HaplotyperConfig:
     # =========== POST-PROCESSING ===========
     merge_distance_threshold: float = 0.02
     min_shared_for_merge: int = 3  # Min shared SNVs with actual calls to consider merging
-    assign_confidence_threshold: float = 0.90
+    assign_confidence_threshold: float = 0.80
 
     # =========== 1-SNP VALIDATION ===========
     validate_1snp_differences: bool = True
