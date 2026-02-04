@@ -621,21 +621,24 @@ def window_results_to_lineages_tsv(
 
     # Aggregate haplotypes by track_id
     track_data = defaultdict(lambda: {
-        'supporting_reads': 0,
-        'total_reads': 0,
+        'supporting_read_ids': set(),
+        'total_read_ids': set(),
         'snvs': defaultdict(dict),  # contig -> {pos -> allele}
         'contigs': set(),
     })
 
     for wr in all_window_results:
         contig_id = wr.window.contig  # Window uses 'contig', not 'contig_id'
-        window_total_reads = len(wr.window.reads)
-        for hap in wr.haplotypes:
+        window_read_ids = [r.id for r in wr.window.reads]
+        for h_idx, hap in enumerate(wr.haplotypes):
             track_id = hap.track_id or f"unlinked_{wr.window.start}"
 
             track_data[track_id]['contigs'].add(contig_id)
-            track_data[track_id]['supporting_reads'] += hap.supporting_reads
-            track_data[track_id]['total_reads'] += window_total_reads
+            track_data[track_id]['total_read_ids'].update(window_read_ids)
+            if wr.assignments:
+                for a in wr.assignments:
+                    if a.get("hap_id") == h_idx and a.get("read_id") is not None:
+                        track_data[track_id]['supporting_read_ids'].add(a["read_id"])
 
             # Aggregate SNV alleles from consensus
             for pos, allele in hap.consensus.items():
@@ -655,8 +658,8 @@ def window_results_to_lineages_tsv(
                 'sample': sample_id,
                 'contig': contig_id,
                 'track_id': track_id,
-                'supporting_reads': data['supporting_reads'],
-                'total_reads': data['total_reads'],
+                'supporting_reads': len(data['supporting_read_ids']),
+                'total_reads': len(data['total_read_ids']),
                 'snv_alleles': snv_alleles_str if snv_alleles_str else '.',
             })
 

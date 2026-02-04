@@ -1333,19 +1333,32 @@ def write_lineage_details(
 
     output_path = os.path.join(output_dir, 'lineage_details.tsv')
 
-    # Build match lookup: detected_lineage_id -> (true_hap, distance)
-    match_lookup = {}
+    # Build match lookup: detected_lineage_id -> {true_strain_ids}, min_distance
+    match_lookup: Dict[str, Dict[str, Any]] = {}
     for true_hap, det_hap, dist in matches:
-        if det_hap.lineage_id not in match_lookup:
-            match_lookup[det_hap.lineage_id] = (true_hap, dist)
+        entry = match_lookup.get(det_hap.lineage_id)
+        if entry is None:
+            match_lookup[det_hap.lineage_id] = {
+                "strain_ids": {true_hap.strain_id},
+                "min_distance": dist,
+            }
+        else:
+            entry["strain_ids"].add(true_hap.strain_id)
+            if dist < entry["min_distance"]:
+                entry["min_distance"] = dist
 
     records = []
     summary_by_track: Dict[str, Dict[str, Any]] = {}
 
     for det_hap in detected_haps:
         lineage_id = det_hap.lineage_id
-        matched_true_hap, dist = match_lookup.get(lineage_id, (None, None))
-        matched_strain = matched_true_hap.strain_id if matched_true_hap else "UNMATCHED"
+        match_entry = match_lookup.get(lineage_id)
+        if match_entry is None:
+            matched_strains_csv = "UNMATCHED"
+            dist = None
+        else:
+            matched_strains_csv = ",".join(sorted(match_entry["strain_ids"]))
+            dist = match_entry["min_distance"]
 
         # Process each contig
         for contig, det_snvs in det_hap.snv_alleles.items():
@@ -1365,16 +1378,24 @@ def write_lineage_details(
             n_different_snvs = 0
             snv_distance = 1.0
 
-            if matched_true_hap and contig in matched_true_hap.snv_positions:
-                true_snvs = matched_true_hap.snv_positions[contig]
-                n_snvs_true = len(true_snvs)
+            if match_entry:
+                # Aggregate true SNVs across all matched strains for this contig
+                true_snvs_combined: Dict[int, str] = {}
+                for true_hap in true_haps:
+                    if true_hap.strain_id in match_entry["strain_ids"]:
+                        true_snvs = true_hap.snv_positions.get(contig, {})
+                        for pos, base in true_snvs.items():
+                            # If multiple strains have different alleles at same pos,
+                            # keep the first (distance is computed on shared positions only).
+                            true_snvs_combined.setdefault(pos, base)
+                n_snvs_true = len(true_snvs_combined)
 
                 # Compute overlap statistics
-                shared_positions = set(det_positions) & set(true_snvs.keys())
+                shared_positions = set(det_positions) & set(true_snvs_combined.keys())
                 n_shared_snvs = len(shared_positions)
 
                 for pos in shared_positions:
-                    if det_snvs[pos] == true_snvs[pos]:
+                    if det_snvs[pos] == true_snvs_combined[pos]:
                         n_matching_snvs += 1
                     else:
                         n_different_snvs += 1
@@ -1387,17 +1408,22 @@ def write_lineage_details(
                 true_abund = 0.0
                 abundance_diff = det_abund
 
-                if matched_true_hap and timepoint in matched_true_hap.abundances:
-                    true_abund = matched_true_hap.abundances[timepoint]
+                if match_entry:
+                    # Sum abundances across all matched strains for this timepoint
+                    for true_hap in true_haps:
+                        if true_hap.strain_id in match_entry["strain_ids"]:
+                            true_abund += true_hap.abundances.get(timepoint, 0.0)
                     abundance_diff = abs(det_abund - true_abund)
 
                 records.append({
                     'lineage_id': lineage_id,
-                    'matched_strain': matched_strain,
+                    'matched_strain': matched_strains_csv,
                     'timepoint': timepoint,
                     'contig': contig,
                     'start_pos': start_pos,
                     'end_pos': end_pos,
+                    'window_length': end_pos - start_pos,
+                    'n_windows': det_hap.n_windows if hasattr(det_hap, "n_windows") and det_hap.n_windows is not None else 1,
                     'n_snvs_detected': n_snvs_detected,
                     'n_snvs_true': n_snvs_true,
                     'n_shared_snvs': n_shared_snvs,
@@ -1408,6 +1434,7 @@ def write_lineage_details(
                     'true_abundance': f"{true_abund:.6f}",
                     'abundance_diff': f"{abundance_diff:.6f}",
                     'track_id': det_hap.track_id or lineage_id,
+                    'n_reads': int(round(det_abund * 1.0, 0)) if det_abund is not None else 0,
                 })
 
                 track_id = det_hap.track_id or lineage_id
@@ -1415,7 +1442,7 @@ def write_lineage_details(
                 if summary is None:
                     summary = {
                         'track_id': track_id,
-                        'matched_strain': matched_strain,
+                        'matched_strain': matched_strains_csv,
                         'lineage_ids': set(),
                         'contigs': set(),
                         'timepoints': set(),
@@ -1450,10 +1477,10 @@ def write_lineage_details(
     if records:
         fieldnames = [
             'lineage_id', 'matched_strain', 'timepoint', 'contig',
-            'start_pos', 'end_pos', 'n_snvs_detected', 'n_snvs_true',
+            'start_pos', 'end_pos', 'window_length', 'n_windows', 'n_snvs_detected', 'n_snvs_true',
             'n_shared_snvs', 'n_matching_snvs', 'n_different_snvs',
             'snv_distance', 'detected_abundance', 'true_abundance',
-            'abundance_diff', 'track_id'
+            'abundance_diff', 'track_id', 'n_reads'
         ]
         with open(output_path, 'w', newline='') as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames, delimiter='\t')
@@ -2090,7 +2117,7 @@ def write_validation_summary(
         f.write("TSV Data Files:\n")
         f.write("  - lineage_details.tsv: Per-lineage/contig/timepoint raw data\n")
         f.write("  - em_convergence.tsv:  Per-window EM algorithm statistics\n")
-        f.write("  - linking_quality.tsv: Cross-timepoint linking analysis\n")
+        # linking_quality.tsv removed
         f.write("\nJSON Files:\n")
         f.write("  - validation_metrics.json: Machine-readable metrics summary\n")
         f.write("\nFigures:\n")
@@ -2643,7 +2670,7 @@ def _validate_tracks_and_lineages(
     logger.info(f"Built track mapping: {len(lineage_to_strain)} lineage->strain, "
                 f"{len(strain_matches)} total track->strain mappings")
 
-    from validation.validate_tracks import validate_tracks, write_linkability_report
+    from validation.validate_tracks import validate_tracks
     inferred_window_size = window_size
     if inferred_window_size is None and window_results:
         first_window = window_results[0].window
@@ -2671,10 +2698,7 @@ def _validate_tracks_and_lineages(
             f"false_link={result.false_link_rate:.3f}, missed_link={result.missed_link_rate:.3f}"
         )
 
-        if track_result.linkability_analysis:
-            linkability_path = os.path.join(output_dir, 'track_linkability.txt')
-            write_linkability_report(track_result.linkability_analysis, linkability_path)
-            logger.info(f"Wrote track linkability report to {linkability_path}")
+        # track_linkability.txt output removed
 
     from validation.validate_lineages import validate_lineages
     detected_lineages: Dict[str, Dict[str, str]] = {}
@@ -3025,9 +3049,7 @@ def _write_validation_reports(
         add("OUTPUT FILES GENERATED")
         add("-" * 80)
         add("lineage_details.tsv")
-        add("linking_quality.tsv")
         add("em_convergence.tsv")
-        add("missed_snvs_report.txt")
         add("missed_windows.txt")
         add("validation_metrics.json")
         add("")
@@ -3168,10 +3190,7 @@ def _write_validation_outputs(
     except Exception as e:
         logger.warning(f"Failed to write lineage_details.tsv: {e}")
 
-    try:
-        write_linking_quality(detected_haps, matches, track_summaries, output_dir)
-    except Exception as e:
-        logger.warning(f"Failed to write linking_quality.tsv: {e}")
+    # linking_quality.tsv output removed
 
     try:
         write_linking_diagnostics(window_results, output_dir)
@@ -3197,10 +3216,7 @@ def _write_validation_outputs(
 
     # validation_summary.txt merged into detailed_report.txt
 
-    try:
-        write_low_abundance_report(result, true_haps, detected_haps, output_dir, window_results)
-    except Exception as e:
-        logger.warning(f"Failed to write missed_snvs_report.txt: {e}")
+    # missed_snvs_report.txt output removed
 
     try:
         write_false_positive_reads(result, window_results, output_dir)

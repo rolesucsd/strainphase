@@ -60,14 +60,17 @@ MIN_AF=0.01
 SKIP_QC=false
 SKIP_STRAINPHASE=false
 SKIP_FLORIA=false
+SKIP_STRAINY=false
 SKIP_VALIDATION=false
 DRY_RUN=false
 SUBFOLDER=""                   # Process only this subfolder (empty = all)
 FLORIA_BIN="floria"
+STRAINY_BIN="strainy.py"
 
 # Conda/mamba environment names (empty = use current environment)
 ENV_ALIGN=""                   # For badread, minimap2, samtools, bcftools, longshot, etc.
 ENV_FLORIA=""                  # For floria
+ENV_STRAINY=""                 # For strainy
 ENV_STRAINPHASE=""             # For strainphase + validation
 
 STRAINPHASE_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -102,6 +105,7 @@ Variant Calling:
 Environments (conda/mamba):
   --env-align NAME         Conda env for alignment/variant calling (badread, minimap2, etc.)
   --env-floria NAME        Conda env for Floria
+  --env-strainy NAME       Conda env for Strainy
   --env-strainphase NAME   Conda env for strainphase + validation
                            If omitted, the current environment is used for that phase.
 
@@ -112,6 +116,8 @@ Execution:
   --skip-strainphase       Skip strainphase analysis
   --skip-floria            Skip Floria analysis
   --floria-bin PATH        Path to floria binary (default: $FLORIA_BIN)
+  --skip-strainy           Skip Strainy analysis
+  --strainy-bin PATH       Path to strainy.py (default: $STRAINY_BIN)
   --skip-validation        Skip validation step
   --dry-run                Print what would be done without executing
   --help                   Show this help
@@ -142,11 +148,14 @@ while [[ $# -gt 0 ]]; do
         --subfolder)          SUBFOLDER="$2"; shift 2 ;;
         --env-align)          ENV_ALIGN="$2"; shift 2 ;;
         --env-floria)         ENV_FLORIA="$2"; shift 2 ;;
+        --env-strainy)        ENV_STRAINY="$2"; shift 2 ;;
         --env-strainphase)    ENV_STRAINPHASE="$2"; shift 2 ;;
         --skip-qc)            SKIP_QC=true; shift ;;
         --skip-strainphase)   SKIP_STRAINPHASE=true; shift ;;
         --skip-floria)        SKIP_FLORIA=true; shift ;;
         --floria-bin)         FLORIA_BIN="$2"; shift 2 ;;
+        --skip-strainy)       SKIP_STRAINY=true; shift ;;
+        --strainy-bin)        STRAINY_BIN="$2"; shift 2 ;;
         --skip-validation)    SKIP_VALIDATION=true; shift ;;
         --dry-run)            DRY_RUN=true; shift ;;
         --help)               usage ;;
@@ -211,6 +220,14 @@ if [[ "$SKIP_FLORIA" == false ]]; then
         check_tool "$FLORIA_BIN" || echo "  (Floria not found, use --skip-floria or --floria-bin)"
     else
         echo "  Floria: will use env '$ENV_FLORIA' (skipping PATH check)"
+    fi
+fi
+
+if [[ "$SKIP_STRAINY" == false ]]; then
+    if [[ -z "$ENV_STRAINY" ]]; then
+        check_tool "$STRAINY_BIN" || echo "  (Strainy not found, use --skip-strainy or --strainy-bin)"
+    else
+        echo "  Strainy: will use env '$ENV_STRAINY' (skipping PATH check)"
     fi
 fi
 
@@ -294,11 +311,12 @@ run_in_env_sh() {
 }
 
 # Check if any env flags were set; if so, verify conda/mamba is available
-if [[ -n "$ENV_ALIGN" || -n "$ENV_FLORIA" || -n "$ENV_STRAINPHASE" ]]; then
+if [[ -n "$ENV_ALIGN" || -n "$ENV_FLORIA" || -n "$ENV_STRAINY" || -n "$ENV_STRAINPHASE" ]]; then
     _init_conda || exit 1
     echo "Conda/mamba environments:"
     [[ -n "$ENV_ALIGN" ]]       && echo "  Alignment:    $ENV_ALIGN"
     [[ -n "$ENV_FLORIA" ]]      && echo "  Floria:       $ENV_FLORIA"
+    [[ -n "$ENV_STRAINY" ]]     && echo "  Strainy:      $ENV_STRAINY"
     [[ -n "$ENV_STRAINPHASE" ]] && echo "  Strainphase:  $ENV_STRAINPHASE"
     echo ""
 fi
@@ -876,9 +894,152 @@ process_subfolder() {
         log "  Step 8: Skipping Floria"
     fi
 
-    # ── Step 9: Validate strainphase output (optional) ──
+    # ── Step 9: Run Strainy (optional) ──
+    if [[ "$SKIP_STRAINY" == false ]]; then
+        log "  Step 9: Running Strainy"
+
+        local strainy_dir="$sub_output/strainy_output"
+        mkdir -p "$strainy_dir"
+
+        # 9a: Convert FASTA reference to GFA (strainy requires GFA input)
+        local ref_gfa="$sub_output/reference.gfa"
+        if [[ ! -f "$ref_gfa" ]]; then
+            log "    Converting reference FASTA to GFA..."
+            python3 - "$sub_output/reference.fasta" "$ref_gfa" <<'PYEOF'
+import sys
+fasta_path, gfa_path = sys.argv[1], sys.argv[2]
+with open(fasta_path) as fin, open(gfa_path, "w") as fout:
+    name, seq = None, []
+    fout.write("H\tVN:Z:1.0\n")
+    for line in fin:
+        line = line.strip()
+        if line.startswith(">"):
+            if name:
+                fout.write(f"S\t{name}\t{''.join(seq)}\n")
+            name = line[1:].split()[0]
+            seq = []
+        else:
+            seq.append(line)
+    if name:
+        fout.write(f"S\t{name}\t{''.join(seq)}\n")
+PYEOF
+        fi
+
+        # 9b: Combine all timepoint reads into a single fastq for strainy
+        # (strainy runs on all reads at once, using the BAM for phasing)
+        local combined_fastq="$sub_output/all_reads.fastq"
+        if [[ ! -f "$combined_fastq" ]]; then
+            log "    Combining reads across timepoints..."
+            > "$combined_fastq"
+            for tp_idx in $(seq 1 "$N_TIMEPOINTS"); do
+                local tp_fastq="$reads_dir/T${tp_idx}_filtered.fastq"
+                if [[ -f "$tp_fastq" ]]; then
+                    cat "$tp_fastq" >> "$combined_fastq"
+                fi
+            done
+        fi
+
+        # 9c: Run Strainy per timepoint
+        log "    Running Strainy per timepoint..."
+        for tp_idx in $(seq 1 "$N_TIMEPOINTS"); do
+            local tp_name="T${tp_idx}"
+            local tp_bam="$sub_output/${tp_name}.bam"
+            local tp_fastq="$reads_dir/${tp_name}_filtered.fastq"
+            local strainy_tp_out="$strainy_dir/strainy_${tp_name}"
+
+            if [[ ! -f "$tp_bam" ]]; then
+                log "      WARNING: BAM not found for $tp_name: $tp_bam — skipping"
+                continue
+            fi
+
+            if [[ -d "$strainy_tp_out" && -f "$strainy_tp_out/strainy_final.gfa" ]]; then
+                log "      $tp_name: Strainy output already exists — skipping"
+            else
+                log "      $tp_name: Running strainy..."
+                mkdir -p "$strainy_tp_out"
+                run_in_env "$ENV_STRAINY" \
+                    "$STRAINY_BIN" \
+                    --gfa_ref "$ref_gfa" \
+                    --fastq "$tp_fastq" \
+                    --mode hifi \
+                    --bam "$tp_bam" \
+                    --snp "$sub_output/variants.vcf" \
+                    --unitig-split-length 0 \
+                    --stage phase \
+                    --output "$strainy_tp_out" \
+                    2>&1 | tee "$strainy_tp_out/strainy_stdout.log" || {
+                        log "      WARNING: Strainy failed for $tp_name"
+                    }
+                log "      $tp_name: Strainy complete"
+            fi
+        done
+
+        # 9d: Convert each Strainy output to per-timepoint lineages.tsv
+        log "    Converting Strainy output to lineages.tsv..."
+        local strainy_convert_dir="$strainy_dir/converted"
+        mkdir -p "$strainy_convert_dir"
+
+        for tp_idx in $(seq 1 "$N_TIMEPOINTS"); do
+            local tp_name="T${tp_idx}"
+            local strainy_tp_out="$strainy_dir/strainy_${tp_name}"
+            local tp_convert_dir="$strainy_convert_dir/${tp_name}"
+
+            if [[ ! -d "$strainy_tp_out" ]]; then
+                log "      $tp_name: No Strainy output — skipping"
+                continue
+            fi
+
+            log "      $tp_name: Converting..."
+            run_in_env "$ENV_STRAINPHASE" \
+                python3 "$STRAINPHASE_ROOT/validation/convert_strainy.py" \
+                --strainy-dir "$strainy_tp_out" \
+                --vcf "$sub_output/variants.vcf" \
+                --sample "$tp_name" \
+                --output-dir "$tp_convert_dir" \
+                2>> "$strainy_dir/convert.log" || {
+                    log "      WARNING: Conversion failed for $tp_name"
+                    continue
+                }
+            log "      $tp_name: Wrote $tp_convert_dir/lineages.tsv"
+        done
+
+        # 9e: Combine per-timepoint lineages into one file
+        log "    Combining lineages across timepoints..."
+        local strainy_combined="$strainy_dir/lineages.tsv"
+        local strainy_header_written=false
+
+        for tp_idx in $(seq 1 "$N_TIMEPOINTS"); do
+            local tp_name="T${tp_idx}"
+            local tp_file="$strainy_convert_dir/${tp_name}/lineages.tsv"
+
+            if [[ ! -f "$tp_file" ]]; then
+                log "      $tp_name: No lineages.tsv — skipping"
+                continue
+            fi
+
+            if [[ "$strainy_header_written" == false ]]; then
+                head -1 "$tp_file" > "$strainy_combined"
+                strainy_header_written=true
+            fi
+
+            # Append data rows, prefixing lineage_id and track_id with timepoint
+            tail -n +2 "$tp_file" | while IFS=$'\t' read -r lineage_id sample contig track_id rest; do
+                printf '%s\t%s\t%s\t%s\t%s\n' \
+                    "${tp_name}_${lineage_id}" "$sample" "$contig" "${tp_name}_${track_id}" "$rest"
+            done >> "$strainy_combined"
+        done
+
+        if [[ -f "$strainy_combined" ]]; then
+            local n_strainy_lines=$(( $(wc -l < "$strainy_combined") - 1 ))
+            log "    Combined $n_strainy_lines Strainy haplotypes into $strainy_combined"
+        fi
+    else
+        log "  Step 9: Skipping Strainy"
+    fi
+
+    # ── Step 10: Validate strainphase output (optional) ──
     if [[ "$SKIP_VALIDATION" == false && "$SKIP_STRAINPHASE" == false ]]; then
-        log "  Step 9: Validating strainphase output"
+        log "  Step 10: Validating strainphase output"
 
         local sp_lineages="$sub_output/strainphase_output/lineages.tsv"
         local sp_val_output="$sub_output/validation_strainphase"
@@ -897,12 +1058,12 @@ process_subfolder() {
             log "    WARNING: No strainphase lineages.tsv found — skipping validation"
         fi
     else
-        log "  Step 9: Skipping strainphase validation"
+        log "  Step 10: Skipping strainphase validation"
     fi
 
-    # ── Step 10: Validate Floria output (optional) ──
+    # ── Step 11: Validate Floria output (optional) ──
     if [[ "$SKIP_VALIDATION" == false && "$SKIP_FLORIA" == false ]]; then
-        log "  Step 10: Validating Floria output"
+        log "  Step 11: Validating Floria output"
 
         local floria_lineages="$sub_output/floria_output/lineages.tsv"
         local floria_val_output="$sub_output/validation_floria"
@@ -921,7 +1082,31 @@ process_subfolder() {
             log "    WARNING: No Floria lineages.tsv found — skipping validation"
         fi
     else
-        log "  Step 10: Skipping Floria validation"
+        log "  Step 11: Skipping Floria validation"
+    fi
+
+    # ── Step 12: Validate Strainy output (optional) ──
+    if [[ "$SKIP_VALIDATION" == false && "$SKIP_STRAINY" == false ]]; then
+        log "  Step 12: Validating Strainy output"
+
+        local strainy_lineages="$sub_output/strainy_output/lineages.tsv"
+        local strainy_val_output="$sub_output/validation_strainy"
+        mkdir -p "$strainy_val_output"
+
+        if [[ -f "$strainy_lineages" ]]; then
+            run_in_env "$ENV_STRAINPHASE" \
+                python3 -m validation.validate_haplotypes \
+                --detected "$strainy_lineages" \
+                --truth "$sub_output" \
+                --output "$strainy_val_output" \
+                2>&1 | tee "$strainy_val_output/validation.log" || {
+                    log "    WARNING: Strainy validation failed for $subfolder_name"
+                }
+        else
+            log "    WARNING: No Strainy lineages.tsv found — skipping validation"
+        fi
+    else
+        log "  Step 12: Skipping Strainy validation"
     fi
 
     log "  Done: $subfolder_name"
@@ -945,9 +1130,12 @@ echo "  Skip QC:        $SKIP_QC"
 echo "  Skip strainphase: $SKIP_STRAINPHASE"
 echo "  Skip Floria:      $SKIP_FLORIA"
 echo "  Floria bin:       $FLORIA_BIN"
+echo "  Skip Strainy:     $SKIP_STRAINY"
+echo "  Strainy bin:      $STRAINY_BIN"
 echo "  Skip validation:  $SKIP_VALIDATION"
 echo "  Env (align):      ${ENV_ALIGN:-(current)}"
 echo "  Env (floria):     ${ENV_FLORIA:-(current)}"
+echo "  Env (strainy):    ${ENV_STRAINY:-(current)}"
 echo "  Env (strainphase): ${ENV_STRAINPHASE:-(current)}"
 echo "============================================================"
 echo ""
@@ -1035,17 +1223,17 @@ import numpy as np
 results_dir = '$OUTPUT_DIR'
 skip_sp = '$SKIP_STRAINPHASE' == 'true'
 skip_fl = '$SKIP_FLORIA' == 'true'
+skip_st = '$SKIP_STRAINY' == 'true'
 
 all_results = {}
 
-# Collect strainphase metrics
-if not skip_sp:
-    sp_metrics = []
-    for val_json in sorted(glob.glob(os.path.join(results_dir, '*/validation_strainphase/validation_metrics.json'))):
+def collect_metrics(pattern):
+    metrics = []
+    for val_json in sorted(glob.glob(os.path.join(results_dir, pattern))):
         subfolder = os.path.basename(os.path.dirname(os.path.dirname(val_json)))
         with open(val_json) as f:
             m = json.load(f)
-        sp_metrics.append({
+        metrics.append({
             'subfolder': subfolder,
             'precision': m.get('precision', 0),
             'recall': m.get('recall', 0),
@@ -1053,24 +1241,14 @@ if not skip_sp:
             'snv_precision': m.get('snv_precision', 0),
             'snv_recall': m.get('snv_recall', 0),
         })
-    all_results['strainphase'] = sp_metrics
+    return metrics
 
-# Collect Floria metrics
+if not skip_sp:
+    all_results['strainphase'] = collect_metrics('*/validation_strainphase/validation_metrics.json')
 if not skip_fl:
-    fl_metrics = []
-    for val_json in sorted(glob.glob(os.path.join(results_dir, '*/validation_floria/validation_metrics.json'))):
-        subfolder = os.path.basename(os.path.dirname(os.path.dirname(val_json)))
-        with open(val_json) as f:
-            m = json.load(f)
-        fl_metrics.append({
-            'subfolder': subfolder,
-            'precision': m.get('precision', 0),
-            'recall': m.get('recall', 0),
-            'f1': m.get('f1', 0),
-            'snv_precision': m.get('snv_precision', 0),
-            'snv_recall': m.get('snv_recall', 0),
-        })
-    all_results['floria'] = fl_metrics
+    all_results['floria'] = collect_metrics('*/validation_floria/validation_metrics.json')
+if not skip_st:
+    all_results['strainy'] = collect_metrics('*/validation_strainy/validation_metrics.json')
 
 for tool_name, metrics in all_results.items():
     if metrics:
@@ -1088,17 +1266,20 @@ if any(all_results.values()):
         json.dump(all_results, f, indent=2)
     print(f'\\nSaved to {agg_file}')
 
-# Side-by-side comparison if both tools ran
-if 'strainphase' in all_results and 'floria' in all_results:
-    sp = {m['subfolder']: m for m in all_results['strainphase']}
-    fl = {m['subfolder']: m for m in all_results['floria']}
-    common = sorted(set(sp.keys()) & set(fl.keys()))
+# Side-by-side comparison across all tools that ran
+tool_names = [t for t in all_results if all_results[t]]
+if len(tool_names) >= 2:
+    tool_data = {t: {m['subfolder']: m for m in all_results[t]} for t in tool_names}
+    common = sorted(set.intersection(*[set(d.keys()) for d in tool_data.values()]))
     if common:
         print(f'\\nSIDE-BY-SIDE COMPARISON ({len(common)} subfolders):')
-        print(f'{\"\":20s}  {\"strainphase\":>12s}  {\"floria\":>12s}')
+        header = f'{\"\":20s}' + ''.join(f'  {t:>12s}' for t in tool_names)
+        print(header)
         for key in ['precision', 'recall', 'f1', 'snv_precision', 'snv_recall']:
-            sp_vals = [sp[s][key] for s in common]
-            fl_vals = [fl[s][key] for s in common]
-            print(f'  {key:20s}: {np.mean(sp_vals):12.3f}  {np.mean(fl_vals):12.3f}')
+            row = f'  {key:20s}:'
+            for t in tool_names:
+                vals = [tool_data[t][s][key] for s in common]
+                row += f'  {np.mean(vals):12.3f}'
+            print(row)
 " 2>/dev/null || true
 fi
