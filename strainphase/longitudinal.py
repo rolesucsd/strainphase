@@ -312,17 +312,24 @@ def build_lineage_table(
                         lambda: defaultdict(float)
                     )
                     total_weight = 0.0
-                    supporting_read_ids: set[str] = set()
-                    total_read_ids: set[str] = set()
+                    supporting_read_weights: dict[str, float] = {}
+                    total_read_weights: dict[str, float] = {}
 
                     for _wr, hap, hap_idx in members:
                         total_weight += hap.weight
-                        # Deduplicate reads across overlapping windows within a track.
-                        total_read_ids.update(r.id for r in _wr.window.reads)
-                        if _wr.assignments:
-                            for a in _wr.assignments:
-                                if a.get("hap_id") == hap_idx and a.get("read_id") is not None:
-                                    supporting_read_ids.add(a["read_id"])
+                        # Deduplicate reads across overlapping windows within a track using soft weights.
+                        if _wr.gamma is not None:
+                            junk_idx = _wr.gamma.shape[1] - 1
+                            for i, read in enumerate(_wr.window.reads):
+                                read_id = read.id
+                                hap_prob = float(_wr.gamma[i, hap_idx])
+                                nonjunk_prob = float(1.0 - _wr.gamma[i, junk_idx])
+                                prev_hap = supporting_read_weights.get(read_id, 0.0)
+                                if hap_prob > prev_hap:
+                                    supporting_read_weights[read_id] = hap_prob
+                                prev_total = total_read_weights.get(read_id, 0.0)
+                                if nonjunk_prob > prev_total:
+                                    total_read_weights[read_id] = nonjunk_prob
                         for pos, base in hap.consensus.items():
                             position_votes[pos][base] += hap.weight
 
@@ -339,8 +346,8 @@ def build_lineage_table(
                             n_windows,
                             merged_consensus,
                             total_weight / n_windows,  # mean_weight
-                            supporting_read_ids,
-                            total_read_ids,
+                            supporting_read_weights,
+                            total_read_weights,
                         )
                     )
 
@@ -376,11 +383,17 @@ def build_lineage_table(
                     merged_n_windows = sum(tracks[i][4] for i in indices)
                     merged_consensus = first[5]  # Same consensus
                     merged_mean_weight = sum(tracks[i][6] for i in indices) / len(indices)
-                    merged_supporting_read_ids: set[str] = set()
-                    merged_total_read_ids: set[str] = set()
+                    merged_supporting_read_weights: dict[str, float] = {}
+                    merged_total_read_weights: dict[str, float] = {}
                     for i in indices:
-                        merged_supporting_read_ids.update(tracks[i][7])
-                        merged_total_read_ids.update(tracks[i][8])
+                        for rid, w in tracks[i][7].items():
+                            prev = merged_supporting_read_weights.get(rid, 0.0)
+                            if w > prev:
+                                merged_supporting_read_weights[rid] = w
+                        for rid, w in tracks[i][8].items():
+                            prev = merged_total_read_weights.get(rid, 0.0)
+                            if w > prev:
+                                merged_total_read_weights[rid] = w
 
                     deduped_tracks.append((
                         sample_id,
@@ -390,8 +403,8 @@ def build_lineage_table(
                         merged_n_windows,
                         merged_consensus,
                         merged_mean_weight,
-                        merged_supporting_read_ids,
-                        merged_total_read_ids,
+                        merged_supporting_read_weights,
+                        merged_total_read_weights,
                     ))
 
             tracks_by_contig[contig_id] = deduped_tracks
@@ -474,8 +487,8 @@ def build_lineage_table(
                         n_windows,
                         consensus,
                         mean_weight,
-                        supporting_read_ids,
-                        total_read_ids,
+                        supporting_read_weights,
+                        total_read_weights,
                     ) = tracks[idx]
 
                     consensus_str = "|".join(
@@ -494,8 +507,8 @@ def build_lineage_table(
                             "span_bp": span_end - span_start,
                             "n_windows": n_windows,
                             "mean_weight": mean_weight,
-                            "supporting_reads": len(supporting_read_ids),
-                            "total_reads": len(total_read_ids),
+                            "supporting_reads": sum(supporting_read_weights.values()),
+                            "total_reads": sum(total_read_weights.values()),
                             "n_snvs": len(consensus),
                             "consensus": consensus_str,
                             "n_timepoints": n_timepoints,
