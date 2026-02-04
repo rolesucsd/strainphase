@@ -620,9 +620,10 @@ def window_results_to_lineages_tsv(
     import csv
 
     # Aggregate haplotypes by track_id
+    # Use hap.weight directly (correct post-processing weight) instead of wr.pi[h_idx]
     track_data = defaultdict(lambda: {
-        'pi_sum': 0.0,
-        'nonjunk_sum': 0.0,
+        'weight_sum': 0.0,
+        'total_reads': 0,
         'n_windows': 0,
         'snvs': defaultdict(dict),  # contig -> {pos -> allele}
         'contigs': set(),
@@ -630,16 +631,13 @@ def window_results_to_lineages_tsv(
 
     for wr in all_window_results:
         contig_id = wr.window.contig  # Window uses 'contig', not 'contig_id'
-        junk_idx = wr.pi.shape[0] - 1 if wr.pi is not None else None
         for h_idx, hap in enumerate(wr.haplotypes):
             track_id = hap.track_id or f"unlinked_{wr.window.start}"
 
             track_data[track_id]['contigs'].add(contig_id)
-            if wr.pi is not None and junk_idx is not None:
-                nonjunk = float(1.0 - wr.pi[junk_idx])
-                track_data[track_id]['pi_sum'] += float(wr.pi[h_idx])
-                track_data[track_id]['nonjunk_sum'] += nonjunk
-                track_data[track_id]['n_windows'] += 1
+            track_data[track_id]['weight_sum'] += hap.weight
+            track_data[track_id]['total_reads'] += len(wr.window.reads)
+            track_data[track_id]['n_windows'] += 1
 
             # Aggregate SNV alleles from consensus
             for pos, allele in hap.consensus.items():
@@ -654,18 +652,21 @@ def window_results_to_lineages_tsv(
                 for pos, allele in sorted(data['snvs'][contig_id].items())
             )
 
+            # abundance = mean weight across windows (junk in denominator)
+            abundance = data['weight_sum'] / data['n_windows'] if data['n_windows'] > 0 else 0.0
+
             records.append({
                 'lineage_id': track_id,
                 'sample': sample_id,
                 'contig': contig_id,
                 'track_id': track_id,
-                'supporting_reads': (data['pi_sum'] / data['n_windows']) if data['n_windows'] > 0 else 0.0,
-                'total_reads': (data['nonjunk_sum'] / data['n_windows']) if data['n_windows'] > 0 else 0.0,
+                'abundance': abundance,
+                'total_reads': data['total_reads'],
                 'snv_alleles': snv_alleles_str if snv_alleles_str else '.',
             })
 
     # Always create the file, even if empty (for validation)
-    fieldnames = ['lineage_id', 'sample', 'contig', 'track_id', 'supporting_reads', 'total_reads', 'snv_alleles']
+    fieldnames = ['lineage_id', 'sample', 'contig', 'track_id', 'abundance', 'total_reads', 'snv_alleles']
     with open(output_path, 'w', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, delimiter='\t')
         writer.writeheader()
@@ -1046,8 +1047,8 @@ class ParameterSweep:
                                 logger.warning(f"    WARNING: Missing timepoints in lineage records: {sorted(missing_timepoints)}")
                             
                             # Convert records to format expected by validation
-                            # build_lineage_table returns: supporting_reads, total_reads, consensus (pipe-separated)
-                            # Validation expects: supporting_reads, total_reads, snv_alleles (comma-separated)
+                            # build_lineage_table returns: abundance, total_reads, consensus (pipe-separated)
+                            # Validation expects: abundance, total_reads, snv_alleles (comma-separated)
                             converted_records = []
                             for rec in lineage_records:
                                 # Convert consensus format: "pos1:base1|pos2:base2" -> "pos1:base1,pos2:base2"
@@ -1059,7 +1060,7 @@ class ParameterSweep:
                                     'sample': rec.get('sample', ''),
                                     'contig': rec.get('contig', ''),
                                     'track_id': rec.get('track_id', ''),
-                                    'supporting_reads': rec.get('supporting_reads', 0),
+                                    'abundance': rec.get('abundance', 0.0),
                                     'total_reads': rec.get('total_reads', 0),
                                     'snv_alleles': snv_alleles,
                                 })
@@ -1074,7 +1075,7 @@ class ParameterSweep:
 
                             # Write lineages.tsv from converted records
                             import csv
-                            fieldnames = ['lineage_id', 'sample', 'contig', 'track_id', 'supporting_reads', 'total_reads', 'snv_alleles']
+                            fieldnames = ['lineage_id', 'sample', 'contig', 'track_id', 'abundance', 'total_reads', 'snv_alleles']
                             with open(lineages_path, 'w', newline='') as f:
                                 writer = csv.DictWriter(f, fieldnames=fieldnames, delimiter='\t')
                                 writer.writeheader()
@@ -1441,8 +1442,8 @@ class ParameterSweep:
                         logger.warning(f"    WARNING: Missing timepoints in lineage records: {sorted(missing_timepoints)}")
                     
                     # Convert records to format expected by validation
-                    # build_lineage_table returns: supporting_reads, total_reads, consensus (pipe-separated)
-                    # Validation expects: supporting_reads, total_reads, snv_alleles (comma-separated)
+                    # build_lineage_table returns: abundance, total_reads, consensus (pipe-separated)
+                    # Validation expects: abundance, total_reads, snv_alleles (comma-separated)
                     converted_records = []
                     for rec in lineage_records:
                         # Convert consensus format: "pos1:base1|pos2:base2" -> "pos1:base1,pos2:base2"
@@ -1454,7 +1455,7 @@ class ParameterSweep:
                             'sample': rec.get('sample', ''),
                             'contig': rec.get('contig', ''),
                             'track_id': rec.get('track_id', ''),
-                            'supporting_reads': rec.get('supporting_reads', 0),
+                            'abundance': rec.get('abundance', 0.0),
                             'total_reads': rec.get('total_reads', 0),
                             'snv_alleles': snv_alleles,
                         })
@@ -1469,7 +1470,7 @@ class ParameterSweep:
 
                     # Write lineages.tsv from converted records
                     import csv
-                    fieldnames = ['lineage_id', 'sample', 'contig', 'track_id', 'supporting_reads', 'total_reads', 'snv_alleles']
+                    fieldnames = ['lineage_id', 'sample', 'contig', 'track_id', 'abundance', 'total_reads', 'snv_alleles']
                     with open(lineages_path, 'w', newline='') as f:
                         writer = csv.DictWriter(f, fieldnames=fieldnames, delimiter='\t')
                         writer.writeheader()

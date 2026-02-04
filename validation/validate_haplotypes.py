@@ -363,13 +363,15 @@ def load_detected_haplotypes(lineages_file: str) -> List[DetectedHaplotype]:
             sample = row.get('sample', row.get('timepoint', ''))
             contig = row.get('contig', '')
 
-            # Compute abundance from read counts, or fall back to abundance column for backwards compatibility
-            if 'supporting_reads' in row and 'total_reads' in row:
+            # Get abundance: use 'abundance' column if present, otherwise compute from read counts
+            if 'abundance' in row:
+                abundance = float(row.get('abundance', 0.0))
+            elif 'supporting_reads' in row and 'total_reads' in row:
                 supporting_reads = float(row.get('supporting_reads', 0))
                 total_reads = float(row.get('total_reads', 1))
                 abundance = supporting_reads / total_reads if total_reads > 0 else 0.0
             else:
-                abundance = float(row.get('abundance', 0.0))
+                abundance = 0.0
 
             # Store abundance
             lineage_data[lineage_id]['abundances'][sample] = abundance
@@ -1335,7 +1337,7 @@ def write_lineage_details(
 
     output_path = os.path.join(output_dir, 'lineage_details.tsv')
 
-    # Build (lineage_id, timepoint, contig) -> supporting_reads map from lineages.tsv
+    # Build (lineage_id, timepoint, contig) -> total_reads map from lineages.tsv
     read_counts: Dict[Tuple[str, str, str], int] = {}
     if lineages_file and Path(lineages_file).exists():
         with open(lineages_file) as f:
@@ -1352,8 +1354,9 @@ def write_lineage_details(
                     contig = row.get('contig', '')
                     if not lineage_id or not contig:
                         continue
-                    supporting_reads = float(row.get('supporting_reads', 0))
-                    read_counts[(lineage_id, sample, contig)] = supporting_reads
+                    # Use total_reads (preferred) or supporting_reads (backwards compat)
+                    total_reads = float(row.get('total_reads', row.get('supporting_reads', 0)))
+                    read_counts[(lineage_id, sample, contig)] = total_reads
 
     # Build (lineage_id, timepoint, contig) -> n_windows from window_results
     n_windows_map: Dict[Tuple[str, str, str], int] = {}
