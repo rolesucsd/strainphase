@@ -303,8 +303,8 @@ def build_lineage_table(
 
                 # Build track info
                 for track_id, members in track_haps.items():
-                    span_start = min(wr.window.start for wr, _ in members)
-                    span_end = max(wr.window.end for wr, _ in members)
+                    span_start = min(wr.window.start for wr, _, _ in members)
+                    span_end = max(wr.window.end for wr, _, _ in members)
                     n_windows = len(members)
 
                     # Merge consensus across all windows in track
