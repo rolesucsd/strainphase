@@ -174,18 +174,30 @@ def build_comparison_df(tool: str,
     #   n_matching_snvs, n_different_snvs, snv_distance, detected_abundance,
     #   true_abundance, abundance_diff, track_id
 
-    # lineages columns: lineage_id, sample, contig, track_id, supporting_reads,
-    #   total_reads, snv_alleles
+    # lineages columns vary by format:
+    #   New strainphase: lineage_id, sample, contig, track_id, abundance, total_reads, snv_alleles
+    #   Old/Floria: lineage_id, sample, contig, track_id, supporting_reads, total_reads, snv_alleles
 
     # Aggregate lineages.tsv per (lineage_id, sample, contig) since a lineage
     # can have multiple tracks (fragments) producing multiple rows.
+    # Handle both old (supporting_reads) and new (abundance) column names
+    has_abundance_col = "abundance" in lineages.columns
+    has_supporting_reads = "supporting_reads" in lineages.columns
+
+    agg_dict = {
+        "total_reads": ("total_reads", "sum"),
+        "n_tracks": ("track_id", "count"),
+    }
+    if has_abundance_col:
+        # New format: average abundance across tracks
+        agg_dict["abundance"] = ("abundance", "mean")
+    if has_supporting_reads:
+        # Old format: sum supporting reads
+        agg_dict["supporting_reads"] = ("supporting_reads", "sum")
+
     lineages_slim = lineages.groupby(
         ["lineage_id", "sample", "contig"], as_index=False
-    ).agg(
-        supporting_reads=("supporting_reads", "sum"),
-        total_reads=("total_reads", "sum"),
-        n_tracks=("track_id", "count"),
-    )
+    ).agg(**agg_dict)
     lineages_slim = lineages_slim.rename(columns={"sample": "timepoint"})
 
     merged = details.merge(
@@ -193,6 +205,13 @@ def build_comparison_df(tool: str,
         on=["lineage_id", "timepoint", "contig"],
         how="left"
     )
+
+    # Get supporting_reads: use from old format, or 0 for new format
+    if "supporting_reads" in merged.columns:
+        supporting_reads = merged["supporting_reads"].fillna(0).astype(int)
+    else:
+        # New abundance format - supporting_reads not meaningful
+        supporting_reads = 0
 
     # Select and rename columns for output
     result = pd.DataFrame({
@@ -203,7 +222,7 @@ def build_comparison_df(tool: str,
         "contig": merged["contig"],
         "start_pos": merged["start_pos"],
         "end_pos": merged["end_pos"],
-        "supporting_reads": merged["supporting_reads"].fillna(0).astype(int),
+        "supporting_reads": supporting_reads,
         "total_reads": merged["total_reads"].fillna(0).astype(int),
         "detected_abundance": merged["detected_abundance"],
         "true_abundance": merged["true_abundance"],

@@ -311,25 +311,25 @@ def build_lineage_table(
                     position_votes: dict[int, dict[str, float]] = defaultdict(
                         lambda: defaultdict(float)
                     )
-                    total_weight = 0.0
-                    pi_sum = 0.0
-                    nonjunk_sum = 0.0
-                    n_windows = 0
+                    # Abundance = mean of hap.weight across windows
+                    # hap.weight is pi[k] from EM, already includes junk in denominator
+                    # (sum of all pi including junk = 1.0)
+                    weight_sum = 0.0
+                    total_reads_sum = 0
+                    n_windows = len(members)
 
                     for _wr, hap, hap_idx in members:
-                        total_weight += hap.weight
-                        # Deduplicate reads across overlapping windows within a track using soft weights.
-                        if _wr.pi is not None:
-                            junk_idx = _wr.pi.shape[0] - 1
-                            pi_sum += float(_wr.pi[hap_idx])
-                            nonjunk_sum += float(1.0 - _wr.pi[junk_idx])
-                            n_windows += 1
+                        weight_sum += hap.weight
+                        total_reads_sum += len(_wr.window.reads)
                         for pos, base in hap.consensus.items():
                             position_votes[pos][base] += hap.weight
 
                     merged_consensus = {}
                     for pos, votes in position_votes.items():
                         merged_consensus[pos] = max(votes.keys(), key=lambda b: votes[b])
+
+                    # abundance = mean weight across windows (junk is in denominator)
+                    abundance = weight_sum / n_windows if n_windows > 0 else 0.0
 
                     tracks_by_contig[contig_id].append(
                         (
@@ -339,9 +339,8 @@ def build_lineage_table(
                             span_end,
                             n_windows,
                             merged_consensus,
-                            total_weight / n_windows,  # mean_weight
-                            pi_sum,
-                            nonjunk_sum,
+                            abundance,
+                            total_reads_sum,
                         )
                     )
 
@@ -369,21 +368,17 @@ def build_lineage_table(
                 else:
                     # Merge duplicate tracks
                     # Combine: track_ids (use first), spans (union), n_windows (sum),
-                    # consensus (same), mean_weight (average), reads (sum)
+                    # consensus (same), abundance (weighted average), total_reads (sum)
                     first = tracks[indices[0]]
                     merged_track_id = first[1]  # Keep first track_id
                     merged_span_start = min(tracks[i][2] for i in indices)
                     merged_span_end = max(tracks[i][3] for i in indices)
                     merged_n_windows = sum(tracks[i][4] for i in indices)
                     merged_consensus = first[5]  # Same consensus
-                    merged_mean_weight = sum(tracks[i][6] for i in indices) / len(indices)
-                    merged_pi_sum = 0.0
-                    merged_nonjunk_sum = 0.0
-                    merged_n_windows = 0
-                    for i in indices:
-                        merged_pi_sum += tracks[i][7]
-                        merged_nonjunk_sum += tracks[i][8]
-                        merged_n_windows += tracks[i][4]
+                    # Weight average of abundance by n_windows
+                    total_weight_sum = sum(tracks[i][6] * tracks[i][4] for i in indices)
+                    merged_abundance = total_weight_sum / merged_n_windows if merged_n_windows > 0 else 0.0
+                    merged_total_reads = sum(tracks[i][7] for i in indices)
 
                     deduped_tracks.append((
                         sample_id,
@@ -392,9 +387,8 @@ def build_lineage_table(
                         merged_span_end,
                         merged_n_windows,
                         merged_consensus,
-                        merged_mean_weight,
-                        merged_pi_sum,
-                        merged_nonjunk_sum,
+                        merged_abundance,
+                        merged_total_reads,
                     ))
 
             tracks_by_contig[contig_id] = deduped_tracks
@@ -413,7 +407,7 @@ def build_lineage_table(
             cluster_spans: list[tuple[int, int]] = []
 
             for i in range(len(tracks)):
-                _, _, span_start_i, span_end_i, _, consensus_i, _, _, _ = tracks[i]
+                _, _, span_start_i, span_end_i, _, consensus_i, _, _ = tracks[i]
                 positions_i = set(consensus_i.keys())
 
                 # Try to find an existing cluster to join
@@ -476,9 +470,8 @@ def build_lineage_table(
                         span_end,
                         n_windows,
                         consensus,
-                        mean_weight,
-                        pi_sum,
-                        nonjunk_sum,
+                        abundance,
+                        total_reads,
                     ) = tracks[idx]
 
                     consensus_str = "|".join(
@@ -496,9 +489,8 @@ def build_lineage_table(
                             "span_end": span_end,
                             "span_bp": span_end - span_start,
                             "n_windows": n_windows,
-                            "mean_weight": mean_weight,
-                            "supporting_reads": (pi_sum / n_windows) if n_windows > 0 else 0.0,
-                            "total_reads": (nonjunk_sum / n_windows) if n_windows > 0 else 0.0,
+                            "abundance": abundance,
+                            "total_reads": total_reads,
                             "n_snvs": len(consensus),
                             "consensus": consensus_str,
                             "n_timepoints": n_timepoints,
@@ -536,7 +528,7 @@ def write_longitudinal_outputs(
             f.write(
                 "lineage_id\tmag\tcontig\tsample\ttrack_id\t"
                 "span_start\tspan_end\tspan_bp\tn_windows\t"
-                "mean_weight\tsupporting_reads\ttotal_reads\t"
+                "abundance\ttotal_reads\t"
                 "n_snvs\tconsensus\tn_timepoints\n"
             )
 
