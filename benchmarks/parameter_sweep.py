@@ -621,32 +621,25 @@ def window_results_to_lineages_tsv(
 
     # Aggregate haplotypes by track_id
     track_data = defaultdict(lambda: {
-        'supporting_read_weights': {},
-        'total_read_weights': {},
+        'pi_sum': 0.0,
+        'nonjunk_sum': 0.0,
+        'n_windows': 0,
         'snvs': defaultdict(dict),  # contig -> {pos -> allele}
         'contigs': set(),
     })
 
     for wr in all_window_results:
         contig_id = wr.window.contig  # Window uses 'contig', not 'contig_id'
-        window_read_ids = [r.id for r in wr.window.reads]
-        junk_idx = wr.gamma.shape[1] - 1 if wr.gamma is not None else None
+        junk_idx = wr.pi.shape[0] - 1 if wr.pi is not None else None
         for h_idx, hap in enumerate(wr.haplotypes):
             track_id = hap.track_id or f"unlinked_{wr.window.start}"
 
             track_data[track_id]['contigs'].add(contig_id)
-            if wr.gamma is not None and junk_idx is not None:
-                for i, read_id in enumerate(window_read_ids):
-                    hap_prob = float(wr.gamma[i, h_idx])
-                    nonjunk_prob = float(1.0 - wr.gamma[i, junk_idx])
-                    if read_id is None:
-                        continue
-                    prev_hap = track_data[track_id]['supporting_read_weights'].get(read_id, 0.0)
-                    if hap_prob > prev_hap:
-                        track_data[track_id]['supporting_read_weights'][read_id] = hap_prob
-                    prev_total = track_data[track_id]['total_read_weights'].get(read_id, 0.0)
-                    if nonjunk_prob > prev_total:
-                        track_data[track_id]['total_read_weights'][read_id] = nonjunk_prob
+            if wr.pi is not None and junk_idx is not None:
+                nonjunk = float(1.0 - wr.pi[junk_idx])
+                track_data[track_id]['pi_sum'] += float(wr.pi[h_idx])
+                track_data[track_id]['nonjunk_sum'] += nonjunk
+                track_data[track_id]['n_windows'] += 1
 
             # Aggregate SNV alleles from consensus
             for pos, allele in hap.consensus.items():
@@ -666,8 +659,8 @@ def window_results_to_lineages_tsv(
                 'sample': sample_id,
                 'contig': contig_id,
                 'track_id': track_id,
-                'supporting_reads': sum(data['supporting_read_weights'].values()),
-                'total_reads': sum(data['total_read_weights'].values()),
+                'supporting_reads': (data['pi_sum'] / data['n_windows']) if data['n_windows'] > 0 else 0.0,
+                'total_reads': (data['nonjunk_sum'] / data['n_windows']) if data['n_windows'] > 0 else 0.0,
                 'snv_alleles': snv_alleles_str if snv_alleles_str else '.',
             })
 
