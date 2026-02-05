@@ -206,6 +206,19 @@ def build_comparison_df(tool: str,
         how="left"
     )
 
+    # If supporting_reads missing/zero, infer from detected_abundance * total_reads
+    if "supporting_reads" not in merged.columns:
+        merged["supporting_reads"] = 0.0
+    if "total_reads" not in merged.columns:
+        merged["total_reads"] = 0.0
+    merged["supporting_reads"] = merged["supporting_reads"].fillna(0).astype(float)
+    merged["total_reads"] = merged["total_reads"].fillna(0).astype(float)
+    inferred = merged["supporting_reads"] <= 0
+    merged.loc[inferred, "supporting_reads"] = (
+        merged.loc[inferred, "detected_abundance"].fillna(0) *
+        merged.loc[inferred, "total_reads"].fillna(0)
+    )
+
     # Get supporting_reads: use from old format, or 0 for new format
     if "supporting_reads" in merged.columns:
         supporting_reads = merged["supporting_reads"].fillna(0).astype(int)

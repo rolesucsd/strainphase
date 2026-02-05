@@ -176,6 +176,10 @@ class WindowMetrics:
     precision: float      # matched_detected / detected
     recall: float         # matched_groups / n_strain_groups
 
+    # Read-level diagnostics
+    n_reads_examined: int
+    reads_within_mismatch_per_hap: List[int]
+
     # SNV-level
     n_snv_positions: int
     n_informative_snvs: int
@@ -1003,6 +1007,13 @@ def compute_window_metrics(
     if abundance_pairs:
         abundance_mae = np.mean([abs(t - d) for t, d in abundance_pairs])
 
+    n_reads_examined = getattr(window_result, "n_reads_examined", len(window_result.window.reads))
+    reads_within_mismatch_per_hap = getattr(window_result, "reads_within_mismatch_per_hap", None)
+    if reads_within_mismatch_per_hap is None:
+        reads_within_mismatch_per_hap = []
+    if not reads_within_mismatch_per_hap and n_detected > 0:
+        reads_within_mismatch_per_hap = [0] * n_detected
+
     return WindowMetrics(
         sample=sample,
         contig=contig,
@@ -1013,6 +1024,8 @@ def compute_window_metrics(
         n_matched=n_matched,
         precision=precision,
         recall=recall,
+        n_reads_examined=n_reads_examined,
+        reads_within_mismatch_per_hap=reads_within_mismatch_per_hap,
         n_snv_positions=len(window_positions),
         n_informative_snvs=n_informative_snvs,
         n_snv_detected=n_snv_detected,
