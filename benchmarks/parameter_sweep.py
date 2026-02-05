@@ -35,7 +35,6 @@ from dataclasses import dataclass, asdict
 from typing import Dict, List, Optional, Any
 from collections import defaultdict
 from pathlib import Path
-    from strainphase.longitudinal import write_lineage_tables
 
 import numpy as np
 
@@ -621,7 +620,6 @@ def window_results_to_lineages_tsv(
     """
     import csv
     from pathlib import Path
-    from strainphase.longitudinal import write_lineage_tables
 
     # Aggregate haplotypes by track_id
     # Use hap.weight directly (correct post-processing weight) instead of wr.pi[h_idx]
