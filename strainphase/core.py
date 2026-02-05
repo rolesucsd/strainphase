@@ -336,6 +336,8 @@ class WindowResult:
     converged: bool
     iterations: int
     linking_debug: list[dict] = field(default_factory=list)
+    n_reads_examined: int = 0
+    reads_within_mismatch_per_hap: list[int] = field(default_factory=list)
 
     def validate(self) -> bool:
         """Validate internal consistency."""
@@ -361,7 +363,44 @@ class WindowResult:
 
         assert len(self.pi) == k_eff, f"pi length {len(self.pi)} != k_eff {k_eff}"
 
+        if self.reads_within_mismatch_per_hap:
+            assert len(self.reads_within_mismatch_per_hap) == n_haps, (
+                f"reads_within_mismatch_per_hap length {len(self.reads_within_mismatch_per_hap)} != n_haps {n_haps}"
+            )
+
         return True
+
+
+def _compute_read_mismatch_counts(
+    window: Window,
+    haplotypes: list[Haplotype],
+    max_mismatch_frac: float,
+) -> tuple[int, list[int]]:
+    """Count reads within max_mismatch_frac of each haplotype consensus."""
+    n_reads = len(window.reads)
+    if not haplotypes or n_reads == 0:
+        return n_reads, [0] * len(haplotypes)
+
+    hap_positions = [set(h.consensus.keys()) for h in haplotypes]
+    counts = [0] * len(haplotypes)
+    read_pos_sets = window.get_read_position_sets()
+
+    for read, read_pos in zip(window.reads, read_pos_sets):
+        if not read_pos:
+            continue
+        for hi, hap in enumerate(haplotypes):
+            shared_positions = read_pos & hap_positions[hi]
+            n_shared = len(shared_positions)
+            if n_shared == 0:
+                continue
+            mismatches = 0
+            for pos in shared_positions:
+                if read.alleles.get(pos) != hap.consensus.get(pos):
+                    mismatches += 1
+            if (mismatches / n_shared) < max_mismatch_frac:
+                counts[hi] += 1
+
+    return n_reads, counts
 
 
 @dataclass
@@ -1532,6 +1571,10 @@ class LongitudinalIntegrator:
                 (gamma_new[:, k] >= self.config.assign_confidence_threshold).sum()
             )
 
+        n_reads_examined, reads_within_mismatch_per_hap = _compute_read_mismatch_counts(
+            window, haplotypes, self.config.max_mismatch_frac
+        )
+
         return WindowResult(
             window=window,
             haplotypes=haplotypes,
@@ -1541,6 +1584,8 @@ class LongitudinalIntegrator:
             assignments=assignments,
             converged=window_result.converged,
             iterations=window_result.iterations,
+            n_reads_examined=n_reads_examined,
+            reads_within_mismatch_per_hap=reads_within_mismatch_per_hap,
         )
 
     def _recompute_gamma(
@@ -1779,6 +1824,9 @@ def process_window(
         pi = np.array([1.0])
         assignments = post.assign_reads(window.reads, gamma, pi)
 
+        n_reads_examined, reads_within_mismatch_per_hap = _compute_read_mismatch_counts(
+            window, [], config.max_mismatch_frac
+        )
         return WindowResult(
             window=window,
             haplotypes=[],
@@ -1788,6 +1836,8 @@ def process_window(
             assignments=assignments,
             converged=True,
             iterations=0,
+            n_reads_examined=n_reads_examined,
+            reads_within_mismatch_per_hap=reads_within_mismatch_per_hap,
         )
 
     # 2) EM haplotyping: refine haplotype consensus and weights.
@@ -1797,6 +1847,9 @@ def process_window(
     if not haplotypes:
         # EM pruned all haplotypes; keep the (junk) assignments.
         assignments = post.assign_reads(window.reads, gamma, pi)
+        n_reads_examined, reads_within_mismatch_per_hap = _compute_read_mismatch_counts(
+            window, [], config.max_mismatch_frac
+        )
         return WindowResult(
             window=window,
             haplotypes=[],
@@ -1806,6 +1859,8 @@ def process_window(
             assignments=assignments,
             converged=converged,
             iterations=iterations,
+            n_reads_examined=n_reads_examined,
+            reads_within_mismatch_per_hap=reads_within_mismatch_per_hap,
         )
 
     # 3) Post-processing: merge near-duplicate haplotypes with 1-SNP guard.
@@ -1813,6 +1868,10 @@ def process_window(
         haplotypes, gamma, pi, window, n_timepoints_seen
     )
     assignments = post.assign_reads(window.reads, final_gamma, final_pi)
+
+    n_reads_examined, reads_within_mismatch_per_hap = _compute_read_mismatch_counts(
+        window, merged_haps, config.max_mismatch_frac
+    )
 
     result = WindowResult(
         window=window,
@@ -1823,6 +1882,8 @@ def process_window(
         assignments=assignments,
         converged=converged,
         iterations=iterations,
+        n_reads_examined=n_reads_examined,
+        reads_within_mismatch_per_hap=reads_within_mismatch_per_hap,
     )
 
     # 4) Optional validation checks on the WindowResult structure.

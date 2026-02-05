@@ -259,7 +259,7 @@ def process_mag_longitudinal(
 
 def build_lineage_table(
     all_results: dict[str, dict[str, dict[str, list[WindowResult]]]], config: HaplotyperConfig
-) -> list[dict]:
+) -> tuple[list[dict], list[dict]]:
     """
     Build lineage tracking table across samples using TRACKS.
 
@@ -283,13 +283,14 @@ def build_lineage_table(
         List of dicts suitable for pd.DataFrame() or TSV writing.
     """
     records: list[dict] = []
+    haplotype_records: list[dict] = []
     lineage_counter = 0
 
     # Process each MAG
     for mag_name, mag_results in all_results.items():
         # Collect all tracks by contig
-        # Structure: {contig_id: [(sample_id, track_id, span_start, span_end, merged_consensus, stats), ...]}
-        tracks_by_contig: dict[str, list[tuple]] = defaultdict(list)
+        # Structure: {contig_id: [track_info, ...]}
+        tracks_by_contig: dict[str, list[dict]] = defaultdict(list)
 
         for sample_id, contig_results in mag_results.items():
             for contig_id, window_results in contig_results.items():
@@ -316,11 +317,10 @@ def build_lineage_table(
                     # (sum of all pi including junk = 1.0)
                     weight_sum = 0.0
                     total_reads_sum = 0
-                    n_windows = len(members)
 
                     for _wr, hap, hap_idx in members:
                         weight_sum += hap.weight
-                        total_reads_sum += len(_wr.window.reads)
+                        total_reads_sum += getattr(_wr, "n_reads_examined", len(_wr.window.reads))
                         for pos, base in hap.consensus.items():
                             position_votes[pos][base] += hap.weight
 
@@ -332,16 +332,17 @@ def build_lineage_table(
                     abundance = weight_sum / n_windows if n_windows > 0 else 0.0
 
                     tracks_by_contig[contig_id].append(
-                        (
-                            sample_id,
-                            track_id,
-                            span_start,
-                            span_end,
-                            n_windows,
-                            merged_consensus,
-                            abundance,
-                            total_reads_sum,
-                        )
+                        {
+                            "sample": sample_id,
+                            "track_id": track_id,
+                            "span_start": span_start,
+                            "span_end": span_end,
+                            "n_windows": n_windows,
+                            "consensus": merged_consensus,
+                            "abundance": abundance,
+                            "total_reads_sum": total_reads_sum,
+                            "members": members,
+                        }
                     )
 
         # Deduplicate tracks within the same sample that have identical consensus
@@ -354,14 +355,14 @@ def build_lineage_table(
             # Merge tracks with identical consensus within the same sample
             dedup_key_to_tracks: dict[tuple, list[int]] = defaultdict(list)
             for i, track in enumerate(tracks):
-                sample_id = track[0]
-                consensus = track[5]  # consensus dict
+                sample_id = track["sample"]
+                consensus = track["consensus"]
                 consensus_key = tuple(sorted(consensus.items()))
                 dedup_key_to_tracks[(sample_id, consensus_key)].append(i)
 
             # Build deduplicated track list
             deduped_tracks = []
-            for (sample_id, consensus_key), indices in dedup_key_to_tracks.items():
+            for (sample_id, _consensus_key), indices in dedup_key_to_tracks.items():
                 if len(indices) == 1:
                     # No duplicates, keep as-is
                     deduped_tracks.append(tracks[indices[0]])
@@ -370,26 +371,30 @@ def build_lineage_table(
                     # Combine: track_ids (use first), spans (union), n_windows (sum),
                     # consensus (same), abundance (weighted average), total_reads (sum)
                     first = tracks[indices[0]]
-                    merged_track_id = first[1]  # Keep first track_id
-                    merged_span_start = min(tracks[i][2] for i in indices)
-                    merged_span_end = max(tracks[i][3] for i in indices)
-                    merged_n_windows = sum(tracks[i][4] for i in indices)
-                    merged_consensus = first[5]  # Same consensus
+                    merged_track_id = first["track_id"]  # Keep first track_id
+                    merged_span_start = min(tracks[i]["span_start"] for i in indices)
+                    merged_span_end = max(tracks[i]["span_end"] for i in indices)
+                    merged_n_windows = sum(tracks[i]["n_windows"] for i in indices)
+                    merged_consensus = first["consensus"]  # Same consensus
                     # Weight average of abundance by n_windows
-                    total_weight_sum = sum(tracks[i][6] * tracks[i][4] for i in indices)
+                    total_weight_sum = sum(tracks[i]["abundance"] * tracks[i]["n_windows"] for i in indices)
                     merged_abundance = total_weight_sum / merged_n_windows if merged_n_windows > 0 else 0.0
-                    merged_total_reads = sum(tracks[i][7] for i in indices)
+                    merged_total_reads = sum(tracks[i]["total_reads_sum"] for i in indices)
+                    merged_members = []
+                    for i in indices:
+                        merged_members.extend(tracks[i]["members"])
 
-                    deduped_tracks.append((
-                        sample_id,
-                        merged_track_id,
-                        merged_span_start,
-                        merged_span_end,
-                        merged_n_windows,
-                        merged_consensus,
-                        merged_abundance,
-                        merged_total_reads,
-                    ))
+                    deduped_tracks.append({
+                        "sample": sample_id,
+                        "track_id": merged_track_id,
+                        "span_start": merged_span_start,
+                        "span_end": merged_span_end,
+                        "n_windows": merged_n_windows,
+                        "consensus": merged_consensus,
+                        "abundance": merged_abundance,
+                        "total_reads_sum": merged_total_reads,
+                        "members": merged_members,
+                    })
 
             tracks_by_contig[contig_id] = deduped_tracks
 
@@ -407,7 +412,9 @@ def build_lineage_table(
             cluster_spans: list[tuple[int, int]] = []
 
             for i in range(len(tracks)):
-                _, _, span_start_i, span_end_i, _, consensus_i, _, _ = tracks[i]
+                span_start_i = tracks[i]["span_start"]
+                span_end_i = tracks[i]["span_end"]
+                consensus_i = tracks[i]["consensus"]
                 positions_i = set(consensus_i.keys())
 
                 # Try to find an existing cluster to join
@@ -460,19 +467,28 @@ def build_lineage_table(
             for cluster in clusters:
                 lineage_counter += 1
                 lineage_id = f"L{lineage_counter:06d}"
-                n_timepoints = len({tracks[idx][0] for idx in cluster})
+                n_timepoints = len({tracks[idx]["sample"] for idx in cluster})
+                lineage_total_windows = sum(tracks[idx]["n_windows"] for idx in cluster)
+                lineage_span_start = min(tracks[idx]["span_start"] for idx in cluster)
+                lineage_span_end = max(tracks[idx]["span_end"] for idx in cluster)
+                lineage_total_span = lineage_span_end - lineage_span_start
 
                 for idx in cluster:
-                    (
-                        sample_id,
-                        track_id,
-                        span_start,
-                        span_end,
-                        n_windows,
-                        consensus,
-                        abundance,
-                        total_reads,
-                    ) = tracks[idx]
+                    track = tracks[idx]
+                    sample_id = track["sample"]
+                    track_id = track["track_id"]
+                    span_start = track["span_start"]
+                    span_end = track["span_end"]
+                    n_windows = track["n_windows"]
+                    consensus = track["consensus"]
+                    abundance = track["abundance"]
+                    total_reads_avg = (
+                        track["total_reads_sum"] / n_windows if n_windows > 0 else 0.0
+                    )
+                    reads_avg = (
+                        sum(h.supporting_reads for _wr, h, _ in track["members"]) / n_windows
+                        if n_windows > 0 else 0.0
+                    )
 
                     consensus_str = "|".join(
                         f"{pos}:{base}" for pos, base in sorted(consensus.items())
@@ -489,20 +505,54 @@ def build_lineage_table(
                             "span_end": span_end,
                             "span_bp": span_end - span_start,
                             "n_windows": n_windows,
+                            "total_windows": lineage_total_windows,
+                            "total_span": lineage_total_span,
                             "abundance": abundance,
-                            "total_reads": total_reads,
+                            "reads": reads_avg,
+                            "total_reads": total_reads_avg,
                             "n_snvs": len(consensus),
                             "consensus": consensus_str,
                             "n_timepoints": n_timepoints,
                         }
                     )
 
-    return records
+                    for wr, hap, hap_idx in track["members"]:
+                        hap_consensus_str = "|".join(
+                            f"{pos}:{base}" for pos, base in sorted(hap.consensus.items())
+                        )
+                        hap_id = f"{track_id}_W{wr.window.start}_H{hap_idx}"
+                        hap_total_reads = getattr(wr, "n_reads_examined", len(wr.window.reads))
+                        hap_reads = hap.supporting_reads
+                        haplotype_records.append(
+                            {
+                                "lineage_id": lineage_id,
+                                "haplotype_id": hap_id,
+                                "mag": mag_name,
+                                "contig": contig_id,
+                                "sample": sample_id,
+                                "track_id": track_id,
+                                "span_start": wr.window.start,
+                                "span_end": wr.window.end,
+                                "span_bp": wr.window.end - wr.window.start,
+                                "n_windows": 1,
+                                "total_windows": lineage_total_windows,
+                                "total_span": lineage_total_span,
+                                "abundance": hap.weight,
+                                "reads": hap_reads,
+                                "total_reads": hap_total_reads,
+                                "n_snvs": len(hap.consensus),
+                                "consensus": hap_consensus_str,
+                                "n_timepoints": n_timepoints,
+                            }
+                        )
+
+    return records, haplotype_records
 
 
 def write_longitudinal_outputs(
     all_results: dict[str, dict[str, dict[str, list[WindowResult]]]],
     lineage_records: list[dict],
+    haplotype_records: list[dict],
     output_dir: str,
 ) -> str:
     """
@@ -528,11 +578,29 @@ def write_longitudinal_outputs(
             f.write(
                 "lineage_id\tmag\tcontig\tsample\ttrack_id\t"
                 "span_start\tspan_end\tspan_bp\tn_windows\t"
-                "abundance\ttotal_reads\t"
+                "total_windows\ttotal_span\t"
+                "abundance\treads\ttotal_reads\t"
                 "n_snvs\tconsensus\tn_timepoints\n"
             )
 
     logging.info(f"Wrote {len(lineage_records)} lineage records to {lineage_path}")
+
+    # 1b. Haplotype table (per haplotype)
+    haplotype_path = os.path.join(output_dir, "haplotypes.tsv")
+    if haplotype_records:
+        df_haps = pd.DataFrame(haplotype_records)
+        df_haps.to_csv(haplotype_path, sep="\t", index=False)
+    else:
+        with open(haplotype_path, "w") as f:
+            f.write(
+                "lineage_id\thaplotype_id\tmag\tcontig\tsample\ttrack_id\t"
+                "span_start\tspan_end\tspan_bp\tn_windows\t"
+                "total_windows\ttotal_span\t"
+                "abundance\treads\ttotal_reads\t"
+                "n_snvs\tconsensus\tn_timepoints\n"
+            )
+
+    logging.info(f"Wrote {len(haplotype_records)} haplotype records to {haplotype_path}")
 
     # 2. Per-sample haplotypes (post-rescue)
     #    Note: if multiple MAGs are processed, each sample file will contain
@@ -744,10 +812,10 @@ def main():
 
     # Build lineage table
     logging.info("Building lineage table across processed MAGs")
-    lineage_records = build_lineage_table(all_results, config)
+    lineage_records, haplotype_records = build_lineage_table(all_results, config)
 
     # Write outputs
-    write_longitudinal_outputs(all_results, lineage_records, args.output_dir)
+    write_longitudinal_outputs(all_results, lineage_records, haplotype_records, args.output_dir)
 
     # Summary in logs
     n_lineages = len({r["lineage_id"] for r in lineage_records}) if lineage_records else 0
