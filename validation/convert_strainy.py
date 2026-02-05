@@ -22,8 +22,10 @@ Usage:
 import argparse
 import csv
 import glob
+import gzip
 import logging
 import os
+import pickle
 import re
 from collections import defaultdict
 from pathlib import Path
@@ -32,26 +34,97 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 
-def parse_vcf(vcf_path: str) -> dict[tuple[str, int], tuple[str, list[str]]]:
+def parse_vcf(vcf_path: str) -> tuple[dict[tuple[str, int], tuple[str, list[str]]], dict[str, list[int]]]:
     """
-    Parse VCF to get ref/alt alleles at each position.
+    Parse VCF to get ref/alt alleles and positions.
 
-    Returns: {(contig, 1-indexed position) -> (ref_allele, [alt_alleles])}
+    Returns:
+        variants: {(contig, 1-indexed position) -> (ref_allele, [alt_alleles])}
+        positions_by_contig: {contig -> [positions]}
     """
     variants = {}
-    with open(vcf_path) as f:
+    positions_by_contig: dict[str, list[int]] = defaultdict(list)
+
+    opener = gzip.open if vcf_path.endswith((".gz", ".bgz")) else open
+    with opener(vcf_path, "rt") as f:
         for line in f:
             if line.startswith("#"):
                 continue
             parts = line.strip().split("\t")
+            if len(parts) < 5:
+                continue
             contig = parts[0]
             pos = int(parts[1])  # VCF is 1-indexed
             ref = parts[3]
             alts = parts[4].split(",")
             variants[(contig, pos)] = (ref, alts)
+            positions_by_contig[contig].append(pos)
 
     logger.info(f"Parsed {len(variants)} variants from VCF")
-    return variants
+    return variants, dict(positions_by_contig)
+
+
+class _DummySeq:
+    def __init__(self, data: str = ""):
+        self._data = data
+
+    def __setstate__(self, state):
+        if isinstance(state, (str, bytes)):
+            self._data = state.decode() if isinstance(state, bytes) else state
+        elif isinstance(state, dict):
+            self.__dict__.update(state)
+        elif isinstance(state, tuple) and len(state) == 1:
+            self._data = state[0]
+        else:
+            self._data = str(state)
+
+    def __str__(self):
+        return getattr(self, "_data", "")
+
+
+class _StrainyUnpickler(pickle.Unpickler):
+    def find_class(self, module, name):
+        if module == "Bio.Seq" and name == "Seq":
+            return _DummySeq
+        return super().find_class(module, name)
+
+
+def load_consensus_dict(pkl_path: str) -> dict:
+    """
+    Load Strainy consensus_dict.pkl without requiring Biopython.
+    """
+    with open(pkl_path, "rb") as f:
+        return _StrainyUnpickler(f).load()
+
+
+def parse_cluster_read_counts(strainy_dir: str) -> dict[tuple[str, str], int]:
+    """
+    Parse Strainy's intermediate cluster CSVs to count reads per cluster.
+
+    Returns: {(contig, cluster_id) -> read_count}
+    """
+    counts: dict[tuple[str, str], int] = defaultdict(int)
+    clusters_dir = Path(strainy_dir) / "intermediate" / "clusters"
+    if not clusters_dir.exists():
+        return dict(counts)
+
+    for csv_path in clusters_dir.glob("clusters_*.csv"):
+        stem = csv_path.stem  # e.g. clusters_contig_3_1000_0.2
+        match = re.match(r"clusters_(.+?)_\\d", stem)
+        contig = match.group(1) if match else stem.replace("clusters_", "")
+        with open(csv_path) as f:
+            header = f.readline().strip().split(",")
+            if "Cluster" not in header:
+                continue
+            cluster_idx = header.index("Cluster")
+            for line in f:
+                parts = line.strip().split(",")
+                if len(parts) <= cluster_idx:
+                    continue
+                cluster_id = parts[cluster_idx]
+                counts[(contig, str(cluster_id))] += 1
+
+    return dict(counts)
 
 
 def parse_snp_pos_tsv(snp_pos_path: str) -> list[dict]:
@@ -215,76 +288,136 @@ def convert_strainy_to_lineages(
     """
     os.makedirs(output_dir, exist_ok=True)
 
-    # Parse VCF for allele lookup
-    variants = parse_vcf(vcf_path)
-
-    # Find contig directories
-    contig_dirs = find_contig_dirs(strainy_dir)
-    if not contig_dirs:
-        logger.error(f"No contig directories with SNP data found in {strainy_dir}")
-        return ""
-
-    logger.info(f"Found {len(contig_dirs)} contig directories in {strainy_dir}")
+    # Parse VCF for positions/alleles (supports bgzip + tabix VCFs)
+    variants, vcf_positions = parse_vcf(vcf_path)
 
     all_records = []
     global_cluster_idx = 0
 
-    for contig_name, contig_dir in contig_dirs:
-        # Parse SNP positions and cluster alleles
-        snp_file = None
-        for name in ["SNP_pos.tsv", "snp_pos.tsv", "SNP_pos.csv"]:
-            candidate = os.path.join(contig_dir, name)
-            if os.path.exists(candidate):
-                snp_file = candidate
-                break
+    # First try legacy per-contig SNP_pos.tsv outputs
+    contig_dirs = find_contig_dirs(strainy_dir)
+    if contig_dirs:
+        logger.info(f"Found {len(contig_dirs)} contig directories in {strainy_dir}")
 
-        if snp_file is None:
-            logger.warning(f"No SNP_pos.tsv in {contig_dir}")
-            continue
+        for contig_name, contig_dir in contig_dirs:
+            # Parse SNP positions and cluster alleles
+            snp_file = None
+            for name in ["SNP_pos.tsv", "snp_pos.tsv", "SNP_pos.csv"]:
+                candidate = os.path.join(contig_dir, name)
+                if os.path.exists(candidate):
+                    snp_file = candidate
+                    break
 
-        snps = parse_snp_pos_tsv(snp_file)
-        if not snps:
-            logger.warning(f"No SNP data parsed from {snp_file}")
-            continue
+            if snp_file is None:
+                logger.warning(f"No SNP_pos.tsv in {contig_dir}")
+                continue
 
-        # Get all cluster names from SNP data
-        cluster_names = set()
-        for snp in snps:
-            cluster_names.update(snp["clusters"].keys())
-        cluster_names = sorted(cluster_names)
+            snps = parse_snp_pos_tsv(snp_file)
+            if not snps:
+                logger.warning(f"No SNP data parsed from {snp_file}")
+                continue
 
-        if not cluster_names:
-            logger.warning(f"No clusters found for {contig_name}")
-            continue
-
-        # Count reads per cluster
-        read_counts = count_cluster_reads(contig_dir)
-
-        # Build per-cluster allele strings
-        for cluster_name in cluster_names:
-            snv_alleles = []
+            # Get all cluster names from SNP data
+            cluster_names = set()
             for snp in snps:
-                allele = snp["clusters"].get(cluster_name)
-                if allele is None:
+                cluster_names.update(snp["clusters"].keys())
+            cluster_names = sorted(cluster_names)
+
+            if not cluster_names:
+                logger.warning(f"No clusters found for {contig_name}")
+                continue
+
+            # Count reads per cluster
+            read_counts = count_cluster_reads(contig_dir)
+
+            # Build per-cluster allele strings
+            for cluster_name in cluster_names:
+                snv_alleles = []
+                for snp in snps:
+                    allele = snp["clusters"].get(cluster_name)
+                    if allele is None:
+                        continue
+                    # Use position from SNP_pos.tsv (already 1-indexed)
+                    pos = snp["pos"]
+                    snv_alleles.append(f"{pos}:{allele}")
+
+                if not snv_alleles:
                     continue
-                # Use VCF position if available, otherwise use the position from SNP_pos.tsv
-                pos = snp["pos"]  # Already 1-indexed from strainy
-                snv_alleles.append(f"{pos}:{allele}")
+
+                n_reads = read_counts.get(cluster_name, 0)
+                # Try matching by index if the cluster name mapping doesn't work
+                if n_reads == 0:
+                    match = re.search(r"(\d+)", cluster_name)
+                    if match:
+                        idx = match.group(1)
+                        for key in read_counts:
+                            if key.endswith(idx):
+                                n_reads = read_counts[key]
+                                break
+
+                hap_id = f"strainy_{global_cluster_idx}"
+                global_cluster_idx += 1
+
+                record = {
+                    "lineage_id": hap_id,
+                    "sample": sample_id,
+                    "contig": contig_name,
+                    "track_id": hap_id,
+                    "supporting_reads": n_reads,
+                    "total_reads": n_reads,
+                    "snv_alleles": ",".join(snv_alleles),
+                }
+                all_records.append(record)
+
+                logger.info(
+                    f"  {hap_id} ({cluster_name}) on {contig_name}: "
+                    f"{len(snv_alleles)} SNVs, {n_reads} reads"
+                )
+    else:
+        # Newer Strainy output format: intermediate/consensus_dict.pkl + clusters CSVs
+        consensus_path = Path(strainy_dir) / "intermediate" / "consensus_dict.pkl"
+        if not consensus_path.exists():
+            logger.error(f"No contig directories or consensus_dict.pkl found in {strainy_dir}")
+            return ""
+
+        consensus_dict = load_consensus_dict(str(consensus_path))
+        if not consensus_dict:
+            logger.error(f"Empty consensus dict: {consensus_path}")
+            return ""
+
+        read_counts = parse_cluster_read_counts(strainy_dir)
+
+        for key, entry in consensus_dict.items():
+            if "-" not in key:
+                continue
+            cluster_id, contig_name = key.split("-", 1)
+            consensus_seq = str(entry.get("consensus", "")).upper()
+            if not consensus_seq:
+                continue
+
+            # Determine positions to report: prefer VCF positions for this contig
+            positions = vcf_positions.get(contig_name)
+            if not positions:
+                # Fallback: use positions where consensus differs from reference_seq
+                ref_seq = str(entry.get("reference_seq", "")).upper()
+                positions = []
+                if ref_seq and len(ref_seq) == len(consensus_seq):
+                    for idx, (r, c) in enumerate(zip(ref_seq, consensus_seq), start=1):
+                        if r in "ACGT" and c in "ACGT" and r != c:
+                            positions.append(idx)
+
+            snv_alleles = []
+            for pos in positions or []:
+                if pos <= 0 or pos > len(consensus_seq):
+                    continue
+                allele = consensus_seq[pos - 1]
+                if allele in ("A", "C", "G", "T"):
+                    snv_alleles.append(f"{pos}:{allele}")
 
             if not snv_alleles:
                 continue
 
-            n_reads = read_counts.get(cluster_name, 0)
-            # Try matching by index if the cluster name mapping doesn't work
-            if n_reads == 0:
-                match = re.search(r"(\d+)", cluster_name)
-                if match:
-                    idx = match.group(1)
-                    for key in read_counts:
-                        if key.endswith(idx):
-                            n_reads = read_counts[key]
-                            break
-
+            n_reads = read_counts.get((contig_name, str(cluster_id)), 0)
             hap_id = f"strainy_{global_cluster_idx}"
             global_cluster_idx += 1
 
@@ -300,7 +433,7 @@ def convert_strainy_to_lineages(
             all_records.append(record)
 
             logger.info(
-                f"  {hap_id} ({cluster_name}) on {contig_name}: "
+                f"  {hap_id} (cluster {cluster_id}) on {contig_name}: "
                 f"{len(snv_alleles)} SNVs, {n_reads} reads"
             )
 
