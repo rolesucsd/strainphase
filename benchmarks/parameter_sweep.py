@@ -604,124 +604,6 @@ def process_contig_with_params(
         return []
 
 
-def window_results_to_lineages_tsv(
-    all_window_results: List[WindowResult],
-    output_path: str,
-    sample_id: str = "sample"
-) -> str:
-    """
-    Convert WindowResults to lineages.tsv format for validation.
-
-    Creates a simplified lineages.tsv that aggregates haplotypes by track_id
-    across all windows and contigs.
-
-    If no haplotypes are detected, creates an empty file with headers.
-    Also writes a sibling haplotypes.tsv with per-haplotype rows.
-    """
-    import csv
-    from pathlib import Path
-
-    # Aggregate haplotypes by track_id
-    # Use hap.weight directly (correct post-processing weight) instead of wr.pi[h_idx]
-    track_data = defaultdict(lambda: {
-        'weight_sum': 0.0,
-        'reads_sum': 0,
-        'total_reads_sum': 0,
-        'n_windows': 0,
-        'span_start': None,
-        'span_end': None,
-        'snvs': defaultdict(dict),  # contig -> {pos -> allele}
-        'contigs': set(),
-        'members': defaultdict(list),  # contig -> list of (wr, h_idx, hap)
-    })
-
-    for wr in all_window_results:
-        contig_id = wr.window.contig  # Window uses 'contig', not 'contig_id'
-        for h_idx, hap in enumerate(wr.haplotypes):
-            track_id = hap.track_id or f"unlinked_{wr.window.start}"
-
-            td = track_data[track_id]
-            td['contigs'].add(contig_id)
-            td['weight_sum'] += hap.weight
-            td['reads_sum'] += hap.supporting_reads
-            td['total_reads_sum'] += getattr(wr, "n_reads_examined", len(wr.window.reads))
-            td['n_windows'] += 1
-            td['span_start'] = wr.window.start if td['span_start'] is None else min(td['span_start'], wr.window.start)
-            td['span_end'] = wr.window.end if td['span_end'] is None else max(td['span_end'], wr.window.end)
-            td['members'][contig_id].append((wr, h_idx, hap))
-
-            # Aggregate SNV alleles from consensus
-            for pos, allele in hap.consensus.items():
-                td['snvs'][contig_id][pos] = allele
-
-    # Build lineage records
-    records = []
-    haplotype_records = []
-    for track_id, data in track_data.items():
-        for contig_id in data['contigs']:
-            snv_alleles_str = ','.join(
-                f"{pos}:{allele}"
-                for pos, allele in sorted(data['snvs'][contig_id].items())
-            )
-
-            n_windows = data['n_windows']
-            span_start = data['span_start'] if data['span_start'] is not None else 0
-            span_end = data['span_end'] if data['span_end'] is not None else 0
-            span_bp = span_end - span_start
-
-            # abundance = mean weight across windows (junk in denominator)
-            abundance = data['weight_sum'] / n_windows if n_windows > 0 else 0.0
-            reads_avg = data['reads_sum'] / n_windows if n_windows > 0 else 0.0
-            total_reads_avg = data['total_reads_sum'] / n_windows if n_windows > 0 else 0.0
-
-            records.append({
-                'lineage_id': track_id,
-                'sample': sample_id,
-                'contig': contig_id,
-                'track_id': track_id,
-                'span_start': span_start,
-                'span_end': span_end,
-                'span_bp': span_bp,
-                'n_windows': n_windows,
-                'total_windows': n_windows,
-                'total_span': span_bp,
-                'abundance': abundance,
-                'reads': reads_avg,
-                'total_reads': total_reads_avg,
-                'n_snvs': len(data['snvs'][contig_id]),
-                'snv_alleles': snv_alleles_str if snv_alleles_str else '.',
-            })
-
-            # Per-haplotype rows
-            for wr, h_idx, hap in data['members'][contig_id]:
-                hap_id = f"{track_id}_W{wr.window.start}_H{h_idx}"
-                hap_total_reads = getattr(wr, "n_reads_examined", len(wr.window.reads))
-                haplotype_records.append({
-                    'lineage_id': track_id,
-                    'haplotype_id': hap_id,
-                    'sample': sample_id,
-                    'contig': contig_id,
-                    'track_id': track_id,
-                    'span_start': wr.window.start,
-                    'span_end': wr.window.end,
-                    'span_bp': wr.window.end - wr.window.start,
-                    'n_windows': 1,
-                    'total_windows': n_windows,
-                    'total_span': span_bp,
-                    'abundance': hap.weight,
-                    'reads': hap.supporting_reads,
-                    'total_reads': hap_total_reads,
-                    'n_snvs': len(hap.consensus),
-                    'snv_alleles': ','.join(
-                        f"{pos}:{allele}" for pos, allele in sorted(hap.consensus.items())
-                    ) if hap.consensus else '.',
-                })    # Write tables using shared helper
-    output_dir = str(Path(output_path).parent)
-    write_lineage_tables(records, haplotype_records, output_dir)
-
-    return output_path
-
-
 class ParameterSweep:
     """
     Run pipeline across parameter grid and analyze stability.
@@ -1091,10 +973,23 @@ class ParameterSweep:
                             # Write full lineage + haplotype tables for validation/output
                             write_lineage_tables(lineage_records, haplotype_records, str(config_output_dir))
                         else:
-                            # Single-timepoint mode: use simple conversion
-                            window_results_to_lineages_tsv(
-                                all_window_results, lineages_path, sample_id=first_timepoint
-                            )
+                            # Single-timepoint mode: restructure data and use build_lineage_table
+                            from strainphase.longitudinal import build_lineage_table, write_lineage_tables
+
+                            # Group window results by contig for single-timepoint
+                            single_tp_results: dict[str, list] = {}
+                            for wr in all_window_results:
+                                contig = wr.window.contig
+                                if contig not in single_tp_results:
+                                    single_tp_results[contig] = []
+                                single_tp_results[contig].append(wr)
+
+                            # Structure: {mag_name -> {sample -> {contig -> [WindowResult]}}}
+                            structured_results = {"MAG_01": {first_timepoint: single_tp_results}}
+
+                            config = params.to_config(n_workers=n_workers)
+                            lineage_records, haplotype_records = build_lineage_table(structured_results, config)
+                            write_lineage_tables(lineage_records, haplotype_records, str(config_output_dir))
                         
                         # Check if file was created
                         if not Path(lineages_path).exists():
@@ -1449,48 +1344,27 @@ class ParameterSweep:
                     missing_timepoints = set(self.timepoints) - samples_in_records
                     if missing_timepoints:
                         logger.warning(f"    WARNING: Missing timepoints in lineage records: {sorted(missing_timepoints)}")
-                    
-                    # Convert records to format expected by validation
-                    # build_lineage_table returns: abundance, total_reads, consensus (pipe-separated)
-                    # Validation expects: abundance, total_reads, snv_alleles (comma-separated)
-                    converted_records = []
-                    for rec in lineage_records:
-                        # Convert consensus format: "pos1:base1|pos2:base2" -> "pos1:base1,pos2:base2"
-                        consensus = rec.get('consensus', '')
-                        snv_alleles = consensus.replace('|', ',') if consensus else ''
 
-                        converted_records.append({
-                            'lineage_id': rec.get('lineage_id', ''),
-                            'sample': rec.get('sample', ''),
-                            'contig': rec.get('contig', ''),
-                            'track_id': rec.get('track_id', ''),
-                            'abundance': rec.get('abundance', 0.0),
-                            'total_reads': rec.get('total_reads', 0),
-                            'snv_alleles': snv_alleles,
-                        })
-
-                    # Log per-timepoint counts AFTER conversion
-                    sample_counts = Counter(rec['sample'] for rec in converted_records)
-                    logger.info(f"    Converted records per timepoint: {dict(sample_counts)}")
-
-                    # Log per-contig breakdown
-                    contig_counts = Counter(rec['contig'] for rec in converted_records)
-                    logger.info(f"    Records per contig: {dict(contig_counts)}")
-
-                    # Write lineages.tsv from converted records
-                    import csv
-                    fieldnames = ['lineage_id', 'sample', 'contig', 'track_id', 'abundance', 'total_reads', 'snv_alleles']
-                    with open(lineages_path, 'w', newline='') as f:
-                        writer = csv.DictWriter(f, fieldnames=fieldnames, delimiter='\t')
-                        writer.writeheader()
-                        if converted_records:
-                            writer.writerows(converted_records)
+                    # Write full lineage + haplotype tables (validation handles both consensus formats)
+                    write_lineage_tables(lineage_records, haplotype_records, str(config_output_dir))
                 else:
-                    # Single-timepoint mode: use simple conversion
+                    # Single-timepoint mode: restructure data and use build_lineage_table
                     first_timepoint = self.timepoints[0] if hasattr(self, 'timepoints') and self.timepoints else list(self.bam_paths.keys())[0] if hasattr(self, 'bam_paths') else "T1"
-                    window_results_to_lineages_tsv(
-                        all_window_results, lineages_path, sample_id=first_timepoint
-                    )
+
+                    # Group window results by contig for single-timepoint
+                    single_tp_results: dict[str, list] = {}
+                    for wr in all_window_results:
+                        contig = wr.window.contig
+                        if contig not in single_tp_results:
+                            single_tp_results[contig] = []
+                        single_tp_results[contig].append(wr)
+
+                    # Structure: {mag_name -> {sample -> {contig -> [WindowResult]}}}
+                    structured_results = {"MAG_01": {first_timepoint: single_tp_results}}
+
+                    config = params.to_config(n_workers=n_workers)
+                    lineage_records, haplotype_records = build_lineage_table(structured_results, config)
+                    write_lineage_tables(lineage_records, haplotype_records, str(config_output_dir))
                 
                 # Run detailed validation (with track/linking support)
                 from validation.validate_haplotypes import run_validation
