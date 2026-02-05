@@ -159,7 +159,7 @@ def cmd_longitudinal(args: argparse.Namespace) -> int:
             all_integrators.append(integrator)
 
     # Build lineage table
-    lineage_records = build_lineage_table(all_results, config)
+    lineage_records, _ = build_lineage_table(all_results, config)
 
     # Write outputs
     if lineage_records:
