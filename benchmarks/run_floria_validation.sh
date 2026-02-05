@@ -109,6 +109,10 @@ for TP in "${TP_ARRAY[@]}"; do
             -v "$VCF" \
             -r "$REF" \
             -o "$FLORIA_OUT" \
+            -e 0.005 \
+            -n 10 \
+            --overwrite \
+            --no-stop-heuristic \
             2>&1 | tee "$FLORIA_OUT/floria_stdout.log"
         echo "  $TP: Floria complete"
     fi
