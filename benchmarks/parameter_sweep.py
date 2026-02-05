@@ -616,17 +616,23 @@ def window_results_to_lineages_tsv(
     across all windows and contigs.
 
     If no haplotypes are detected, creates an empty file with headers.
+    Also writes a sibling haplotypes.tsv with per-haplotype rows.
     """
     import csv
+    from pathlib import Path
 
     # Aggregate haplotypes by track_id
     # Use hap.weight directly (correct post-processing weight) instead of wr.pi[h_idx]
     track_data = defaultdict(lambda: {
         'weight_sum': 0.0,
-        'total_reads': 0,
+        'reads_sum': 0,
+        'total_reads_sum': 0,
         'n_windows': 0,
+        'span_start': None,
+        'span_end': None,
         'snvs': defaultdict(dict),  # contig -> {pos -> allele}
         'contigs': set(),
+        'members': defaultdict(list),  # contig -> list of (wr, h_idx, hap)
     })
 
     for wr in all_window_results:
@@ -634,17 +640,23 @@ def window_results_to_lineages_tsv(
         for h_idx, hap in enumerate(wr.haplotypes):
             track_id = hap.track_id or f"unlinked_{wr.window.start}"
 
-            track_data[track_id]['contigs'].add(contig_id)
-            track_data[track_id]['weight_sum'] += hap.weight
-            track_data[track_id]['total_reads'] += len(wr.window.reads)
-            track_data[track_id]['n_windows'] += 1
+            td = track_data[track_id]
+            td['contigs'].add(contig_id)
+            td['weight_sum'] += hap.weight
+            td['reads_sum'] += hap.supporting_reads
+            td['total_reads_sum'] += getattr(wr, "n_reads_examined", len(wr.window.reads))
+            td['n_windows'] += 1
+            td['span_start'] = wr.window.start if td['span_start'] is None else min(td['span_start'], wr.window.start)
+            td['span_end'] = wr.window.end if td['span_end'] is None else max(td['span_end'], wr.window.end)
+            td['members'][contig_id].append((wr, h_idx, hap))
 
             # Aggregate SNV alleles from consensus
             for pos, allele in hap.consensus.items():
-                track_data[track_id]['snvs'][contig_id][pos] = allele
+                td['snvs'][contig_id][pos] = allele
 
-    # Write lineages.tsv (create even if empty)
+    # Build lineage records
     records = []
+    haplotype_records = []
     for track_id, data in track_data.items():
         for contig_id in data['contigs']:
             snv_alleles_str = ','.join(
@@ -652,33 +664,90 @@ def window_results_to_lineages_tsv(
                 for pos, allele in sorted(data['snvs'][contig_id].items())
             )
 
+            n_windows = data['n_windows']
+            span_start = data['span_start'] if data['span_start'] is not None else 0
+            span_end = data['span_end'] if data['span_end'] is not None else 0
+            span_bp = span_end - span_start
+
             # abundance = mean weight across windows (junk in denominator)
-            abundance = data['weight_sum'] / data['n_windows'] if data['n_windows'] > 0 else 0.0
+            abundance = data['weight_sum'] / n_windows if n_windows > 0 else 0.0
+            reads_avg = data['reads_sum'] / n_windows if n_windows > 0 else 0.0
+            total_reads_avg = data['total_reads_sum'] / n_windows if n_windows > 0 else 0.0
 
             records.append({
                 'lineage_id': track_id,
                 'sample': sample_id,
                 'contig': contig_id,
                 'track_id': track_id,
+                'span_start': span_start,
+                'span_end': span_end,
+                'span_bp': span_bp,
+                'n_windows': n_windows,
+                'total_windows': n_windows,
+                'total_span': span_bp,
                 'abundance': abundance,
-                'total_reads': data['total_reads'],
+                'reads': reads_avg,
+                'total_reads': total_reads_avg,
+                'n_snvs': len(data['snvs'][contig_id]),
                 'snv_alleles': snv_alleles_str if snv_alleles_str else '.',
             })
 
-    # Always create the file, even if empty (for validation)
-    fieldnames = ['lineage_id', 'sample', 'contig', 'track_id', 'abundance', 'total_reads', 'snv_alleles']
+            # Per-haplotype rows
+            for wr, h_idx, hap in data['members'][contig_id]:
+                hap_id = f"{track_id}_W{wr.window.start}_H{h_idx}"
+                hap_total_reads = getattr(wr, "n_reads_examined", len(wr.window.reads))
+                haplotype_records.append({
+                    'lineage_id': track_id,
+                    'haplotype_id': hap_id,
+                    'sample': sample_id,
+                    'contig': contig_id,
+                    'track_id': track_id,
+                    'span_start': wr.window.start,
+                    'span_end': wr.window.end,
+                    'span_bp': wr.window.end - wr.window.start,
+                    'n_windows': 1,
+                    'total_windows': n_windows,
+                    'total_span': span_bp,
+                    'abundance': hap.weight,
+                    'reads': hap.supporting_reads,
+                    'total_reads': hap_total_reads,
+                    'n_snvs': len(hap.consensus),
+                    'snv_alleles': ','.join(
+                        f"{pos}:{allele}" for pos, allele in sorted(hap.consensus.items())
+                    ) if hap.consensus else '.',
+                })
+
+    # Always create the lineages file, even if empty (for validation)
+    fieldnames = [
+        'lineage_id', 'sample', 'contig', 'track_id',
+        'span_start', 'span_end', 'span_bp', 'n_windows',
+        'total_windows', 'total_span',
+        'abundance', 'reads', 'total_reads',
+        'n_snvs', 'snv_alleles'
+    ]
     with open(output_path, 'w', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames, delimiter='\t')
+        writer = csv.DictWriter(f, fieldnames=fieldnames, delimiter='	')
         writer.writeheader()
         if records:
             writer.writerows(records)
 
+    # Write haplotypes.tsv next to lineages.tsv
+    haplotypes_path = str(Path(output_path).with_name('haplotypes.tsv'))
+    hap_fieldnames = [
+        'lineage_id', 'haplotype_id', 'sample', 'contig', 'track_id',
+        'span_start', 'span_end', 'span_bp', 'n_windows',
+        'total_windows', 'total_span',
+        'abundance', 'reads', 'total_reads',
+        'n_snvs', 'snv_alleles'
+    ]
+    with open(haplotypes_path, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=hap_fieldnames, delimiter='	')
+        writer.writeheader()
+        if haplotype_records:
+            writer.writerows(haplotype_records)
+
     return output_path
 
-
-# =============================================================================
-# Parameter sweep class
-# =============================================================================
 
 class ParameterSweep:
     """
