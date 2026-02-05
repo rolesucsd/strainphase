@@ -1029,7 +1029,7 @@ class ParameterSweep:
                             structured_results = {"MAG_01": mag_results}
                             
                             # Build lineage table (creates records with lineage_id, sample, contig, etc.)
-                            lineage_records = build_lineage_table(structured_results, config)
+                            lineage_records, _ = build_lineage_table(structured_results, config)
                             
                             # Log which timepoints have records BEFORE conversion
                             samples_in_records = set(rec.get('sample', '') for rec in lineage_records)
@@ -1424,7 +1424,7 @@ class ParameterSweep:
                         structured_results["MAG_01"][sample][contig].append(wr)
                     
                     # Build lineage table (creates records with lineage_id, sample, contig, etc.)
-                    lineage_records = build_lineage_table(structured_results, config)
+                    lineage_records, _ = build_lineage_table(structured_results, config)
                     
                     # Log which timepoints have records BEFORE conversion
                     samples_in_records = set(rec.get('sample', '') for rec in lineage_records)
