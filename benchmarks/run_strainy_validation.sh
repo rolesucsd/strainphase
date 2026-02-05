@@ -7,10 +7,10 @@ set -euo pipefail
 # Usage:
 #   bash benchmarks/run_strainy_validation.sh \
 #       --bam-dir results/mixed_samples_10x \
-#       --vcf results/mixed_samples_10x/variants.vcf \
+#       --vcf results/mixed_samples_10x/variants.vcf.gz \
 #       --ref results/mixed_samples_10x/reference.fasta \
 #       --truth-dir results/truth \
-#       --output-dir results/strainy_validation \
+#       --output-dir results/strainy_10x \
 #       --timepoints T1,T2,T3,T4
 #
 # Expects BAM files named {bam-dir}/{timepoint}.bam (e.g. T1.bam, T2.bam, ...)
@@ -23,7 +23,7 @@ REF=""
 TRUTH_DIR=""
 OUTPUT_DIR=""
 TIMEPOINTS="T1,T2,T3,T4"
-STRAINY_BIN="strainy.py"
+STRAINY_BIN="strainy"
 STRAINY_MODE="hifi"
 STRAINPHASE_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
