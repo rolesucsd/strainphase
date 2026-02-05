@@ -1007,7 +1007,9 @@ def compute_window_metrics(
     if abundance_pairs:
         abundance_mae = np.mean([abs(t - d) for t, d in abundance_pairs])
 
-    n_reads_examined = getattr(window_result, "n_reads_examined", len(window_result.window.reads))
+    n_reads_examined = getattr(window_result, "n_reads_examined", None)
+    if n_reads_examined is None:
+        n_reads_examined = len(getattr(window_result.window, "reads", []))
     reads_within_mismatch_per_hap = getattr(window_result, "reads_within_mismatch_per_hap", None)
     if reads_within_mismatch_per_hap is None:
         reads_within_mismatch_per_hap = []
