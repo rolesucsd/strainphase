@@ -90,6 +90,7 @@ def cmd_longitudinal(args: argparse.Namespace) -> int:
         load_allowed_contigs,
         parse_reference_contigs,
         process_mag_longitudinal,
+        write_lineage_tables,
     )
 
     # Parse samples
@@ -159,18 +160,14 @@ def cmd_longitudinal(args: argparse.Namespace) -> int:
             all_integrators.append(integrator)
 
     # Build lineage table
-    lineage_records, _ = build_lineage_table(all_results, config)
+    lineage_records, haplotype_records = build_lineage_table(all_results, config)
 
-    # Write outputs
-    if lineage_records:
-        import csv
-
-        output_path = os.path.join(args.output_dir, "lineages.tsv")
-        with open(output_path, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=lineage_records[0].keys(), delimiter="\t")
-            writer.writeheader()
-            writer.writerows(lineage_records)
-        logging.info(f"Wrote {len(lineage_records)} lineage records to {output_path}")
+    # Write outputs using shared writer (creates both lineages.tsv and haplotypes.tsv)
+    lineage_path, haplotype_path = write_lineage_tables(
+        lineage_records, haplotype_records, args.output_dir
+    )
+    logging.info(f"Wrote {len(lineage_records)} lineage records to {lineage_path}")
+    logging.info(f"Wrote {len(haplotype_records)} haplotype records to {haplotype_path}")
 
     return 0
 

@@ -317,10 +317,16 @@ def build_lineage_table(
                     # (sum of all pi including junk = 1.0)
                     weight_sum = 0.0
                     total_reads_sum = 0
+                    reads_sum = 0  # reads matching consensus at max_mismatch_frac
 
                     for _wr, hap, hap_idx in members:
                         weight_sum += hap.weight
                         total_reads_sum += getattr(_wr, "n_reads_examined", len(_wr.window.reads))
+                        # Use reads_within_mismatch_per_hap for accurate read count
+                        if hasattr(_wr, "reads_within_mismatch_per_hap") and _wr.reads_within_mismatch_per_hap:
+                            reads_sum += _wr.reads_within_mismatch_per_hap[hap_idx]
+                        else:
+                            reads_sum += hap.supporting_reads  # fallback
                         for pos, base in hap.consensus.items():
                             position_votes[pos][base] += hap.weight
 
@@ -341,6 +347,7 @@ def build_lineage_table(
                             "consensus": merged_consensus,
                             "abundance": abundance,
                             "total_reads_sum": total_reads_sum,
+                            "reads_sum": reads_sum,
                             "members": members,
                         }
                     )
@@ -369,7 +376,7 @@ def build_lineage_table(
                 else:
                     # Merge duplicate tracks
                     # Combine: track_ids (use first), spans (union), n_windows (sum),
-                    # consensus (same), abundance (weighted average), total_reads (sum)
+                    # consensus (same), abundance (weighted average), total_reads (sum), reads (sum)
                     first = tracks[indices[0]]
                     merged_track_id = first["track_id"]  # Keep first track_id
                     merged_span_start = min(tracks[i]["span_start"] for i in indices)
@@ -380,6 +387,7 @@ def build_lineage_table(
                     total_weight_sum = sum(tracks[i]["abundance"] * tracks[i]["n_windows"] for i in indices)
                     merged_abundance = total_weight_sum / merged_n_windows if merged_n_windows > 0 else 0.0
                     merged_total_reads = sum(tracks[i]["total_reads_sum"] for i in indices)
+                    merged_reads = sum(tracks[i]["reads_sum"] for i in indices)
                     merged_members = []
                     for i in indices:
                         merged_members.extend(tracks[i]["members"])
@@ -393,6 +401,7 @@ def build_lineage_table(
                         "consensus": merged_consensus,
                         "abundance": merged_abundance,
                         "total_reads_sum": merged_total_reads,
+                        "reads_sum": merged_reads,
                         "members": merged_members,
                     })
 
@@ -485,9 +494,9 @@ def build_lineage_table(
                     total_reads_avg = (
                         track["total_reads_sum"] / n_windows if n_windows > 0 else 0.0
                     )
+                    # reads = reads matching consensus at max_mismatch_frac, averaged across windows
                     reads_avg = (
-                        sum(h.supporting_reads for _wr, h, _ in track["members"]) / n_windows
-                        if n_windows > 0 else 0.0
+                        track["reads_sum"] / n_windows if n_windows > 0 else 0.0
                     )
 
                     consensus_str = "|".join(
@@ -522,7 +531,11 @@ def build_lineage_table(
                         )
                         hap_id = f"{track_id}_W{wr.window.start}_H{hap_idx}"
                         hap_total_reads = getattr(wr, "n_reads_examined", len(wr.window.reads))
-                        hap_reads = hap.supporting_reads
+                        # reads = reads matching consensus at max_mismatch_frac in this window
+                        if hasattr(wr, "reads_within_mismatch_per_hap") and wr.reads_within_mismatch_per_hap:
+                            hap_reads = wr.reads_within_mismatch_per_hap[hap_idx]
+                        else:
+                            hap_reads = hap.supporting_reads  # fallback
                         haplotype_records.append(
                             {
                                 "lineage_id": lineage_id,
