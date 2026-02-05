@@ -35,6 +35,7 @@ from dataclasses import dataclass, asdict
 from typing import Dict, List, Optional, Any
 from collections import defaultdict
 from pathlib import Path
+    from strainphase.longitudinal import write_lineage_tables
 
 import numpy as np
 
@@ -620,6 +621,7 @@ def window_results_to_lineages_tsv(
     """
     import csv
     from pathlib import Path
+    from strainphase.longitudinal import write_lineage_tables
 
     # Aggregate haplotypes by track_id
     # Use hap.weight directly (correct post-processing weight) instead of wr.pi[h_idx]
@@ -715,36 +717,9 @@ def window_results_to_lineages_tsv(
                     'snv_alleles': ','.join(
                         f"{pos}:{allele}" for pos, allele in sorted(hap.consensus.items())
                     ) if hap.consensus else '.',
-                })
-
-    # Always create the lineages file, even if empty (for validation)
-    fieldnames = [
-        'lineage_id', 'sample', 'contig', 'track_id',
-        'span_start', 'span_end', 'span_bp', 'n_windows',
-        'total_windows', 'total_span',
-        'abundance', 'reads', 'total_reads',
-        'n_snvs', 'snv_alleles'
-    ]
-    with open(output_path, 'w', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames, delimiter='	')
-        writer.writeheader()
-        if records:
-            writer.writerows(records)
-
-    # Write haplotypes.tsv next to lineages.tsv
-    haplotypes_path = str(Path(output_path).with_name('haplotypes.tsv'))
-    hap_fieldnames = [
-        'lineage_id', 'haplotype_id', 'sample', 'contig', 'track_id',
-        'span_start', 'span_end', 'span_bp', 'n_windows',
-        'total_windows', 'total_span',
-        'abundance', 'reads', 'total_reads',
-        'n_snvs', 'snv_alleles'
-    ]
-    with open(haplotypes_path, 'w', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=hap_fieldnames, delimiter='	')
-        writer.writeheader()
-        if haplotype_records:
-            writer.writerows(haplotype_records)
+                })    # Write tables using shared helper
+    output_dir = str(Path(output_path).parent)
+    write_lineage_tables(records, haplotype_records, output_dir)
 
     return output_path
 
@@ -1091,14 +1066,14 @@ class ParameterSweep:
                     try:
                         if use_longitudinal:
                             # For longitudinal mode, use build_lineage_table to create proper lineages.tsv
-                            from strainphase.longitudinal import build_lineage_table
+                            from strainphase.longitudinal import build_lineage_table, write_lineage_tables
                             
                             # Reconstruct the structure expected by build_lineage_table
                             # {mag_name -> {sample -> {contig -> [WindowResult]}}}
                             structured_results = {"MAG_01": mag_results}
                             
                             # Build lineage table (creates records with lineage_id, sample, contig, etc.)
-                            lineage_records, _ = build_lineage_table(structured_results, config)
+                            lineage_records, haplotype_records = build_lineage_table(structured_results, config)
                             
                             # Log which timepoints have records BEFORE conversion
                             samples_in_records = set(rec.get('sample', '') for rec in lineage_records)
@@ -1115,41 +1090,8 @@ class ParameterSweep:
                             if missing_timepoints:
                                 logger.warning(f"    WARNING: Missing timepoints in lineage records: {sorted(missing_timepoints)}")
                             
-                            # Convert records to format expected by validation
-                            # build_lineage_table returns: abundance, total_reads, consensus (pipe-separated)
-                            # Validation expects: abundance, total_reads, snv_alleles (comma-separated)
-                            converted_records = []
-                            for rec in lineage_records:
-                                # Convert consensus format: "pos1:base1|pos2:base2" -> "pos1:base1,pos2:base2"
-                                consensus = rec.get('consensus', '')
-                                snv_alleles = consensus.replace('|', ',') if consensus else ''
-
-                                converted_records.append({
-                                    'lineage_id': rec.get('lineage_id', ''),
-                                    'sample': rec.get('sample', ''),
-                                    'contig': rec.get('contig', ''),
-                                    'track_id': rec.get('track_id', ''),
-                                    'abundance': rec.get('abundance', 0.0),
-                                    'total_reads': rec.get('total_reads', 0),
-                                    'snv_alleles': snv_alleles,
-                                })
-
-                            # Log per-timepoint counts AFTER conversion
-                            sample_counts = Counter(rec['sample'] for rec in converted_records)
-                            logger.info(f"    Converted records per timepoint: {dict(sample_counts)}")
-
-                            # Log per-contig breakdown
-                            contig_counts = Counter(rec['contig'] for rec in converted_records)
-                            logger.info(f"    Records per contig: {dict(contig_counts)}")
-
-                            # Write lineages.tsv from converted records
-                            import csv
-                            fieldnames = ['lineage_id', 'sample', 'contig', 'track_id', 'abundance', 'total_reads', 'snv_alleles']
-                            with open(lineages_path, 'w', newline='') as f:
-                                writer = csv.DictWriter(f, fieldnames=fieldnames, delimiter='\t')
-                                writer.writeheader()
-                                if converted_records:
-                                    writer.writerows(converted_records)
+                            # Write full lineage + haplotype tables for validation/output
+                            write_lineage_tables(lineage_records, haplotype_records, str(config_output_dir))
                         else:
                             # Single-timepoint mode: use simple conversion
                             window_results_to_lineages_tsv(
@@ -1473,7 +1415,7 @@ class ParameterSweep:
             try:
                 if hasattr(self, 'use_longitudinal') and self.use_longitudinal:
                     # For longitudinal mode, use build_lineage_table to create proper lineages.tsv
-                    from strainphase.longitudinal import build_lineage_table
+                    from strainphase.longitudinal import build_lineage_table, write_lineage_tables
                     from strainphase.core import HaplotyperConfig
                     
                     config = params.to_config(n_workers=n_workers)
@@ -1493,7 +1435,7 @@ class ParameterSweep:
                         structured_results["MAG_01"][sample][contig].append(wr)
                     
                     # Build lineage table (creates records with lineage_id, sample, contig, etc.)
-                    lineage_records, _ = build_lineage_table(structured_results, config)
+                    lineage_records, haplotype_records = build_lineage_table(structured_results, config)
                     
                     # Log which timepoints have records BEFORE conversion
                     samples_in_records = set(rec.get('sample', '') for rec in lineage_records)

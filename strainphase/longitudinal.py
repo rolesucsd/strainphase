@@ -549,6 +549,48 @@ def build_lineage_table(
     return records, haplotype_records
 
 
+def write_lineage_tables(
+    lineage_records: list[dict],
+    haplotype_records: list[dict],
+    output_dir: str,
+) -> tuple[str, str]:
+    """Write lineages.tsv and haplotypes.tsv with consistent headers."""
+    import csv
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    lineage_path = os.path.join(output_dir, "lineages.tsv")
+    haplotype_path = os.path.join(output_dir, "haplotypes.tsv")
+
+    lineage_fieldnames = list(lineage_records[0].keys()) if lineage_records else [
+        "lineage_id", "mag", "contig", "sample", "track_id",
+        "span_start", "span_end", "span_bp", "n_windows",
+        "total_windows", "total_span",
+        "abundance", "reads", "total_reads",
+        "n_snvs", "consensus", "n_timepoints",
+    ]
+    with open(lineage_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=lineage_fieldnames, delimiter="	")
+        writer.writeheader()
+        if lineage_records:
+            writer.writerows(lineage_records)
+
+    hap_fieldnames = list(haplotype_records[0].keys()) if haplotype_records else [
+        "lineage_id", "haplotype_id", "mag", "contig", "sample", "track_id",
+        "span_start", "span_end", "span_bp", "n_windows",
+        "total_windows", "total_span",
+        "abundance", "reads", "total_reads",
+        "n_snvs", "consensus", "n_timepoints",
+    ]
+    with open(haplotype_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=hap_fieldnames, delimiter="	")
+        writer.writeheader()
+        if haplotype_records:
+            writer.writerows(haplotype_records)
+
+    return lineage_path, haplotype_path
+
+
 def write_longitudinal_outputs(
     all_results: dict[str, dict[str, dict[str, list[WindowResult]]]],
     lineage_records: list[dict],
@@ -565,42 +607,13 @@ def write_longitudinal_outputs(
         (If multiple MAGs are processed, each sample file will contain
          haplotypes from all those MAGs; MAG is a column in the TSV.)
     """
-    os.makedirs(output_dir, exist_ok=True)
-
-    # 1. Lineage table
-    lineage_path = os.path.join(output_dir, "lineages.tsv")
-
-    if lineage_records:
-        df = pd.DataFrame(lineage_records)
-        df.to_csv(lineage_path, sep="\t", index=False)
-    else:
-        with open(lineage_path, "w") as f:
-            f.write(
-                "lineage_id\tmag\tcontig\tsample\ttrack_id\t"
-                "span_start\tspan_end\tspan_bp\tn_windows\t"
-                "total_windows\ttotal_span\t"
-                "abundance\treads\ttotal_reads\t"
-                "n_snvs\tconsensus\tn_timepoints\n"
-            )
-
+    os.makedirs(output_dir, exist_ok=True)    # 1. Lineage + haplotype tables
+    lineage_path, haplotype_path = write_lineage_tables(
+        lineage_records, haplotype_records, output_dir
+    )
     logging.info(f"Wrote {len(lineage_records)} lineage records to {lineage_path}")
-
-    # 1b. Haplotype table (per haplotype)
-    haplotype_path = os.path.join(output_dir, "haplotypes.tsv")
-    if haplotype_records:
-        df_haps = pd.DataFrame(haplotype_records)
-        df_haps.to_csv(haplotype_path, sep="\t", index=False)
-    else:
-        with open(haplotype_path, "w") as f:
-            f.write(
-                "lineage_id\thaplotype_id\tmag\tcontig\tsample\ttrack_id\t"
-                "span_start\tspan_end\tspan_bp\tn_windows\t"
-                "total_windows\ttotal_span\t"
-                "abundance\treads\ttotal_reads\t"
-                "n_snvs\tconsensus\tn_timepoints\n"
-            )
-
     logging.info(f"Wrote {len(haplotype_records)} haplotype records to {haplotype_path}")
+
 
     # 2. Per-sample haplotypes (post-rescue)
     #    Note: if multiple MAGs are processed, each sample file will contain
