@@ -150,6 +150,7 @@ for TP in "${TP_ARRAY[@]}"; do
             --snp "$VCF" \
             --unitig-split-length 0 \
             --stage phase \
+            --min-unitig-coverage 1 \
             --output "$STRAINY_OUT" \
             2>&1 | tee "$STRAINY_OUT/strainy_stdout.log" || {
                 echo "  WARNING: Strainy failed for $TP"
