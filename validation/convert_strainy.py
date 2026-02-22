@@ -69,8 +69,17 @@ class _DummySeq:
         self._data = data
 
     def __setstate__(self, state):
+        # Bio.Seq objects are pickled as (None, {'_data': bytes_sequence})
         if isinstance(state, (str, bytes)):
             self._data = state.decode() if isinstance(state, bytes) else state
+        elif isinstance(state, tuple) and len(state) == 2:
+            # Handle (None, dict) tuple from Bio.Seq pickling
+            _, state_dict = state
+            if isinstance(state_dict, dict) and '_data' in state_dict:
+                data = state_dict['_data']
+                self._data = data.decode() if isinstance(data, bytes) else str(data)
+            else:
+                self.__dict__.update(state_dict)
         elif isinstance(state, dict):
             self.__dict__.update(state)
         elif isinstance(state, tuple) and len(state) == 1:

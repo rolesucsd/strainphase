@@ -101,7 +101,7 @@ class HaplotyperConfig:
 
     # =========== GRAPH CONSTRUCTION ===========
     min_shared_snvs_for_edge: int = 1
-    max_mismatch_frac: float = 0.005
+    max_mismatch_frac: float = 0.02
     min_reads_per_cluster: int = 3
 
     # =========== EM PARAMETERS ===========
@@ -130,7 +130,7 @@ class HaplotyperConfig:
 
     # =========== LONGITUDINAL PARAMETERS ===========
     min_weight_for_anchor: float = 0.2
-    rescue_match_distance: float = 0.01  # 0.1% error rate — near-exact match required
+    rescue_match_distance: float = 0.02  # 2% divergence — matches unified distance threshold
     min_shared_for_rescue: int = 3  # Min shared SNVs with actual calls for rescue matching
     rescued_min_weight: float = 0.02
 
@@ -147,7 +147,7 @@ class HaplotyperConfig:
     # =========== WINDOW LINKING PARAMETERS ===========
     # Haplotypes in adjacent overlapping windows are linked if their
     # consensus agrees on shared SNVs (Hamming distance <= max_link_distance)
-    max_link_distance: float = 0.005  # Max mismatch fraction to link
+    max_link_distance: float = 0.02  # Max mismatch fraction to link
     min_shared_snvs_for_link: int = (
         3  # Min shared SNVs with ACTUAL CALLS to link (not just window overlap)
     )
@@ -1546,8 +1546,10 @@ class LongitudinalIntegrator:
 
         # Build new pi
         pi_new = np.zeros(k_eff_new)
-        # Scale down existing haplotype weights proportionally
-        scale = (1.0 - total_rescued_weight - new_junk_weight) / (1.0 - old_junk_weight) if old_junk_weight < 1.0 else 1.0
+        # Scale down existing haplotype weights proportionally.
+        # Clamp to 0 so pi values never go negative (can happen when many
+        # rescued haplotypes collectively exceed the remaining non-junk budget).
+        scale = max(0.0, (1.0 - total_rescued_weight - new_junk_weight) / (1.0 - old_junk_weight)) if old_junk_weight < 1.0 else 1.0
         for k in range(n_haps):
             pi_new[k] = pi[k] * scale
         for k, new_hap in enumerate(new_haplotypes):
