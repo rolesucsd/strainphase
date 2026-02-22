@@ -2759,7 +2759,14 @@ def _validate_tracks_and_lineages(
         # track_linkability.txt output removed
 
     from validation.validate_lineages import validate_lineages
+    # Build detected_lineages from ALL detected haplotypes, not just matched ones.
+    # Unmatched lineages appear with empty dicts so they count against precision.
     detected_lineages: Dict[str, Dict[str, str]] = {}
+    for det_hap in detected_haps:
+        if not det_hap.lineage_id:
+            continue
+        detected_lineages.setdefault(det_hap.lineage_id, {})
+    # Now overlay strain assignments from matches
     for true_hap, det_match, _ in matches:
         if not det_match.lineage_id:
             continue
