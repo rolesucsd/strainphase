@@ -304,17 +304,18 @@ def build_lineage_table(
 
                 # Build track info
                 for track_id, members in track_haps.items():
-                    span_start = min(wr.window.start for wr, _, _ in members)
-                    span_end = max(wr.window.end for wr, _, _ in members)
+                    window_span_start = min(wr.window.start for wr, _, _ in members)
+                    window_span_end = max(wr.window.end for wr, _, _ in members)
                     n_windows = len(members)
 
                     # Merge consensus across all windows in track
                     position_votes: dict[int, dict[str, float]] = defaultdict(
                         lambda: defaultdict(float)
                     )
-                    # Abundance = mean of hap.weight across windows
-                    # hap.weight is pi[k] from EM, already includes junk in denominator
-                    # (sum of all pi including junk = 1.0)
+                    # Abundance = mean of hap.weight across windows (EM mixture proportion).
+                    # This is higher quality than a simple read count: it accounts for
+                    # soft assignments and normalizes across haplotypes; hap.weight is
+                    # pi[k] from EM, with junk in denominator (sum of all pi = 1.0).
                     weight_sum = 0.0
                     total_reads_sum = 0
                     reads_sum = 0  # reads matching consensus at max_mismatch_frac
@@ -336,6 +337,14 @@ def build_lineage_table(
                     merged_consensus = {}
                     for pos, votes in position_votes.items():
                         merged_consensus[pos] = max(votes.keys(), key=lambda b: votes[b])
+
+                    # Span: first SNV position to last SNV position (fallback to window span if no SNVs).
+                    if merged_consensus:
+                        span_start = min(merged_consensus.keys())
+                        span_end = max(merged_consensus.keys())
+                    else:
+                        span_start = window_span_start
+                        span_end = window_span_end
 
                     # abundance = mean weight across windows, clamped to [0, 1].
                     # The rescue weight redistribution can produce small negative weights
@@ -384,10 +393,14 @@ def build_lineage_table(
                     # consensus (same), abundance (weighted average), total_reads (sum), reads (sum)
                     first = tracks[indices[0]]
                     merged_track_id = first["track_id"]  # Keep first track_id
-                    merged_span_start = min(tracks[i]["span_start"] for i in indices)
-                    merged_span_end = max(tracks[i]["span_end"] for i in indices)
-                    merged_n_windows = sum(tracks[i]["n_windows"] for i in indices)
                     merged_consensus = first["consensus"]  # Same consensus
+                    if merged_consensus:
+                        merged_span_start = min(merged_consensus.keys())
+                        merged_span_end = max(merged_consensus.keys())
+                    else:
+                        merged_span_start = min(tracks[i]["span_start"] for i in indices)
+                        merged_span_end = max(tracks[i]["span_end"] for i in indices)
+                    merged_n_windows = sum(tracks[i]["n_windows"] for i in indices)
                     # Weight average of abundance by n_windows, clamped to [0, 1].
                     total_weight_sum = sum(tracks[i]["abundance"] * tracks[i]["n_windows"] for i in indices)
                     merged_abundance = max(0.0, min(1.0, total_weight_sum / merged_n_windows if merged_n_windows > 0 else 0.0))
@@ -481,7 +494,6 @@ def build_lineage_table(
             for cluster in clusters:
                 lineage_counter += 1
                 lineage_id = f"L{lineage_counter:06d}"
-                lineage_total_windows = sum(tracks[idx]["n_windows"] for idx in cluster)
                 lineage_span_start = min(tracks[idx]["span_start"] for idx in cluster)
                 lineage_span_end = max(tracks[idx]["span_end"] for idx in cluster)
                 lineage_total_span = lineage_span_end - lineage_span_start
@@ -514,11 +526,17 @@ def build_lineage_table(
                             for pos, base in t["consensus"].items():
                                 m_pos_votes[pos][base] += w
                         m_consensus = {pos: max(votes, key=votes.get) for pos, votes in m_pos_votes.items()}
+                        if m_consensus:
+                            m_span_start = min(m_consensus.keys())
+                            m_span_end = max(m_consensus.keys())
+                        else:
+                            m_span_start = min(t["span_start"] for t in s_tracks)
+                            m_span_end = max(t["span_end"] for t in s_tracks)
                         merged_cluster_tracks.append({
                             "sample": s_id,
                             "track_id": s_tracks[0]["track_id"],
-                            "span_start": min(t["span_start"] for t in s_tracks),
-                            "span_end": max(t["span_end"] for t in s_tracks),
+                            "span_start": m_span_start,
+                            "span_end": m_span_end,
                             "n_windows": m_n_windows,
                             "consensus": m_consensus,
                             "abundance": m_abundance,
@@ -562,8 +580,6 @@ def build_lineage_table(
                             "span_start": span_start,
                             "span_end": span_end,
                             "span_bp": span_end - span_start,
-                            "n_windows": n_windows,
-                            "total_windows": lineage_total_windows,
                             "total_span": lineage_total_span,
                             "abundance": abundance,
                             "reads": reads_total,
@@ -587,6 +603,14 @@ def build_lineage_table(
                         junk_col_w = wr.gamma.shape[1] - 1
                         n_junk_w = int((wr.gamma[:, junk_col_w] >= 0.5).sum())
                         hap_total_reads = n_reads_w - n_junk_w
+                        if hap.consensus:
+                            hap_span_start = min(hap.consensus.keys())
+                            hap_span_end = max(hap.consensus.keys())
+                            hap_span_bp = hap_span_end - hap_span_start
+                        else:
+                            hap_span_start = wr.window.start
+                            hap_span_end = wr.window.end
+                            hap_span_bp = hap_span_end - hap_span_start
                         haplotype_records.append(
                             {
                                 "lineage_id": lineage_id,
@@ -595,11 +619,10 @@ def build_lineage_table(
                                 "contig": contig_id,
                                 "sample": sample_id,
                                 "track_id": track_id,
-                                "span_start": wr.window.start,
-                                "span_end": wr.window.end,
-                                "span_bp": wr.window.end - wr.window.start,
+                                "span_start": hap_span_start,
+                                "span_end": hap_span_end,
+                                "span_bp": hap_span_bp,
                                 "n_windows": 1,
-                                "total_windows": lineage_total_windows,
                                 "total_span": lineage_total_span,
                                 "abundance": max(0.0, min(1.0, hap.weight)),
                                 "reads": hap_reads,
@@ -628,8 +651,8 @@ def write_lineage_tables(
 
     lineage_fieldnames = list(lineage_records[0].keys()) if lineage_records else [
         "lineage_id", "mag", "contig", "sample", "track_id",
-        "span_start", "span_end", "span_bp", "n_windows",
-        "total_windows", "total_span",
+        "span_start", "span_end", "span_bp",
+        "total_span",
         "abundance", "reads", "total_reads",
         "n_snvs", "consensus", "n_timepoints",
     ]
@@ -642,7 +665,7 @@ def write_lineage_tables(
     hap_fieldnames = list(haplotype_records[0].keys()) if haplotype_records else [
         "lineage_id", "haplotype_id", "mag", "contig", "sample", "track_id",
         "span_start", "span_end", "span_bp", "n_windows",
-        "total_windows", "total_span",
+        "total_span",
         "abundance", "reads", "total_reads",
         "n_snvs", "consensus", "n_timepoints",
     ]

@@ -237,12 +237,14 @@ results/longitudinal/
 | `contig` | Contig ID |
 | `sample` | Sample/timepoint ID |
 | `track_id` | Track ID within sample |
-| `span_start` | Genomic start position |
-| `span_end` | Genomic end position |
-| `span_bp` | Span length |
+| `span_start` | First SNV position in consensus |
+| `span_end` | Last SNV position in consensus |
+| `span_bp` | span_end − span_start (bp between first and last SNV) |
 | `n_windows` | Windows in this track |
-| `mean_weight` | Mean abundance |
-| `total_supporting_reads` | Supporting reads |
+| `total_span` | Lineage span in bp (last SNV − first SNV across all samples) |
+| `abundance` | Mean EM mixture proportion (weight) |
+| `reads` | Reads assigned to this track |
+| `total_reads` | Total non-junk reads in windows |
 | `n_snvs` | SNVs in consensus |
 | `consensus` | SNV profile |
 | `n_timepoints` | How many timepoints have this lineage |
