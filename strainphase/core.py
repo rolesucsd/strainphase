@@ -2219,9 +2219,9 @@ def results_to_dataframe(results: dict[str, list[WindowResult]]) -> list[dict]:
 
         # Build one record per track
         for track_id, members in tracks.items():
-            # Compute span and aggregate stats
-            span_start = min(wr.window.start for wr, _, _ in members)
-            span_end = max(wr.window.end for wr, _, _ in members)
+            # Window span (fallback if no consensus SNVs)
+            window_span_start = min(wr.window.start for wr, _, _ in members)
+            window_span_end = max(wr.window.end for wr, _, _ in members)
             n_windows = len(members)
 
             # Merge consensus across all windows (weighted voting)
@@ -2243,6 +2243,14 @@ def results_to_dataframe(results: dict[str, list[WindowResult]]) -> list[dict]:
             for pos, votes in position_votes.items():
                 best_base = max(votes.keys(), key=lambda b: votes[b])
                 merged_consensus[pos] = best_base
+
+            # Span: first to last consensus SNV position (fallback to window span)
+            if merged_consensus:
+                span_start = min(merged_consensus.keys())
+                span_end = max(merged_consensus.keys())
+            else:
+                span_start = window_span_start
+                span_end = window_span_end
 
             # Get sample from first window (all should be same)
             sample = members[0][0].window.sample
