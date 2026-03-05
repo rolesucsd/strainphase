@@ -1388,18 +1388,58 @@ class LongitudinalIntegrator:
         # Avoid duplicating an already-present haplotype in this window.
         existing_consensuses = [h.consensus for h in haplotypes]
 
+        # Matching thresholds for anchor comparisons.
+        max_distance = self.config.rescue_match_distance
+        min_shared = self.config.min_shared_for_rescue
+        min_shared_for_read = 2  # Lower threshold for individual reads
+
+        # ---- Step 1: For each junk read, find all anchors it matches (distance).
+        # read_matches[i] = list of (anchor_idx, distance) for read i (junk only).
+        read_matches: dict[int, list[tuple[int, float]]] = defaultdict(list)
+        for i, read in enumerate(reads):
+            if not junk_read_mask[i]:
+                continue
+            for anchor_idx, anchor in enumerate(anchor_haps):
+                n_shared = 0
+                n_match = 0
+                for pos, allele in read.alleles.items():
+                    if pos in anchor.consensus:
+                        n_shared += 1
+                        if anchor.consensus[pos] == allele:
+                            n_match += 1
+                if n_shared >= min_shared_for_read:
+                    distance = 1.0 - (n_match / n_shared)
+                    if distance <= max_distance:
+                        read_matches[i].append((anchor_idx, distance))
+
+        # ---- Step 2: Assign each junk read to exactly one anchor (best distance, then lowest index).
+        # This avoids double-counting: the same read was previously counted for every matching
+        # anchor, inflating total_rescued_weight and biasing original haplotype weights.
+        anchor_to_reads: dict[int, list[tuple[int, int, int, int]]] = defaultdict(list)
+        for i, matches in read_matches.items():
+            if not matches:
+                continue
+            # Best = smallest distance, then smallest anchor_idx
+            anchor_idx, dist = min(matches, key=lambda x: (x[1], x[0]))
+            read = reads[i]
+            n_shared = 0
+            n_match = 0
+            for pos, allele in read.alleles.items():
+                if pos in anchor_haps[anchor_idx].consensus:
+                    n_shared += 1
+                    if anchor_haps[anchor_idx].consensus[pos] == allele:
+                        n_match += 1
+            # (read_idx, n_agree, n_disagree, n_total)
+            anchor_to_reads[anchor_idx].append((i, n_match, n_shared - n_match, n_shared))
+
+        # ---- Step 3: Build rescued haplotypes only for anchors that are not already present
+        # and have at least one uniquely assigned read.
         rescued_any = False
         new_haplotypes = []
 
-        # Matching thresholds for anchor comparisons.
-        max_distance = self.config.rescue_match_distance  # default 0.0005 = 99.95% match required
-        min_shared = self.config.min_shared_for_rescue
-
         for anchor_idx, anchor in enumerate(anchor_haps):
-            # Check if this anchor is already present as a haplotype
             anchor_already_present = False
             for existing in existing_consensuses:
-                # Compare anchor vs existing consensus on shared SNV positions.
                 n_shared = 0
                 n_match = 0
                 for pos in window.snv_pos:
@@ -1409,45 +1449,17 @@ class LongitudinalIntegrator:
                             n_match += 1
                 if n_shared >= min_shared:
                     distance = 1.0 - (n_match / n_shared) if n_shared > 0 else 1.0
-                    if distance <= max_distance:  # Already have this haplotype
+                    if distance <= max_distance:
                         anchor_already_present = True
                         break
 
             if anchor_already_present:
                 continue
 
-            # Count junk reads that are consistent with this anchor.
-            n_matching_junk = 0
-            matching_read_indices = []
-            matching_read_info = []  # Store (read_idx, n_agree, n_disagree, n_total) for rescued reads
-            min_shared_for_read = 2  # Lower threshold for individual reads
+            matching_read_info = anchor_to_reads.get(anchor_idx, [])
+            n_matching_junk = len(matching_read_info)
 
-            for i, read in enumerate(reads):
-                if not junk_read_mask[i]:
-                    continue
-
-                # Check if this read matches the anchor within error tolerance.
-                n_shared = 0
-                n_match = 0
-                for pos, allele in read.alleles.items():
-                    if pos in anchor.consensus:
-                        n_shared += 1
-                        if anchor.consensus[pos] == allele:
-                            n_match += 1
-
-                # Require sufficient shared positions and distance within error tolerance
-                if n_shared >= min_shared_for_read:
-                    distance = 1.0 - (n_match / n_shared)
-                    if distance <= max_distance:  # Within sequencing error tolerance
-                        n_matching_junk += 1
-                        matching_read_indices.append(i)
-                        # Store SNP agreement info: (read_idx, n_agree, n_disagree, n_total)
-                        matching_read_info.append((i, n_match, n_shared - n_match, n_shared))
-
-            # If any junk reads match this anchor near-exactly, create a rescued haplotype.
-            # The strict rescue_match_distance (0.05%) ensures only truly matching reads pass.
             if n_matching_junk >= 1:
-                # Create new haplotype from anchor consensus (restricted to this window's SNVs).
                 new_consensus = {
                     pos: anchor.consensus[pos]
                     for pos in window.snv_pos
@@ -1455,18 +1467,17 @@ class LongitudinalIntegrator:
                 }
 
                 if len(new_consensus) >= self.config.min_snvs_per_window:
-                    # Estimate weight from junk reads; enforce rescued_min_weight.
                     rescued_weight = max(
                         n_matching_junk / len(reads),
-                        self.config.rescued_min_weight
+                        self.config.rescued_min_weight,
                     )
 
                     new_hap = Haplotype(
                         consensus=new_consensus,
                         weight=rescued_weight,
                         supporting_reads=n_matching_junk,
-                        confidence=0.8,  # Mark as rescued
-                        track_id=None,  # Will be assigned during linking
+                        confidence=0.8,
+                        track_id=None,
                     )
                     new_haplotypes.append(new_hap)
 
@@ -1490,10 +1501,9 @@ class LongitudinalIntegrator:
                     )
                     rescued_any = True
 
-                    # Track each rescued read with SNP agreement/disagreement info
                     for read_idx, n_agree, n_disagree, n_total in matching_read_info:
                         read = reads[read_idx]
-                        read_name = getattr(read, 'name', f"read_{read_idx}")
+                        read_name = getattr(read, "name", f"read_{read_idx}")
                         self.rescued_reads.append(
                             RescuedReadInfo(
                                 read_name=read_name,
@@ -1539,17 +1549,29 @@ class LongitudinalIntegrator:
         n_haps_new = len(haplotypes)
         k_eff_new = n_haps_new + 1
 
-        # Redistribute weight: take from junk, give to rescued
-        total_rescued_weight = sum(h.weight for h in new_haplotypes)
+        # Redistribute weight: take from junk only; never take more than available.
+        # This avoids zeroing out original haplotypes when rescued_min_weight or
+        # (previously) double-counted reads made total_rescued_weight > old_junk_weight.
         old_junk_weight = pi[junk_idx]
-        new_junk_weight = max(0.01, old_junk_weight - total_rescued_weight)
+        min_junk_floor = 0.01  # Keep a small junk component for numerical stability
+        available_from_junk = max(0.0, old_junk_weight - min_junk_floor)
 
-        # Build new pi
+        total_rescued_weight = sum(h.weight for h in new_haplotypes)
+        if total_rescued_weight > available_from_junk and total_rescued_weight > 0:
+            # Scale down rescued weights so they sum to available_from_junk (preserve ratios).
+            scale_rescued = available_from_junk / total_rescued_weight
+            for h in new_haplotypes:
+                h.weight *= scale_rescued
+            total_rescued_weight = available_from_junk
+
+        new_junk_weight = max(min_junk_floor, old_junk_weight - total_rescued_weight)
+
+        # Build new pi: original haplotypes scaled to fill (1 - total_rescued - new_junk).
         pi_new = np.zeros(k_eff_new)
-        # Scale down existing haplotype weights proportionally.
-        # Clamp to 0 so pi values never go negative (can happen when many
-        # rescued haplotypes collectively exceed the remaining non-junk budget).
-        scale = max(0.0, (1.0 - total_rescued_weight - new_junk_weight) / (1.0 - old_junk_weight)) if old_junk_weight < 1.0 else 1.0
+        non_junk_before = 1.0 - old_junk_weight
+        non_junk_after = 1.0 - total_rescued_weight - new_junk_weight
+        scale = (non_junk_after / non_junk_before) if non_junk_before > 0 else 0.0
+        scale = max(0.0, scale)  # avoid negative if floating point
         for k in range(n_haps):
             pi_new[k] = pi[k] * scale
         for k, new_hap in enumerate(new_haplotypes):
