@@ -1891,6 +1891,23 @@ def process_window(
     merged_haps, final_gamma, final_pi = post.merge_similar_haplotypes(
         haplotypes, gamma, pi, window, n_timepoints_seen
     )
+
+    # 3b) Prune invariant positions: keep only SNV sites where at least two
+    #      haplotypes disagree.  Monomorphic sites (e.g. AF≈1 fixed ALTs)
+    #      add no discriminative signal and inflate shared-SNV counts during linking.
+    if len(merged_haps) >= 2:
+        all_positions = set()
+        for h in merged_haps:
+            all_positions.update(h.consensus.keys())
+        variable_positions = set()
+        for pos in all_positions:
+            calls = {h.consensus[pos] for h in merged_haps if pos in h.consensus}
+            if len(calls) > 1:
+                variable_positions.add(pos)
+        for h in merged_haps:
+            h.consensus = {pos: base for pos, base in h.consensus.items()
+                           if pos in variable_positions}
+
     assignments = post.assign_reads(window.reads, final_gamma, final_pi)
 
     n_reads_examined, reads_within_mismatch_per_hap = _compute_read_mismatch_counts(
