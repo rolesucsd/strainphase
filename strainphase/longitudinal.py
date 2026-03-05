@@ -312,16 +312,17 @@ def build_lineage_table(
                     position_votes: dict[int, dict[str, float]] = defaultdict(
                         lambda: defaultdict(float)
                     )
-                    # Abundance = mean of hap.weight across windows (EM mixture proportion).
-                    # This is higher quality than a simple read count: it accounts for
-                    # soft assignments and normalizes across haplotypes; hap.weight is
-                    # pi[k] from EM, with junk in denominator (sum of all pi = 1.0).
-                    weight_sum = 0.0
+                    # Abundance is computed from the EM mixture proportions but
+                    # explicitly conditioned on NON-junk reads. For each window we
+                    # take pi_k / (1 - pi_junk), where pi_k is the haplotype's
+                    # mixture weight and pi_junk is the junk component. This
+                    # removes the influence of the junk bucket on abundance
+                    # estimates while still using the soft-assignments from EM.
+                    window_abundance_sum = 0.0
                     total_reads_sum = 0
                     reads_sum = 0  # reads matching consensus at max_mismatch_frac
 
                     for _wr, hap, hap_idx in members:
-                        weight_sum += hap.weight
                         # total_reads: reads assigned to any haplotype (non-junk),
                         # derived from gamma so it reflects the state after rescue.
                         n_reads = getattr(_wr, "n_reads_examined", len(_wr.window.reads))
@@ -331,6 +332,18 @@ def build_lineage_table(
                         # reads: gamma-based supporting reads for THIS haplotype,
                         # updated after rescue so rescued haplotypes are included.
                         reads_sum += hap.supporting_reads
+                        # Per-window abundance for this haplotype, conditioned on
+                        # non-junk reads in the window. If the window is junk-only
+                        # (pi_junk ~= 1), treat its contribution as zero.
+                        pi_vec = getattr(_wr, "pi", None)
+                        window_abundance = 0.0
+                        if pi_vec is not None and len(pi_vec) > hap_idx:
+                            pi_junk = float(pi_vec[-1])
+                            denom = 1.0 - pi_junk
+                            if denom > 0:
+                                pi_k = float(pi_vec[hap_idx])
+                                window_abundance = max(0.0, min(1.0, pi_k / denom))
+                        window_abundance_sum += window_abundance
                         for pos, base in hap.consensus.items():
                             position_votes[pos][base] += hap.weight
 
@@ -346,10 +359,13 @@ def build_lineage_table(
                         span_start = window_span_start
                         span_end = window_span_end
 
-                    # abundance = mean weight across windows, clamped to [0, 1].
-                    # The rescue weight redistribution can produce small negative weights
-                    # in edge cases; clamping here ensures a valid probability.
-                    abundance = max(0.0, min(1.0, weight_sum / n_windows if n_windows > 0 else 0.0))
+                    # Abundance = mean per-window conditional mixture weight
+                    # (pi_k / (1 - pi_junk)) across windows, clamped to [0, 1].
+                    abundance = (
+                        max(0.0, min(1.0, window_abundance_sum / n_windows))
+                        if n_windows > 0
+                        else 0.0
+                    )
 
                     tracks_by_contig[contig_id].append(
                         {
@@ -401,9 +417,15 @@ def build_lineage_table(
                         merged_span_start = min(tracks[i]["span_start"] for i in indices)
                         merged_span_end = max(tracks[i]["span_end"] for i in indices)
                     merged_n_windows = sum(tracks[i]["n_windows"] for i in indices)
-                    # Weight average of abundance by n_windows, clamped to [0, 1].
-                    total_weight_sum = sum(tracks[i]["abundance"] * tracks[i]["n_windows"] for i in indices)
-                    merged_abundance = max(0.0, min(1.0, total_weight_sum / merged_n_windows if merged_n_windows > 0 else 0.0))
+                    # Weighted average of abundance by n_windows, clamped to [0, 1].
+                    total_weight_sum = sum(
+                        tracks[i]["abundance"] * tracks[i]["n_windows"] for i in indices
+                    )
+                    merged_abundance = (
+                        max(0.0, min(1.0, total_weight_sum / merged_n_windows))
+                        if merged_n_windows > 0
+                        else 0.0
+                    )
                     merged_total_reads = sum(tracks[i]["total_reads_sum"] for i in indices)
                     merged_reads = sum(tracks[i]["reads_sum"] for i in indices)
                     merged_members = []
@@ -611,6 +633,16 @@ def build_lineage_table(
                             hap_span_start = wr.window.start
                             hap_span_end = wr.window.end
                             hap_span_bp = hap_span_end - hap_span_start
+                        # Per-window abundance for this haplotype, conditioned on
+                        # non-junk reads (pi_k / (1 - pi_junk)).
+                        pi_vec = getattr(wr, "pi", None)
+                        hap_abundance = 0.0
+                        if pi_vec is not None and len(pi_vec) > hap_idx:
+                            pi_junk_w = float(pi_vec[-1])
+                            denom_w = 1.0 - pi_junk_w
+                            if denom_w > 0:
+                                pi_k_w = float(pi_vec[hap_idx])
+                                hap_abundance = max(0.0, min(1.0, pi_k_w / denom_w))
                         haplotype_records.append(
                             {
                                 "lineage_id": lineage_id,
@@ -624,7 +656,7 @@ def build_lineage_table(
                                 "span_bp": hap_span_bp,
                                 "n_windows": 1,
                                 "total_span": lineage_total_span,
-                                "abundance": max(0.0, min(1.0, hap.weight)),
+                                "abundance": hap_abundance,
                                 "reads": hap_reads,
                                 "total_reads": hap_total_reads,
                                 "n_snvs": len(hap.consensus),
