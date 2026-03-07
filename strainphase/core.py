@@ -2237,6 +2237,23 @@ def process_mag_longitudinal(*args, **kwargs):
 # =============================================================================
 
 
+def _weighted_median(values: list[float], weights: list[float]) -> float:
+    """Weighted median of *values* with corresponding *weights*."""
+    if not values:
+        return 0.0
+    total = sum(weights)
+    if total <= 0:
+        return 0.0
+    paired = sorted(zip(values, weights))
+    cumulative = 0.0
+    half = total / 2.0
+    for val, w in paired:
+        cumulative += w
+        if cumulative >= half:
+            return max(0.0, min(1.0, val))
+    return max(0.0, min(1.0, paired[-1][0]))
+
+
 def results_to_dataframe(results: dict[str, list[WindowResult]]) -> list[dict]:
     """
     Convert results to track-based records for DataFrame.
@@ -2269,6 +2286,9 @@ def results_to_dataframe(results: dict[str, list[WindowResult]]) -> list[dict]:
             total_reads = 0
             confidences = []
 
+            window_abundances = []
+            window_read_weights = []
+
             for _wr, _k, hap in members:
                 total_weight += hap.weight
                 total_reads += hap.supporting_reads
@@ -2276,6 +2296,22 @@ def results_to_dataframe(results: dict[str, list[WindowResult]]) -> list[dict]:
 
                 for pos, base in hap.consensus.items():
                     position_votes[pos][base] += hap.weight
+
+                # Per-window abundance (conditioned on non-junk).
+                pi_vec = _wr.pi
+                wa = 0.0
+                if len(pi_vec) > _k:
+                    pi_junk = float(pi_vec[-1])
+                    denom = 1.0 - pi_junk
+                    if denom > 0:
+                        wa = max(0.0, min(1.0, float(pi_vec[_k]) / denom))
+                junk_col = _wr.gamma.shape[1] - 1
+                n_junk = int((_wr.gamma[:, junk_col] >= 0.5).sum())
+                n_nonjunk = max(
+                    getattr(_wr, "n_reads_examined", len(_wr.window.reads)) - n_junk, 0
+                )
+                window_abundances.append(wa)
+                window_read_weights.append(n_nonjunk)
 
             # Build merged consensus from votes
             merged_consensus = {}
@@ -2304,7 +2340,7 @@ def results_to_dataframe(results: dict[str, list[WindowResult]]) -> list[dict]:
                     "span_bp": span_end - span_start,
                     "n_windows": n_windows,
                     "n_snvs": len(merged_consensus),
-                    "mean_weight": total_weight / n_windows if n_windows > 0 else 0.0,
+                    "mean_weight": _weighted_median(window_abundances, window_read_weights),
                     "total_supporting_reads": total_reads,
                     "mean_confidence": np.mean(confidences) if confidences else 0.0,
                     "consensus": "|".join(

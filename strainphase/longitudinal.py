@@ -53,6 +53,33 @@ from strainphase.core import (
 )
 
 # -----------------------------------------------------------------------------#
+# Helpers
+# -----------------------------------------------------------------------------#
+
+
+def _weighted_median(values: list[float], weights: list[float]) -> float:
+    """Weighted median of *values* with corresponding *weights*.
+
+    Returns 0.0 when all weights are zero or the inputs are empty.
+    """
+    if not values:
+        return 0.0
+    total = sum(weights)
+    if total <= 0:
+        return 0.0
+    # Sort by value, carry weights along.
+    paired = sorted(zip(values, weights))
+    cumulative = 0.0
+    half = total / 2.0
+    for val, w in paired:
+        cumulative += w
+        if cumulative >= half:
+            return max(0.0, min(1.0, val))
+    # Fallback (should not reach here).
+    return max(0.0, min(1.0, paired[-1][0]))
+
+
+# -----------------------------------------------------------------------------#
 # Reference parsing and contig filtering
 # -----------------------------------------------------------------------------#
 
@@ -318,7 +345,8 @@ def build_lineage_table(
                     # mixture weight and pi_junk is the junk component. This
                     # removes the influence of the junk bucket on abundance
                     # estimates while still using the soft-assignments from EM.
-                    window_abundance_sum = 0.0
+                    window_abundances = []
+                    window_read_weights = []
                     total_reads_sum = 0
                     reads_sum = 0  # reads matching consensus at max_mismatch_frac
 
@@ -328,7 +356,8 @@ def build_lineage_table(
                         n_reads = getattr(_wr, "n_reads_examined", len(_wr.window.reads))
                         junk_col = _wr.gamma.shape[1] - 1
                         n_junk = int((_wr.gamma[:, junk_col] >= 0.5).sum())
-                        total_reads_sum += n_reads - n_junk
+                        n_nonjunk = n_reads - n_junk
+                        total_reads_sum += n_nonjunk
                         # reads: gamma-based supporting reads for THIS haplotype,
                         # updated after rescue so rescued haplotypes are included.
                         reads_sum += hap.supporting_reads
@@ -343,7 +372,8 @@ def build_lineage_table(
                             if denom > 0:
                                 pi_k = float(pi_vec[hap_idx])
                                 window_abundance = max(0.0, min(1.0, pi_k / denom))
-                        window_abundance_sum += window_abundance
+                        window_abundances.append(window_abundance)
+                        window_read_weights.append(max(n_nonjunk, 0))
                         for pos, base in hap.consensus.items():
                             position_votes[pos][base] += hap.weight
 
@@ -359,13 +389,11 @@ def build_lineage_table(
                         span_start = window_span_start
                         span_end = window_span_end
 
-                    # Abundance = mean per-window conditional mixture weight
-                    # (pi_k / (1 - pi_junk)) across windows, clamped to [0, 1].
-                    abundance = (
-                        max(0.0, min(1.0, window_abundance_sum / n_windows))
-                        if n_windows > 0
-                        else 0.0
-                    )
+                    # Abundance = weighted median of per-window conditional
+                    # mixture weights, where the weight for each window is
+                    # its number of non-junk reads.  This is more robust to
+                    # outlier windows (e.g. low-coverage edges) than a mean.
+                    abundance = _weighted_median(window_abundances, window_read_weights)
 
                     tracks_by_contig[contig_id].append(
                         {
@@ -417,15 +445,24 @@ def build_lineage_table(
                         merged_span_start = min(tracks[i]["span_start"] for i in indices)
                         merged_span_end = max(tracks[i]["span_end"] for i in indices)
                     merged_n_windows = sum(tracks[i]["n_windows"] for i in indices)
-                    # Weighted average of abundance by n_windows, clamped to [0, 1].
-                    total_weight_sum = sum(
-                        tracks[i]["abundance"] * tracks[i]["n_windows"] for i in indices
-                    )
-                    merged_abundance = (
-                        max(0.0, min(1.0, total_weight_sum / merged_n_windows))
-                        if merged_n_windows > 0
-                        else 0.0
-                    )
+                    # Recompute weighted median from all underlying members.
+                    m_abundances = []
+                    m_weights = []
+                    for i in indices:
+                        for _wr, _hap, _hap_idx in tracks[i]["members"]:
+                            pi_vec = getattr(_wr, "pi", None)
+                            wa = 0.0
+                            if pi_vec is not None and len(pi_vec) > _hap_idx:
+                                pi_junk = float(pi_vec[-1])
+                                denom = 1.0 - pi_junk
+                                if denom > 0:
+                                    wa = max(0.0, min(1.0, float(pi_vec[_hap_idx]) / denom))
+                            n_reads = getattr(_wr, "n_reads_examined", len(_wr.window.reads))
+                            junk_col = _wr.gamma.shape[1] - 1
+                            n_junk = int((_wr.gamma[:, junk_col] >= 0.5).sum())
+                            m_abundances.append(wa)
+                            m_weights.append(max(n_reads - n_junk, 0))
+                    merged_abundance = _weighted_median(m_abundances, m_weights)
                     merged_total_reads = sum(tracks[i]["total_reads_sum"] for i in indices)
                     merged_reads = sum(tracks[i]["reads_sum"] for i in indices)
                     merged_members = []
@@ -534,8 +571,24 @@ def build_lineage_table(
                         merged_cluster_tracks.append(s_tracks[0])
                     else:
                         m_n_windows = sum(t["n_windows"] for t in s_tracks)
-                        m_weight_sum = sum(t["abundance"] * t["n_windows"] for t in s_tracks)
-                        m_abundance = max(0.0, min(1.0, m_weight_sum / m_n_windows if m_n_windows > 0 else 0.0))
+                        # Recompute weighted median from all underlying members.
+                        m_ab_vals = []
+                        m_ab_wts = []
+                        for t in s_tracks:
+                            for _wr, _hap, _hap_idx in t["members"]:
+                                pi_vec = getattr(_wr, "pi", None)
+                                wa = 0.0
+                                if pi_vec is not None and len(pi_vec) > _hap_idx:
+                                    pi_junk = float(pi_vec[-1])
+                                    denom = 1.0 - pi_junk
+                                    if denom > 0:
+                                        wa = max(0.0, min(1.0, float(pi_vec[_hap_idx]) / denom))
+                                n_r = getattr(_wr, "n_reads_examined", len(_wr.window.reads))
+                                jc = _wr.gamma.shape[1] - 1
+                                nj = int((_wr.gamma[:, jc] >= 0.5).sum())
+                                m_ab_vals.append(wa)
+                                m_ab_wts.append(max(n_r - nj, 0))
+                        m_abundance = _weighted_median(m_ab_vals, m_ab_wts)
                         m_total_reads = sum(t["total_reads_sum"] for t in s_tracks)
                         m_reads = sum(t["reads_sum"] for t in s_tracks)
                         m_members: list = []
