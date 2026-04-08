@@ -18,3 +18,4 @@ pytest tests/test_core.py::TestHaplotyperConfig -v
 ## Test Structure
 
 - `test_core.py` - Unit and integration tests for the core haplotyper pipeline
+- `test_longitudinal.py` - Tests for cross-timepoint integration and lineage rescue
