@@ -45,7 +45,6 @@ from strainphase.core import (
     Haplotype,
     HaplotyperConfig,
     LongitudinalIntegrator,
-    RescueStatistic,
     WindowResult,
     link_windows,
     process_contig,
@@ -68,7 +67,7 @@ def _weighted_median(values: list[float], weights: list[float]) -> float:
     if total <= 0:
         return 0.0
     # Sort by value, carry weights along.
-    paired = sorted(zip(values, weights))
+    paired = sorted(zip(values, weights, strict=False))
     cumulative = 0.0
     half = total / 2.0
     for val, w in paired:
@@ -178,7 +177,7 @@ def process_mag_longitudinal(
     bam_paths: dict[str, str],
     vcf_paths: dict[str, str],
     config: HaplotyperConfig,
-) -> tuple[dict[str, dict[str, list[WindowResult]]], "LongitudinalIntegrator | None"]:
+) -> tuple[dict[str, dict[str, list[WindowResult]]], LongitudinalIntegrator | None]:
     """
     Process a single MAG across all samples with longitudinal rescue.
 

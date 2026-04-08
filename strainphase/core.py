@@ -281,7 +281,7 @@ class Haplotype:
     track_id: str | None = None  # Assigned after window linking
 
     def distance_to(
-        self, other: "Haplotype", positions: list[int], max_mismatches: int | None = None
+        self, other: Haplotype, positions: list[int], max_mismatches: int | None = None
     ) -> tuple[float, int, int]:
         """
         Compute normalized Hamming distance with optional early exit.
@@ -312,7 +312,7 @@ class Haplotype:
             return 1.0, 0, 0
         return mismatches / total, mismatches, total
 
-    def get_differing_positions(self, other: "Haplotype", positions: list[int]) -> list[int]:
+    def get_differing_positions(self, other: Haplotype, positions: list[int]) -> list[int]:
         """Return list of positions where haplotypes differ."""
         return [
             pos
@@ -385,7 +385,7 @@ def _compute_read_mismatch_counts(
     counts = [0] * len(haplotypes)
     read_pos_sets = window.get_read_position_sets()
 
-    for read, read_pos in zip(window.reads, read_pos_sets):
+    for read, read_pos in zip(window.reads, read_pos_sets, strict=False):
         if not read_pos:
             continue
         for hi, hap in enumerate(haplotypes):
@@ -1380,7 +1380,7 @@ class LongitudinalIntegrator:
                     anchor_distance=-1.0,
                     n_shared_with_anchor=0,
                     n_mismatched_with_anchor=0,
-                    reason=f"no_junk_reads",
+                    reason="no_junk_reads",
                 )
             )
             return window_result
@@ -1687,10 +1687,10 @@ class LongitudinalIntegrator:
         total_reads = 0
         n_anchors = 0
 
-        for window_key, sample_results in windows_by_position.items():
+        for _window_key, sample_results in windows_by_position.items():
             if len(sample_results) >= 2:
                 n_windows_with_multiple_timepoints += 1
-            for sample_id, wr in sample_results.items():
+            for _sample_id, wr in sample_results.items():
                 n_reads = wr.gamma.shape[0]
                 junk_idx = wr.gamma.shape[1] - 1
                 junk_reads = (wr.gamma[:, junk_idx] > 0.5).sum()
@@ -2244,7 +2244,7 @@ def _weighted_median(values: list[float], weights: list[float]) -> float:
     total = sum(weights)
     if total <= 0:
         return 0.0
-    paired = sorted(zip(values, weights))
+    paired = sorted(zip(values, weights, strict=False))
     cumulative = 0.0
     half = total / 2.0
     for val, w in paired:
