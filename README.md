@@ -2,7 +2,6 @@
 
 **Hybrid graph-probabilistic haplotype reconstruction for PacBio HiFi metagenomic data**
 
-[![PyPI version](https://badge.fury.io/py/strainphase.svg)](https://badge.fury.io/py/strainphase)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![License: BSD 3-Clause](https://img.shields.io/badge/License-BSD%203--Clause-yellow.svg)](https://opensource.org/license/bsd-3-clause/)
 
@@ -17,29 +16,13 @@ Strainphase reconstructs distinct bacterial haplotypes (strain-specific SNV patt
 
 ## Installation
 
-### From PyPI (recommended)
-```bash
-pip install strainphase
-```
-
-### With optional dependencies
-```bash
-# Full installation (includes pysam for BAM/VCF I/O)
-pip install strainphase[full]
-
-# Development installation
-pip install strainphase[dev]
-
-# Everything
-pip install strainphase[all]
-```
-
-### From source
 ```bash
 git clone https://github.com/rolesucsd/strainphase.git
 cd strainphase
 pip install -e .
 ```
+
+**Dependencies:** `numpy`, `scipy`, `networkx`, `pandas`, `python-louvain`, `pysam`
 
 ## Quick Start
 
@@ -62,27 +45,19 @@ strainphase longitudinal \
     --reference combined_bins.fasta \
     --output-dir results/ \
     --mags MAG_01
-
-# Run tests
-strainphase test
-
-# Parameter sensitivity analysis
-strainphase sweep --quick
 ```
 
 ### Python API
 
 ```python
-from strainphase import HaplotyperConfig, process_contig, results_to_dataframe
+from strainphase import HaplotyperConfig, process_contig
 
-# Configure
 config = HaplotyperConfig(
     window_size=3000,
     max_mismatch_frac=0.02,
     min_weight_for_anchor=0.15,
 )
 
-# Process
 results = process_contig(
     bam_path="sample.bam",
     vcf_path="variants.vcf.gz",
@@ -90,9 +65,6 @@ results = process_contig(
     contig_length=50000,
     config=config,
 )
-
-# Export
-records = results_to_dataframe({"MAG_01_contig_1": results})
 ```
 
 ## CLI Commands
@@ -102,7 +74,7 @@ records = results_to_dataframe({"MAG_01_contig_1": results})
 | `strainphase run` | Process a single contig |
 | `strainphase longitudinal` | Multi-sample longitudinal analysis |
 | `strainphase test` | Run unit test suite |
-| `strainphase sweep` | Parameter sensitivity analysis |
+| `strainphase sweep` | Parameter sensitivity analysis (developer tool) |
 | `strainphase version` | Show version |
 
 ### `strainphase run`
@@ -140,24 +112,12 @@ Required:
   --output-dir DIR    Output directory
 
 Options:
-  --mags LIST         Comma-separated MAG names [default: all]
-  --contig-filter F   File listing allowed contigs
-  --window-size INT   Window size [default: 3000]
-  --max-reads INT     Max reads per window [default: 300]
-  --min-anchor-weight Minimum weight for anchor panel [default: 0.15]
-  --rescued-min-weight Minimum weight after rescue [default: 0.02]
-```
-
-### `strainphase sweep` (developer tool)
-
-```
-strainphase sweep [OPTIONS]
-
-Options:
-  --quick             Use reduced parameter grid (~2-5 min)
-  --output-dir DIR    Output directory for results
-  --max-configs INT   Limit number of configurations to test
-  -q, --quiet         Suppress progress output
+  --mags LIST              Comma-separated MAG names [default: all]
+  --contig-filter F        File listing allowed contigs
+  --window-size INT        Window size [default: 3000]
+  --max-reads INT          Max reads per window [default: 300]
+  --min-anchor-weight FLT  Minimum weight for anchor panel [default: 0.15]
+  --rescued-min-weight FLT Minimum weight after rescue [default: 0.02]
 ```
 
 ## Key Parameters
@@ -205,44 +165,6 @@ Options:
 ├─────────────────────────────────────────────────────────────┤
 │ 6. RESCUE: Cross-timepoint anchor matching (longitudinal)  │
 └─────────────────────────────────────────────────────────────┘
-```
-
-## Testing
-
-```bash
-# Run unit tests
-strainphase test
-
-# Run with verbose output
-strainphase test -v
-
-# Parameter sensitivity (quick; developer tool)
-strainphase sweep --quick
-
-# Full parameter sweep (324 configs × 4 scenarios; developer tool)
-strainphase sweep --output-dir full_sweep_results/
-```
-
-### Test Scenarios
-
-| Scenario | Haplotypes | Timepoints | Description |
-|----------|------------|------------|-------------|
-| `simple_2hap` | 2 | 3 | Clear separation, no sweep |
-| `sweep_2hap` | 2 | 4 | Selective sweep dynamics |
-| `complex_4hap` | 4 | 5 | Multiple related strains |
-| `low_abundance` | 3 | 4 | Rare strain detection |
-
-## Citation
-
-If you use Strainphase in your research, please cite:
-
-```bibtex
-@software{strainphase,
-  author = {Oles, Renee},
-  title = {Strainphase: Hybrid graph-probabilistic haplotype reconstruction},
-  year = {2025},
-  url = {https://github.com/rolesucsd/strainphase}
-}
 ```
 
 ## License
