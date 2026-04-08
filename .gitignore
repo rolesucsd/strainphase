@@ -4,6 +4,7 @@ __pycache__/
 *.pyd
 *.so
 *.egg-info/
+strainphase.egg-info/
 PKG-INFO
 
 # Virtual environments
