@@ -28,11 +28,12 @@ dist/
 .idea/
 .vscode/
 
-# Hide manuscript and tutorials from GitHub
-docs/manuscript/
-docs/tutorials/
+# Hide from GitHub
+docs/
+validation/
+benchmarks/
 
-# Generated data (simulations, benchmarks)
+# Generated data
 data/
 tmp/
 tmp2/
