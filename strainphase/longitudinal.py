@@ -67,7 +67,7 @@ def _weighted_median(values: list[float], weights: list[float]) -> float:
     if total <= 0:
         return 0.0
     # Sort by value, carry weights along.
-    paired = sorted(zip(values, weights, strict=False))
+    paired = sorted(zip(values, weights))  # noqa: B905
     cumulative = 0.0
     half = total / 2.0
     for val, w in paired:

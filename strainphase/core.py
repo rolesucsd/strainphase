@@ -385,7 +385,7 @@ def _compute_read_mismatch_counts(
     counts = [0] * len(haplotypes)
     read_pos_sets = window.get_read_position_sets()
 
-    for read, read_pos in zip(window.reads, read_pos_sets, strict=False):
+    for read, read_pos in zip(window.reads, read_pos_sets):  # noqa: B905
         if not read_pos:
             continue
         for hi, hap in enumerate(haplotypes):
@@ -2244,7 +2244,7 @@ def _weighted_median(values: list[float], weights: list[float]) -> float:
     total = sum(weights)
     if total <= 0:
         return 0.0
-    paired = sorted(zip(values, weights, strict=False))
+    paired = sorted(zip(values, weights))  # noqa: B905
     cumulative = 0.0
     half = total / 2.0
     for val, w in paired:
