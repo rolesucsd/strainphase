@@ -93,11 +93,23 @@ class HaplotyperConfig:
     default_base_quality: int = 20
     max_reads_per_window: int = 1000
 
-    # =========== SNV FILTERING (Clair3) ===========
+    # =========== VARIANT FILTERING ===========
     min_depth_site: int = 3
-    af_range: tuple[float, float] = (0.05, 0.95)
     require_biallelic: bool = True
-    skip_af_filter_if_missing: bool = True
+    # Optional AF range filter. ``None`` (default) keeps all variants regardless
+    # of allele frequency, which is what you want for longitudinal phasing
+    # because a position fixed at AF=0 or AF=1 in one timepoint can still be
+    # informative across timepoints. Set to e.g. ``(0.05, 0.95)`` to restrict
+    # to within-sample polymorphic sites.
+    af_range: tuple[float, float] | None = None
+
+    # =========== INDEL HANDLING ===========
+    # When True, indel sites in the VCF are loaded alongside SNVs. A read is
+    # labeled "DEL" if its CIGAR has a D op exactly matching the VCF deletion
+    # footprint, "INS" if it has an I op anchored at the VCF insertion anchor,
+    # otherwise the matched reference base (or no call). All deletions/
+    # insertions at a position collapse to a single state regardless of size.
+    include_indels: bool = True
 
     # =========== GRAPH CONSTRUCTION ===========
     min_shared_snvs_for_edge: int = 1
@@ -171,8 +183,10 @@ class HaplotyperConfig:
                 f"merge_distance_threshold must be in [0, 1], got {self.merge_distance_threshold}"
             )
 
-        # AF range
-        if not (0 <= self.af_range[0] < self.af_range[1] <= 1):
+        # AF range (optional)
+        if self.af_range is not None and not (
+            0 <= self.af_range[0] < self.af_range[1] <= 1
+        ):
             raise ValueError(
                 f"af_range must be (low, high) with 0 <= low < high <= 1, got {self.af_range}"
             )
@@ -228,7 +242,7 @@ class Window:
     Represents a genomic window (contig interval) with associated SNVs and reads.
 
     Notes:
-    - snv_pos and ref_alleles are populated from the VCF (see load_snvs_from_clair3).
+    - snv_pos and ref_alleles are populated from the VCF (see load_snvs).
     - reads are pulled from the BAM and filtered to this window in make_windows_lazy.
     - sample is optional metadata; reads may also carry their own sample tag.
     """
@@ -447,18 +461,27 @@ class LogProbCache:
     """
     Cache for log probability computations.
 
-    Avoids redundant 10**(-Q/10) calculations.
+    Avoids redundant 10**(-Q/10) calculations. The mismatch probability is
+    spread uniformly over the ``n_alleles - 1`` non-matching states.
+
+    For SNV-only phasing the alphabet is {A, C, G, T} → ``n_alleles=4``. With
+    indels enabled (``HaplotyperConfig.include_indels=True``) the alphabet
+    expands to {A, C, G, T, DEL, INS} → ``n_alleles=6``.
     """
 
-    def __init__(self, max_q: int = 60):
+    def __init__(self, max_q: int = 60, n_alleles: int = 4):
         """Precompute log probabilities for all Q scores."""
+        if n_alleles < 2:
+            raise ValueError(f"n_alleles must be >= 2, got {n_alleles}")
         self._log_match = np.zeros(max_q + 1)
         self._log_mismatch = np.zeros(max_q + 1)
+        self.n_alleles = n_alleles
 
+        denom = float(n_alleles - 1)
         for q in range(max_q + 1):
             p_err = 10 ** (-q / 10.0)
             self._log_match[q] = np.log(1.0 - p_err + 1e-12)
-            self._log_mismatch[q] = np.log(p_err / 3.0 + 1e-12)
+            self._log_mismatch[q] = np.log(p_err / denom + 1e-12)
 
     def log_prob_base(self, hap_base: str, read_base: str, q: int) -> float:
         """Get log probability from cache."""
@@ -468,8 +491,15 @@ class LogProbCache:
         return self._log_mismatch[q]
 
 
-# Global cache instance
-_LOG_PROB_CACHE = LogProbCache()
+# Global cache instances. The 4-allele cache is the default for SNV-only
+# phasing; the 6-allele cache is selected at use-time when indels are enabled.
+_LOG_PROB_CACHE = LogProbCache(n_alleles=4)
+_LOG_PROB_CACHE_INDEL = LogProbCache(n_alleles=6)
+
+
+def _select_log_prob_cache(config: "HaplotyperConfig") -> "LogProbCache":
+    """Pick the appropriate cache for the active config."""
+    return _LOG_PROB_CACHE_INDEL if config.include_indels else _LOG_PROB_CACHE
 
 
 # =============================================================================
@@ -477,13 +507,53 @@ _LOG_PROB_CACHE = LogProbCache()
 # =============================================================================
 
 
-def load_snvs_from_clair3(
+def load_snvs(
     vcf_path: str,
     contig_id: str | None = None,
     sample_name: str | None = None,
     config: HaplotyperConfig = DEFAULT_CONFIG,
-) -> tuple[list[int], dict[int, str], dict[int, int], dict[int, float | None]]:
-    """Load SNVs from Clair3 VCF."""
+) -> tuple[
+    list[int],
+    dict[int, str],
+    dict[int, int],
+    dict[int, float | None],
+    dict[int, str],
+    dict[int, tuple[int, int]],
+    dict[int, int],
+]:
+    """Load variants from a VCF.
+
+    Returns SNVs and (when ``config.include_indels`` is True) indels. The site
+    type per position is one of ``"snv"``, ``"del"``, or ``"ins"``.
+
+    The caller is trusted: this loader does not realign, fuzz-match, or attempt
+    to reconcile alignment differences. Each VCF record's position and alleles
+    are taken as-is. Run ``bcftools norm -f REF`` upstream so the placement is
+    canonical.
+
+    Returns
+    -------
+    snv_pos
+        Sorted list of variant positions (1-based VCF anchor position).
+    ref_alleles
+        Per-position REF allele string from the VCF (for SNVs one base; for
+        indels the full anchor+changed sequence).
+    depth, af
+        Per-position site depth and alt-allele frequency (AF may be ``None``).
+    site_type
+        Per-position type: ``"snv"`` / ``"del"`` / ``"ins"``.
+    del_span
+        For ``"del"`` sites only: the inclusive 1-based deleted-base footprint
+        on the reference, ``(start, end)``.
+    ins_len
+        For ``"ins"`` sites only: the number of inserted bases.
+
+    Notes
+    -----
+    Multi-allelic records are skipped when ``config.require_biallelic`` is True.
+    MNP records (same-length multi-base substitutions) are always skipped; rely
+    on ``bcftools norm -a`` to split them into SNVs upstream if needed.
+    """
     if not HAS_PYSAM:
         raise ImportError("pysam required for VCF parsing")
 
@@ -491,6 +561,9 @@ def load_snvs_from_clair3(
     ref_alleles = {}
     depth = {}
     af = {}
+    site_type: dict[int, str] = {}
+    del_span: dict[int, tuple[int, int]] = {}
+    ins_len: dict[int, int] = {}
 
     vcf = pysam.VariantFile(vcf_path)
 
@@ -507,10 +580,6 @@ def load_snvs_from_clair3(
         if record.filter.keys() and "PASS" not in record.filter.keys():
             continue
 
-        # SNP only
-        if len(record.ref) != 1:
-            continue
-
         alts = record.alts
         if alts is None or len(alts) == 0:
             continue
@@ -519,8 +588,21 @@ def load_snvs_from_clair3(
         if config.require_biallelic and len(alts) > 1:
             continue
 
+        ref = record.ref
         alt = alts[0]
-        if len(alt) != 1:
+
+        # Classify variant. We collapse all indels at a position to a single
+        # state (DEL/INS); size differences are intentionally ignored.
+        if len(ref) == 1 and len(alt) == 1:
+            stype = "snv"
+        elif not config.include_indels:
+            continue
+        elif len(ref) > len(alt):
+            stype = "del"
+        elif len(alt) > len(ref):
+            stype = "ins"
+        else:
+            # MNP (same length, multi-base) — skip; not handled.
             continue
 
         # Get sample
@@ -552,21 +634,33 @@ def load_snvs_from_clair3(
             if ad and len(ad) >= 2 and sum(ad) > 0:
                 site_af = ad[1] / sum(ad)
 
-        # AF filter
-        if site_af is not None:
+        # Optional AF range filter (None = no filter; the default).
+        if config.af_range is not None and site_af is not None:
             if not (config.af_range[0] <= site_af <= config.af_range[1]):
                 continue
-        elif not config.skip_af_filter_if_missing:
-            continue
 
         pos = record.pos
         snv_pos.append(pos)
-        ref_alleles[pos] = record.ref
+        ref_alleles[pos] = ref
         depth[pos] = site_depth
         af[pos] = site_af
+        site_type[pos] = stype
+
+        # Pre-compute exact CIGAR-event keys per indel site so the per-read
+        # decision is a dict/set lookup. After ``bcftools norm``, biallelic
+        # indels are left-anchored: REF starts with the anchor base(s)
+        # matching ALT, then either deletes (REF longer) or inserts (ALT
+        # longer) the trailing bases.
+        if stype == "del":
+            del_start = pos + len(alt)
+            del_end = pos + len(ref) - 1
+            if del_end >= del_start:
+                del_span[pos] = (del_start, del_end)
+        elif stype == "ins":
+            ins_len[pos] = len(alt) - len(ref)
 
     vcf.close()
-    return snv_pos, ref_alleles, depth, af
+    return snv_pos, ref_alleles, depth, af, site_type, del_span, ins_len
 
 
 def make_windows_lazy(
@@ -577,6 +671,9 @@ def make_windows_lazy(
     ref_alleles: dict[int, str],
     config: HaplotyperConfig = DEFAULT_CONFIG,
     sample_id: str | None = None,
+    site_type: dict[int, str] | None = None,
+    del_span: dict[int, tuple[int, int]] | None = None,
+    ins_len: dict[int, int] | None = None,
 ) -> list[Window]:
     """
     Create overlapping windows with lazy per-window read loading.
@@ -620,6 +717,27 @@ def make_windows_lazy(
         snv_set = set(window_snvs)
         reads = []
 
+        # Partition window sites by type for fast lookup during extraction.
+        # Sites without a recorded type default to "snv" (back-compat).
+        st = site_type or {}
+        ds = del_span or {}
+        il = ins_len or {}
+        # Per-window indel index. Decisions are dict/set lookups (O(1)) at
+        # use time:
+        #   del_key_to_pos: (D-op start_1b, D-op length) -> indel site pos
+        #   ins_anchor_to_pos: I-op anchor_1b -> indel site pos
+        indel_site_set = {p for p in window_snvs if st.get(p, "snv") != "snv"}
+        del_key_to_pos: dict[tuple[int, int], int] = {}
+        ins_anchor_to_pos: dict[int, int] = {}
+        for p in indel_site_set:
+            stype_p = st[p]
+            if stype_p == "del" and p in ds:
+                d_start, d_end = ds[p]
+                d_len = d_end - d_start + 1
+                del_key_to_pos[(d_start, d_len)] = p
+            elif stype_p == "ins" and p in il:
+                ins_anchor_to_pos[p] = p
+
         # pysam fetch uses 0-based coordinates
         for aln in bam.fetch(contig_id, start - 1, end - 1):
             if aln.is_secondary or aln.is_supplementary or aln.is_unmapped:
@@ -645,7 +763,7 @@ def make_windows_lazy(
                     f"Some reads lack quality scores. Using default Q{config.default_base_quality}.",
                 )
 
-            # Extract alleles at SNV positions
+            # Extract alleles at SNV positions (matched bases only).
             has_overlap = False
             for query_pos, ref_pos in aln.get_aligned_pairs(with_seq=False):
                 if query_pos is None or ref_pos is None:
@@ -653,6 +771,9 @@ def make_windows_lazy(
 
                 ref_pos_1based = ref_pos + 1
                 if ref_pos_1based not in snv_set:
+                    continue
+                # Indel sites are handled below via the CIGAR scan.
+                if ref_pos_1based in indel_site_set:
                     continue
 
                 base = query_seq[query_pos]
@@ -662,6 +783,81 @@ def make_windows_lazy(
                     r.alleles[ref_pos_1based] = base
                     r.quals[ref_pos_1based] = qual
                     has_overlap = True
+
+            # Extract alleles at indel sites.
+            #
+            # We trust the variant caller's positions exactly (run bcftools
+            # norm upstream). For each VCF indel site, the read carries the
+            # variant iff its CIGAR contains the matching indel op:
+            #
+            #   DEL: a D op of exactly the deleted length, starting at the
+            #        deleted footprint's first base
+            #   INS: an I op anchored exactly at the VCF anchor position
+            #
+            # Otherwise, if a matched base (M/=/X) covers the anchor, record
+            # it as the read's "vote against" the indel. Otherwise, no call.
+            if indel_site_set and aln.cigartuples:
+                # Single CIGAR walk: collect indel events and the matched-base
+                # ref->query mapping for indel-anchor positions only.
+                ref_cursor = aln.reference_start  # 0-based
+                query_cursor = 0
+                # Calls produced by this read at indel anchors. We assemble
+                # them, then resolve REF-base fallback at the end.
+                indel_calls: dict[int, tuple[str, int]] = {}
+                # ref_pos_1b -> query_idx for indel anchors covered by M/=/X.
+                anchor_qpos: dict[int, int] = {}
+
+                for op, length in aln.cigartuples:
+                    if op in (0, 7, 8):  # M / = / X — consumes both
+                        # For each indel anchor inside this M op, remember
+                        # the query index so we can record the matched base
+                        # if no DEL/INS call is made.
+                        op_start_1b = ref_cursor + 1
+                        op_end_1b_excl = ref_cursor + length + 1
+                        for pos in indel_site_set:
+                            if op_start_1b <= pos < op_end_1b_excl:
+                                anchor_qpos[pos] = query_cursor + (pos - op_start_1b)
+                        ref_cursor += length
+                        query_cursor += length
+                    elif op == 2:  # D
+                        key = (ref_cursor + 1, length)
+                        pos = del_key_to_pos.get(key)
+                        if pos is not None:
+                            indel_calls[pos] = ("DEL", aln.mapping_quality)
+                        ref_cursor += length
+                    elif op == 1:  # I
+                        # Anchor is the 1-based position immediately before
+                        # the inserted bases (== ref_cursor in 1-based terms).
+                        anchor = ref_cursor
+                        pos = ins_anchor_to_pos.get(anchor)
+                        if pos is not None:
+                            indel_calls[pos] = ("INS", aln.mapping_quality)
+                        query_cursor += length
+                    elif op == 3:  # N: consumes ref only
+                        ref_cursor += length
+                    elif op == 4:  # S: consumes query only
+                        query_cursor += length
+                    # op 5 (H) and 6 (P) consume neither.
+
+                # Apply DEL/INS calls.
+                for pos, (allele, mq) in indel_calls.items():
+                    r.alleles[pos] = allele
+                    r.quals[pos] = mq
+                    has_overlap = True
+
+                # For indel sites with no DEL/INS call but a matched anchor
+                # base, record the base as the read's "ref-like" vote.
+                for pos, qpos in anchor_qpos.items():
+                    if pos in indel_calls:
+                        continue
+                    base = query_seq[qpos]
+                    qual = (
+                        query_qual[qpos] if query_qual else config.default_base_quality
+                    )
+                    if qual >= config.min_base_quality:
+                        r.alleles[pos] = base
+                        r.quals[pos] = qual
+                        has_overlap = True
 
             if has_overlap:
                 reads.append(r)
@@ -837,8 +1033,9 @@ class EMHaplotyper:
         self.reads = window.reads
         self.config = config
 
-        # Use global log probability cache
-        self._cache = _LOG_PROB_CACHE
+        # Use the cache appropriate for the active alphabet size (4 for SNVs
+        # only, 6 when indels are enabled).
+        self._cache = _select_log_prob_cache(config)
 
     def _compute_log_prob_read_hap(self, read: Read, haplotype: Haplotype) -> float | None:
         """Compute log P(read | haplotype) using cached base probs."""
@@ -856,8 +1053,9 @@ class EMHaplotyper:
     def _compute_log_prob_read_junk(self, read: Read) -> float:
         """Compute log P(read | junk) using divergent reference model."""
         p_div = self.config.junk_divergence_rate
+        n_alleles = self._cache.n_alleles
         log_match = np.log(1.0 - p_div + 1e-12)
-        log_miss = np.log(p_div / 3.0 + 1e-12)
+        log_miss = np.log(p_div / float(n_alleles - 1) + 1e-12)
 
         log_prob = 0.0
         for pos, read_base in read.alleles.items():
@@ -1623,12 +1821,15 @@ class LongitudinalIntegrator:
         junk_idx = n_haps
 
         gamma = np.zeros((n_reads, k_eff))
-        cache = _LOG_PROB_CACHE
+        cache = _select_log_prob_cache(self.config)
 
-        # Junk model constants
+        # Junk model constants. Spread the divergence probability over the
+        # ``n_alleles - 1`` non-matching states so the model is consistent with
+        # the active alphabet (4 for SNVs only, 6 with indels).
         p_div = self.config.junk_divergence_rate
+        n_alleles = cache.n_alleles
         log_junk_match = np.log(1.0 - p_div + 1e-12)
-        log_junk_miss = np.log(p_div / 3.0 + 1e-12)
+        log_junk_miss = np.log(p_div / float(n_alleles - 1) + 1e-12)
 
         for i, read in enumerate(reads):
             logp_k = np.full(k_eff, -np.inf)
@@ -2141,18 +2342,27 @@ def process_contig(
     Windows overlap by 50% to enable linking haplotypes based on
     consensus similarity in shared SNV positions.
     """
-    # 1) Load SNVs for this contig from the VCF.
-    snv_pos, ref_alleles, depth, af = load_snvs_from_clair3(
+    # 1) Load SNVs (and indels, if enabled) for this contig from the VCF.
+    snv_pos, ref_alleles, depth, af, site_type, del_span, ins_len = load_snvs(
         vcf_path, contig_id, vcf_sample_name, config
     )
 
     if not snv_pos:
-        logging.warning(f"No SNVs found for contig {contig_id}")
+        logging.warning(f"No variants found for contig {contig_id}")
         return []
 
     # 2) Create overlapping windows with lazy read loading.
     windows = make_windows_lazy(
-        bam_path, contig_id, contig_length, snv_pos, ref_alleles, config, sample_id
+        bam_path,
+        contig_id,
+        contig_length,
+        snv_pos,
+        ref_alleles,
+        config,
+        sample_id,
+        site_type=site_type,
+        del_span=del_span,
+        ins_len=ins_len,
     )
 
     if not windows:
