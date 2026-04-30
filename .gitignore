@@ -46,3 +46,6 @@ strains/
 
 # Local instructions
 agents.md
+future_work.md
+submit_bcf_to_vcf_array.sh
+run_bcf_to_vcf_array.sh
