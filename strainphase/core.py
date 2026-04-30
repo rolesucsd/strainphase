@@ -29,7 +29,6 @@ import logging
 import warnings
 from collections import defaultdict
 from dataclasses import dataclass, field
-from functools import partial
 from multiprocessing import Pool
 
 import community as community_louvain
@@ -2335,6 +2334,7 @@ def process_contig(
     config: HaplotyperConfig = DEFAULT_CONFIG,
     sample_id: str | None = None,
     vcf_sample_name: str | None = None,
+    pool: Pool | None = None,
 ) -> list[WindowResult]:
     """
     Process all windows in a contig and link haplotypes across windows.
@@ -2369,18 +2369,25 @@ def process_contig(
         logging.warning(f"No valid windows for contig {contig_id}")
         return []
 
-    # 3) Process windows (parallel if n_workers > 1).
+    # 3) Process windows (parallel if a pool is supplied or n_workers > 1).
     n_workers = config.n_workers
-    if n_workers > 1 and len(windows) > 1:
-        # Parallel processing using multiprocessing Pool
+    if pool is not None and len(windows) > 1:
+        # Reuse a caller-owned pool. Workers must already have been initialized
+        # with this config via _init_worker (see make_worker_pool).
+        n_pool_workers = getattr(pool, "_processes", 1)
+        chunksize = max(1, len(windows) // (n_pool_workers * 4))
+        logging.info(
+            f"Processing {len(windows)} windows on {contig_id} with {n_pool_workers} shared workers"
+        )
+        results = pool.map(_process_window_wrapper, windows, chunksize=chunksize)
+    elif n_workers > 1 and len(windows) > 1:
+        # No pool supplied: spin up a one-shot pool. Initializer ships config
+        # to workers exactly once instead of re-pickling it with every task.
         n_workers = min(n_workers, len(windows))
         logging.info(f"Processing {len(windows)} windows with {n_workers} workers")
-
-        # Use partial to bind config to process_window
-        process_func = partial(_process_window_wrapper, config=config)
-
-        with Pool(n_workers) as pool:
-            results = pool.map(process_func, windows)
+        chunksize = max(1, len(windows) // (n_workers * 4))
+        with make_worker_pool(n_workers, config) as p:
+            results = p.map(_process_window_wrapper, windows, chunksize=chunksize)
     else:
         # Sequential processing
         results = []
@@ -2394,9 +2401,28 @@ def process_contig(
     return results
 
 
-def _process_window_wrapper(window: Window, config: HaplotyperConfig) -> WindowResult:
-    """Wrapper for process_window that can be pickled for multiprocessing."""
-    return process_window(window, config)
+_WORKER_CONFIG: HaplotyperConfig | None = None
+
+
+def _init_worker(config: HaplotyperConfig) -> None:
+    """Pool initializer: stash config in a module global so workers can read it
+    without paying pickle cost per task."""
+    global _WORKER_CONFIG
+    _WORKER_CONFIG = config
+
+
+def _process_window_wrapper(window: Window) -> WindowResult:
+    """Wrapper for process_window. Reads config from the worker-local global
+    set by _init_worker, avoiding per-task config pickling."""
+    assert _WORKER_CONFIG is not None, "Worker pool was not initialized with a config"
+    return process_window(window, _WORKER_CONFIG)
+
+
+def make_worker_pool(n_workers: int, config: HaplotyperConfig) -> Pool:
+    """Create a multiprocessing Pool whose workers are pre-initialized with
+    `config`. Reuse this pool across many process_contig calls to avoid
+    paying spawn/import overhead per contig."""
+    return Pool(n_workers, initializer=_init_worker, initargs=(config,))
 
 
 def process_mag_longitudinal(*args, **kwargs):

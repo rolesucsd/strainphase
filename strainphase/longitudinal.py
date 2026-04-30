@@ -47,6 +47,7 @@ from strainphase.core import (
     LongitudinalIntegrator,
     WindowResult,
     link_windows,
+    make_worker_pool,
     process_contig,
     results_to_dataframe,
 )
@@ -197,6 +198,12 @@ def process_mag_longitudinal(
     # (process_contig now includes window linking)
     all_results: dict[str, dict[str, list[WindowResult]]] = {}
 
+    # Build one worker pool for the whole MAG run so we don't pay spawn /
+    # re-import / config-pickling cost per contig. Workers are initialized
+    # once with `config`; process_contig forwards `pool` and uses it directly.
+    n_workers = max(1, getattr(config, "n_workers", 1))
+    worker_pool = make_worker_pool(n_workers, config) if n_workers > 1 else None
+
     for sample_id in samples:
         logging.info(f"  Sample {sample_id}: initial contig processing")
         all_results[sample_id] = {}
@@ -210,6 +217,7 @@ def process_mag_longitudinal(
                     contig_length=contig_length,
                     config=config,
                     sample_id=sample_id,
+                    pool=worker_pool,
                 )
 
                 if results:
@@ -279,6 +287,10 @@ def process_mag_longitudinal(
         logging.info(f"  Returning integrator with {len(integrator.rescue_statistics)} statistics records")
     else:
         logging.info(f"  No integrator (len(samples)={len(samples)})")
+
+    if worker_pool is not None:
+        worker_pool.close()
+        worker_pool.join()
 
     return all_results, integrator
 
