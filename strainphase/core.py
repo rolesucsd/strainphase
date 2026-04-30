@@ -83,15 +83,15 @@ class HaplotyperConfig:
     """
 
     # =========== WINDOW PARAMETERS ===========
-    window_size: int = 10000
-    min_snvs_per_window: int = 3
-    min_reads_per_window: int = 5
+    window_size: int = 20000
+    min_snvs_per_window: int = 1
+    min_reads_per_window: int = 3
 
     # =========== READ FILTERING ===========
     min_mapq: int = 20
     min_base_quality: int = 20
     default_base_quality: int = 20
-    max_reads_per_window: int = 1000
+    max_reads_per_window: int = 10000
 
     # =========== VARIANT FILTERING ===========
     min_depth_site: int = 3
@@ -2583,8 +2583,8 @@ if __name__ == "__main__":
     parser.add_argument("--vcf-sample", help="Sample name in VCF")
     parser.add_argument("--output", default="haplotypes.tsv")
     parser.add_argument("--seed", type=int, help="Random seed for reproducibility")
-    parser.add_argument("--window-size", type=int, default=3000)
-    parser.add_argument("--max-reads", type=int, default=300)
+    parser.add_argument("--window-size", type=int, default=20000)
+    parser.add_argument("--max-reads", type=int, default=10000)
     parser.add_argument("--no-validate", action="store_true", help="Disable result validation")
 
     args = parser.parse_args()

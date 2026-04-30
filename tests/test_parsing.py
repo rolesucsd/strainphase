@@ -672,3 +672,63 @@ def test_default_config_is_indel_aware():
     """The default config enables indels and uses no AF filter."""
     assert DEFAULT_CONFIG.include_indels is True
     assert DEFAULT_CONFIG.af_range is None
+
+
+# ============================================================================
+# Simulator: indel injection round-trip
+# ============================================================================
+
+
+def test_simulator_emits_indel_cigar():
+    """``simulate_read`` emits D and I CIGAR ops when the strain carries indels."""
+    import numpy as np
+
+    from validation.simulate_reads import Strain, simulate_read
+
+    s = Strain(id="S", genome_file="-")
+    ref = "ACGTACGTACGT" * 20  # 240 bp
+    s.contigs["c"] = ref
+    s.deletions["c"] = {50: 3}  # delete 3 bases after pos 50
+    s.insertions["c"] = {100: "NNN"}  # insert NNN after pos 100
+
+    rng = np.random.default_rng(0)
+    seq, quals, cigar = simulate_read(s, "c", 0, 200, 0.0, rng)
+
+    assert "3D" in cigar
+    assert "3I" in cigar
+    # Read sequence: 200 ref positions - 3 deleted + 3 inserted = 200 bp
+    assert len(seq) == 200
+    assert len(quals) == 200
+
+
+def test_simulator_writes_canonical_indel_vcf(tmp_path):
+    """``write_vcf`` emits indels in canonical left-anchored form."""
+    from validation.simulate_reads import Strain, write_vcf
+
+    ref = Strain(id="ref", genome_file="-")
+    ref.contigs["c"] = "ACGT" * 60  # 240 bp
+
+    s1 = Strain(id="s1", genome_file="-")
+    s1.contigs["c"] = ref.contigs["c"]
+    s1.deletions["c"] = {100: 3}
+    s1.insertions["c"] = {150: "TTT"}
+
+    out = tmp_path / "truth.vcf"
+    write_vcf({"c": []}, [ref, s1], ref, str(out))
+
+    body = [l for l in out.read_text().splitlines() if not l.startswith("#")]
+    # Two records: one DEL and one INS
+    assert len(body) == 2
+
+    rows = [l.split("\t") for l in body]
+    by_pos = {int(r[1]): r for r in rows}
+
+    # DEL: anchor 0-based 100 -> VCF POS 101; REF len = 1+3 = 4; ALT len = 1
+    del_row = by_pos[101]
+    assert len(del_row[3]) == 4
+    assert len(del_row[4]) == 1
+
+    # INS: anchor 0-based 150 -> VCF POS 151; REF len = 1; ALT len = 1+3 = 4
+    ins_row = by_pos[151]
+    assert len(ins_row[3]) == 1
+    assert len(ins_row[4]) == 4
