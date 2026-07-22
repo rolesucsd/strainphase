@@ -10,6 +10,8 @@ Usage:
     strainphase version      # Show version
 """
 
+from __future__ import annotations
+
 import argparse
 import logging
 import os
@@ -100,6 +102,9 @@ def cmd_longitudinal(args: argparse.Namespace) -> int:
     # Build path mappings
     bam_paths = {s: args.bams.format(sample=s) for s in samples}
     vcf_paths = {s: args.vcfs.format(sample=s) for s in samples}
+    sv_sidecar_paths = None
+    if getattr(args, "sv_sidecars", None):
+        sv_sidecar_paths = {s: args.sv_sidecars.format(sample=s) for s in samples}
 
     # Verify files exist
     for sample in samples:
@@ -108,6 +113,9 @@ def cmd_longitudinal(args: argparse.Namespace) -> int:
             return 1
         if not os.path.exists(vcf_paths[sample]):
             logging.error(f"VCF not found: {vcf_paths[sample]}")
+            return 1
+        if sv_sidecar_paths and not os.path.exists(sv_sidecar_paths[sample]):
+            logging.error(f"SV sidecar not found: {sv_sidecar_paths[sample]}")
             return 1
 
     # Load contig filter if provided
@@ -155,6 +163,7 @@ def cmd_longitudinal(args: argparse.Namespace) -> int:
             bam_paths=bam_paths,
             vcf_paths=vcf_paths,
             config=config,
+            sv_sidecar_paths=sv_sidecar_paths,
         )
         all_results[mag_name] = results
         if integrator:
@@ -292,6 +301,11 @@ Examples:
     long_parser.add_argument("--samples", required=True, help="Comma-separated sample IDs")
     long_parser.add_argument("--bams", required=True, help="BAM path template with {sample}")
     long_parser.add_argument("--vcfs", required=True, help="VCF path template with {sample}")
+    long_parser.add_argument(
+        "--sv-sidecars",
+        help="Optional SV sidecar TSV template with {sample} "
+        "(from strainphase.sv_encoding) to co-phase structural variants",
+    )
     long_parser.add_argument("--reference", required=True, help="Reference FASTA")
     long_parser.add_argument("--output-dir", "-o", required=True, help="Output directory")
     long_parser.add_argument("--mags", help="Comma-separated MAG names (default: all)")

@@ -495,6 +495,11 @@ class LogProbCache:
 _LOG_PROB_CACHE = LogProbCache(n_alleles=4)
 _LOG_PROB_CACHE_INDEL = LogProbCache(n_alleles=6)
 
+# Padding (bp) around an SV breakpoint anchor when deciding whether a read's
+# reference span brackets it. Absorbs Sniffles breakpoint imprecision
+# (CIPOS/CIEND) and soft-clip edges. See strainphase.sv_encoding.
+_SV_ANCHOR_PAD = 50
+
 
 def _select_log_prob_cache(config: "HaplotyperConfig") -> "LogProbCache":
     """Pick the appropriate cache for the active config."""
@@ -673,6 +678,7 @@ def make_windows_lazy(
     site_type: dict[int, str] | None = None,
     del_span: dict[int, tuple[int, int]] | None = None,
     ins_len: dict[int, int] | None = None,
+    sv_support: dict[int, set[str]] | None = None,
 ) -> list[Window]:
     """
     Create overlapping windows with lazy per-window read loading.
@@ -721,11 +727,18 @@ def make_windows_lazy(
         st = site_type or {}
         ds = del_span or {}
         il = ins_len or {}
+        sv_sup = sv_support or {}
         # Per-window indel index. Decisions are dict/set lookups (O(1)) at
         # use time:
         #   del_key_to_pos: (D-op start_1b, D-op length) -> indel site pos
         #   ins_anchor_to_pos: I-op anchor_1b -> indel site pos
-        indel_site_set = {p for p in window_snvs if st.get(p, "snv") != "snv"}
+        indel_site_set = {p for p in window_snvs if st.get(p, "snv") in ("del", "ins")}
+        # SV pseudo-sites: present/absent driven by Sniffles' supporting-read
+        # set (see strainphase.sv_encoding), NOT by CIGAR ops. Kept separate
+        # from indel_site_set so the D/I exact-match logic never touches them.
+        sv_site_set = {p for p in window_snvs if st.get(p, "snv") in ("sv_ins", "sv_del")}
+        # Sites parsed outside the base-by-base SNV loop (indels + SVs).
+        special_site_set = indel_site_set | sv_site_set
         del_key_to_pos: dict[tuple[int, int], int] = {}
         ins_anchor_to_pos: dict[int, int] = {}
         for p in indel_site_set:
@@ -771,8 +784,8 @@ def make_windows_lazy(
                 ref_pos_1based = ref_pos + 1
                 if ref_pos_1based not in snv_set:
                     continue
-                # Indel sites are handled below via the CIGAR scan.
-                if ref_pos_1based in indel_site_set:
+                # Indel and SV sites are handled below (CIGAR scan / support set).
+                if ref_pos_1based in special_site_set:
                     continue
 
                 base = query_seq[query_pos]
@@ -795,25 +808,25 @@ def make_windows_lazy(
             #
             # Otherwise, if a matched base (M/=/X) covers the anchor, record
             # it as the read's "vote against" the indel. Otherwise, no call.
-            if indel_site_set and aln.cigartuples:
+            if special_site_set and aln.cigartuples:
                 # Single CIGAR walk: collect indel events and the matched-base
-                # ref->query mapping for indel-anchor positions only.
+                # ref->query mapping for indel/SV-anchor positions only.
                 ref_cursor = aln.reference_start  # 0-based
                 query_cursor = 0
                 # Calls produced by this read at indel anchors. We assemble
                 # them, then resolve REF-base fallback at the end.
                 indel_calls: dict[int, tuple[str, int]] = {}
-                # ref_pos_1b -> query_idx for indel anchors covered by M/=/X.
+                # ref_pos_1b -> query_idx for indel/SV anchors covered by M/=/X.
                 anchor_qpos: dict[int, int] = {}
 
                 for op, length in aln.cigartuples:
                     if op in (0, 7, 8):  # M / = / X — consumes both
-                        # For each indel anchor inside this M op, remember
+                        # For each indel/SV anchor inside this M op, remember
                         # the query index so we can record the matched base
-                        # if no DEL/INS call is made.
+                        # if no DEL/INS/SV call is made.
                         op_start_1b = ref_cursor + 1
                         op_end_1b_excl = ref_cursor + length + 1
-                        for pos in indel_site_set:
+                        for pos in special_site_set:
                             if op_start_1b <= pos < op_end_1b_excl:
                                 anchor_qpos[pos] = query_cursor + (pos - op_start_1b)
                         ref_cursor += length
@@ -844,10 +857,27 @@ def make_windows_lazy(
                     r.quals[pos] = mq
                     has_overlap = True
 
-                # For indel sites with no DEL/INS call but a matched anchor
-                # base, record the base as the read's "ref-like" vote.
+                # Apply SV pseudo-site "present" calls. A read carries the SV
+                # iff its name is in Sniffles' supporting-read set AND this
+                # alignment's reference span brackets the breakpoint anchor
+                # (within a small pad for breakpoint imprecision / soft-clip).
+                # The span check prevents a read whose *other* split segment
+                # supports the SV elsewhere from being called present here.
+                if sv_site_set:
+                    aln_start_1b = aln.reference_start + 1
+                    aln_end_1b = aln.reference_end  # 1-based inclusive
+                    for pos in sv_site_set:
+                        if aln.query_name not in sv_sup.get(pos, ()):
+                            continue
+                        if aln_start_1b - _SV_ANCHOR_PAD <= pos <= aln_end_1b + _SV_ANCHOR_PAD:
+                            r.alleles[pos] = "INS" if st.get(pos) == "sv_ins" else "DEL"
+                            r.quals[pos] = aln.mapping_quality
+                            has_overlap = True
+
+                # For indel/SV sites with no event call but a matched anchor
+                # base, record the base as the read's "ref-like" (absent) vote.
                 for pos, qpos in anchor_qpos.items():
-                    if pos in indel_calls:
+                    if pos in r.alleles:  # already called (indel or SV present)
                         continue
                     base = query_seq[qpos]
                     qual = (
@@ -2335,17 +2365,52 @@ def process_contig(
     sample_id: str | None = None,
     vcf_sample_name: str | None = None,
     pool: Pool | None = None,
+    sv_sidecar_path: str | None = None,
 ) -> list[WindowResult]:
     """
     Process all windows in a contig and link haplotypes across windows.
 
     Windows overlap by 50% to enable linking haplotypes based on
     consensus similarity in shared SNV positions.
+
+    If ``sv_sidecar_path`` is given (see :mod:`strainphase.sv_encoding`),
+    structural variants are merged in as biallelic pseudo-sites and co-phased
+    with SNVs. Backward compatible: ``None`` reproduces SNV/indel-only behavior.
     """
     # 1) Load SNVs (and indels, if enabled) for this contig from the VCF.
     snv_pos, ref_alleles, depth, af, site_type, del_span, ins_len = load_snvs(
         vcf_path, contig_id, vcf_sample_name, config
     )
+
+    # 1b) Merge SV pseudo-sites from the sidecar (if provided). Anchors that
+    # collide with a real variant are dropped to avoid clobbering (caveat 7).
+    sv_support = None
+    if sv_sidecar_path:
+        from strainphase.sv_encoding import load_sv_sidecar_for_contig
+
+        sv_pos, sv_ref, sv_stype, sv_support = load_sv_sidecar_for_contig(
+            sv_sidecar_path, contig_id
+        )
+        n_added = n_collision = 0
+        for p in sv_pos:
+            if p in ref_alleles:
+                n_collision += 1
+                sv_support.pop(p, None)
+                continue
+            snv_pos.append(p)
+            ref_alleles[p] = sv_ref[p]
+            site_type[p] = sv_stype[p]
+            n_added += 1
+        if n_added or n_collision:
+            logging.info(
+                f"Contig {contig_id}: merged {n_added} SV pseudo-sites "
+                f"({n_collision} dropped for colliding with a called variant)"
+            )
+        if n_added and not config.include_indels:
+            logging.warning(
+                "SV pseudo-sites use the INS/DEL alphabet but include_indels=False; "
+                "set include_indels=True for a consistent 6-allele error model."
+            )
 
     if not snv_pos:
         logging.warning(f"No variants found for contig {contig_id}")
@@ -2363,6 +2428,7 @@ def process_contig(
         site_type=site_type,
         del_span=del_span,
         ins_len=ins_len,
+        sv_support=sv_support,
     )
 
     if not windows:
