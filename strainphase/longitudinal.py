@@ -872,12 +872,21 @@ def main():
     parser.add_argument(
         "--contig-filter", help="TSV or text file listing contigs to include (see docstring)"
     )
-    parser.add_argument("--window-size", type=int, default=6000, help="Window size for haplotyping")
+    parser.add_argument("--window-size", type=int, default=20000, help="Window size for haplotyping")
     parser.add_argument(
         "--max-reads",
         type=int,
         default=1000,
         help="Max reads per window (subsampling for performance)",
+    )
+    parser.add_argument(
+        "-j",
+        "--workers",
+        type=int,
+        default=1,
+        help="Parallel worker processes for within-MAG window processing "
+        "(default: 1 = sequential). Set this to --cpus-per-task so reserved "
+        "cores are actually used; useful for large/high-coverage MAGs.",
     )
     parser.add_argument("--seed", type=int, help="Random seed")
     parser.add_argument(
@@ -969,13 +978,18 @@ def main():
         lineage_merge_distance=args.lineage_merge_distance,
         min_shared_for_lineage=args.min_shared_for_lineage,
         max_span_gap_for_lineage=args.max_span_gap,
+        n_workers=max(1, args.workers),
     )
 
     # Get MAG -> contigs map, optionally filtered by allowed_contigs
     all_mags = parse_reference_contigs(args.reference, allowed_contigs)
 
-    if args.mags:
-        mag_names = [m.strip() for m in args.mags.split(",") if m.strip()]
+    mag_names_raw = args.mags.strip() if args.mags else ""
+    if mag_names_raw:
+        mag_names = [m.strip() for m in mag_names_raw.split(",") if m.strip()]
+        if not mag_names:
+            logging.error("--mags was provided but contains no valid MAG names after stripping whitespace")
+            sys.exit(1)
         mags_to_process = {m: all_mags[m] for m in mag_names if m in all_mags}
         missing = sorted(set(mag_names) - set(mags_to_process.keys()))
         if missing:

@@ -112,7 +112,7 @@ class HaplotyperConfig:
 
     # =========== GRAPH CONSTRUCTION ===========
     min_shared_snvs_for_edge: int = 1
-    max_mismatch_frac: float = 0.02
+    max_mismatch_frac: float = 0.01
     min_reads_per_cluster: int = 3
 
     # =========== EM PARAMETERS ===========
@@ -127,8 +127,8 @@ class HaplotyperConfig:
     junk_divergence_rate: float = 0.10
 
     # =========== POST-PROCESSING ===========
-    merge_distance_threshold: float = 0.02
-    min_shared_for_merge: int = 3  # Min shared SNVs with actual calls to consider merging
+    merge_distance_threshold: float = 0.01
+    min_shared_for_merge: int = 2  # Min shared SNVs with actual calls to consider merging
     assign_confidence_threshold: float = 0.80
 
     # =========== 1-SNP VALIDATION ===========
@@ -141,14 +141,14 @@ class HaplotyperConfig:
 
     # =========== LONGITUDINAL PARAMETERS ===========
     min_weight_for_anchor: float = 0.2
-    rescue_match_distance: float = 0.02  # 2% divergence — matches unified distance threshold
-    min_shared_for_rescue: int = 3  # Min shared SNVs with actual calls for rescue matching
+    rescue_match_distance: float = 0.01  # 1% divergence — matches unified distance threshold
+    min_shared_for_rescue: int = 2  # Min shared SNVs with actual calls for rescue matching
     rescued_min_weight: float = 0.02
 
     # =========== LINEAGE CLUSTERING PARAMETERS ===========
     # Controls how tracks are clustered into lineages across samples
-    lineage_merge_distance: float = 0.02  # Max distance to merge tracks into same lineage
-    min_shared_for_lineage: int = 3  # Min shared SNVs to consider merging into lineage
+    lineage_merge_distance: float = 0.01  # Max distance to merge tracks into same lineage
+    min_shared_for_lineage: int = 2  # Min shared SNVs to consider merging into lineage
 
     # =========== LINKING DIAGNOSTICS ===========
     linking_debug: bool = False  # Record detailed linking diagnostics
@@ -158,7 +158,7 @@ class HaplotyperConfig:
     # =========== WINDOW LINKING PARAMETERS ===========
     # Haplotypes in adjacent overlapping windows are linked if their
     # consensus agrees on shared SNVs (Hamming distance <= max_link_distance)
-    max_link_distance: float = 0.02  # Max mismatch fraction to link
+    max_link_distance: float = 0.01  # Max mismatch fraction to link
     min_shared_snvs_for_link: int = (
         3  # Min shared SNVs with ACTUAL CALLS to link (not just window overlap)
     )

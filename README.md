@@ -53,7 +53,7 @@ strainphase longitudinal \
 from strainphase import HaplotyperConfig, process_contig
 
 config = HaplotyperConfig(
-    window_size=3000,
+    window_size=20000,
     max_mismatch_frac=0.02,
     min_weight_for_anchor=0.15,
 )
@@ -91,7 +91,7 @@ Required:
 Options:
   --sample ID         Sample identifier
   --output FILE       Output TSV file [default: haplotypes.tsv]
-  --window-size INT   Analysis window size [default: 3000]
+  --window-size INT   Analysis window size [default: 20000]
   --max-reads INT     Max reads per window [default: 300]
   --min-mapq INT      Minimum MAPQ [default: 20]
   --max-mismatch FLT  Max mismatch fraction [default: 0.02]
@@ -114,7 +114,7 @@ Required:
 Options:
   --mags LIST              Comma-separated MAG names [default: all]
   --contig-filter F        File listing allowed contigs
-  --window-size INT        Window size [default: 3000]
+  --window-size INT        Window size [default: 20000]
   --max-reads INT          Max reads per window [default: 300]
   --min-anchor-weight FLT  Minimum weight for anchor panel [default: 0.15]
   --rescued-min-weight FLT Minimum weight after rescue [default: 0.02]
@@ -124,7 +124,7 @@ Options:
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `window_size` | 3000 | Analysis window size (bp) |
+| `window_size` | 20000 | Analysis window size (bp) |
 | `max_mismatch_frac` | 0.02 | Max Hamming distance for graph edges |
 | `min_shared_snvs_for_edge` | 3 | Min shared SNVs to connect reads |
 | `merge_distance_threshold` | 0.01 | Distance threshold for merging haplotypes |

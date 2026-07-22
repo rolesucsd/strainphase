@@ -135,6 +135,7 @@ def cmd_longitudinal(args: argparse.Namespace) -> int:
         max_reads_per_window=args.max_reads,
         min_weight_for_anchor=args.min_anchor_weight,
         rescued_min_weight=args.rescued_min_weight,
+        n_workers=max(1, getattr(args, "workers", 1)),
         validate_results=False,
     )
 
@@ -269,7 +270,7 @@ Examples:
     run_parser.add_argument("--sample", help="Sample ID")
     run_parser.add_argument("--vcf-sample", help="Sample name in VCF")
     run_parser.add_argument("--output", "-o", default="haplotypes.tsv", help="Output file")
-    run_parser.add_argument("--window-size", type=int, default=3000, help="Window size (bp)")
+    run_parser.add_argument("--window-size", type=int, default=20000, help="Window size (bp)")
     run_parser.add_argument("--max-reads", type=int, default=300, help="Max reads per window")
     run_parser.add_argument("--min-mapq", type=int, default=20, help="Minimum MAPQ")
     run_parser.add_argument(
@@ -295,8 +296,16 @@ Examples:
     long_parser.add_argument("--output-dir", "-o", required=True, help="Output directory")
     long_parser.add_argument("--mags", help="Comma-separated MAG names (default: all)")
     long_parser.add_argument("--contig-filter", help="File with allowed contig names")
-    long_parser.add_argument("--window-size", type=int, default=3000, help="Window size (bp)")
+    long_parser.add_argument("--window-size", type=int, default=20000, help="Window size (bp)")
     long_parser.add_argument("--max-reads", type=int, default=300, help="Max reads per window")
+    long_parser.add_argument(
+        "-j",
+        "--workers",
+        type=int,
+        default=1,
+        help="Parallel worker processes for within-MAG window processing "
+        "(default: 1). Set to --cpus-per-task so reserved cores are used.",
+    )
     long_parser.add_argument(
         "--min-anchor-weight", type=float, default=0.15, help="Min weight for anchor"
     )
