@@ -41,6 +41,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         max_reads_per_window=args.max_reads,
         min_mapq=args.min_mapq,
         max_mismatch_frac=args.max_mismatch,
+        min_depth_site=args.min_depth_site,
         random_seed=args.seed,
         validate_results=not args.no_validate,
     )
@@ -143,6 +144,7 @@ def cmd_longitudinal(args: argparse.Namespace) -> int:
         max_reads_per_window=args.max_reads,
         min_weight_for_anchor=args.min_anchor_weight,
         rescued_min_weight=args.rescued_min_weight,
+        min_depth_site=args.min_depth_site,
         n_workers=max(1, getattr(args, "workers", 1)),
         validate_results=False,
     )
@@ -285,6 +287,13 @@ Examples:
     run_parser.add_argument(
         "--max-mismatch", type=float, default=0.02, help="Max mismatch fraction"
     )
+    run_parser.add_argument(
+        "--min-depth-site",
+        type=int,
+        default=3,
+        help="Min VCF DP to load a site. Set 1 for pre-called SNV lists (e.g. "
+        "SNooPy) where the BAM re-genotyping is the real depth gate.",
+    )
     run_parser.add_argument("--seed", type=int, help="Random seed")
     run_parser.add_argument("--no-validate", action="store_true", help="Skip result validation")
     run_parser.add_argument(
@@ -325,6 +334,13 @@ Examples:
     )
     long_parser.add_argument(
         "--rescued-min-weight", type=float, default=0.02, help="Min weight after rescue"
+    )
+    long_parser.add_argument(
+        "--min-depth-site",
+        type=int,
+        default=3,
+        help="Min VCF DP to load a site. Set 1 for pre-called SNV lists (e.g. "
+        "SNooPy) where the BAM re-genotyping is the real depth gate.",
     )
     long_parser.add_argument(
         "--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"]
