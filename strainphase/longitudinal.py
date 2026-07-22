@@ -178,6 +178,7 @@ def process_mag_longitudinal(
     bam_paths: dict[str, str],
     vcf_paths: dict[str, str],
     config: HaplotyperConfig,
+    sv_sidecar_paths: dict[str, str] | None = None,
 ) -> tuple[dict[str, dict[str, list[WindowResult]]], LongitudinalIntegrator | None]:
     """
     Process a single MAG across all samples with longitudinal rescue.
@@ -218,6 +219,9 @@ def process_mag_longitudinal(
                     config=config,
                     sample_id=sample_id,
                     pool=worker_pool,
+                    sv_sidecar_path=(
+                        sv_sidecar_paths.get(sample_id) if sv_sidecar_paths else None
+                    ),
                 )
 
                 if results:
@@ -862,6 +866,12 @@ def main():
     parser.add_argument("--samples", required=True, help="Comma-separated list of sample names")
     parser.add_argument("--bams", required=True, help="BAM path template with {sample} placeholder")
     parser.add_argument("--vcfs", required=True, help="VCF path template with {sample} placeholder")
+    parser.add_argument(
+        "--sv-sidecars",
+        help="Optional SV sidecar TSV path template with {sample} placeholder "
+        "(from strainphase.sv_encoding). Enables co-phasing of structural "
+        "variants as pseudo-SNVs.",
+    )
     parser.add_argument("--reference", required=True, help="Combined reference FASTA")
     parser.add_argument("--output-dir", required=True, help="Output directory")
 
@@ -953,10 +963,16 @@ def main():
     # Build file paths
     bam_paths = {s: args.bams.replace("{sample}", s) for s in samples}
     vcf_paths = {s: args.vcfs.replace("{sample}", s) for s in samples}
+    sv_sidecar_paths = None
+    if getattr(args, "sv_sidecars", None):
+        sv_sidecar_paths = {s: args.sv_sidecars.replace("{sample}", s) for s in samples}
 
     # Validate files exist
     for sample in samples:
-        for path, name in [(bam_paths[sample], "BAM"), (vcf_paths[sample], "VCF")]:
+        checks = [(bam_paths[sample], "BAM"), (vcf_paths[sample], "VCF")]
+        if sv_sidecar_paths:
+            checks.append((sv_sidecar_paths[sample], "SV sidecar"))
+        for path, name in checks:
             if not os.path.exists(path):
                 logging.error(f"{name} not found for {sample}: {path}")
                 sys.exit(1)
@@ -1015,6 +1031,7 @@ def main():
             bam_paths=bam_paths,
             vcf_paths=vcf_paths,
             config=config,
+            sv_sidecar_paths=sv_sidecar_paths,
         )
         all_results[mag_name] = mag_results
         if integrator:
