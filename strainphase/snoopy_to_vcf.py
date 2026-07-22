@@ -27,14 +27,15 @@ for two reasons this script fixes:
    valid ``##fileformat=VCFv4.2`` header (contig lengths sourced from the
    reference FASTA, so names/lengths match the BAM), sorts, bgzips, and tabixes.
 
-**All mutation types are kept by default** — SNVs, atomized MNP→SNVs, and
-indels — so nothing snoopy called is dropped. Length-changing blocks are
-emitted as a single left-anchored (shared-prefix-trimmed) del/ins record. Some
-snoopy indel blocks are *complex* (substitution + length change with no shared
-anchor base); those are emitted as-is and are best canonicalized by piping this
-tool's output through ``bcftools norm -a -f REF`` downstream (the Snakemake
-``snoopy_sample_vcf`` rule does exactly this). Pass ``--drop-indels`` only if
-you deliberately want an SNV-only VCF.
+**All mutation types are ALWAYS kept** — SNVs, atomized MNP→SNVs, and indels —
+so nothing snoopy called is dropped. There is no flag to disable indels
+(invariant, matching strainphase core; see ``docs/MUTATION_HANDLING.md``).
+Length-changing blocks are emitted as a single left-anchored
+(shared-prefix-trimmed) del/ins record. Some snoopy indel blocks are *complex*
+(substitution + length change with no shared anchor base); those are emitted
+as-is and are canonicalized by piping this tool's output through
+``bcftools norm -a -f REF`` downstream (the Snakemake ``snoopy_sample_vcf``
+rule does exactly this).
 
 Input (``--snoopy``) may be either:
   * a directory of SNooPy per-window/per-contig VCFs (e.g. the ``tmp/`` dir), or
@@ -141,13 +142,18 @@ def _parse_dp(info: str) -> int | None:
     return None
 
 
-def atomize(contig, pos, ref, alt, dp, include_indels):
+def atomize(contig, pos, ref, alt, dp):
     """Decompose one SNooPy record into atomic ``(pos, ref, alt, dp)`` variants.
+
+    EVERY mutation type is kept — SNVs, MNP->SNVs, and indels (invariant; there
+    is no flag to drop indels, matching strainphase core):
 
     * 1bp REF / 1bp ALT  -> passed through unchanged.
     * equal-length block -> one SNV per differing offset (identical bases dropped).
-    * length-changing    -> a single left-anchored del/ins if ``include_indels``,
-                            else skipped.
+    * length-changing    -> a single left-anchored del/ins (shared prefix trimmed
+                            to one anchor base; complex blocks with no shared
+                            anchor are emitted as-is for ``bcftools norm -a``
+                            downstream).
     """
     lr, la = len(ref), len(alt)
     out = []
@@ -159,7 +165,7 @@ def atomize(contig, pos, ref, alt, dp, include_indels):
             rb, ab = ref[i], alt[i]
             if rb.upper() != ab.upper() and rb in _BASES and ab in _BASES:
                 out.append((pos + i, rb.upper(), ab.upper(), dp))
-    elif include_indels:  # length-changing block: left-anchor on shared prefix
+    else:  # length-changing block -> indel (always kept)
         # Trim the common leading bases so the record is left-anchored, matching
         # the VCF indel convention strainphase's CIGAR matcher expects.
         shift = 0
@@ -202,14 +208,16 @@ def convert(
     snoopy_path: str,
     output: str,
     contig_lengths: dict[str, int],
-    include_indels: bool = True,
     check_ref: str | None = None,
 ) -> dict:
-    """Convert SNooPy output to a bgzipped, tabix-indexed strainphase VCF."""
+    """Convert SNooPy output to a bgzipped, tabix-indexed strainphase VCF.
+
+    Keeps every mutation type (SNVs, MNP->SNVs, indels); nothing is dropped.
+    """
     # (contig, pos) -> dict of {(ref, alt): dp}. A position with more than one
-    # distinct ALT is emitted as a multi-allelic record so strainphase's
-    # require_biallelic filter conservatively skips it rather than silently
-    # taking a last-write-wins allele.
+    # distinct ALT is emitted as a multi-allelic record; strainphase's load_snvs
+    # keeps multi-allelic sites (invariant), and `bcftools norm -m -` downstream
+    # splits them into biallelic records anyway.
     sites: dict[tuple[str, int], dict[tuple[str, str], int]] = defaultdict(dict)
 
     stats = defaultdict(int)
@@ -223,7 +231,7 @@ def convert(
             unknown_contigs.add(contig)
             continue
         dp = _parse_dp(info)
-        for apos, aref, aalt, adp in atomize(contig, pos, ref, alt, dp, include_indels):
+        for apos, aref, aalt, adp in atomize(contig, pos, ref, alt, dp):
             if apos < 1 or apos > contig_lengths[contig]:
                 stats["out_of_bounds"] += 1
                 continue
@@ -310,7 +318,6 @@ def main(argv=None):
     ap.add_argument("--ref", help="Reference FASTA (source of contig lengths; .fai built if absent)")
     ap.add_argument("--lengths-from", help="Alt length source: BAM/CRAM or BCF/VCF header")
     ap.add_argument("--sample", help="Sample label (informational; not written into the VCF)")
-    ap.add_argument("--drop-indels", action="store_true", help="Emit SNV-only VCF (default: keep indels too)")
     ap.add_argument("--check-ref", help="FASTA to validate SNooPy REF bases against (QC; reports mismatches)")
     args = ap.parse_args(argv)
 
@@ -321,7 +328,6 @@ def main(argv=None):
         args.snoopy,
         args.output,
         contig_lengths,
-        include_indels=not args.drop_indels,
         check_ref=args.check_ref,
     )
 
