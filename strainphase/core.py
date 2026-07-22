@@ -733,10 +733,12 @@ def make_windows_lazy(
         #   del_key_to_pos: (D-op start_1b, D-op length) -> indel site pos
         #   ins_anchor_to_pos: I-op anchor_1b -> indel site pos
         indel_site_set = {p for p in window_snvs if st.get(p, "snv") in ("del", "ins")}
-        # SV pseudo-sites: present/absent driven by Sniffles' supporting-read
-        # set (see strainphase.sv_encoding), NOT by CIGAR ops. Kept separate
-        # from indel_site_set so the D/I exact-match logic never touches them.
-        sv_site_set = {p for p in window_snvs if st.get(p, "snv") in ("sv_ins", "sv_del")}
+        # SV pseudo-sites: the "present" allele is the UNIQUE event ID (from
+        # Sniffles' supporting-read set; see strainphase.sv_encoding), NOT a
+        # generic INS/DEL token — distinct events stay distinct alleles so reads
+        # cluster only when they carry the identical event. Kept separate from
+        # indel_site_set so the D/I exact-match logic never touches them.
+        sv_site_set = {p for p in window_snvs if st.get(p, "snv") == "sv"}
         # Sites parsed outside the base-by-base SNV loop (indels + SVs).
         special_site_set = indel_site_set | sv_site_set
         del_key_to_pos: dict[tuple[int, int], int] = {}
@@ -857,22 +859,28 @@ def make_windows_lazy(
                     r.quals[pos] = mq
                     has_overlap = True
 
-                # Apply SV pseudo-site "present" calls. A read carries the SV
-                # iff its name is in Sniffles' supporting-read set AND this
-                # alignment's reference span brackets the breakpoint anchor
-                # (within a small pad for breakpoint imprecision / soft-clip).
-                # The span check prevents a read whose *other* split segment
-                # supports the SV elsewhere from being called present here.
+                # Apply SV pseudo-site "present" calls. A read carries a specific
+                # event iff its name is in THAT event's supporting-read set AND
+                # this alignment's reference span brackets the breakpoint anchor
+                # (small pad for imprecision / soft-clip). The allele is the
+                # event ID, so two distinct events at one anchor are a genuinely
+                # multi-allelic site. The span check prevents a read whose *other*
+                # split segment supports the SV elsewhere from being called here.
                 if sv_site_set:
                     aln_start_1b = aln.reference_start + 1
                     aln_end_1b = aln.reference_end  # 1-based inclusive
                     for pos in sv_site_set:
-                        if aln.query_name not in sv_sup.get(pos, ()):
+                        events = sv_sup.get(pos)
+                        if not events:
                             continue
-                        if aln_start_1b - _SV_ANCHOR_PAD <= pos <= aln_end_1b + _SV_ANCHOR_PAD:
-                            r.alleles[pos] = "INS" if st.get(pos) == "sv_ins" else "DEL"
-                            r.quals[pos] = aln.mapping_quality
-                            has_overlap = True
+                        if not (aln_start_1b - _SV_ANCHOR_PAD <= pos <= aln_end_1b + _SV_ANCHOR_PAD):
+                            continue
+                        for event_id, ev_reads in events.items():
+                            if aln.query_name in ev_reads:
+                                r.alleles[pos] = event_id
+                                r.quals[pos] = aln.mapping_quality
+                                has_overlap = True
+                                break
 
                 # For indel/SV sites with no event call but a matched anchor
                 # base, record the base as the read's "ref-like" (absent) vote.
@@ -2374,8 +2382,10 @@ def process_contig(
     consensus similarity in shared SNV positions.
 
     If ``sv_sidecar_path`` is given (see :mod:`strainphase.sv_encoding`),
-    structural variants are merged in as biallelic pseudo-sites and co-phased
-    with SNVs. Backward compatible: ``None`` reproduces SNV/indel-only behavior.
+    structural variants are merged in as pseudo-sites and co-phased with SNVs.
+    The "present" allele is the unique event ID, so a locus carrying two distinct
+    events is a multi-allelic site. Backward compatible: ``None`` reproduces
+    SNV/indel-only behavior.
     """
     # 1) Load SNVs (and indels, if enabled) for this contig from the VCF.
     snv_pos, ref_alleles, depth, af, site_type, del_span, ins_len = load_snvs(
@@ -2408,8 +2418,8 @@ def process_contig(
             )
         if n_added and not config.include_indels:
             logging.warning(
-                "SV pseudo-sites use the INS/DEL alphabet but include_indels=False; "
-                "set include_indels=True for a consistent 6-allele error model."
+                "SV pseudo-sites are non-ACGT alleles but include_indels=False; "
+                "set include_indels=True so the multi-state error model is used."
             )
 
     if not snv_pos:
