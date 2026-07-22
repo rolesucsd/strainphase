@@ -26,6 +26,7 @@ Date: 2025
 from __future__ import annotations
 
 import logging
+import os
 import warnings
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -94,7 +95,10 @@ class HaplotyperConfig:
 
     # =========== VARIANT FILTERING ===========
     min_depth_site: int = 3
-    require_biallelic: bool = True
+    # DEPRECATED / no-op. ``load_snvs`` now decomposes multi-allelic records
+    # allele-by-allele instead of dropping them, so nothing is lost. Retained
+    # only so old configs/CLIs that set it keep constructing.
+    require_biallelic: bool = False
     # Optional AF range filter. ``None`` (default) keeps all variants regardless
     # of allele frequency, which is what you want for longitudinal phasing
     # because a position fixed at AF=0 or AF=1 in one timepoint can still be
@@ -510,6 +514,51 @@ def _select_log_prob_cache(config: "HaplotyperConfig") -> "LogProbCache":
 # I/O FUNCTIONS - LAZY LOADING
 # =============================================================================
 
+# Canonical single-base alleles. Anything else at a 1bp site (N, IUPAC codes,
+# symbolic) is counted and logged rather than silently taken as a SNV.
+_ACGT = frozenset("ACGT")
+
+
+def _log_load_summary(vcf_path: str, contig_id: str | None, stats: dict[str, int]) -> None:
+    """Log a full per-load accounting so no variant is ever dropped silently.
+
+    Emits one INFO line with sites loaded per type and every skip reason with a
+    non-zero count. If any records were skipped, also emits a one-line WARNING
+    naming the reasons, so a reviewer scanning logs sees the loss immediately.
+    """
+    loaded = {
+        k[len("loaded_") :]: v for k, v in stats.items() if k.startswith("loaded_")
+    }
+    n_sites = sum(loaded.values())
+    skips = {
+        k: v for k, v in stats.items() if k.startswith("skip_") or k in (
+            "position_conflict",
+            "duplicate_site",
+        )
+    }
+    where = f" [{contig_id}]" if contig_id else ""
+    loaded_str = " ".join(f"{k}={v}" for k, v in sorted(loaded.items())) or "none"
+    logging.info(
+        "load_snvs%s %s: %d records seen -> %d sites (%s); "
+        "mnp_atomized=%d multiallelic_records=%d",
+        where,
+        os.path.basename(vcf_path),
+        stats.get("records_seen", 0),
+        n_sites,
+        loaded_str,
+        stats.get("mnp_atomized", 0),
+        stats.get("multiallelic_records", 0),
+    )
+    dropped = {k: v for k, v in skips.items() if v}
+    if dropped:
+        logging.warning(
+            "load_snvs%s %s: %d record/allele rejections (NOT silent) -> %s",
+            where,
+            os.path.basename(vcf_path),
+            sum(dropped.values()),
+            " ".join(f"{k}={v}" for k, v in sorted(dropped.items())),
+        )
+
 
 def load_snvs(
     vcf_path: str,
@@ -554,20 +603,71 @@ def load_snvs(
 
     Notes
     -----
-    Multi-allelic records are skipped when ``config.require_biallelic`` is True.
-    MNP records (same-length multi-base substitutions) are always skipped; rely
-    on ``bcftools norm -a`` to split them into SNVs upstream if needed.
+    **Nothing is dropped silently.** Every input record is decomposed into atomic
+    variants so no mutation is lost, and a full accounting (loaded per type +
+    every skip reason) is logged at INFO before returning:
+
+    * SNVs (1bp REF / 1bp ALT) are loaded as-is.
+    * **MNPs** (equal-length multi-base substitutions, e.g. ``TACG>CACC``) are
+      **atomized** into one SNV per offset where the bases differ. They are no
+      longer skipped.
+    * **Multi-allelic** records are decomposed allele-by-allele; each ALT is
+      classified independently. They are no longer dropped. ``require_biallelic``
+      is retained only for backward compatibility and no longer filters.
+    * **Indels** (length-changing REF/ALT) are loaded as-is when
+      ``config.include_indels`` is True (the default). Positions are trusted
+      exactly — run ``bcftools norm -f REF`` upstream so placement is canonical.
+
+    Quality gates (FILTER!=PASS, missing/low DP, optional AF band) still apply,
+    but each rejection is COUNTED and logged, never silent. When two atomic
+    variants collide on one position, the first wins and the collision is counted
+    (``position_conflict``) — again, logged, not silent.
     """
     if not HAS_PYSAM:
         raise ImportError("pysam required for VCF parsing")
 
-    snv_pos = []
-    ref_alleles = {}
-    depth = {}
-    af = {}
+    snv_pos: list[int] = []
+    seen_pos: set[int] = set()
+    ref_alleles: dict[int, str] = {}
+    depth: dict[int, int] = {}
+    af: dict[int, float | None] = {}
     site_type: dict[int, str] = {}
     del_span: dict[int, tuple[int, int]] = {}
     ins_len: dict[int, int] = {}
+
+    # Full accounting so no variant is ever dropped silently.
+    stats: dict[str, int] = defaultdict(int)
+
+    def _register(apos: int, aref: str, aalt: str, stype: str, dp, site_af) -> bool:
+        """Record one atomic variant. Dedup by position (first-write-wins with a
+        counted, non-silent conflict). Returns True if newly registered."""
+        if apos <= 0:
+            stats["skip_out_of_bounds"] += 1
+            return False
+        if apos in seen_pos:
+            if site_type.get(apos) != stype or ref_alleles.get(apos) != aref:
+                stats["position_conflict"] += 1
+            else:
+                stats["duplicate_site"] += 1
+            return False
+        seen_pos.add(apos)
+        snv_pos.append(apos)
+        ref_alleles[apos] = aref
+        depth[apos] = dp
+        af[apos] = site_af
+        site_type[apos] = stype
+        # After ``bcftools norm``, indels are left-anchored: REF starts with the
+        # anchor base(s) matching ALT, then deletes (REF longer) / inserts (ALT
+        # longer) the trailing bases. Positions are trusted exactly.
+        if stype == "del":
+            del_start = apos + len(aalt)
+            del_end = apos + len(aref) - 1
+            if del_end >= del_start:
+                del_span[apos] = (del_start, del_end)
+        elif stype == "ins":
+            ins_len[apos] = len(aalt) - len(aref)
+        stats[f"loaded_{stype}"] += 1
+        return True
 
     vcf = pysam.VariantFile(vcf_path)
 
@@ -580,36 +680,21 @@ def load_snvs(
         )
 
     for record in vcf.fetch(contig=contig_id) if contig_id else vcf.fetch():
-        # Filter check
+        stats["records_seen"] += 1
+
+        # Filter check (counted, not silent).
         if record.filter.keys() and "PASS" not in record.filter.keys():
+            stats["skip_filter_not_pass"] += 1
             continue
 
         alts = record.alts
         if alts is None or len(alts) == 0:
-            continue
-
-        # Biallelic check
-        if config.require_biallelic and len(alts) > 1:
+            stats["skip_no_alt"] += 1
             continue
 
         ref = record.ref
-        alt = alts[0]
 
-        # Classify variant. We collapse all indels at a position to a single
-        # state (DEL/INS); size differences are intentionally ignored.
-        if len(ref) == 1 and len(alt) == 1:
-            stype = "snv"
-        elif not config.include_indels:
-            continue
-        elif len(ref) > len(alt):
-            stype = "del"
-        elif len(alt) > len(ref):
-            stype = "ins"
-        else:
-            # MNP (same length, multi-base) — skip; not handled.
-            continue
-
-        # Get sample
+        # Get sample (for DP/AD fallbacks on caller VCFs that carry them there).
         if sample_name is not None:
             sample = record.samples[sample_name]
         elif n_samples > 0:
@@ -624,7 +709,11 @@ def load_snvs(
         elif sample is not None and "DP" in sample:
             site_depth = sample["DP"]
 
-        if site_depth is None or site_depth < config.min_depth_site:
+        if site_depth is None:
+            stats["skip_no_depth"] += 1
+            continue
+        if site_depth < config.min_depth_site:
+            stats["skip_low_depth"] += 1
             continue
 
         # Extract AF
@@ -641,29 +730,47 @@ def load_snvs(
         # Optional AF range filter (None = no filter; the default).
         if config.af_range is not None and site_af is not None:
             if not (config.af_range[0] <= site_af <= config.af_range[1]):
+                stats["skip_af_band"] += 1
                 continue
 
-        pos = record.pos
-        snv_pos.append(pos)
-        ref_alleles[pos] = ref
-        depth[pos] = site_depth
-        af[pos] = site_af
-        site_type[pos] = stype
+        if len(alts) > 1:
+            stats["multiallelic_records"] += 1
 
-        # Pre-compute exact CIGAR-event keys per indel site so the per-read
-        # decision is a dict/set lookup. After ``bcftools norm``, biallelic
-        # indels are left-anchored: REF starts with the anchor base(s)
-        # matching ALT, then either deletes (REF longer) or inserts (ALT
-        # longer) the trailing bases.
-        if stype == "del":
-            del_start = pos + len(alt)
-            del_end = pos + len(ref) - 1
-            if del_end >= del_start:
-                del_span[pos] = (del_start, del_end)
-        elif stype == "ins":
-            ins_len[pos] = len(alt) - len(ref)
+        # Decompose EVERY ALT allele into atomic variants — no allele is dropped.
+        for alt in alts:
+            if alt is None or alt == "*" or alt == "<*>" or alt.startswith("<"):
+                # Spanning-deletion star / symbolic (gVCF <*>, <DEL> etc.) — no
+                # concrete allele to phase against.
+                stats["skip_symbolic_allele"] += 1
+                continue
+            lr, la = len(ref), len(alt)
+            if lr == 1 and la == 1:
+                rb, ab = ref.upper(), alt.upper()
+                if rb in _ACGT and ab in _ACGT and rb != ab:
+                    _register(record.pos, rb, ab, "snv", site_depth, site_af)
+                else:
+                    stats["skip_noncanonical_snv"] += 1
+            elif lr == la:
+                # MNP / MNV: atomize into per-position SNVs (differing bases).
+                emitted = False
+                for i in range(lr):
+                    rb, ab = ref[i].upper(), alt[i].upper()
+                    if rb != ab and rb in _ACGT and ab in _ACGT:
+                        if _register(record.pos + i, rb, ab, "snv", site_depth, site_af):
+                            emitted = True
+                if emitted:
+                    stats["mnp_atomized"] += 1
+            else:
+                # Length-changing: indel. Loaded as-is (positions trusted).
+                if not config.include_indels:
+                    stats["skip_indel_disabled"] += 1
+                    continue
+                stype = "del" if lr > la else "ins"
+                _register(record.pos, ref.upper(), alt.upper(), stype, site_depth, site_af)
 
     vcf.close()
+
+    _log_load_summary(vcf_path, contig_id, stats)
     return snv_pos, ref_alleles, depth, af, site_type, del_span, ins_len
 
 

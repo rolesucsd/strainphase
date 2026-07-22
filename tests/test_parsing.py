@@ -101,27 +101,55 @@ def test_loader_simple_insertion(tmp_path, base_config):
     assert 100 not in ds
 
 
-def test_loader_mnp_skipped(tmp_path, base_config):
-    """Same-length multi-base records (MNPs) are skipped."""
+def test_loader_mnp_atomized(tmp_path, base_config):
+    """Same-length multi-base records (MNPs) are atomized into per-base SNVs.
+
+    ``AT>GC`` at 100 differs at both offsets -> SNVs at 100 and 101.
+    """
     vcf = write_vcf(
         tmp_path,
         CONTIG,
         [
-            _record(100, "AT", "GC"),  # MNP -> skip
+            _record(100, "AT", "GC"),  # MNP -> SNVs at 100 and 101
             _record(200, "A", "G"),  # SNV -> keep
         ],
     )
-    pos, _, _, _, st, _, _ = load_snvs(vcf, CONTIG, config=base_config)
+    pos, refs, _, _, st, _, _ = load_snvs(vcf, CONTIG, config=base_config)
 
-    assert pos == [200]
+    assert sorted(pos) == [100, 101, 200]
+    assert refs[100] == "A" and st[100] == "snv"
+    assert refs[101] == "T" and st[101] == "snv"
     assert st[200] == "snv"
 
 
-def test_loader_multiallelic_dropped_when_biallelic_required(tmp_path, base_config):
-    """A record with two ALT alleles is skipped when require_biallelic=True."""
+def test_loader_mnp_only_differing_positions(tmp_path, base_config):
+    """Identical bases inside an MNP block are not emitted as variants.
+
+    ``TACG>CACC`` differs only at offsets 0 (T/C) and 3 (G/C).
+    """
+    vcf = write_vcf(tmp_path, CONTIG, [_record(100, "TACG", "CACC")])
+    pos, refs, _, _, st, _, _ = load_snvs(vcf, CONTIG, config=base_config)
+    assert sorted(pos) == [100, 103]
+    assert refs[100] == "T" and refs[103] == "G"
+
+
+def test_loader_multiallelic_snv_kept(tmp_path, base_config):
+    """A record with two SNV ALT alleles is kept (position, not dropped)."""
     vcf = write_vcf(tmp_path, CONTIG, [_record(100, "A", ["G", "C"])])
-    pos, _, _, _, _, _, _ = load_snvs(vcf, CONTIG, config=base_config)
-    assert pos == []
+    pos, refs, _, _, st, _, _ = load_snvs(vcf, CONTIG, config=base_config)
+    assert pos == [100]
+    assert refs[100] == "A"
+    assert st[100] == "snv"
+
+
+def test_loader_multiallelic_snv_plus_indel(tmp_path, base_config):
+    """Mixed multi-allelic (SNV + indel) keeps the first allele's site; the
+    conflicting second allele is counted, not silently taken."""
+    # A>G (snv) and A>ACGT (ins) at the same anchor: first-write-wins on pos 100.
+    vcf = write_vcf(tmp_path, CONTIG, [_record(100, "A", ["G", "ACGT"])])
+    pos, _, _, _, st, _, _ = load_snvs(vcf, CONTIG, config=base_config)
+    assert pos == [100]
+    assert st[100] == "snv"  # first allele wins the position
 
 
 def test_loader_af_range_none_keeps_fixed_sites(tmp_path):
