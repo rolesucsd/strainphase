@@ -16,7 +16,6 @@ from strainphase.core import (
     DEFAULT_CONFIG,
     HaplotyperConfig,
     LogProbCache,
-    _select_log_prob_cache,
     load_snvs,
     make_windows_lazy,
 )
@@ -39,8 +38,6 @@ def base_config():
     return HaplotyperConfig(
         min_depth_site=1,
         af_range=None,
-        require_biallelic=True,
-        include_indels=True,
         min_snvs_per_window=1,
         min_reads_per_window=1,
     )
@@ -177,23 +174,23 @@ def test_loader_af_range_strict_drops_fixed_sites(tmp_path):
     assert pos == [200]
 
 
-def test_loader_include_indels_false(tmp_path):
-    """When include_indels=False, only SNVs come through."""
-    cfg = HaplotyperConfig(min_depth_site=1, af_range=None, include_indels=False)
+def test_loader_indels_always_kept(tmp_path):
+    """Indels are ALWAYS loaded — there is no flag to drop them (invariant)."""
+    cfg = HaplotyperConfig(min_depth_site=1, af_range=None)
     vcf = write_vcf(
         tmp_path,
         CONTIG,
         [
-            _record(100, "A", "G"),  # SNV -> keep
-            _record(200, "AGCT", "A"),  # DEL -> skip
-            _record(300, "A", "ACGT"),  # INS -> skip
+            _record(100, "A", "G"),  # SNV
+            _record(200, "AGCT", "A"),  # DEL
+            _record(300, "A", "ACGT"),  # INS
         ],
     )
     pos, _, _, _, st, ds, il = load_snvs(vcf, CONTIG, config=cfg)
-    assert pos == [100]
+    assert sorted(pos) == [100, 200, 300]
     assert st[100] == "snv"
-    assert ds == {}
-    assert il == {}
+    assert st[200] == "del" and ds[200] == (201, 203)
+    assert st[300] == "ins" and il[300] == 3
 
 
 def test_loader_non_pass_filter_skipped(tmp_path, base_config):
@@ -276,7 +273,6 @@ def cigar_config():
         min_mapq=0,
         min_base_quality=0,
         af_range=None,
-        include_indels=True,
         max_reads_per_window=1000,
     )
 
@@ -575,7 +571,6 @@ def test_cigar_low_quality_anchor_skipped(tmp_path):
         min_mapq=0,
         min_base_quality=20,  # threshold above the read's qual
         af_range=None,
-        include_indels=True,
     )
     vcf_recs = [_record(100, "A", "ACGT")]  # INS site
     reads = [
@@ -661,13 +656,11 @@ class TestLogProbCacheAlphabet:
         with pytest.raises(ValueError):
             LogProbCache(n_alleles=1)
 
-    def test_select_log_prob_cache_picks_4_when_indels_disabled(self):
-        cfg = HaplotyperConfig(include_indels=False)
-        assert _select_log_prob_cache(cfg).n_alleles == 4
+    def test_global_cache_is_six_allele(self):
+        """The one global cache is always 6-allele {A,C,G,T,DEL,INS}."""
+        from strainphase.core import _LOG_PROB_CACHE
 
-    def test_select_log_prob_cache_picks_6_when_indels_enabled(self):
-        cfg = HaplotyperConfig(include_indels=True)
-        assert _select_log_prob_cache(cfg).n_alleles == 6
+        assert _LOG_PROB_CACHE.n_alleles == 6
 
 
 # ============================================================================
@@ -696,10 +689,12 @@ def test_empty_vcf_yields_no_windows(tmp_path, cigar_config, caplog):
     assert windows == []
 
 
-def test_default_config_is_indel_aware():
-    """The default config enables indels and uses no AF filter."""
-    assert DEFAULT_CONFIG.include_indels is True
+def test_default_config_has_no_af_filter():
+    """The default config uses no AF filter (indels/multiallelic are always on
+    and have no flag to assert)."""
     assert DEFAULT_CONFIG.af_range is None
+    assert not hasattr(DEFAULT_CONFIG, "include_indels")
+    assert not hasattr(DEFAULT_CONFIG, "require_biallelic")
 
 
 # ============================================================================

@@ -1,5 +1,12 @@
 # Strainphase Simulation & Benchmarking Pipeline
 
+> **Mutation-handling invariants (do not violate):** strainphase ALWAYS loads
+> every mutation type (SNV, MNP→SNVs, insertion, deletion) and ALWAYS keeps
+> multi-allelic sites — there is no `include_indels` or `require_biallelic`
+> option, by design. Nothing is dropped silently; every skip is counted and
+> logged. See [`docs/MUTATION_HANDLING.md`](docs/MUTATION_HANDLING.md) before
+> touching `load_snvs`, `_atomize_allele`, or `HaplotyperConfig`.
+
 ## Overview
 
 This document describes the simulation and benchmarking framework for validating strainphase's haplotype reconstruction accuracy and parameter sensitivity.

@@ -95,10 +95,6 @@ class HaplotyperConfig:
 
     # =========== VARIANT FILTERING ===========
     min_depth_site: int = 3
-    # DEPRECATED / no-op. ``load_snvs`` now decomposes multi-allelic records
-    # allele-by-allele instead of dropping them, so nothing is lost. Retained
-    # only so old configs/CLIs that set it keep constructing.
-    require_biallelic: bool = False
     # Optional AF range filter. ``None`` (default) keeps all variants regardless
     # of allele frequency, which is what you want for longitudinal phasing
     # because a position fixed at AF=0 or AF=1 in one timepoint can still be
@@ -106,13 +102,12 @@ class HaplotyperConfig:
     # to within-sample polymorphic sites.
     af_range: tuple[float, float] | None = None
 
-    # =========== INDEL HANDLING ===========
-    # When True, indel sites in the VCF are loaded alongside SNVs. A read is
-    # labeled "DEL" if its CIGAR has a D op exactly matching the VCF deletion
-    # footprint, "INS" if it has an I op anchored at the VCF insertion anchor,
-    # otherwise the matched reference base (or no call). All deletions/
-    # insertions at a position collapse to a single state regardless of size.
-    include_indels: bool = True
+    # =========== MUTATION HANDLING — INVARIANT ===========
+    # There is deliberately NO ``include_indels`` and NO ``require_biallelic``
+    # flag. strainphase ALWAYS loads every mutation type (SNV, MNP->SNVs,
+    # insertion, deletion) and ALWAYS keeps multi-allelic (>2 allele) sites.
+    # This is a hard invariant — see ``docs/MUTATION_HANDLING.md``. Do not add a
+    # switch that lets a caller drop indels or collapse alleles.
 
     # =========== GRAPH CONSTRUCTION ===========
     min_shared_snvs_for_edge: int = 1
@@ -467,9 +462,9 @@ class LogProbCache:
     Avoids redundant 10**(-Q/10) calculations. The mismatch probability is
     spread uniformly over the ``n_alleles - 1`` non-matching states.
 
-    For SNV-only phasing the alphabet is {A, C, G, T} → ``n_alleles=4``. With
-    indels enabled (``HaplotyperConfig.include_indels=True``) the alphabet
-    expands to {A, C, G, T, DEL, INS} → ``n_alleles=6``.
+    The alphabet is always {A, C, G, T, DEL, INS} → ``n_alleles=6``, because
+    indels are always processed (invariant — see ``docs/MUTATION_HANDLING.md``).
+    SV pseudo-alleles reuse the same 6-state error model.
     """
 
     def __init__(self, max_q: int = 60, n_alleles: int = 4):
@@ -494,10 +489,9 @@ class LogProbCache:
         return self._log_mismatch[q]
 
 
-# Global cache instances. The 4-allele cache is the default for SNV-only
-# phasing; the 6-allele cache is selected at use-time when indels are enabled.
-_LOG_PROB_CACHE = LogProbCache(n_alleles=4)
-_LOG_PROB_CACHE_INDEL = LogProbCache(n_alleles=6)
+# Single global cache. The alphabet is always {A,C,G,T,DEL,INS} (indels are
+# always processed — invariant), so the 6-state error model is used everywhere.
+_LOG_PROB_CACHE = LogProbCache(n_alleles=6)
 
 # Padding (bp) around an SV breakpoint anchor when deciding whether a read's
 # reference span brackets it. Absorbs Sniffles breakpoint imprecision
@@ -505,18 +499,46 @@ _LOG_PROB_CACHE_INDEL = LogProbCache(n_alleles=6)
 _SV_ANCHOR_PAD = 50
 
 
-def _select_log_prob_cache(config: "HaplotyperConfig") -> "LogProbCache":
-    """Pick the appropriate cache for the active config."""
-    return _LOG_PROB_CACHE_INDEL if config.include_indels else _LOG_PROB_CACHE
-
-
 # =============================================================================
 # I/O FUNCTIONS - LAZY LOADING
 # =============================================================================
 
-# Canonical single-base alleles. Anything else at a 1bp site (N, IUPAC codes,
-# symbolic) is counted and logged rather than silently taken as a SNV.
+# Canonical single-base alleles. Anything else at a substitution offset (N,
+# IUPAC codes, symbolic) is counted and logged rather than silently taken.
 _ACGT = frozenset("ACGT")
+
+
+def _atomize_allele(pos: int, ref: str, alt: str) -> list[tuple[int, str, str, str]]:
+    """Decompose one REF/ALT pair into atomic variants ``(pos, ref, alt, type)``.
+
+    This is the SINGLE, uniform decomposition applied to every allele, so all
+    mutation types are handled the same clean way:
+
+    * 1bp REF / 1bp ALT              -> one ``snv``
+    * equal-length multi-base (MNP)  -> one ``snv`` per differing offset
+    * REF longer  (net deletion)     -> one ``del`` (positions trusted as-is)
+    * ALT longer  (net insertion)    -> one ``ins`` (positions trusted as-is)
+
+    INVARIANT: indels and multi-nucleotide substitutions are ALWAYS decomposed
+    and kept — there is no option to disable either (see
+    ``docs/MUTATION_HANDLING.md``). Non-ACGT bases at a substitution offset are
+    ambiguity codes, not phaseable alleles, so they yield no primitive; the
+    empty result is counted by the caller, never dropped silently.
+    """
+    ref = ref.upper()
+    alt = alt.upper()
+    if ref == alt:
+        return []
+    lr, la = len(ref), len(alt)
+    if lr == la:
+        # SNV (lr == 1) or MNP (lr > 1): one SNV per differing, canonical offset.
+        return [
+            (pos + i, ref[i], alt[i], "snv")
+            for i in range(lr)
+            if ref[i] != alt[i] and ref[i] in _ACGT and alt[i] in _ACGT
+        ]
+    # Length-changing: a single indel primitive (del if REF longer, else ins).
+    return [(pos, ref, alt, "del" if lr > la else "ins")]
 
 
 def _log_load_summary(vcf_path: str, contig_id: str | None, stats: dict[str, int]) -> None:
@@ -576,8 +598,10 @@ def load_snvs(
 ]:
     """Load variants from a VCF.
 
-    Returns SNVs and (when ``config.include_indels`` is True) indels. The site
-    type per position is one of ``"snv"``, ``"del"``, or ``"ins"``.
+    Returns every mutation as atomic sites: SNVs (incl. MNP blocks split into
+    per-position SNVs) and indels. The site type per position is one of
+    ``"snv"``, ``"del"``, or ``"ins"``. Indels and multi-allelic sites are
+    always kept (invariant — see ``docs/MUTATION_HANDLING.md``).
 
     The caller is trusted: this loader does not realign, fuzz-match, or attempt
     to reconcile alignment differences. Each VCF record's position and alleles
@@ -609,14 +633,16 @@ def load_snvs(
 
     * SNVs (1bp REF / 1bp ALT) are loaded as-is.
     * **MNPs** (equal-length multi-base substitutions, e.g. ``TACG>CACC``) are
-      **atomized** into one SNV per offset where the bases differ. They are no
-      longer skipped.
+      **atomized** into one SNV per offset where the bases differ.
     * **Multi-allelic** records are decomposed allele-by-allele; each ALT is
-      classified independently. They are no longer dropped. ``require_biallelic``
-      is retained only for backward compatibility and no longer filters.
-    * **Indels** (length-changing REF/ALT) are loaded as-is when
-      ``config.include_indels`` is True (the default). Positions are trusted
-      exactly — run ``bcftools norm -f REF`` upstream so placement is canonical.
+      classified independently. ALWAYS kept — there is no biallelic filter.
+    * **Indels** (length-changing REF/ALT) are ALWAYS loaded as-is. Positions
+      are trusted exactly — run ``bcftools norm -f REF`` upstream so placement
+      is canonical.
+
+    All four are handled by the one ``_atomize_allele`` helper; there is no flag
+    to disable indels or collapse alleles (invariant — see the module doc and
+    ``docs/MUTATION_HANDLING.md``).
 
     Quality gates (FILTER!=PASS, missing/low DP, optional AF band) still apply,
     but each rejection is COUNTED and logged, never silent. When two atomic
@@ -736,37 +762,24 @@ def load_snvs(
         if len(alts) > 1:
             stats["multiallelic_records"] += 1
 
-        # Decompose EVERY ALT allele into atomic variants — no allele is dropped.
+        # Decompose EVERY allele into atomic primitives via the one shared
+        # helper. All mutation types — SNV, MNP, insertion, deletion — and all
+        # (>2) alleles are ALWAYS kept; nothing here can turn that off.
         for alt in alts:
-            if alt is None or alt == "*" or alt == "<*>" or alt.startswith("<"):
-                # Spanning-deletion star / symbolic (gVCF <*>, <DEL> etc.) — no
+            if alt is None or alt == "*" or alt.startswith("<"):
+                # Spanning-deletion star / symbolic (gVCF <*>, <DEL> …): no
                 # concrete allele to phase against.
                 stats["skip_symbolic_allele"] += 1
                 continue
-            lr, la = len(ref), len(alt)
-            if lr == 1 and la == 1:
-                rb, ab = ref.upper(), alt.upper()
-                if rb in _ACGT and ab in _ACGT and rb != ab:
-                    _register(record.pos, rb, ab, "snv", site_depth, site_af)
-                else:
-                    stats["skip_noncanonical_snv"] += 1
-            elif lr == la:
-                # MNP / MNV: atomize into per-position SNVs (differing bases).
-                emitted = False
-                for i in range(lr):
-                    rb, ab = ref[i].upper(), alt[i].upper()
-                    if rb != ab and rb in _ACGT and ab in _ACGT:
-                        if _register(record.pos + i, rb, ab, "snv", site_depth, site_af):
-                            emitted = True
-                if emitted:
-                    stats["mnp_atomized"] += 1
-            else:
-                # Length-changing: indel. Loaded as-is (positions trusted).
-                if not config.include_indels:
-                    stats["skip_indel_disabled"] += 1
-                    continue
-                stype = "del" if lr > la else "ins"
-                _register(record.pos, ref.upper(), alt.upper(), stype, site_depth, site_af)
+            prims = _atomize_allele(record.pos, ref, alt)
+            if not prims:
+                # Identical (no-op) or non-ACGT ambiguity code — counted here.
+                stats["skip_noncanonical"] += 1
+                continue
+            if len(ref) == len(alt) and len(ref) > 1:
+                stats["mnp_atomized"] += 1
+            for apos, aref, aalt, stype in prims:
+                _register(apos, aref, aalt, stype, site_depth, site_af)
 
     vcf.close()
 
@@ -1177,9 +1190,8 @@ class EMHaplotyper:
         self.reads = window.reads
         self.config = config
 
-        # Use the cache appropriate for the active alphabet size (4 for SNVs
-        # only, 6 when indels are enabled).
-        self._cache = _select_log_prob_cache(config)
+        # Single 6-state alphabet {A,C,G,T,DEL,INS} — indels are always on.
+        self._cache = _LOG_PROB_CACHE
 
     def _compute_log_prob_read_hap(self, read: Read, haplotype: Haplotype) -> float | None:
         """Compute log P(read | haplotype) using cached base probs."""
@@ -1965,7 +1977,7 @@ class LongitudinalIntegrator:
         junk_idx = n_haps
 
         gamma = np.zeros((n_reads, k_eff))
-        cache = _select_log_prob_cache(self.config)
+        cache = _LOG_PROB_CACHE
 
         # Junk model constants. Spread the divergence probability over the
         # ``n_alleles - 1`` non-matching states so the model is consistent with
@@ -2522,11 +2534,6 @@ def process_contig(
             logging.info(
                 f"Contig {contig_id}: merged {n_added} SV pseudo-sites "
                 f"({n_collision} dropped for colliding with a called variant)"
-            )
-        if n_added and not config.include_indels:
-            logging.warning(
-                "SV pseudo-sites are non-ACGT alleles but include_indels=False; "
-                "set include_indels=True so the multi-state error model is used."
             )
 
     if not snv_pos:
