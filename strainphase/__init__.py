@@ -7,7 +7,7 @@ with probabilistic EM refinement.
 
 Example usage:
     >>> from strainphase import HaplotyperConfig, process_contig
-    >>> config = HaplotyperConfig(window_size=3000, max_mismatch_frac=0.02)
+    >>> config = HaplotyperConfig(window_size=20000, max_mismatch_frac=0.02)
     >>> results = process_contig(bam, vcf, contig_id, contig_length, config)
 
 CLI usage:
