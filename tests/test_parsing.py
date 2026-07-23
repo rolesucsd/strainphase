@@ -326,7 +326,7 @@ def test_cigar_del_exact_match(tmp_path, cigar_config):
     windows = _run_window(tmp_path, cigar_config, vcf_recs, reads)
     alleles = _read_alleles(windows, "del_carrier")
     assert alleles is not None
-    assert alleles[100] == "DEL"
+    assert alleles[100] == "DEL3"
 
 
 def test_cigar_del_wrong_size_no_call(tmp_path, cigar_config):
@@ -408,7 +408,23 @@ def test_cigar_ins_exact_match(tmp_path, cigar_config):
     windows = _run_window(tmp_path, cigar_config, vcf_recs, reads)
     alleles = _read_alleles(windows, "ins_carrier")
     assert alleles is not None
-    assert alleles[100] == "INS"
+    assert alleles[100] == "INS3"
+
+
+def test_cigar_ins_length_specific(tmp_path, cigar_config):
+    """A 3-bp insertion is its own allele (INS3); a read with a DIFFERENT-size
+    insertion at the same anchor does NOT match it (no collapse to generic INS)."""
+    vcf_recs = [_record(100, "A", "ACGT")]  # a 3-bp insertion at anchor 100
+    reads = [
+        {"name": "ins3", "start": 0, "cigar": "100M3I50M", "seq": "A" * 153},
+        {"name": "ins5", "start": 0, "cigar": "100M5I50M", "seq": "A" * 155},
+    ]
+    windows = _run_window(tmp_path, cigar_config, vcf_recs, reads)
+    a3 = _read_alleles(windows, "ins3")
+    a5 = _read_alleles(windows, "ins5")
+    assert a3[100] == "INS3"          # matches the VCF's 3-bp insertion
+    assert a5[100] != "INS3"          # a 5-bp insertion is not the same edit
+    assert a5[100] != a3[100]         # distinct alleles, not both "INS"
 
 
 def test_cigar_ins_off_by_one_no_call(tmp_path, cigar_config):
@@ -477,8 +493,8 @@ def test_cigar_read_carries_both_del_and_ins(tmp_path, cigar_config):
     windows = _run_window(tmp_path, cigar_config, vcf_recs, reads)
     alleles = _read_alleles(windows, "both")
     assert alleles is not None
-    assert alleles[100] == "DEL"
-    assert alleles[200] == "INS"
+    assert alleles[100] == "DEL3"
+    assert alleles[200] == "INS2"
 
 
 def test_cigar_snv_alongside_indel(tmp_path, cigar_config):
@@ -502,7 +518,7 @@ def test_cigar_snv_alongside_indel(tmp_path, cigar_config):
     alleles = _read_alleles(windows, "mixed")
     assert alleles is not None
     assert alleles[50] == "G"
-    assert alleles[100] == "DEL"
+    assert alleles[100] == "DEL3"
 
 
 def test_cigar_soft_clip_then_deletion(tmp_path, cigar_config):
@@ -522,7 +538,7 @@ def test_cigar_soft_clip_then_deletion(tmp_path, cigar_config):
     windows = _run_window(tmp_path, cigar_config, vcf_recs, reads)
     alleles = _read_alleles(windows, "softclip")
     assert alleles is not None
-    assert alleles[100] == "DEL"
+    assert alleles[100] == "DEL3"
 
 
 def test_cigar_hard_clip_does_not_break_cursor(tmp_path, cigar_config):
@@ -539,7 +555,7 @@ def test_cigar_hard_clip_does_not_break_cursor(tmp_path, cigar_config):
     windows = _run_window(tmp_path, cigar_config, vcf_recs, reads)
     alleles = _read_alleles(windows, "hardclip")
     assert alleles is not None
-    assert alleles[100] == "DEL"
+    assert alleles[100] == "DEL3"
 
 
 def test_cigar_read_does_not_cover_site(tmp_path, cigar_config):
@@ -613,7 +629,7 @@ def test_cigar_indel_at_window_boundary(tmp_path, cigar_config):
     windows = _run_window(tmp_path, cigar_config, vcf_recs, reads)
     alleles = _read_alleles(windows, "boundary")
     assert alleles is not None
-    assert alleles[199] == "DEL"
+    assert alleles[199] == "DEL2"
 
 
 # ============================================================================
@@ -739,11 +755,11 @@ def test_simulator_writes_canonical_indel_vcf(tmp_path):
     out = tmp_path / "truth.vcf"
     write_vcf({"c": []}, [ref, s1], ref, str(out))
 
-    body = [l for l in out.read_text().splitlines() if not l.startswith("#")]
+    body = [ln for ln in out.read_text().splitlines() if not ln.startswith("#")]
     # Two records: one DEL and one INS
     assert len(body) == 2
 
-    rows = [l.split("\t") for l in body]
+    rows = [ln.split("\t") for ln in body]
     by_pos = {int(r[1]): r for r in rows}
 
     # DEL: anchor 0-based 100 -> VCF POS 101; REF len = 1+3 = 4; ALT len = 1

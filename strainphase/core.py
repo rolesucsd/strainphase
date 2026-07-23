@@ -851,7 +851,10 @@ def make_windows_lazy(
         # Per-window indel index. Decisions are dict/set lookups (O(1)) at
         # use time:
         #   del_key_to_pos: (D-op start_1b, D-op length) -> indel site pos
-        #   ins_anchor_to_pos: I-op anchor_1b -> indel site pos
+        #   ins_key_to_pos: (I-op anchor_1b, inserted length) -> indel site pos
+        # Both keys are SIZE-specific, so a <len>-bp indel is its own allele
+        # (DEL<len> / INS<len>) rather than collapsing every indel here to a
+        # generic "DEL"/"INS" — mirrors the per-event SV encoding.
         indel_site_set = {p for p in window_snvs if st.get(p, "snv") in ("del", "ins")}
         # SV pseudo-sites: the "present" allele is the UNIQUE event ID (from
         # Sniffles' supporting-read set; see strainphase.sv_encoding), NOT a
@@ -862,7 +865,7 @@ def make_windows_lazy(
         # Sites parsed outside the base-by-base SNV loop (indels + SVs).
         special_site_set = indel_site_set | sv_site_set
         del_key_to_pos: dict[tuple[int, int], int] = {}
-        ins_anchor_to_pos: dict[int, int] = {}
+        ins_key_to_pos: dict[tuple[int, int], int] = {}
         for p in indel_site_set:
             stype_p = st[p]
             if stype_p == "del" and p in ds:
@@ -870,7 +873,9 @@ def make_windows_lazy(
                 d_len = d_end - d_start + 1
                 del_key_to_pos[(d_start, d_len)] = p
             elif stype_p == "ins" and p in il:
-                ins_anchor_to_pos[p] = p
+                # (anchor, inserted length): a read only matches an insertion of
+                # the SAME size, so different-size insertions stay distinct.
+                ins_key_to_pos[(p, il[p])] = p
 
         # pysam fetch uses 0-based coordinates
         for aln in bam.fetch(contig_id, start - 1, end - 1):
@@ -924,10 +929,12 @@ def make_windows_lazy(
             # norm upstream). For each VCF indel site, the read carries the
             # variant iff its CIGAR contains the matching indel op:
             #
-            #   DEL: a D op of exactly the deleted length, starting at the
-            #        deleted footprint's first base
-            #   INS: an I op anchored exactly at the VCF anchor position
-            #
+            #   DEL: a D op of exactly the deleted length, at the footprint's
+            #        first base -> allele "DEL<len>"
+            #   INS: an I op of exactly the inserted length, at the VCF anchor
+            #        -> allele "INS<len>"
+            # The size is part of the allele, so a <len>-bp indel clusters only
+            # with reads carrying the same-size edit (not every indel here).
             # Otherwise, if a matched base (M/=/X) covers the anchor, record
             # it as the read's "vote against" the indel. Otherwise, no call.
             if special_site_set and aln.cigartuples:
@@ -957,15 +964,17 @@ def make_windows_lazy(
                         key = (ref_cursor + 1, length)
                         pos = del_key_to_pos.get(key)
                         if pos is not None:
-                            indel_calls[pos] = ("DEL", aln.mapping_quality)
+                            # per-edit token: a <len>-bp deletion is its own allele.
+                            indel_calls[pos] = (f"DEL{length}", aln.mapping_quality)
                         ref_cursor += length
                     elif op == 1:  # I
-                        # Anchor is the 1-based position immediately before
-                        # the inserted bases (== ref_cursor in 1-based terms).
-                        anchor = ref_cursor
-                        pos = ins_anchor_to_pos.get(anchor)
+                        # Anchor is the 1-based position immediately before the
+                        # inserted bases (== ref_cursor in 1-based terms). Match on
+                        # (anchor, inserted length) so a <len>-bp insertion is its
+                        # own allele rather than collapsing to a generic "INS".
+                        pos = ins_key_to_pos.get((ref_cursor, length))
                         if pos is not None:
-                            indel_calls[pos] = ("INS", aln.mapping_quality)
+                            indel_calls[pos] = (f"INS{length}", aln.mapping_quality)
                         query_cursor += length
                     elif op == 3:  # N: consumes ref only
                         ref_cursor += length
