@@ -54,8 +54,8 @@ from strainphase import HaplotyperConfig, process_contig
 
 config = HaplotyperConfig(
     window_size=20000,
-    max_mismatch_frac=0.02,
-    min_weight_for_anchor=0.15,
+    max_mismatch_frac=0.01,
+    min_weight_for_anchor=0.20,
 )
 
 results = process_contig(
@@ -125,8 +125,8 @@ Options:
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `window_size` | 20000 | Analysis window size (bp) |
-| `max_mismatch_frac` | 0.02 | Max Hamming distance for graph edges |
-| `min_shared_snvs_for_edge` | 3 | Min shared SNVs to connect reads |
+| `max_mismatch_frac` | 0.01 | Max Hamming distance for graph edges |
+| `min_shared_snvs_for_edge` | 2 | Min shared SNVs to connect reads |
 | `merge_distance_threshold` | 0.01 | Distance threshold for merging haplotypes |
 | `assign_confidence_threshold` | 0.90 | γ threshold for hard read assignment |
 | `min_weight_for_anchor` | 0.20 | Min abundance for anchor panel |
@@ -188,7 +188,7 @@ run_cluster_benchmark.sh         # top-level submitter (SLURM or local)
 | `benchmarks/cluster_benchmark.sh` | Per-complexity SLURM worker. Picks a base genome from `$GENOME_SOURCE`, sets `N_STRAINS`/`SNV_COUNTS` (overridable via env vars) based on the complexity level, invokes `run_full_benchmark.py`. |
 | `benchmarks/run_full_benchmark.py` | Orchestrator. Steps: simulate reads → SAM→BAM → build truth VCF → run parameter sweep → optional performance benchmark. |
 | `benchmarks/parameter_sweep.py` | Defines `ParameterSweep.REQUIRED_GRID` and runs **grid** (Cartesian product, optionally clipped by `--max-configs`) or **sequential** (coordinate descent) sweeps. Computes precision / recall / F1 for SNVs, haplotypes, and lineages, plus abundance MAE / Pearson when ground truth is available. |
-| `benchmarks/best_params.json` | Trimmed grid focused on the most impactful parameters; used as `--params` in grid mode. Includes the `include_indels` axis. |
+| `benchmarks/best_params.json` | Trimmed grid focused on the most impactful parameters; used as `--params` in grid mode. |
 | `validation/simulate_reads.py` | Synthetic data generator. Generates strains, abundances, and reads. Now supports **indel injection** via `--indel-density` (deletions and insertions emit proper `D`/`I` CIGAR ops in the simulated BAM and matching records in the truth VCF). |
 
 ### How to run
@@ -287,13 +287,12 @@ SNV_COUNTS=10000 N_STRAINS=8 \
 - `max_link_distance`: `[0.005, 0.01, 0.02, 0.05, 0.1]`
 - `min_shared_snvs_for_link`: `[1, 2, 3, 4, 5, 6]`
 - `min_depth_site`: `[3, 5, 10, 20, 50]`
-- `include_indels`: `[false, true]` *(new)*
 
 Sequential mode visits these in `DEFAULT_PARAM_ORDER`, varying one at a time and locking the best value before moving on.
 
 **`best_params.json` (recommended starting grid, ~144 configs):**
 
-Focuses on the parameters most likely to move accuracy. Smaller domains for less-impactful axes. The `include_indels: [false, true]` axis verifies the new indel pipeline does not regress on SNV-only inputs, and exercises the CIGAR walk on indel-rich inputs.
+Focuses on the parameters most likely to move accuracy. Smaller domains for less-impactful axes. (Indels are always loaded — there is no `include_indels` toggle — so no sweep axis is needed to exercise them.)
 
 **Metrics computed per config (when truth is available):**
 
@@ -308,13 +307,13 @@ Focuses on the parameters most likely to move accuracy. Smaller domains for less
 
 These were gaps in the previous version of the suite and have been addressed:
 
-- **Indel pipeline coverage.** `simulate_reads.py` now injects deletions and insertions when `--indel-density > 0`. Reads from strains carrying indels emit `D`/`I` CIGAR ops in the SAM/BAM. The truth VCF gets canonical left-anchored indel records. The sweep grid has an `include_indels` axis so the new code path is exercised.
+- **Indel pipeline coverage.** `simulate_reads.py` now injects deletions and insertions when `--indel-density > 0`. Reads from strains carrying indels emit `D`/`I` CIGAR ops in the SAM/BAM. The truth VCF gets canonical left-anchored indel records. Indels are always loaded and each distinct edit is its own allele (`DEL<len>`/`INS<len>`).
 - **Coverage and timepoints are now overridable** at the `cluster_benchmark.sh` level via the `COVERAGE` and `TIMEPOINTS` env vars. Sweep them by submitting once per value (see "How to run").
 - **Default coverage is consistent.** Both `cluster_benchmark.sh` and `run_full_benchmark.py` default to `30x`.
 - **Strain count and SNV diversity can be set independently** via `N_STRAINS` and `SNV_COUNTS` env vars. Defaults still follow the original complexity-level table.
 - **Error rate is a knob.** `ERROR_RATE` env var (default `0.001`) controls the simulator's HiFi error rate.
 - **`test_configs.json` removed.** It had no callers.
-- **`best_params.json` rewritten** to focus on impactful axes only and to include the `include_indels` toggle.
+- **`best_params.json` rewritten** to focus on impactful axes only.
 
 ### Remaining gaps
 

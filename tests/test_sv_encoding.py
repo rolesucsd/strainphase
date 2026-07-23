@@ -204,6 +204,24 @@ def test_reconcile_merges_drifted_events(tmp_path):
     assert stats["clusters"] == 2 and stats["merged"] == 2
 
 
+def test_reconcile_span_cap_prevents_chaining(tmp_path):
+    """Chained drift (A~B~C spanning > max_span) must NOT collapse into one
+    cluster whose canonical anchor would fall outside a member's pad. reconcile
+    declines the wide merge instead of dropping — A+B merge, C stays separate."""
+    s1 = _write_sidecar(tmp_path, [_rec("c1", 1000, "ev.A", "DEL", {"r1"}, svlen=1000, dv=9)], name="a.tsv")
+    s2 = _write_sidecar(tmp_path, [_rec("c1", 1040, "ev.B", "DEL", {"r2"}, svlen=1000, dv=5)], name="b.tsv")
+    s3 = _write_sidecar(tmp_path, [_rec("c1", 1080, "ev.C", "DEL", {"r3"}, svlen=1000, dv=5)], name="c.tsv")
+    # pos_tol=50 allows A~B (40) and B~C (40), but A..C span is 80 > max_span=50.
+    mapping, stats = reconcile_events([s1, s2, s3], pos_tol=50, len_tol_frac=0.25, max_span=50)
+    # A and B merge; C is declined (span cap) and stays its own event.
+    assert mapping["ev.A"][0] == mapping["ev.B"][0]
+    assert mapping["ev.C"][0] != mapping["ev.A"][0]
+    assert stats["declined_span"] >= 1
+    # every canonical anchor is within max_span of its members (no read-drop risk)
+    for eid, (_cid, cpos) in mapping.items():
+        assert abs(cpos - {"ev.A": 1000, "ev.B": 1040, "ev.C": 1080}[eid]) <= 50
+
+
 def test_reconcile_never_merges_same_sample(tmp_path):
     """Two nearby distinct events in ONE sample must NOT be collapsed."""
     s1 = _write_sidecar(

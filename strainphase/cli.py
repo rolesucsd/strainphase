@@ -285,7 +285,7 @@ Examples:
     run_parser.add_argument("--max-reads", type=int, default=300, help="Max reads per window")
     run_parser.add_argument("--min-mapq", type=int, default=20, help="Minimum MAPQ")
     run_parser.add_argument(
-        "--max-mismatch", type=float, default=0.02, help="Max mismatch fraction"
+        "--max-mismatch", type=float, default=0.01, help="Max mismatch fraction"
     )
     run_parser.add_argument(
         "--min-depth-site",
