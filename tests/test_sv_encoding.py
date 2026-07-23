@@ -11,6 +11,8 @@ from strainphase.sv_encoding import (
     SVRecord,
     check_event_consistency,
     load_sv_sidecar_for_contig,
+    reconcile_events,
+    write_reconciled,
     write_sidecar,
 )
 
@@ -181,6 +183,60 @@ def test_event_consistency_check(tmp_path):
     assert check_event_consistency([s1, s2_ok]) == []  # same event, same locus
     bad = check_event_consistency([s1, s2_bad])  # same event, drifted locus
     assert len(bad) == 1 and "ev.1" in bad[0]
+
+
+def test_reconcile_merges_drifted_events(tmp_path):
+    """The same DEL called with drifting breakpoints/IDs across 3 samples is
+    reconciled to one canonical (id, pos); a distinct event stays separate."""
+    s1 = _write_sidecar(tmp_path, [_rec("c1", 1000, "ev.A1", "DEL", {"r1"}, svlen=1200, dv=9)], name="s1.tsv")
+    s2 = _write_sidecar(tmp_path, [_rec("c1", 1030, "ev.A2", "DEL", {"r2"}, svlen=1180, dv=4)], name="s2.tsv")
+    s3 = _write_sidecar(tmp_path, [_rec("c1", 1015, "ev.A3", "DEL", {"r3"}, svlen=1210, dv=5)], name="s3.tsv")
+    # a genuinely different event far away
+    s4 = _write_sidecar(tmp_path, [_rec("c1", 8000, "ev.B", "INS", {"r4"}, svlen=500)], name="s4.tsv")
+
+    mapping, stats = reconcile_events([s1, s2, s3, s4], pos_tol=50, len_tol_frac=0.25)
+    # A1/A2/A3 collapse to one canonical id (the best-supported = ev.A1, dv=9)
+    assert mapping["ev.A1"][0] == mapping["ev.A2"][0] == mapping["ev.A3"][0] == "ev.A1"
+    # canonical pos is the median (1015)
+    assert mapping["ev.A1"][1] == 1015
+    # the distinct INS is untouched
+    assert mapping["ev.B"] == ("ev.B", 8000)
+    assert stats["clusters"] == 2 and stats["merged"] == 2
+
+
+def test_reconcile_never_merges_same_sample(tmp_path):
+    """Two nearby distinct events in ONE sample must NOT be collapsed."""
+    s1 = _write_sidecar(
+        tmp_path,
+        [_rec("c1", 1000, "ev.X", "DEL", {"r1"}, svlen=1000),
+         _rec("c1", 1020, "ev.Y", "DEL", {"r2"}, svlen=1000)],
+        name="s1.tsv",
+    )
+    mapping, stats = reconcile_events([s1], pos_tol=50, len_tol_frac=0.25)
+    assert mapping["ev.X"][0] != mapping["ev.Y"][0]  # stay distinct
+    assert stats["merged"] == 0
+
+
+def test_reconcile_respects_type_and_length(tmp_path):
+    """Same locus, but different type or discordant length -> not merged."""
+    s1 = _write_sidecar(tmp_path, [_rec("c1", 1000, "ev.del", "DEL", {"r1"}, svlen=1000)], name="s1.tsv")
+    s2 = _write_sidecar(tmp_path, [_rec("c1", 1010, "ev.ins", "INS", {"r2"}, svlen=1000)], name="s2.tsv")
+    s3 = _write_sidecar(tmp_path, [_rec("c1", 1010, "ev.big", "DEL", {"r3"}, svlen=5000)], name="s3.tsv")
+    mapping, _ = reconcile_events([s1, s2, s3], pos_tol=50, len_tol_frac=0.25)
+    ids = {mapping["ev.del"][0], mapping["ev.ins"][0], mapping["ev.big"][0]}
+    assert len(ids) == 3  # none merged
+
+
+def test_write_reconciled_roundtrip(tmp_path):
+    s1 = _write_sidecar(tmp_path, [_rec("c1", 1000, "ev.A1", "DEL", {"r1"}, svlen=1200)], name="s1.tsv")
+    s2 = _write_sidecar(tmp_path, [_rec("c1", 1030, "ev.A2", "DEL", {"r2"}, svlen=1200)], name="s2.tsv")
+    mapping, _ = reconcile_events([s1, s2], pos_tol=50, len_tol_frac=0.25)
+    outdir = str(tmp_path / "recon")
+    written = write_reconciled([s1, s2], mapping, outdir)
+    for w in written:
+        _SIDECAR_CACHE.pop(w, None)
+    # after reconcile, verify passes (one id -> one locus)
+    assert check_event_consistency(written) == []
 
 
 if __name__ == "__main__":
