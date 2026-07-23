@@ -110,7 +110,7 @@ class HaplotyperConfig:
     # switch that lets a caller drop indels or collapse alleles.
 
     # =========== GRAPH CONSTRUCTION ===========
-    min_shared_snvs_for_edge: int = 1
+    min_shared_snvs_for_edge: int = 2
     max_mismatch_frac: float = 0.01
     min_reads_per_cluster: int = 3
 
@@ -128,7 +128,7 @@ class HaplotyperConfig:
     # =========== POST-PROCESSING ===========
     merge_distance_threshold: float = 0.01
     min_shared_for_merge: int = 2  # Min shared SNVs with actual calls to consider merging
-    assign_confidence_threshold: float = 0.80
+    assign_confidence_threshold: float = 0.90
 
     # =========== 1-SNP VALIDATION ===========
     validate_1snp_differences: bool = True
@@ -798,7 +798,7 @@ def make_windows_lazy(
     site_type: dict[int, str] | None = None,
     del_span: dict[int, tuple[int, int]] | None = None,
     ins_len: dict[int, int] | None = None,
-    sv_support: dict[int, set[str]] | None = None,
+    sv_support: dict[int, dict[str, set[str]]] | None = None,
 ) -> list[Window]:
     """
     Create overlapping windows with lazy per-window read loading.
@@ -995,9 +995,9 @@ def make_windows_lazy(
                 # event ID, so two distinct events at one anchor are a genuinely
                 # multi-allelic site. The span check prevents a read whose *other*
                 # split segment supports the SV elsewhere from being called here.
-                if sv_site_set:
+                if sv_site_set and aln.reference_end is not None:
                     aln_start_1b = aln.reference_start + 1
-                    aln_end_1b = aln.reference_end  # 1-based inclusive
+                    aln_end_1b = aln.reference_end  # 1-based inclusive (None-guarded above)
                     for pos in sv_site_set:
                         events = sv_sup.get(pos)
                         if not events:

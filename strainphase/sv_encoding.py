@@ -204,22 +204,37 @@ def _svtypes_concordant(t1: str, l1: int, t2: str, l2: int, len_tol_frac: float)
     return abs(l1 - l2) <= len_tol_frac * max(l1, l2, 1)
 
 
+# A reconciled cluster's total position span is capped at this many bp. It MUST
+# stay <= core._SV_ANCHOR_PAD (the phasing span-bracket tolerance): with the cap,
+# the canonical (median) anchor is within max_span of every member, so a read
+# that bracketed a member still brackets the canonical anchor — reconcile only
+# DECLINES to merge when the cap would be exceeded; it NEVER drops a read.
+_RECONCILE_MAX_SPAN = 50
+
+
 def reconcile_events(
-    sidecar_paths: list[str], pos_tol: int = 50, len_tol_frac: float = 0.25
+    sidecar_paths: list[str],
+    pos_tol: int = 50,
+    len_tol_frac: float = 0.25,
+    max_span: int = _RECONCILE_MAX_SPAN,
 ) -> tuple[dict[str, tuple[str, int]], dict[str, int]]:
-    """Cluster drifted events across sidecars into canonical (id, pos).
+    """Cluster drifted events across sidecars into a canonical (id, pos).
 
     Two events reconcile iff: same contig, |Δpos| <= pos_tol, same SVTYPE, and
-    concordant SVLEN. Events that co-occur in the SAME sample are NEVER merged
-    (that would collapse a genuine multi-allelic site). Each cluster gets one
-    canonical event ID (the best-supported member) and one canonical anchor
-    (the median position) — safe because reads are kb-scale and the +/-pad span
-    check still brackets a position moved by <= pos_tol.
+    concordant SVLEN. A merge is DECLINED (events kept separate) when it would:
+      - collapse two events that co-occur in the SAME sample (a real
+        multi-allelic site), or
+      - grow the cluster's total position span beyond ``max_span``.
+    The span cap makes reconciliation SAFE-BY-CONSTRUCTION: the canonical anchor
+    (median) then sits within max_span (<= the phasing pad) of every member, so
+    canonicalizing a member's position never pushes it outside a supporting
+    read's span bracket. Reconcile therefore only ever *declines to merge* — it
+    never drops a read. Events it declines to merge simply stay distinct alleles.
 
     Returns
     -------
     mapping : {original_event_id: (canonical_id, canonical_pos)}
-    stats   : {"events", "clusters", "merged"}
+    stats   : {"events", "clusters", "merged", "declined_span", "declined_sample"}
     """
     import statistics
 
@@ -227,7 +242,7 @@ def reconcile_events(
     samples_of: dict[str, set[str]] = {}
     dv_of: dict[str, int] = {}
     pos_of: dict[str, list[int]] = {}
-    contig_of: dict[str, str] = {}
+    range_of: dict[str, tuple[int, int]] = {}  # root -> (min_pos, max_pos)
     for path in sidecar_paths:
         sample = os.path.basename(path)
         for contig, recs in _load_sidecar_grouped(path).items():
@@ -236,9 +251,12 @@ def reconcile_events(
                 samples_of.setdefault(r.event_id, set()).add(sample)
                 dv_of[r.event_id] = max(dv_of.get(r.event_id, 0), r.dv)
                 pos_of.setdefault(r.event_id, []).append(r.pos)
-                contig_of[r.event_id] = contig
+
+    for e, ps in pos_of.items():
+        range_of[e] = (min(ps), max(ps))
 
     parent: dict[str, str] = {e: e for e in samples_of}
+    declined = {"span": 0, "sample": 0}
 
     def find(x: str) -> str:
         root = x
@@ -250,10 +268,19 @@ def reconcile_events(
 
     def union(a: str, b: str) -> None:
         ra, rb = find(a), find(b)
-        if ra == rb or (samples_of[ra] & samples_of[rb]):
-            return  # already joined, or would collapse a same-sample site
+        if ra == rb:
+            return
+        if samples_of[ra] & samples_of[rb]:
+            declined["sample"] += 1
+            return  # would collapse a same-sample multi-allelic site
+        lo = min(range_of[ra][0], range_of[rb][0])
+        hi = max(range_of[ra][1], range_of[rb][1])
+        if hi - lo > max_span:
+            declined["span"] += 1
+            return  # cluster would span wider than the phasing pad -> keep apart
         parent[rb] = ra
         samples_of[ra] |= samples_of[rb]
+        range_of[ra] = (lo, hi)
 
     rows.sort(key=lambda x: (x[0], x[1]))
     n = len(rows)
@@ -282,7 +309,13 @@ def reconcile_events(
         if len(members) > 1:
             merged += len(members) - 1
 
-    stats = {"events": len(samples_of), "clusters": len(clusters), "merged": merged}
+    stats = {
+        "events": len(samples_of),
+        "clusters": len(clusters),
+        "merged": merged,
+        "declined_span": declined["span"],
+        "declined_sample": declined["sample"],
+    }
     return mapping, stats
 
 
@@ -338,14 +371,21 @@ def _reconcile_main(argv: list[str]) -> int:
     p.add_argument("--out-dir", required=True, help="Directory for reconciled sidecars")
     p.add_argument("--pos-tol", type=int, default=50, help="Max breakpoint drift (bp) [50]")
     p.add_argument("--len-tol", type=float, default=0.25, help="Max SVLEN fractional diff [0.25]")
+    p.add_argument(
+        "--max-span", type=int, default=_RECONCILE_MAX_SPAN,
+        help=f"Max total cluster span (bp); keep <= the phasing pad [{_RECONCILE_MAX_SPAN}]",
+    )
     args = p.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-    mapping, stats = reconcile_events(args.sidecars, pos_tol=args.pos_tol, len_tol_frac=args.len_tol)
+    mapping, stats = reconcile_events(
+        args.sidecars, pos_tol=args.pos_tol, len_tol_frac=args.len_tol, max_span=args.max_span
+    )
     write_reconciled(args.sidecars, mapping, args.out_dir)
     logging.info(
-        "Reconciled %d events -> %d canonical (%d drifted events merged) into %s",
-        stats["events"], stats["clusters"], stats["merged"], args.out_dir,
+        "Reconciled %d events -> %d canonical (%d merged; declined %d span / %d same-sample) into %s",
+        stats["events"], stats["clusters"], stats["merged"],
+        stats["declined_span"], stats["declined_sample"], args.out_dir,
     )
     return 0
 
