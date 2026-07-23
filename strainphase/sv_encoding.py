@@ -1,59 +1,60 @@
 #!/usr/bin/env python3
 """
-Encode Sniffles2 structural variants as phaseable pseudo-SNVs for strainphase.
+Structural-variant input for strainphase: the SV SIDECAR format.
 
-Each structural variant becomes a pseudo-site at its breakpoint anchor. Unlike a
-plain SNV, the "present" allele is the event's UNIQUE ID (Sniffles' merged VCF
-ID), not a generic INS/DEL token. This matters for lineage clustering: two reads
-are grouped only if they carry the *identical* event. Collapsing different events
-(or different sizes/types) to a shared token would let genuinely different
-structural changes look the same and falsely merge into one lineage — so we do
-NOT collapse. A read that spans the locus reference-like votes the matched
-reference base ("absent"); otherwise it is a no-call.
+strainphase's SV interface is ONE documented, caller-agnostic format — the
+sidecar TSV. strainphase consumes it via ``load_sv_sidecar_for_contig``; how you
+produce it is up to you. Caller-specific readers (e.g. Sniffles2) live in the
+PIPELINE, not here — the package stays tool-agnostic. Any caller (Sniffles,
+cuteSV, SVIM, hand-made) is fine as long as the output conforms to the format
+below; a reference Sniffles adapter ships in the pipeline as
+``scripts/sniffles_to_sidecar.py`` and imports ``SVRecord`` / ``write_sidecar``
+from here so this spec stays authoritative.
 
-Because the token is the event ID, a locus with two distinct events is handled
-as a genuinely multi-allelic site (read supports event A -> "A", event B -> "B",
-neither -> ref base). strainphase compares alleles by string equality, so
-arbitrary event-ID tokens work without any alphabet change.
+SIDECAR FORMAT (tab-separated, one row per event per sample)
+------------------------------------------------------------
+    #contig  pos  event_id  svtype  svlen  af  dr  dv  support_reads
 
-The per-read "present" decision is driven by Sniffles' supporting-read list
-(``RNAMES``, requires ``--output-rnames``), not CIGAR matching — large SVs are
-split reads that the strainphase CIGAR scan skips, and breakpoints are imprecise.
+  contig         reference contig name (must match the phasing BAM/reference)
+  pos            1-based breakpoint anchor
+  event_id       UNIQUE, cross-sample-STABLE label for the event = the phasing
+                 allele. Two reads cluster into one lineage iff they carry the
+                 SAME event_id, so the SAME real event MUST carry the SAME id (and
+                 the SAME pos) in every sample. Distinct events MUST differ.
+  svtype         INS/DEL/DUP/INV/BND (kept for interpretation; NOT the allele)
+  svlen          event length (0 for BND)
+  af, dr, dv     allele freq, ref-support, variant-support (metadata)
+  support_reads  comma-separated read names that carry the event; MUST match the
+                 BAM query names. This is what makes a read "present" at the site.
 
-VERIFICATIONS built in
-----------------------
-1. RNAMES fail-fast: ``parse_sniffles`` errors if the VCF has no RNAMES at all
-   (the ``--output-rnames`` flag silently didn't take effect), instead of
-   emitting an empty sidecar.
-2. Cross-sample consistency: ``verify`` subcommand asserts each event ID maps to
-   a single (contig, pos) across all per-sample sidecars — required so the same
-   event clusters into one lineage across timepoints.
+Encoding rationale: the allele is the event ID (never a generic INS/DEL token),
+so a locus with two distinct events is a genuinely multi-allelic site and
+different structural changes never falsely merge. A read that spans the anchor
+reference-like votes the matched base ("absent"); one that doesn't span → no-call.
 
-CLI
----
-    # Convert one Sniffles VCF -> one sidecar
-    python -m strainphase.sv_encoding \
-        --sniffles sample.sv.vcf.gz --out-sidecar sample.sv_sidecar.tsv \
-        [--out-vcf markers.vcf] [--min-support 3] [--min-af 0.05] [--max-af 0.95] \
-        [--svtypes INS,DEL,DUP,INV,BND] [--contigs contigs.txt]
+TOOLS (all operate on the standard sidecar; only --sniffles is caller-specific)
+-------------------------------------------------------------------------------
+  reconcile  Harmonize breakpoint DRIFT: cluster events within +/-pos_tol with
+             concordant type/length into one canonical (id, pos), so one real
+             event isn't split into several alleles across samples. Never merges
+             two events from the same sample. Run this BEFORE phasing.
+  verify     Assert each event_id maps to a single (contig, pos) across sidecars
+             (guaranteed to pass after reconcile).
 
-    # Verify event-ID consistency across all sidecars (verification #2)
-    python -m strainphase.sv_encoding verify --sidecars s1.tsv s2.tsv ...
+CLI (both operate on the standard sidecar; producing sidecars is the pipeline's job)
+------------------------------------------------------------------------------------
+    python -m strainphase.sv_encoding reconcile --sidecars *.tsv --out-dir recon/ \
+        [--pos-tol 50] [--len-tol 0.25]
+    python -m strainphase.sv_encoding verify --sidecars recon/*.tsv [--out ok]
 """
 
 from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 from dataclasses import dataclass, field
-
-# svtype -> "del-like" or "ins-like", used ONLY to classify placeholder REF/ALT
-# in the optional inspection VCF. It does NOT define the phasing allele (that is
-# the unique event ID). All svtypes are retained as distinct events.
-_SVTYPE_IS_DEL = {"DEL": True}
-_DEFAULT_SVTYPES = ("INS", "DEL", "DUP", "INV", "BND")
-
 
 @dataclass
 class SVRecord:
@@ -68,146 +69,6 @@ class SVRecord:
     dr: int
     dv: int
     support_reads: set[str] = field(default_factory=set)
-
-
-# ------------------------------------------------------------------ parsing --#
-
-
-def _get_info(record, key, default=None):
-    if key not in record.info:
-        return default
-    val = record.info[key]
-    if isinstance(val, tuple):
-        return val[0] if len(val) == 1 else val
-    return val
-
-
-def _sample_dr_dv(record):
-    if not record.samples:
-        return None, None
-    smp = record.samples[list(record.samples)[0]]
-    dr = smp.get("DR")
-    dv = smp.get("DV")
-    if isinstance(dr, tuple):
-        dr = dr[0] if dr else None
-    if isinstance(dv, tuple):
-        dv = dv[0] if dv else None
-    return dr, dv
-
-
-def parse_sniffles(
-    vcf_path: str,
-    min_support: int = 3,
-    min_af: float = 0.0,
-    max_af: float = 1.0,
-    svtypes: tuple[str, ...] = _DEFAULT_SVTYPES,
-    allowed_contigs: set[str] | None = None,
-) -> list[SVRecord]:
-    """Parse a Sniffles2 VCF into :class:`SVRecord`s (one per SV, uniquely labeled).
-
-    Requires ``pysam`` and a VCF produced with ``--output-rnames``. Raises
-    ``RuntimeError`` if RNAMES is entirely absent (verification #1).
-    """
-    try:
-        import pysam
-    except ImportError as exc:  # pragma: no cover - environment guard
-        raise ImportError("pysam is required to parse Sniffles VCFs") from exc
-
-    svtypes = tuple(s.upper() for s in svtypes)
-    records: list[SVRecord] = []
-    n_records = 0
-    n_no_rnames = 0
-    n_filtered = 0
-
-    vcf = pysam.VariantFile(vcf_path)
-    header_has_rnames = "RNAMES" in vcf.header.info
-
-    for rec in vcf.fetch():
-        if rec.filter.keys() and "PASS" not in rec.filter.keys():
-            n_filtered += 1
-            continue
-
-        raw_svtype = _get_info(rec, "SVTYPE")
-        if raw_svtype is None or raw_svtype.upper() not in svtypes:
-            continue
-        raw_svtype = raw_svtype.upper()
-        n_records += 1
-
-        contig = rec.contig
-        if allowed_contigs is not None and contig not in allowed_contigs:
-            continue
-
-        svlen = _get_info(rec, "SVLEN", 0)
-        try:
-            svlen = abs(int(svlen)) if svlen is not None else 0
-        except (TypeError, ValueError):
-            svlen = 0
-
-        dr, dv = _sample_dr_dv(rec)
-        if dv is None:
-            dv = _get_info(rec, "SUPPORT", 0) or 0
-        if dr is None:
-            dr = 0
-        dr, dv = int(dr), int(dv)
-        if dv < min_support:
-            continue
-
-        denom = dr + dv
-        af = (dv / denom) if denom > 0 else 0.0
-        if not (min_af <= af <= max_af):
-            continue
-
-        rnames = _get_info(rec, "RNAMES")
-        if rnames is None:
-            n_no_rnames += 1
-            continue
-        if isinstance(rnames, str):
-            rnames = rnames.split(",")
-        support = {r for r in rnames if r}
-        if not support:
-            n_no_rnames += 1
-            continue
-
-        # Unique, cross-sample-stable label. After Sniffles population merge +
-        # --genotype-vcf, rec.id is inherited from the merged VCF, so the SAME
-        # event carries the SAME id in every sample (verified by `verify`).
-        event_id = rec.id if rec.id and rec.id != "." else f"{raw_svtype}.{contig}.{rec.pos}.{svlen}"
-
-        records.append(
-            SVRecord(
-                contig=contig,
-                pos=int(rec.pos),
-                event_id=event_id,
-                svtype=raw_svtype,
-                svlen=svlen,
-                af=af,
-                dr=dr,
-                dv=dv,
-                support_reads=support,
-            )
-        )
-
-    vcf.close()
-
-    # Verification #1: RNAMES must actually be present.
-    if n_records > 0 and not header_has_rnames:
-        raise RuntimeError(
-            f"{vcf_path}: no RNAMES INFO field in header. Re-run Sniffles with "
-            "--output-rnames (and, for --genotype-vcf, confirm your Sniffles "
-            "version emits per-sample RNAMES at forced sites)."
-        )
-    if n_records > 0 and not records and n_no_rnames == n_records:
-        raise RuntimeError(
-            f"{vcf_path}: every SV record lacked RNAMES. Re-run Sniffles with "
-            "--output-rnames; per-read SV assignment is impossible without it."
-        )
-
-    if n_no_rnames:
-        logging.warning("%d SV records skipped for missing/empty RNAMES", n_no_rnames)
-    if n_filtered:
-        logging.info("%d non-PASS SV records skipped", n_filtered)
-    logging.info("Parsed %d structural variants from %s", len(records), vcf_path)
-    return records
 
 
 # ------------------------------------------------------------------ writing --#
@@ -237,26 +98,6 @@ def write_sidecar(records: list[SVRecord], path: str) -> None:
                 + "\n"
             )
     logging.info("Wrote %d SV pseudo-sites to sidecar %s", len(records), path)
-
-
-def write_synthetic_vcf(records: list[SVRecord], path: str) -> None:
-    """Inspection-only synthetic VCF (one biallelic record per SV). Sequence
-    content is a placeholder; the phasing allele is the event ID in the sidecar."""
-    contigs = sorted({r.contig for r in records})
-    with open(path, "w") as fh:
-        fh.write("##fileformat=VCFv4.2\n")
-        fh.write('##INFO=<ID=SVMARK,Number=0,Type=Flag,Description="strainphase SV pseudo-site">\n')
-        fh.write('##INFO=<ID=SVTYPE,Number=1,Type=String,Description="Sniffles SVTYPE">\n')
-        fh.write('##INFO=<ID=DP,Number=1,Type=Integer,Description="DR+DV at breakpoint">\n')
-        fh.write('##INFO=<ID=AF,Number=1,Type=Float,Description="DV/(DR+DV)">\n')
-        for c in contigs:
-            fh.write(f"##contig=<ID={c}>\n")
-        fh.write("#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n")
-        for r in sorted(records, key=lambda x: (x.contig, x.pos, x.event_id)):
-            ref, alt = ("NN", "N") if _SVTYPE_IS_DEL.get(r.svtype) else ("N", "NN")
-            info = f"SVMARK;SVTYPE={r.svtype};DP={r.dr + r.dv};AF={r.af:.4f}"
-            fh.write(f"{r.contig}\t{r.pos}\t{r.event_id}\t{ref}\t{alt}\t.\tPASS\t{info}\n")
-    logging.info("Wrote %d SV markers to synthetic VCF %s", len(records), path)
 
 
 # ----------------------------------------------------------------- loading --#
@@ -346,49 +187,126 @@ def check_event_consistency(sidecar_paths: list[str]) -> list[str]:
     return violations
 
 
+# ------------------------------------------------------------- reconciliation -#
+# Allele identity == event-ID identity, so breakpoint drift (one real event
+# called with slightly different anchors / IDs across samples) makes strainphase
+# see several alleles and under-cluster. reconcile harmonizes drifted events
+# into one canonical (id, pos) BEFORE phasing. It operates on the standard
+# sidecar format alone — caller-agnostic.
+
+
+def _svtypes_concordant(t1: str, l1: int, t2: str, l2: int, len_tol_frac: float) -> bool:
+    """Same SV type, and (for length-bearing types) concordant SVLEN."""
+    if t1 != t2:
+        return False
+    if t1 in ("BND", "INV"):  # length not meaningful
+        return True
+    return abs(l1 - l2) <= len_tol_frac * max(l1, l2, 1)
+
+
+def reconcile_events(
+    sidecar_paths: list[str], pos_tol: int = 50, len_tol_frac: float = 0.25
+) -> tuple[dict[str, tuple[str, int]], dict[str, int]]:
+    """Cluster drifted events across sidecars into canonical (id, pos).
+
+    Two events reconcile iff: same contig, |Δpos| <= pos_tol, same SVTYPE, and
+    concordant SVLEN. Events that co-occur in the SAME sample are NEVER merged
+    (that would collapse a genuine multi-allelic site). Each cluster gets one
+    canonical event ID (the best-supported member) and one canonical anchor
+    (the median position) — safe because reads are kb-scale and the +/-pad span
+    check still brackets a position moved by <= pos_tol.
+
+    Returns
+    -------
+    mapping : {original_event_id: (canonical_id, canonical_pos)}
+    stats   : {"events", "clusters", "merged"}
+    """
+    import statistics
+
+    rows = []  # (contig, pos, svtype, svlen, event_id, sample, dv)
+    samples_of: dict[str, set[str]] = {}
+    dv_of: dict[str, int] = {}
+    pos_of: dict[str, list[int]] = {}
+    contig_of: dict[str, str] = {}
+    for path in sidecar_paths:
+        sample = os.path.basename(path)
+        for contig, recs in _load_sidecar_grouped(path).items():
+            for r in recs:
+                rows.append((contig, r.pos, r.svtype, r.svlen, r.event_id, sample, r.dv))
+                samples_of.setdefault(r.event_id, set()).add(sample)
+                dv_of[r.event_id] = max(dv_of.get(r.event_id, 0), r.dv)
+                pos_of.setdefault(r.event_id, []).append(r.pos)
+                contig_of[r.event_id] = contig
+
+    parent: dict[str, str] = {e: e for e in samples_of}
+
+    def find(x: str) -> str:
+        root = x
+        while parent[root] != root:
+            root = parent[root]
+        while parent[x] != root:  # path compression
+            parent[x], x = root, parent[x]
+        return root
+
+    def union(a: str, b: str) -> None:
+        ra, rb = find(a), find(b)
+        if ra == rb or (samples_of[ra] & samples_of[rb]):
+            return  # already joined, or would collapse a same-sample site
+        parent[rb] = ra
+        samples_of[ra] |= samples_of[rb]
+
+    rows.sort(key=lambda x: (x[0], x[1]))
+    n = len(rows)
+    for i in range(n):
+        ci, pi, ti, li, ei = rows[i][0], rows[i][1], rows[i][2], rows[i][3], rows[i][4]
+        for j in range(i + 1, n):
+            cj, pj = rows[j][0], rows[j][1]
+            if cj != ci or pj - pi > pos_tol:
+                break
+            ej = rows[j][4]
+            if ei != ej and _svtypes_concordant(ti, li, rows[j][2], rows[j][3], len_tol_frac):
+                union(ei, ej)
+
+    clusters: dict[str, list[str]] = {}
+    for e in parent:
+        clusters.setdefault(find(e), []).append(e)
+
+    mapping: dict[str, tuple[str, int]] = {}
+    merged = 0
+    for members in clusters.values():
+        canon_id = max(members, key=lambda e: (dv_of[e], e))
+        all_pos = [p for e in members for p in pos_of[e]]
+        canon_pos = int(statistics.median(all_pos))
+        for e in members:
+            mapping[e] = (canon_id, canon_pos)
+        if len(members) > 1:
+            merged += len(members) - 1
+
+    stats = {"events": len(samples_of), "clusters": len(clusters), "merged": merged}
+    return mapping, stats
+
+
+def write_reconciled(
+    sidecar_paths: list[str], mapping: dict[str, tuple[str, int]], out_dir: str
+) -> list[str]:
+    """Rewrite each sidecar into out_dir with canonical event IDs + positions."""
+    os.makedirs(out_dir, exist_ok=True)
+    written = []
+    for path in sidecar_paths:
+        out = os.path.join(out_dir, os.path.basename(path))
+        new_recs = []
+        for contig, recs in _load_sidecar_grouped(path).items():
+            for r in recs:
+                cid, cpos = mapping.get(r.event_id, (r.event_id, r.pos))
+                new_recs.append(
+                    SVRecord(r.contig, cpos, cid, r.svtype, r.svlen, r.af, r.dr, r.dv, r.support_reads)
+                )
+        write_sidecar(new_recs, out)
+        written.append(out)
+    return written
+
+
 # --------------------------------------------------------------------- CLI --#
-
-
-def _convert_main(argv: list[str]) -> int:
-    p = argparse.ArgumentParser(prog="strainphase.sv_encoding")
-    p.add_argument("--sniffles", required=True, help="Sniffles2 VCF (run with --output-rnames)")
-    p.add_argument("--out-sidecar", required=True, help="Output sidecar TSV")
-    p.add_argument("--out-vcf", help="Optional inspection-only synthetic VCF")
-    p.add_argument("--min-support", type=int, default=3, help="Min supporting reads (DV) [3]")
-    p.add_argument("--min-af", type=float, default=0.05, help="Min AF = DV/(DR+DV) [0.05]")
-    p.add_argument("--max-af", type=float, default=0.95, help="Max AF [0.95]")
-    p.add_argument(
-        "--svtypes",
-        default=",".join(_DEFAULT_SVTYPES),
-        help="Comma-separated SVTYPEs to keep [INS,DEL,DUP,INV,BND]",
-    )
-    p.add_argument("--contigs", help="Optional file listing contigs to keep (one per line)")
-    p.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
-    args = p.parse_args(argv)
-    logging.basicConfig(
-        level=getattr(logging, args.log_level),
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-
-    allowed = None
-    if args.contigs:
-        with open(args.contigs) as fh:
-            allowed = {ln.strip() for ln in fh if ln.strip()}
-    svtypes = tuple(s.strip().upper() for s in args.svtypes.split(",") if s.strip())
-
-    records = parse_sniffles(
-        args.sniffles,
-        min_support=args.min_support,
-        min_af=args.min_af,
-        max_af=args.max_af,
-        svtypes=svtypes,
-        allowed_contigs=allowed,
-    )
-    write_sidecar(records, args.out_sidecar)
-    if args.out_vcf:
-        write_synthetic_vcf(records, args.out_vcf)
-    return 0
 
 
 def _verify_main(argv: list[str]) -> int:
@@ -414,11 +332,37 @@ def _verify_main(argv: list[str]) -> int:
     return 0
 
 
+def _reconcile_main(argv: list[str]) -> int:
+    p = argparse.ArgumentParser(prog="strainphase.sv_encoding reconcile")
+    p.add_argument("--sidecars", required=True, nargs="+", help="Per-sample sidecar TSVs")
+    p.add_argument("--out-dir", required=True, help="Directory for reconciled sidecars")
+    p.add_argument("--pos-tol", type=int, default=50, help="Max breakpoint drift (bp) [50]")
+    p.add_argument("--len-tol", type=float, default=0.25, help="Max SVLEN fractional diff [0.25]")
+    args = p.parse_args(argv)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
+    mapping, stats = reconcile_events(args.sidecars, pos_tol=args.pos_tol, len_tol_frac=args.len_tol)
+    write_reconciled(args.sidecars, mapping, args.out_dir)
+    logging.info(
+        "Reconciled %d events -> %d canonical (%d drifted events merged) into %s",
+        stats["events"], stats["clusters"], stats["merged"], args.out_dir,
+    )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     if argv and argv[0] == "verify":
         return _verify_main(argv[1:])
-    return _convert_main(argv)
+    if argv and argv[0] == "reconcile":
+        return _reconcile_main(argv[1:])
+    sys.stderr.write(
+        "usage: python -m strainphase.sv_encoding {reconcile,verify} ...\n"
+        "The package is caller-agnostic and consumes the sidecar TSV format; "
+        "produce sidecars with your own adapter (e.g. the pipeline's "
+        "sniffles_to_sidecar.py).\n"
+    )
+    return 2
 
 
 if __name__ == "__main__":
