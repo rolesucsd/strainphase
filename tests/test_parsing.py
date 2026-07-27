@@ -40,6 +40,11 @@ def base_config():
         af_range=None,
         min_snvs_per_window=1,
         min_reads_per_window=1,
+        # These tests exercise VCF/CIGAR parsing with tiny synthetic reads, so the
+        # physical-overlap gates (1 kb by default) would drop every read before the
+        # parser is reached. Depth policy is covered by its own tests.
+        min_read_window_overlap_bp=0,
+        min_read_read_overlap_bp=0,
     )
 
 
@@ -274,6 +279,10 @@ def cigar_config():
         min_base_quality=0,
         af_range=None,
         max_reads_per_window=1000,
+        # 200 bp windows and 150 bp synthetic reads are both far below the 1 kb
+        # physical-overlap defaults; these tests exercise the CIGAR walk, not depth policy.
+        min_read_window_overlap_bp=0,
+        min_read_read_overlap_bp=0,
     )
 
 

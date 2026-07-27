@@ -51,10 +51,30 @@ from strainphase.core import (
     process_contig,
     results_to_dataframe,
 )
+from strainphase.window_groups import WindowHaplotype, group_all_windows
 
 # -----------------------------------------------------------------------------#
 # Helpers
 # -----------------------------------------------------------------------------#
+
+
+def _window_conditional_abundance(pi_vec, hap_idx: int) -> float | None:
+    """Per-window abundance ``pi_k / (1 - pi_junk)``, or ``None`` when unmeasurable.
+
+    Returning ``None`` rather than ``0.0`` is the point. A window with no ``pi`` vector,
+    a short one, or one that is entirely junk (``pi_junk == 1``) has *no measurement* -
+    it is not a measurement of zero. Collapsing the two let a junk-dominated window
+    contribute a hard 0.0 carrying full window-read weight, and since the aggregate is a
+    weighted median (a selection operator, which returns one input verbatim) that
+    spurious 0.0 could be the value actually reported for the timepoint.
+    """
+    if pi_vec is None or len(pi_vec) <= hap_idx:
+        return None
+    pi_junk = float(pi_vec[-1])
+    denom = 1.0 - pi_junk
+    if denom <= 0:
+        return None
+    return max(0.0, min(1.0, float(pi_vec[hap_idx]) / denom))
 
 
 def _weighted_median(values: list[float], weights: list[float]) -> float:
@@ -379,16 +399,17 @@ def build_lineage_table(
                         # Per-window abundance for this haplotype, conditioned on
                         # non-junk reads in the window. If the window is junk-only
                         # (pi_junk ~= 1), treat its contribution as zero.
+                        # ZERO-LEAK FIX: a window with no usable pi vector, or one that is
+                        # entirely junk, must contribute NOTHING - not zero. Appending a
+                        # hard 0.0 with full window-read weight let a junk-dominated
+                        # window inject a spurious minimum, and because the aggregate is a
+                        # weighted MEDIAN (a selection operator) that injected 0.0 could
+                        # become the value actually reported.
                         pi_vec = getattr(_wr, "pi", None)
-                        window_abundance = 0.0
-                        if pi_vec is not None and len(pi_vec) > hap_idx:
-                            pi_junk = float(pi_vec[-1])
-                            denom = 1.0 - pi_junk
-                            if denom > 0:
-                                pi_k = float(pi_vec[hap_idx])
-                                window_abundance = max(0.0, min(1.0, pi_k / denom))
-                        window_abundances.append(window_abundance)
-                        window_read_weights.append(max(n_nonjunk, 0))
+                        window_abundance = _window_conditional_abundance(pi_vec, hap_idx)
+                        if window_abundance is not None:
+                            window_abundances.append(window_abundance)
+                            window_read_weights.append(max(n_nonjunk, 0))
                         for pos, base in hap.consensus.items():
                             position_votes[pos][base] += hap.weight
 
@@ -465,13 +486,12 @@ def build_lineage_table(
                     m_weights = []
                     for i in indices:
                         for _wr, _hap, _hap_idx in tracks[i]["members"]:
-                            pi_vec = getattr(_wr, "pi", None)
-                            wa = 0.0
-                            if pi_vec is not None and len(pi_vec) > _hap_idx:
-                                pi_junk = float(pi_vec[-1])
-                                denom = 1.0 - pi_junk
-                                if denom > 0:
-                                    wa = max(0.0, min(1.0, float(pi_vec[_hap_idx]) / denom))
+                            # Zero-leak fix: skip unmeasurable windows entirely.
+                            wa = _window_conditional_abundance(
+                                getattr(_wr, "pi", None), _hap_idx
+                            )
+                            if wa is None:
+                                continue
                             n_reads = getattr(_wr, "n_reads_examined", len(_wr.window.reads))
                             junk_col = _wr.gamma.shape[1] - 1
                             n_junk = int((_wr.gamma[:, junk_col] >= 0.5).sum())
@@ -591,13 +611,12 @@ def build_lineage_table(
                         m_ab_wts = []
                         for t in s_tracks:
                             for _wr, _hap, _hap_idx in t["members"]:
-                                pi_vec = getattr(_wr, "pi", None)
-                                wa = 0.0
-                                if pi_vec is not None and len(pi_vec) > _hap_idx:
-                                    pi_junk = float(pi_vec[-1])
-                                    denom = 1.0 - pi_junk
-                                    if denom > 0:
-                                        wa = max(0.0, min(1.0, float(pi_vec[_hap_idx]) / denom))
+                                # Zero-leak fix: skip unmeasurable windows entirely.
+                                wa = _window_conditional_abundance(
+                                    getattr(_wr, "pi", None), _hap_idx
+                                )
+                                if wa is None:
+                                    continue
                                 n_r = getattr(_wr, "n_reads_examined", len(_wr.window.reads))
                                 jc = _wr.gamma.shape[1] - 1
                                 nj = int((_wr.gamma[:, jc] >= 0.5).sum())
@@ -703,14 +722,11 @@ def build_lineage_table(
                             hap_span_bp = hap_span_end - hap_span_start
                         # Per-window abundance for this haplotype, conditioned on
                         # non-junk reads (pi_k / (1 - pi_junk)).
-                        pi_vec = getattr(wr, "pi", None)
-                        hap_abundance = 0.0
-                        if pi_vec is not None and len(pi_vec) > hap_idx:
-                            pi_junk_w = float(pi_vec[-1])
-                            denom_w = 1.0 - pi_junk_w
-                            if denom_w > 0:
-                                pi_k_w = float(pi_vec[hap_idx])
-                                hap_abundance = max(0.0, min(1.0, pi_k_w / denom_w))
+                        hap_abundance = _window_conditional_abundance(
+                            getattr(wr, "pi", None), hap_idx
+                        )
+                        if hap_abundance is None:
+                            hap_abundance = float("nan")
                         haplotype_records.append(
                             {
                                 "lineage_id": lineage_id,
@@ -734,6 +750,191 @@ def build_lineage_table(
                         )
 
     return records, haplotype_records
+
+
+def build_window_tables(
+    all_results: dict[str, dict[str, dict[str, list[WindowResult]]]],
+    config: HaplotyperConfig,
+    sample_order: list[str] | None = None,
+) -> tuple[list[dict], list[dict], list[dict], list[dict]]:
+    """Build the three window-level tables plus the recorded cross-sample comparisons.
+
+    Returns ``(haplotypes, windows_within_sample, windows_across_samples, edges)``:
+
+    ``haplotypes``
+        One row per haplotype per window per sample. The raw unit; no merging applied.
+
+    ``windows_within_sample``
+        Windows merged WITHIN one sample, across windows - the ``link_windows`` output
+        (the "horizontal" axis). One row per (sample, contig, entity).
+
+    ``windows_across_samples``
+        Windows merged ACROSS samples at ONE FIXED window - the "vertical" axis. One row
+        per (contig, window, group).
+
+    ``edges``
+        Every cross-sample comparison that was attempted, passed or failed, with the
+        reason. ``failed_no_evidence`` (a dropout) and ``failed_mismatch`` (a genuine
+        genotypic difference, i.e. a candidate recombination breakpoint) must stay
+        distinguishable; a discarded comparison cannot be told apart from one never made.
+
+    The final lineage table is deliberately NOT produced here - composing these two axes
+    into a lineage is an open decision (see FIGURE4 diagnosis §6 #9). These tables are the
+    substrate that decision will be evaluated on.
+    """
+    haplotype_rows: list[dict] = []
+    within_rows: list[dict] = []
+    window_haps: list[WindowHaplotype] = []
+    site_type_all: dict[int, str] = {}
+
+    for mag_name, mag_results in all_results.items():
+        for sample_id, contig_results in mag_results.items():
+            for contig_id, window_results in contig_results.items():
+                # Group by the within-sample entity id assigned by link_windows.
+                entities: dict[str, list[tuple[WindowResult, Haplotype, int]]] = defaultdict(list)
+
+                for wr in window_results:
+                    site_type_all.update(getattr(wr.window, "site_type", {}) or {})
+                    n_reads_w = getattr(wr, "n_reads_examined", len(wr.window.reads))
+                    junk_col = wr.gamma.shape[1] - 1
+                    n_junk_w = int((wr.gamma[:, junk_col] >= 0.5).sum())
+                    nonjunk = n_reads_w - n_junk_w
+
+                    for h_idx, hap in enumerate(wr.haplotypes):
+                        if hap.supporting_reads == 0:
+                            continue
+                        eid = hap.track_id or f"unlinked_W{wr.window.start}"
+                        entities[eid].append((wr, hap, h_idx))
+
+                        abundance = _window_conditional_abundance(
+                            getattr(wr, "pi", None), h_idx
+                        )
+                        hap_id = f"{eid}_W{wr.window.start}_H{h_idx}"
+                        consensus_str = "|".join(
+                            f"{p}:{b}" for p, b in sorted(hap.consensus.items())
+                        )
+                        haplotype_rows.append(
+                            {
+                                "haplotype_id": hap_id,
+                                "mag": mag_name,
+                                "contig": contig_id,
+                                "sample": sample_id,
+                                "window_start": wr.window.start,
+                                "window_end": wr.window.end,
+                                "within_sample_id": eid,
+                                "abundance": abundance,
+                                "reads": hap.supporting_reads,
+                                "total_reads": nonjunk,
+                                "n_markers": len(hap.consensus),
+                                "consensus": consensus_str,
+                            }
+                        )
+                        window_haps.append(
+                            WindowHaplotype(
+                                sample=sample_id,
+                                contig=contig_id,
+                                window_start=wr.window.start,
+                                window_end=wr.window.end,
+                                haplotype_id=hap_id,
+                                consensus=dict(hap.consensus),
+                                reads=hap.supporting_reads,
+                                total_reads=nonjunk,
+                                abundance=abundance if abundance is not None else float("nan"),
+                            )
+                        )
+
+                for eid, members in entities.items():
+                    starts = [wr.window.start for wr, _, _ in members]
+                    ends = [wr.window.end for wr, _, _ in members]
+                    within_rows.append(
+                        {
+                            "within_sample_id": eid,
+                            "mag": mag_name,
+                            "contig": contig_id,
+                            "sample": sample_id,
+                            "n_windows": len({s for s in starts}),
+                            "window_min": min(starts),
+                            "window_max": max(ends),
+                            "span_bp": max(ends) - min(starts),
+                            "reads": sum(h.supporting_reads for _, h, _ in members),
+                            "haplotype_ids": ";".join(
+                                f"{eid}_W{wr.window.start}_H{i}" for wr, _, i in members
+                            ),
+                        }
+                    )
+
+    # ---- vertical axis: group across samples at each fixed window ----
+    groups, edges = group_all_windows(
+        window_haps, config, sample_order=sample_order, site_type=site_type_all
+    )
+
+    across_rows: list[dict] = []
+    for g in groups:
+        across_rows.append(
+            {
+                "window_group_id": g.group_id,
+                "contig": g.contig,
+                "window_start": g.window_start,
+                "window_end": g.window_end,
+                "n_members": g.n_members,
+                "n_samples": g.n_samples,
+                "samples": ";".join(sorted({m.sample for m in g.members})),
+                "haplotype_ids": ";".join(m.haplotype_id for m in g.members),
+                "method": config.cross_sample_method,
+            }
+        )
+
+    edge_rows = [
+        {
+            "contig": e.contig,
+            "window_start": e.window_start,
+            "sample_a": e.sample_a,
+            "sample_b": e.sample_b,
+            "haplotype_a": e.haplotype_a,
+            "haplotype_b": e.haplotype_b,
+            "reason": e.reason,
+            "rate": e.rate,
+            "n_shared": e.n_shared,
+            "n_diff": e.n_diff,
+        }
+        for e in edges
+    ]
+
+    return haplotype_rows, within_rows, across_rows, edge_rows
+
+
+def write_window_tables(
+    haplotype_rows: list[dict],
+    within_rows: list[dict],
+    across_rows: list[dict],
+    edge_rows: list[dict],
+    output_dir: str,
+) -> dict[str, str]:
+    """Write the three window-level tables plus the comparison log."""
+    import csv as _csv
+
+    os.makedirs(output_dir, exist_ok=True)
+    written: dict[str, str] = {}
+
+    tables = [
+        ("haplotypes.tsv", haplotype_rows),
+        ("windows_within_sample.tsv", within_rows),
+        ("windows_across_samples.tsv", across_rows),
+        ("window_comparisons.tsv", edge_rows),
+    ]
+    for name, rows in tables:
+        path = os.path.join(output_dir, name)
+        with open(path, "w", newline="") as f:
+            if rows:
+                writer = _csv.DictWriter(f, fieldnames=list(rows[0].keys()), delimiter="\t")
+                writer.writeheader()
+                writer.writerows(rows)
+            else:
+                f.write("")
+        written[name] = path
+        logging.info(f"Wrote {len(rows)} rows to {path}")
+
+    return written
 
 
 def write_lineage_tables(
@@ -886,8 +1087,10 @@ def main():
     parser.add_argument(
         "--max-reads",
         type=int,
-        default=1000,
-        help="Max reads per window (subsampling for performance)",
+        default=500,
+        help="Max reads per window; above this reads are uniformly subsampled with the "
+        "config seed. Applied to RAW reads before junk classification, so the effective "
+        "non-junk ceiling is lower.",
     )
     parser.add_argument(
         "-j",
@@ -919,24 +1122,82 @@ def main():
         help="Min mixture weight to assign to rescued haplotypes",
     )
 
-    # Lineage clustering parameters
+    # Identity gates (shared across the three linking levels)
     parser.add_argument(
         "--lineage-merge-distance",
         type=float,
-        default=0.02,
-        help="Max distance to merge tracks into same lineage (default: 0.02 = 2%%)",
+        default=0.01,
+        help="Max mismatch RATE to group haplotypes (default: 0.01 = 1%%)",
+    )
+    parser.add_argument(
+        "--max-num-diff",
+        type=int,
+        default=1,
+        help="Max ABSOLUTE mismatches. The rate gate is a floor, so it already forces 0 "
+        "mismatches below n_shared=100; this cap is what binds at high n_shared, where a "
+        "rate alone would tolerate 11 mismatches at n_shared=1172.",
     )
     parser.add_argument(
         "--min-shared-for-lineage",
         type=int,
         default=3,
-        help="Min shared SNVs to consider merging tracks into lineage",
+        help="Min shared identity markers to compare two haplotypes across samples",
     )
     parser.add_argument(
-        "--max-span-gap",
+        "--min-cosupported-span-frac",
+        type=float,
+        default=0.25,
+        help="Min co-supported span between two haplotypes, as a fraction of their shared "
+        "region. 0.25 rejects 16%% of adjacent-window pairs; 0.50 rejects 30%%.",
+    )
+    parser.add_argument(
+        "--min-entity-overlap-bp",
         type=int,
-        default=10000,
-        help="Max bp gap between track spans to consider same locus",
+        default=1000,
+        help="Min physical overlap between two entities; below this the verdict is an "
+        "explicit non-merge rather than 'unknown'",
+    )
+    parser.add_argument(
+        "--min-read-window-overlap-bp",
+        type=int,
+        default=1000,
+        help="A read must cover at least this many bp of a window to be counted in it",
+    )
+    parser.add_argument(
+        "--min-read-read-overlap-bp",
+        type=int,
+        default=1000,
+        help="Two reads must physically overlap by at least this much to be compared",
+    )
+    parser.add_argument(
+        "--cross-sample-method",
+        choices=["clique", "reciprocal"],
+        default="clique",
+        help="How haplotypes are grouped across samples at a fixed window. 'clique' = "
+        "complete linkage, no time axis, immune to irregular timepoint spacing. "
+        "'reciprocal' = unique-best + mutual between consecutive samples; requires "
+        "--samples to be in true chronological order.",
+    )
+    parser.add_argument(
+        "--min-reads-for-rescue",
+        type=int,
+        default=5,
+        help="Reads needed for a window to be BUILT (so rescue can populate it). De-novo "
+        "phasing uses the higher --min-reads-per-window.",
+    )
+    parser.add_argument(
+        "--min-reads-per-window",
+        type=int,
+        default=10,
+        help="Reads needed to PHASE a window de novo. Below this no haplotype is invented "
+        "and the trajectory carries a gap.",
+    )
+    parser.add_argument(
+        "--build-lineages",
+        action="store_true",
+        help="Also run the LEGACY greedy cross-sample lineage clustering. Off by default: "
+        "composing the two linking axes into a lineage is an open decision, and the legacy "
+        "algorithm over- and under-merges simultaneously. For comparison only.",
     )
 
     parser.add_argument(
@@ -990,10 +1251,18 @@ def main():
         validate_results=args.validate_results,
         min_weight_for_anchor=args.min_anchor_weight,
         rescued_min_weight=args.rescued_min_weight,
-        # Lineage clustering
+        # Depth policy
+        min_reads_per_window=args.min_reads_per_window,
+        min_reads_for_rescue=args.min_reads_for_rescue,
+        # Identity gates
         lineage_merge_distance=args.lineage_merge_distance,
         min_shared_for_lineage=args.min_shared_for_lineage,
-        max_span_gap_for_lineage=args.max_span_gap,
+        max_num_diff=args.max_num_diff,
+        min_cosupported_span_frac=args.min_cosupported_span_frac,
+        min_entity_overlap_bp=args.min_entity_overlap_bp,
+        min_read_window_overlap_bp=args.min_read_window_overlap_bp,
+        min_read_read_overlap_bp=args.min_read_read_overlap_bp,
+        cross_sample_method=args.cross_sample_method,
         n_workers=max(1, args.workers),
     )
 
@@ -1037,16 +1306,42 @@ def main():
         if integrator:
             all_integrators.append(integrator)
 
-    # Build lineage table
-    logging.info("Building lineage table across processed MAGs")
-    lineage_records, haplotype_records = build_lineage_table(all_results, config)
+    # ---- Window-level tables (the three deliverables) ----
+    # The final lineage table is PAUSED: composing the within-sample and across-sample
+    # axes into a lineage is an open decision (FIGURE4 diagnosis §6 #9), and these tables
+    # are the substrate that decision will be evaluated on. Pass --build-lineages to run
+    # the legacy greedy clustering anyway; it is retained only for comparison and is known
+    # to over- and under-merge simultaneously.
+    logging.info("Building window tables across processed MAGs")
+    hap_rows, within_rows, across_rows, edge_rows = build_window_tables(
+        all_results, config, sample_order=samples
+    )
+    write_window_tables(hap_rows, within_rows, across_rows, edge_rows, args.output_dir)
 
-    # Write outputs
-    write_longitudinal_outputs(all_results, lineage_records, haplotype_records, args.output_dir)
+    n_within = len({(r["sample"], r["contig"], r["within_sample_id"]) for r in within_rows})
+    n_across = len(across_rows)
+    n_failed_mismatch = sum(1 for e in edge_rows if e["reason"] == "failed_mismatch")
+    n_failed_evidence = sum(1 for e in edge_rows if e["reason"] == "failed_no_evidence")
+    logging.info(
+        f"DONE: {len(mags_to_process)} MAGs | {len(hap_rows)} window-haplotypes | "
+        f"{n_within} within-sample entities | {n_across} across-sample window groups "
+        f"(method={config.cross_sample_method}) | comparisons: "
+        f"{len(edge_rows) - n_failed_mismatch - n_failed_evidence} linked, "
+        f"{n_failed_evidence} no-evidence, {n_failed_mismatch} mismatch"
+    )
 
-    # Summary in logs
-    n_lineages = len({r["lineage_id"] for r in lineage_records}) if lineage_records else 0
-    logging.info(f"DONE: {len(mags_to_process)} MAGs processed, {n_lineages} lineages identified")
+    if args.build_lineages:
+        logging.warning(
+            "--build-lineages: running the LEGACY greedy cross-sample clustering. It is "
+            "order-dependent and accretes; it over- and under-merges simultaneously. "
+            "Retained for comparison only."
+        )
+        lineage_records, haplotype_records = build_lineage_table(all_results, config)
+        write_longitudinal_outputs(
+            all_results, lineage_records, haplotype_records, args.output_dir
+        )
+        n_lineages = len({r["lineage_id"] for r in lineage_records}) if lineage_records else 0
+        logging.info(f"  legacy lineage table: {n_lineages} lineages")
 
 
 if __name__ == "__main__":
