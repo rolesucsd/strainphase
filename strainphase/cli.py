@@ -156,6 +156,9 @@ def cmd_longitudinal(args: argparse.Namespace) -> int:
         min_read_read_overlap_bp=args.min_read_read_overlap_bp,
         min_entity_overlap_bp=args.min_entity_overlap_bp,
         min_cosupported_span_frac=args.min_cosupported_span_frac,
+        min_shared_snvs_for_link=args.min_shared_snvs_for_link,
+        min_shared_calls_for_link=args.min_shared_calls_for_link,
+        max_link_distance=args.max_link_distance,
         max_num_diff=args.max_num_diff,
         lineage_merge_distance=args.lineage_merge_distance,
         min_shared_for_lineage=args.min_shared_for_lineage,
@@ -404,6 +407,22 @@ Examples:
         "--min-entity-overlap-bp", type=int, default=1000,
         help="Min physical overlap between two entities; below it the verdict is an "
              "explicit non-merge rather than 'unknown'.",
+    )
+    # --- within-sample window linking (the HORIZONTAL axis) ---
+    long_parser.add_argument(
+        "--min-shared-snvs-for-link", type=int, default=3,
+        help="Min shared SNV POSITIONS between two overlapping windows before their "
+             "haplotypes are even compared.",
+    )
+    long_parser.add_argument(
+        "--min-shared-calls-for-link", type=int, default=3,
+        help="Min shared ACTUAL CALLS between two haplotypes in overlapping windows. "
+             "Separate from --min-shared-snvs-for-link; this is the one that governs "
+             "whether a haplotype can chain across windows.",
+    )
+    long_parser.add_argument(
+        "--max-link-distance", type=float, default=0.01,
+        help="Max mismatch RATE to link two haplotypes across adjacent windows.",
     )
     long_parser.add_argument(
         "--min-cosupported-span-frac", type=float, default=0.25,
