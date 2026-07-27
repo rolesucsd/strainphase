@@ -29,6 +29,7 @@ import logging
 import os
 import warnings
 from collections import defaultdict
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from multiprocessing import Pool
 
@@ -85,13 +86,32 @@ class HaplotyperConfig:
     # =========== WINDOW PARAMETERS ===========
     window_size: int = 20000
     min_snvs_per_window: int = 1
-    min_reads_per_window: int = 3
+    # Depth policy (FIGURE4 diagnosis §6 #3). Two DIFFERENT floors:
+    #   min_reads_per_window  - reads needed to PHASE a window de novo. Separating two
+    #                           haplotypes at 50/50 needs ~10-20 reads; 3 cannot resolve
+    #                           anything and manufactures the abundance==1.0 artifact.
+    #   min_reads_for_rescue  - reads needed for a window to be BUILT AT ALL, so it can
+    #                           still receive a rescued haplotype from the anchor panel.
+    #                           Rescue matches an established anchor rather than doing de
+    #                           novo separation, so it legitimately needs less evidence.
+    # A window with min_reads_for_rescue <= n < min_reads_per_window is created but not phased.
+    min_reads_per_window: int = 10
+    min_reads_for_rescue: int = 5
 
     # =========== READ FILTERING ===========
     min_mapq: int = 20
     min_base_quality: int = 20
     default_base_quality: int = 20
-    max_reads_per_window: int = 10000
+    # Cap per window; reads above this are uniformly subsampled with the config seed.
+    max_reads_per_window: int = 500
+    # A read must physically cover at least this many bp of a window to be counted in it.
+    # Without this a read overlapping by 1 bp entered n_reads_examined, the junk
+    # classification and the abundance denominator identically to one spanning 20 kb.
+    # (FIGURE4 diagnosis §6 #6b; costs ~8% of reads on 000089747_1.)
+    min_read_window_overlap_bp: int = 1000
+    # Two reads must physically overlap by at least this much to be compared at all
+    # (FIGURE4 diagnosis §6 #8, LEVEL 1).
+    min_read_read_overlap_bp: int = 1000
 
     # =========== VARIANT FILTERING ===========
     min_depth_site: int = 3
@@ -110,9 +130,27 @@ class HaplotyperConfig:
     # switch that lets a caller drop indels or collapse alleles.
 
     # =========== GRAPH CONSTRUCTION ===========
-    min_shared_snvs_for_edge: int = 2
+    min_shared_snvs_for_edge: int = 3
     max_mismatch_frac: float = 0.01
     min_reads_per_cluster: int = 3
+
+    # =========== IDENTITY GATES (shared by all three linking levels) ===========
+    # The rate gate is applied as int(max_mismatch_frac * n_shared) - a FLOOR - so it
+    # already forces 0 mismatches below n_shared=100 and 1 below n_shared=200. The
+    # absolute cap therefore does nothing at low n_shared and becomes the binding gate
+    # at high n_shared, where a rate alone would tolerate 11 mismatches at n=1172.
+    # The two guard opposite ends of the range; both are required.
+    # (FIGURE4 diagnosis §6 #8.)
+    max_num_diff: int = 1
+    # Minimum physical overlap between two entities, below which the verdict is an
+    # explicit NON-MERGE rather than "unknown" (Strainy's I = 1000).
+    min_entity_overlap_bp: int = 1000
+    # Structural variants are ALWAYS loaded, phased and reported, but are excluded from
+    # the identity distance: an invertible promoter at af ~0.5 flips independently of
+    # strain background, so using it as an identity marker splits a lineage in two every
+    # time the inversion flips - destroying the very trajectory it is there to show.
+    # (FIGURE4 diagnosis §6 #16.)
+    exclude_sv_from_identity: bool = True
 
     # =========== EM PARAMETERS ===========
     em_max_iter: int = 30
@@ -144,10 +182,30 @@ class HaplotyperConfig:
     min_shared_for_rescue: int = 2  # Min shared SNVs with actual calls for rescue matching
     rescued_min_weight: float = 0.02
 
-    # =========== LINEAGE CLUSTERING PARAMETERS ===========
-    # Controls how tracks are clustered into lineages across samples
-    lineage_merge_distance: float = 0.01  # Max distance to merge tracks into same lineage
-    min_shared_for_lineage: int = 2  # Min shared SNVs to consider merging into lineage
+    # =========== CROSS-SAMPLE WINDOW GROUPING ===========
+    # Groups haplotypes at ONE FIXED WINDOW across samples (the "vertical" axis).
+    # Windows are fixed coordinate tiles, so every comparison here has an identical
+    # footprint - no span gating, nothing to expand, no imputation gap.
+    lineage_merge_distance: float = 0.01  # Max mismatch rate to group
+    min_shared_for_lineage: int = 3  # Min shared markers (raised 2 -> 3 to match linking)
+    # Identity shape. This decision is still OPEN (FIGURE4 diagnosis §6 #9); both are
+    # implemented so they can be compared on identical inputs.
+    #   "clique"     - complete linkage: a group is a clique, every member passes the
+    #                  gates against every other member. No time axis, so immune to
+    #                  irregular timepoint spacing and to sample-ordering mistakes.
+    #   "reciprocal" - unique-best-on-both-sides + mutual between consecutive samples,
+    #                  with a per-haplotype dropout skip. Requires a correct
+    #                  chronological sample order to mean anything.
+    cross_sample_method: str = "clique"
+
+    # =========== ABUNDANCE COHERENCE ===========
+    # A genome cannot hold two frequencies at one locus at one time. Tested on RAW
+    # counts (never the derived, already-quantised `abundance`) with Fisher's exact
+    # test, so the rule self-tightens as depth grows instead of using a fixed cutoff.
+    # SINGLE TIMEPOINT ONLY - this is a window-merging check, never a cross-timepoint
+    # comparison. (FIGURE4 diagnosis §6 #14.)
+    abundance_coherence_alpha: float = 0.01
+    min_reads_for_coherence: int = 10
 
     # =========== LINKING DIAGNOSTICS ===========
     linking_debug: bool = False  # Record detailed linking diagnostics
@@ -158,9 +216,18 @@ class HaplotyperConfig:
     # Haplotypes in adjacent overlapping windows are linked if their
     # consensus agrees on shared SNVs (Hamming distance <= max_link_distance)
     max_link_distance: float = 0.01  # Max mismatch fraction to link
-    min_shared_snvs_for_link: int = (
-        3  # Min shared SNVs with ACTUAL CALLS to link (not just window overlap)
-    )
+    # Window-level shared SNV POSITIONS (does the window pair even have common sites).
+    min_shared_snvs_for_link: int = 3
+    # Haplotype-level shared ACTUAL CALLS. Previously the same knob as the line above,
+    # which meant the two could not be set independently (FIGURE4 diagnosis §6 #8, LEVEL 2).
+    min_shared_calls_for_link: int = 3
+    # The two haplotypes' CO-SUPPORTED SPAN inside the shared region, as a fraction of
+    # that region. Window geometry itself is not a useful gate (tiles overlap by exactly
+    # 50% or exactly 0%, nothing between). Measured on 000089747_1: 25% rejects 16.0% of
+    # adjacent-window pairs, 50% rejects 30.0% - too aggressive given under-merging is the
+    # standing risk. 25% of a 10 kb overlap is 2500 bp, comfortably above
+    # min_entity_overlap_bp so the two gates agree rather than one masking the other.
+    min_cosupported_span_frac: float = 0.25
 
     # =========== RUNTIME PARAMETERS ===========
     random_seed: int | None = None
@@ -205,6 +272,35 @@ class HaplotyperConfig:
         if self.window_size < 100:
             raise ValueError(f"window_size too small: {self.window_size}")
 
+        # Depth policy: a window must be buildable before it can be phased, so the
+        # rescue floor has to sit at or below the phasing floor. Clamp rather than raise -
+        # a caller lowering min_reads_per_window (tests, low-coverage runs) means "be more
+        # permissive", and erroring on that would be hostile. Above the phasing floor the
+        # rescue band would simply be empty, which is silent and confusing.
+        if self.min_reads_for_rescue > self.min_reads_per_window:
+            object.__setattr__(self, "min_reads_for_rescue", self.min_reads_per_window)
+
+        if self.max_num_diff < 0:
+            raise ValueError(f"max_num_diff must be >= 0, got {self.max_num_diff}")
+
+        if not (0 <= self.min_cosupported_span_frac <= 1):
+            raise ValueError(
+                f"min_cosupported_span_frac must be in [0, 1], got "
+                f"{self.min_cosupported_span_frac}"
+            )
+
+        if self.cross_sample_method not in ("clique", "reciprocal"):
+            raise ValueError(
+                f"cross_sample_method must be 'clique' or 'reciprocal', got "
+                f"{self.cross_sample_method!r}"
+            )
+
+        if not (0 < self.abundance_coherence_alpha < 1):
+            raise ValueError(
+                f"abundance_coherence_alpha must be in (0, 1), got "
+                f"{self.abundance_coherence_alpha}"
+            )
+
         # EM iterations
         if self.em_max_iter < 1:
             raise ValueError(f"em_max_iter must be >= 1, got {self.em_max_iter}")
@@ -232,6 +328,19 @@ class Read:
     alleles: dict[int, str] = field(default_factory=dict)
     quals: dict[int, int] = field(default_factory=dict)
     sample: str | None = None
+    # Reference alignment span, 1-based inclusive-exclusive (from aln.reference_start /
+    # aln.reference_end). Needed for the physical-overlap gates; without these the only
+    # available proxy is the span between shared VARIANT sites, which under-counts badly
+    # in variant-sparse regions. Default (0, 0) means "unknown" - overlap gates are then
+    # skipped rather than silently rejecting everything.
+    ref_start: int = 0
+    ref_end: int = 0
+
+    def overlap_bp(self, other: Read) -> int:
+        """Physical reference overlap with *other*, in bp. -1 when either span is unknown."""
+        if self.ref_end <= self.ref_start or other.ref_end <= other.ref_start:
+            return -1
+        return max(0, min(self.ref_end, other.ref_end) - max(self.ref_start, other.ref_start))
 
 
 @dataclass
@@ -884,9 +993,27 @@ def make_windows_lazy(
             if aln.mapping_quality < config.min_mapq:
                 continue
 
+            # Physical read-to-window overlap. pysam reference_start/_end are 0-based
+            # half-open; the window is [start-1, end-1) in the same frame.
+            a_start = aln.reference_start
+            a_end = aln.reference_end
+            if a_end is None:
+                continue
+            win_overlap = min(a_end, end - 1) - max(a_start, start - 1)
+            if win_overlap < config.min_read_window_overlap_bp:
+                # A read barely clipping the window edge carries almost no information
+                # about it, yet would otherwise count identically to one spanning the
+                # whole window in n_reads_examined and the abundance denominator.
+                continue
+
             # Parse alleles at SNV sites
             r = Read(
-                id=aln.query_name, contig=contig_id, mapq=aln.mapping_quality, sample=sample_id
+                id=aln.query_name,
+                contig=contig_id,
+                mapq=aln.mapping_quality,
+                sample=sample_id,
+                ref_start=a_start + 1,  # store 1-based to match allele positions
+                ref_end=a_end + 1,
             )
 
             query_seq = aln.query_sequence
@@ -1033,7 +1160,12 @@ def make_windows_lazy(
             indices = rng.permutation(len(reads))[: config.max_reads_per_window]
             reads = [reads[i] for i in indices]
 
-        if len(reads) < config.min_reads_per_window:
+        # Window CREATION uses the lower rescue floor, so windows in the
+        # [min_reads_for_rescue, min_reads_per_window) band still exist and can receive a
+        # rescued haplotype from the anchor panel. De-novo PHASING is gated separately in
+        # process_window() at the higher min_reads_per_window. If creation used the
+        # phasing floor instead, the rescue floor would be unreachable.
+        if len(reads) < config.min_reads_for_rescue:
             continue
 
         w = Window(contig=contig_id, start=start, end=end, sample=sample_id, window_idx=window_idx)
@@ -1093,13 +1225,25 @@ class GraphInitializer:
                 if n_shared < self.config.min_shared_snvs_for_edge:
                     continue
 
-                # Count mismatches with early exit.
-                # We stop once mismatches exceed the allowed fraction.
-                max_allowed = int(self.config.max_mismatch_frac * n_shared)
+                r_i, r_j = reads[i], reads[j]
+
+                # Physical read-read overlap. -1 means the alignment spans are unknown
+                # (e.g. synthetic reads in tests), in which case the gate is skipped
+                # rather than rejecting everything.
+                ov = r_i.overlap_bp(r_j)
+                if 0 <= ov < self.config.min_read_read_overlap_bp:
+                    continue
+
+                # Count mismatches with early exit. Two independent gates: the RATE
+                # (floor(max_mismatch_frac * n_shared), which forces 0 mismatches below
+                # n_shared=100) and the ABSOLUTE cap, which is what actually binds once
+                # n_shared is large enough for the rate to go permissive.
+                max_allowed = min(
+                    int(self.config.max_mismatch_frac * n_shared), self.config.max_num_diff
+                )
                 mismatches = 0
                 exceeded = False
 
-                r_i, r_j = reads[i], reads[j]
                 for p in shared:
                     if r_i.alleles[p] != r_j.alleles[p]:
                         mismatches += 1
@@ -2202,6 +2346,31 @@ def process_window(
     """Process a single window through the full pipeline."""
     post = PostProcessor(config)
 
+    # 0) Resolving-depth floor. Windows are CREATED at min_reads_for_rescue so the
+    #    anchor panel can still populate them, but de-novo phasing needs enough reads to
+    #    actually separate haplotypes. Below the floor we emit a junk-only result: no
+    #    haplotype is invented, so the trajectory carries a gap instead of a
+    #    manufactured abundance of 1.0.
+    if len(window.reads) < config.min_reads_per_window:
+        n_reads = len(window.reads)
+        gamma = np.ones((n_reads, 1))
+        pi = np.array([1.0])
+        n_reads_examined, reads_within_mismatch_per_hap = _compute_read_mismatch_counts(
+            window, [], config.max_mismatch_frac
+        )
+        return WindowResult(
+            window=window,
+            haplotypes=[],
+            gamma=gamma,
+            pi=pi,
+            log_likelihood=-np.inf,
+            assignments=post.assign_reads(window.reads, gamma, pi),
+            converged=True,
+            iterations=0,
+            n_reads_examined=n_reads_examined,
+            reads_within_mismatch_per_hap=reads_within_mismatch_per_hap,
+        )
+
     # 1) Initialize haplotypes via read clustering on the overlap graph.
     initializer = GraphInitializer(config)
     initial_haps, cluster_sizes = initializer.get_initial_haplotypes(window)
@@ -2258,21 +2427,25 @@ def process_window(
         haplotypes, gamma, pi, window, n_timepoints_seen
     )
 
-    # 3b) Prune invariant positions: keep only SNV sites where at least two
-    #      haplotypes disagree.  Monomorphic sites (e.g. AF≈1 fixed ALTs)
-    #      add no discriminative signal and inflate shared-SNV counts during linking.
-    if len(merged_haps) >= 2:
-        all_positions = set()
-        for h in merged_haps:
-            all_positions.update(h.consensus.keys())
-        variable_positions = set()
-        for pos in all_positions:
-            calls = {h.consensus[pos] for h in merged_haps if pos in h.consensus}
-            if len(calls) > 1:
-                variable_positions.add(pos)
-        for h in merged_haps:
-            h.consensus = {pos: base for pos, base in h.consensus.items()
-                           if pos in variable_positions}
+    # 3b) NO invariant-site pruning here.
+    #
+    #     This step used to delete positions where the haplotypes in THIS window agreed,
+    #     gated on `if len(merged_haps) >= 2`. It was wrong in both directions:
+    #
+    #       * skipped entirely for single-haplotype windows (85% of windows on
+    #         000089747_1), so those kept every position they covered - a median of 743
+    #         positions of which 42.6% are invariant across the entire MAG - while
+    #         2-haplotype windows kept a median of 3. Distances were therefore computed
+    #         on wildly asymmetric marker sets.
+    #       * window-LOCAL, so a genuinely polymorphic position that happened to be
+    #         monomorphic among this window's haplotypes was destroyed for good.
+    #
+    #     Pruning is now a comparison-time concern, not a construction-time one:
+    #     `variable_marker_positions()` computes the marker set at the widest scope
+    #     available (all haplotypes in the sample for window linking; all haplotypes in
+    #     all samples for cross-sample grouping) and the linking code filters against it.
+    #     Construction keeps everything; nothing is destroyed before the scope is known.
+    #     (FIGURE4 diagnosis §2.6a.)
 
     assignments = post.assign_reads(window.reads, final_gamma, final_pi)
 
@@ -2300,6 +2473,154 @@ def process_window(
     return result
 
 
+# =============================================================================
+# IDENTITY: marker set + the shared gate stack
+# =============================================================================
+
+
+def variable_marker_positions(
+    consensuses: Iterable[dict[int, str]],
+    site_type: dict[int, str] | None = None,
+    config: HaplotyperConfig = DEFAULT_CONFIG,
+) -> set[int]:
+    """Positions usable as identity markers, computed over *consensuses*.
+
+    A position is a marker only if at least two distinct alleles are observed across the
+    whole collection. A position where every haplotype agrees carries zero identity
+    information, yet still inflates ``n_shared`` and dilutes the mismatch rate - on
+    ``000089747_1`` 42.6% of emitted positions were invariant MAG-wide, accounting for
+    38.5% of all consensus entries.
+
+    Call this at the WIDEST scope available for the comparison being made:
+      * window linking within a sample -> every haplotype in that sample/contig
+      * grouping across samples        -> every haplotype in every sample, that contig
+
+    Structural-variant sites are excluded when ``config.exclude_sv_from_identity`` is set.
+    They remain loaded, phased and reported - they are simply not identity markers,
+    because an invertible promoter flips independently of strain background.
+    """
+    seen: dict[int, set[str]] = defaultdict(set)
+    for consensus in consensuses:
+        for pos, base in consensus.items():
+            seen[pos].add(base)
+
+    markers = {pos for pos, alleles in seen.items() if len(alleles) > 1}
+    if config.exclude_sv_from_identity and site_type:
+        markers -= {pos for pos in markers if site_type.get(pos) == "sv"}
+    return markers
+
+
+@dataclass
+class GateResult:
+    """Outcome of one identity comparison.
+
+    ``reason`` distinguishes the two ways a comparison can fail, which is the
+    information the (paused) lineage layer needs in order to tell a measurement hole
+    from a real genotypic wall:
+
+      ``"linked"``              passed every gate
+      ``"failed_no_evidence"``  too few shared markers, or too little physical overlap -
+                                a DROPOUT. Nothing was shown to differ.
+      ``"failed_mismatch"``     enough shared markers, but the alleles genuinely disagree
+                                beyond the gates - a candidate recombination breakpoint.
+    """
+
+    passed: bool
+    reason: str
+    rate: float
+    n_shared: int
+    n_diff: int
+    # True when no discriminating markers were available and the comparison fell back to
+    # all co-covered positions. See compare_consensus for why that fallback exists.
+    used_fallback: bool = False
+
+
+def compare_consensus(
+    a: dict[int, str],
+    b: dict[int, str],
+    markers: set[int],
+    config: HaplotyperConfig = DEFAULT_CONFIG,
+    min_shared: int | None = None,
+    region: tuple[int, int] | None = None,
+    min_cospan_frac: float | None = None,
+    max_rate: float | None = None,
+) -> GateResult:
+    """Apply the full identity gate stack to two consensus dicts.
+
+    Gates, in order: shared markers >= ``min_shared``; co-supported span >=
+    ``min_cospan_frac`` of ``region`` (and >= ``min_entity_overlap_bp``); absolute
+    mismatches <= ``max_num_diff``; mismatch rate <= ``lineage_merge_distance``.
+
+    The absolute cap and the rate guard opposite ends of the range: the rate is applied
+    as a floor, so it already forces zero mismatches below n_shared=100, while at
+    n_shared=1172 it would tolerate 11 - which is where the absolute cap binds.
+    """
+    if min_shared is None:
+        min_shared = config.min_shared_for_lineage
+    if min_cospan_frac is None:
+        min_cospan_frac = config.min_cosupported_span_frac
+    if max_rate is None:
+        max_rate = config.lineage_merge_distance
+
+    def _restrict(positions):
+        if region is None:
+            return set(positions)
+        lo, hi = region
+        return {p for p in positions if lo <= p <= hi}
+
+    shared = _restrict(a.keys() & b.keys() & markers)
+    used_fallback = False
+
+    if len(shared) < min_shared:
+        # No DISCRIMINATING markers between these two. Absence of discriminating
+        # evidence is not evidence of difference: a clonal locus legitimately has no
+        # variable positions at all, and a clonal SAMPLE can have almost none - 85% of
+        # windows on 000089747_1 hold a single haplotype. Restricting to markers would
+        # then make every comparison impossible and split a real lineage into singletons.
+        # Fall back to all co-covered positions, and record that we did so.
+        fallback = _restrict(a.keys() & b.keys())
+        if len(fallback) >= min_shared:
+            shared, used_fallback = fallback, True
+
+    n_shared = len(shared)
+    if n_shared < min_shared:
+        return GateResult(False, "failed_no_evidence", 1.0, n_shared, 0, used_fallback)
+
+    # Co-supported span: the stretch over which BOTH haplotypes actually have calls.
+    cospan = max(shared) - min(shared)
+    if cospan < config.min_entity_overlap_bp:
+        return GateResult(False, "failed_no_evidence", 1.0, n_shared, 0, used_fallback)
+    if region is not None:
+        lo, hi = region
+        if hi > lo and cospan < min_cospan_frac * (hi - lo):
+            return GateResult(False, "failed_no_evidence", 1.0, n_shared, 0, used_fallback)
+
+    n_diff = sum(1 for p in shared if a[p] != b[p])
+    rate = n_diff / n_shared
+    if n_diff > config.max_num_diff or rate > max_rate:
+        return GateResult(False, "failed_mismatch", rate, n_shared, n_diff, used_fallback)
+    return GateResult(True, "linked", rate, n_shared, n_diff, used_fallback)
+
+
+def unique_best_matches(
+    matches: dict[int, list[tuple[float, int]]],
+) -> dict[int, int]:
+    """Keep only unambiguous best matches; a tie contributes NOTHING.
+
+    Shared by window linking and cross-sample grouping. Uniqueness on both sides means
+    every node has at most one partner in each direction, so a connected component is a
+    PATH rather than a hub - which is what bounds an entity's size by construction
+    instead of by tuning.
+    """
+    unique: dict[int, int] = {}
+    for idx, options in matches.items():
+        options.sort(key=lambda x: x[0])
+        best_dist = options[0][0]
+        if len([o for o in options if o[0] == best_dist]) == 1:
+            unique[idx] = options[0][1]
+    return unique
+
+
 def link_windows(
     results: list[WindowResult], config: HaplotyperConfig = DEFAULT_CONFIG
 ) -> list[WindowResult]:
@@ -2323,6 +2644,19 @@ def link_windows(
 
     # Sort by genomic coordinate so adjacent windows are compared in order.
     sorted_results = sorted(results, key=lambda wr: wr.window.start)
+
+    # Marker set at the widest scope available here: every haplotype in this sample and
+    # contig. Positions where every haplotype agrees carry no identity information and
+    # are excluded, as are SV sites. Construction no longer prunes, so this is where the
+    # non-informative positions are removed.
+    site_type_all: dict[int, str] = {}
+    for wr in sorted_results:
+        site_type_all.update(getattr(wr.window, "site_type", {}) or {})
+    markers = variable_marker_positions(
+        (hap.consensus for wr in sorted_results for hap in wr.haplotypes),
+        site_type_all,
+        config,
+    )
 
     # Build graph: nodes = (window_idx, hap_idx); edges = linkable haplotype pairs.
     graph = nx.Graph()  # Undirected for connected components
@@ -2364,16 +2698,30 @@ def link_windows(
             if len(shared_snvs) < config.min_shared_snvs_for_link:
                 continue
 
+            # The region shared by the two windows; the co-supported span gate is
+            # measured as a fraction of it.
+            region = (
+                max(curr_wr.window.start, next_wr.window.start),
+                min(curr_wr.window.end, next_wr.window.end) - 1,
+            )
+
             # Evaluate candidate pairings before linking (avoid cross-links).
+            # Full gate stack: shared markers >= min_shared_calls_for_link, co-supported
+            # span >= 25% of the shared region, num_diff <= 1, rate <= max_link_distance.
             candidates: list[tuple[int, int, float, int]] = []
             for hi, hap_i in enumerate(curr_wr.haplotypes):
                 for hj, hap_j in enumerate(next_wr.haplotypes):
-                    dist, _, n_shared = hap_i.distance_to(hap_j, shared_snvs)
-                    # Only consider pairs with real shared calls
-                    if n_shared < config.min_shared_snvs_for_link:
-                        continue
-                    if dist <= config.max_link_distance:
-                        candidates.append((hi, hj, dist, n_shared))
+                    gate = compare_consensus(
+                        hap_i.consensus,
+                        hap_j.consensus,
+                        markers,
+                        config,
+                        min_shared=config.min_shared_calls_for_link,
+                        region=region,
+                        max_rate=config.max_link_distance,
+                    )
+                    if gate.passed:
+                        candidates.append((hi, hj, gate.rate, gate.n_shared))
 
             if not candidates:
                 if config.linking_debug:

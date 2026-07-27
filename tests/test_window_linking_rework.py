@@ -1,0 +1,323 @@
+#!/usr/bin/env python3
+"""Tests for the window-linking rework.
+
+Covers the identity gate stack, the marker set (including the clonal-fallback that a
+naive implementation gets wrong), both cross-sample grouping shapes, the abundance
+coherence test, the QC gate, and the zero-leak fix.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import pytest
+
+from strainphase.coherence import abundance_coherent, qc_flags
+from strainphase.core import (
+    HaplotyperConfig,
+    Read,
+    compare_consensus,
+    unique_best_matches,
+    variable_marker_positions,
+)
+from strainphase.longitudinal import _window_conditional_abundance, _weighted_median
+from strainphase.window_groups import WindowHaplotype, group_window_across_samples
+
+
+def cfg(**kw) -> HaplotyperConfig:
+    """Config sized for small synthetic markers rather than 20 kb windows."""
+    base = {
+        "min_entity_overlap_bp": 0,
+        "min_cosupported_span_frac": 0.0,
+        "min_shared_for_lineage": 3,
+    }
+    base.update(kw)
+    return HaplotyperConfig(**base)
+
+
+# --------------------------------------------------------------------------- #
+# Marker set
+# --------------------------------------------------------------------------- #
+
+
+def test_marker_set_keeps_only_variable_positions():
+    """A position where every haplotype agrees carries no identity information."""
+    consensuses = [
+        {10: "A", 20: "C", 30: "G"},
+        {10: "A", 20: "T", 30: "G"},  # only pos 20 differs
+    ]
+    assert variable_marker_positions(consensuses) == {20}
+
+
+def test_marker_set_excludes_sv_sites():
+    """SVs stay loaded and reported, but must never drive identity: an invertible
+    promoter flips independently of strain background."""
+    consensuses = [{10: "A", 99: "ev.INV.1"}, {10: "T", 99: "ev.INV.2"}]
+    site_type = {10: "snv", 99: "sv"}
+    assert variable_marker_positions(consensuses, site_type) == {10}
+    keep = variable_marker_positions(
+        consensuses, site_type, cfg(exclude_sv_from_identity=False)
+    )
+    assert keep == {10, 99}
+
+
+def test_marker_set_is_empty_for_a_clonal_locus():
+    """The precondition for the fallback below: a clonal sample has NO variable sites."""
+    consensuses = [{10: "A", 20: "C"}, {10: "A", 20: "C"}]
+    assert variable_marker_positions(consensuses) == set()
+
+
+# --------------------------------------------------------------------------- #
+# Gate stack
+# --------------------------------------------------------------------------- #
+
+
+def test_clonal_fallback_still_links():
+    """REGRESSION: with no discriminating markers, absence of evidence of difference is
+    not evidence of difference.
+
+    85% of windows hold a single haplotype, so a clonal sample can have almost no
+    variable positions at all. Restricting the comparison to markers would then make
+    every comparison impossible and shatter a real lineage into singletons.
+    """
+    a = {10: "A", 20: "C", 30: "G"}
+    b = {10: "A", 20: "C", 30: "G"}
+    gate = compare_consensus(a, b, markers=set(), config=cfg())
+    assert gate.passed
+    assert gate.used_fallback
+    assert gate.n_shared == 3
+
+
+def test_absolute_cap_binds_where_the_rate_does_not():
+    """The rate is a floor, so at large n_shared it tolerates many mismatches; the
+    absolute cap is what actually binds there."""
+    a = {i: "A" for i in range(1000)}
+    b = dict(a)
+    for i in (5, 15, 25):  # 3 mismatches out of 1000 -> rate 0.003, under 0.01
+        b[i] = "T"
+    # All 1000 positions are markers: in a real run the marker set is computed across
+    # every sample on the contig, so a position can vary somewhere in the cohort while
+    # these two particular haplotypes happen to agree on it.
+    markers = set(range(1000))
+    permissive = compare_consensus(a, b, markers, cfg(max_num_diff=10))
+    assert permissive.passed, "rate alone admits 3 mismatches at n_shared=1000"
+    strict = compare_consensus(a, b, markers, cfg(max_num_diff=1))
+    assert not strict.passed
+    assert strict.reason == "failed_mismatch"
+
+
+def test_failure_reason_distinguishes_dropout_from_disagreement():
+    """The lineage layer needs to tell a measurement hole from a genotypic wall."""
+    a = {10: "A", 20: "C", 30: "G"}
+    thin = {10: "A"}  # only 1 shared position -> no evidence either way
+    assert compare_consensus(a, thin, set(), cfg()).reason == "failed_no_evidence"
+
+    differing = {10: "T", 20: "A", 30: "C"}
+    markers = variable_marker_positions([a, differing])
+    assert compare_consensus(a, differing, markers, cfg()).reason == "failed_mismatch"
+
+
+def test_min_entity_overlap_is_an_explicit_non_merge():
+    """Below the physical-overlap floor the verdict is NON-MERGE, not 'unknown'."""
+    a = {10: "A", 11: "C", 12: "G"}
+    b = {10: "A", 11: "C", 12: "G"}
+    gate = compare_consensus(a, b, set(), cfg(min_entity_overlap_bp=1000))
+    assert not gate.passed
+    assert gate.reason == "failed_no_evidence"
+
+
+def test_cosupported_span_fraction_gate():
+    """Two haplotypes touching only at the edge of a shared region are rejected."""
+    a = {p: "A" for p in (100, 101, 102)}
+    b = {p: "A" for p in (100, 101, 102)}
+    config = cfg(min_cosupported_span_frac=0.25, min_entity_overlap_bp=0)
+    # co-supported span is 2 bp inside a 10 kb region -> far below 25%
+    assert not compare_consensus(a, b, set(), config, region=(1, 10001)).passed
+    # same pair with no region constraint passes
+    assert compare_consensus(a, b, set(), config).passed
+
+
+# --------------------------------------------------------------------------- #
+# unique_best_matches
+# --------------------------------------------------------------------------- #
+
+
+def test_tie_contributes_no_edge():
+    """A tied best match is ambiguous and must yield nothing -- this is what bounds
+    entity size by construction rather than by tuning."""
+    assert unique_best_matches({0: [(0.0, 1)]}) == {0: 1}
+    assert unique_best_matches({0: [(0.0, 1), (0.0, 2)]}) == {}
+    assert unique_best_matches({0: [(0.0, 1), (0.5, 2)]}) == {0: 1}
+
+
+# --------------------------------------------------------------------------- #
+# Cross-sample grouping
+# --------------------------------------------------------------------------- #
+
+
+def _hap(sample, hid, consensus, window_start=1, reads=20, total=40):
+    return WindowHaplotype(
+        sample=sample,
+        contig="c1",
+        window_start=window_start,
+        window_end=window_start + 20000,
+        haplotype_id=hid,
+        consensus=consensus,
+        reads=reads,
+        total_reads=total,
+    )
+
+
+@pytest.mark.parametrize("method", ["clique", "reciprocal"])
+def test_identical_haplotypes_group_together(method):
+    cons = {100: "A", 2000: "C", 5000: "G"}
+    haps = [_hap(f"t{i}", f"h{i}", dict(cons)) for i in range(4)]
+    groups, edges = group_window_across_samples(
+        haps, markers=set(), config=cfg(cross_sample_method=method)
+    )
+    assert len(groups) == 1
+    assert groups[0].n_samples == 4
+    assert all(e.reason == "linked" for e in edges)
+
+
+@pytest.mark.parametrize("method", ["clique", "reciprocal"])
+def test_divergent_haplotypes_stay_separate(method):
+    a = {100: "A", 2000: "C", 5000: "G"}
+    b = {100: "T", 2000: "A", 5000: "C"}
+    haps = [_hap("t0", "h0", a), _hap("t1", "h1", b)]
+    groups, edges = group_window_across_samples(
+        haps, markers={100, 2000, 5000}, config=cfg(cross_sample_method=method)
+    )
+    assert len(groups) == 2
+    assert {e.reason for e in edges} == {"failed_mismatch"}
+
+
+def test_clique_refuses_to_chain():
+    """A and C differ, but both match B. Single linkage would chain them into one group;
+    complete linkage must not -- this is the accretion being removed."""
+    a = {100: "A", 2000: "A", 5000: "A", 8000: "A"}
+    b = {100: "A", 2000: "A", 5000: "A", 8000: "T"}  # 1 diff from a
+    c = {100: "A", 2000: "A", 5000: "T", 8000: "T"}  # 1 diff from b, 2 from a
+    haps = [_hap("t0", "ha", a), _hap("t1", "hb", b), _hap("t2", "hc", c)]
+    markers = variable_marker_positions([a, b, c])
+    groups, _ = group_window_across_samples(
+        haps, markers, cfg(cross_sample_method="clique", max_num_diff=1)
+    )
+    labels = {m.haplotype_id: g.group_id for g in groups for m in g.members}
+    assert labels["ha"] != labels["hc"], "a and c differ by 2 and must not share a group"
+
+
+def test_edges_record_every_comparison_including_failures():
+    """A discarded comparison is indistinguishable from one never made."""
+    a = {100: "A", 2000: "C", 5000: "G"}
+    b = {100: "T", 2000: "A", 5000: "C"}
+    haps = [_hap("t0", "h0", a), _hap("t1", "h1", b), _hap("t2", "h2", dict(a))]
+    _, edges = group_window_across_samples(haps, {100, 2000, 5000}, cfg())
+    assert len(edges) == 3  # all pairs, not just successes
+    assert {e.reason for e in edges} == {"linked", "failed_mismatch"}
+
+
+# --------------------------------------------------------------------------- #
+# Abundance coherence -- SINGLE TIMEPOINT ONLY
+# --------------------------------------------------------------------------- #
+
+
+def test_coherent_when_counts_agree():
+    assert abundance_coherent([(20, 40), (22, 40), (19, 40)]).coherent
+
+
+def test_incoherent_when_counts_disagree_with_depth_to_prove_it():
+    result = abundance_coherent([(2, 100), (95, 100)])
+    assert not result.coherent
+    assert result.min_p < 0.01
+
+
+def test_low_depth_windows_are_excluded_not_failed():
+    """At 3 reads the test has no power; including such windows would dilute the result
+    rather than inform it."""
+    result = abundance_coherent([(1, 3), (3, 3)])
+    assert result.coherent
+    assert result.n_tested == 0
+
+
+def test_sampling_noise_alone_does_not_reject():
+    """At ~12 reads two windows at the SAME true frequency routinely differ by 0.3+, so
+    a fixed threshold would reject real merges. A likelihood test must not."""
+    assert abundance_coherent([(6, 12), (9, 12)]).coherent
+
+
+# --------------------------------------------------------------------------- #
+# QC gate
+# --------------------------------------------------------------------------- #
+
+
+def test_qc_flags_detect_too_many_members_per_cell():
+    members = [
+        {"sample": "t0", "window_start": 1, "reads": 10, "total_reads": 40}
+        for _ in range(3)
+    ]
+    assert qc_flags("E1", members).too_many_per_cell
+
+
+def test_qc_flags_clean_entity_passes():
+    members = [
+        {"sample": f"t{i}", "window_start": 1, "reads": 20, "total_reads": 40}
+        for i in range(6)
+    ]
+    assert not qc_flags("E1", members).failed
+
+
+def test_qc_flags_detect_horizontal_occupancy():
+    """An over-merged entity piles many windows across timepoints without any single
+    timepoint holding them all."""
+    members = [
+        {"sample": f"t{i}", "window_start": i * 10000, "reads": 20, "total_reads": 40}
+        for i in range(9)
+    ]
+    assert qc_flags("E1", members).horizontal_occupancy
+
+
+# --------------------------------------------------------------------------- #
+# Zero-leak
+# --------------------------------------------------------------------------- #
+
+
+def test_unmeasurable_window_returns_none_not_zero():
+    """A junk-only or pi-less window has NO measurement; it is not a measurement of 0."""
+    assert _window_conditional_abundance(None, 0) is None
+    assert _window_conditional_abundance(np.array([1.0]), 0) is None  # pi_junk == 1
+    assert _window_conditional_abundance(np.array([0.5, 0.5]), 5) is None  # short vector
+
+
+def test_measurable_window_is_conditioned_on_non_junk():
+    got = _window_conditional_abundance(np.array([0.4, 0.2, 0.4]), 0)
+    assert got == pytest.approx(0.4 / 0.6)
+
+
+def test_zero_leak_would_have_dragged_the_median_down():
+    """Why None matters: the aggregate is a weighted MEDIAN, a selection operator that
+    returns one input verbatim, so an injected 0.0 can become the reported value."""
+    real = [0.8, 0.82, 0.79]
+    weights = [30.0, 30.0, 30.0]
+    assert _weighted_median(real, weights) == pytest.approx(0.8, abs=0.03)
+    leaked = _weighted_median([0.0] + real, [90.0] + weights)
+    assert leaked == 0.0
+
+
+# --------------------------------------------------------------------------- #
+# Read coordinates
+# --------------------------------------------------------------------------- #
+
+
+def test_read_overlap_bp():
+    a = Read(id="a", contig="c1", mapq=60, ref_start=1000, ref_end=5000)
+    b = Read(id="b", contig="c1", mapq=60, ref_start=4000, ref_end=9000)
+    assert a.overlap_bp(b) == 1000
+    far = Read(id="c", contig="c1", mapq=60, ref_start=8000, ref_end=9000)
+    assert a.overlap_bp(far) == 0
+
+
+def test_read_overlap_unknown_is_minus_one_not_zero():
+    """Unknown spans must skip the gate, not silently reject every pair."""
+    a = Read(id="a", contig="c1", mapq=60)
+    b = Read(id="b", contig="c1", mapq=60, ref_start=1, ref_end=100)
+    assert a.overlap_bp(b) == -1

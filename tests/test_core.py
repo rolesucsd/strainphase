@@ -477,9 +477,15 @@ class TestWindowLinking(unittest.TestCase):
     
     def setUp(self):
         """Set up test fixtures."""
+        # Synthetic 500 bp windows with 3 markers each: far below the production
+        # defaults (20 kb windows, 1 kb minimum overlap), so the physical-span gates
+        # are relaxed here. This class tests the LINKING decision, not depth policy.
         self.config = HaplotyperConfig(
             max_link_distance=0.1,
-            min_shared_snvs_for_link=2
+            min_shared_snvs_for_link=2,
+            min_shared_calls_for_link=2,
+            min_entity_overlap_bp=0,
+            min_cosupported_span_frac=0.0,
         )
     
     def test_link_overlapping_windows(self):

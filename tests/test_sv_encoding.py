@@ -73,7 +73,11 @@ def test_present_allele_is_event_id(tmp_path):
         contig_length=1000,
         snv_positions=[200, 500],
         ref_alleles={200: "A", 500: "N"},
-        config=DEFAULT_CONFIG,
+        # 800 bp synthetic reads on a 1 kb contig sit below the 1 kb overlap
+        # default; this test is about SV allele encoding, not depth policy.
+        config=HaplotyperConfig(
+            min_read_window_overlap_bp=0, min_read_read_overlap_bp=0
+        ),
         site_type={200: "snv", 500: "sv"},
         sv_support={500: {"ev.INS.7": {"pres1", "pres2"}}},
     )
@@ -97,7 +101,11 @@ def test_distinct_events_at_one_anchor_stay_distinct(tmp_path):
         contig_length=1000,
         snv_positions=[200, 500],
         ref_alleles={200: "A", 500: "N"},
-        config=DEFAULT_CONFIG,
+        # 800 bp synthetic reads on a 1 kb contig sit below the 1 kb overlap
+        # default; this test is about SV allele encoding, not depth policy.
+        config=HaplotyperConfig(
+            min_read_window_overlap_bp=0, min_read_read_overlap_bp=0
+        ),
         site_type={200: "snv", 500: "sv"},
         sv_support={500: {"ev.A": {"a1", "a2"}, "ev.B": {"b1", "b2"}}},
     )
@@ -134,7 +142,11 @@ def test_sv_present_requires_span_overlap(tmp_path):
         contig_length=2000,
         snv_positions=[200, 500],
         ref_alleles={200: "A", 500: "N"},
-        config=HaplotyperConfig(window_size=1200),
+        # Synthetic reads here are far shorter than the 1 kb physical-overlap
+        # default, so the gates are disabled; this test is about SV allele encoding.
+        config=HaplotyperConfig(
+            window_size=1200, min_read_window_overlap_bp=0, min_read_read_overlap_bp=0
+        ),
         site_type={200: "snv", 500: "sv"},
         sv_support={500: {"ev.X": {"faraway"}}},
     )
@@ -163,7 +175,14 @@ def test_process_contig_merges_and_drops_collisions(tmp_path):
         vcf_path=vcf,
         contig_id="c1",
         contig_length=1000,
-        config=HaplotyperConfig(),
+        # 4 synthetic reads, far shorter than the 1 kb physical-overlap default and
+        # below the 10-read phasing floor. Both are relaxed here; this test is about SV
+        # allele encoding, not depth policy.
+        config=HaplotyperConfig(
+            min_read_window_overlap_bp=0,
+            min_read_read_overlap_bp=0,
+            min_reads_per_window=1,
+        ),
         sample_id="s1",
         sv_sidecar_path=sidecar,
     )
