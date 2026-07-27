@@ -809,7 +809,14 @@ def build_window_tables(
                         abundance = _window_conditional_abundance(
                             getattr(wr, "pi", None), h_idx
                         )
-                        hap_id = f"{eid}_W{wr.window.start}_H{h_idx}"
+                        # GLOBALLY unique. `eid` comes from link_windows' track_id, which
+                        # is assigned per (sample, contig) and therefore RESTARTS at T0001
+                        # in every sample - so "T0001_W10001_H0" recurred in 14 different
+                        # samples on 000089747_1. That made the `haplotype_ids` member list
+                        # in windows_across_samples.tsv impossible to join back to
+                        # haplotypes.tsv without silently fanning out. Sample and contig
+                        # are part of the identity, so they belong in the id.
+                        hap_id = f"{sample_id}|{contig_id}|{eid}_W{wr.window.start}_H{h_idx}"
                         consensus_str = "|".join(
                             f"{p}:{b}" for p, b in sorted(hap.consensus.items())
                         )
