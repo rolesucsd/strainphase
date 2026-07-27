@@ -22,6 +22,13 @@
 # The final lineage table is NOT produced. Composing the two linking axes into a
 # lineage is still an open decision; these tables are the substrate for it. Add
 # --build-lineages to also emit the legacy greedy clustering for comparison.
+#
+# SVs: --sv-sidecars co-phases structural variants as pseudo-SNVs. They ARE loaded,
+# phased and reported, but are EXCLUDED from the identity distance - an invertible
+# promoter at af~0.5 flips independently of strain background, so using it as an
+# identity marker would split a lineage in two every time the inversion flips,
+# destroying the very trajectory it is there to show. Drop the flag (and SV_DIR) if
+# you have no sidecars; nothing else is affected.
 # =============================================================================
 set -euo pipefail
 
@@ -35,6 +42,7 @@ BASE="/ddn_scratch/roles/strain_analysis/Larry"
 REF="${BASE}/results/references/combined_bins.fasta"
 OUT_BASE="${BASE}/results/haplotypes/longitudinal_wlr"
 VCF_DIR="${BASE}/results/summarized_vcf"
+SV_DIR="${BASE}/results/sv/sidecars"        # strainphase.sv_encoding output, one TSV per sample
 BAM_DIR="${BASE}/results/mapping"
 MAG_LIST="${BASE}/results/references/mag_list.txt"   # one MAG name per line
 
@@ -70,6 +78,7 @@ strainphase longitudinal \
     --samples "${SAMPLES}" \
     --bams    "${BAM_DIR}/{sample}.sorted.bam" \
     --vcfs    "${VCF_DIR}/{sample}.vcf.gz" \
+    --sv-sidecars "${SV_DIR}/{sample}.sv_sidecar.tsv" \
     --reference "${REF}" \
     --output-dir "${OUT_DIR}" \
     --mags "${MAG}" \

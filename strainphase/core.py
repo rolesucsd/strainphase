@@ -360,6 +360,12 @@ class Window:
     snv_pos: list[int] = field(default_factory=list)  # SNV positions (from VCF)
     ref_alleles: dict[int, str] = field(default_factory=dict)  # REF base per SNV (from VCF)
     reads: list[Read] = field(default_factory=list)  # Reads overlapping this window (from BAM)
+    # Per-position site type ("snv" / "del" / "ins" / "sv") for the positions in this
+    # window. Carried on the Window because the identity code downstream needs to know
+    # which positions are structural variants in order to exclude them from the distance
+    # (an invertible promoter flips independently of strain background). Without this the
+    # SV exclusion cannot fire at all.
+    site_type: dict[int, str] = field(default_factory=dict)
     sample: str | None = None  # Optional timepoint/sample label (redundant with Read.sample)
     window_idx: int = 0  # Position in contig's window sequence
 
@@ -1172,6 +1178,9 @@ def make_windows_lazy(
         w.snv_pos = window_snvs
         w.ref_alleles = {p: ref_alleles[p] for p in window_snvs}
         w.reads = reads
+        # Carry the site types through. The identity code needs them to exclude SV
+        # positions from the distance; if they stop here the exclusion silently no-ops.
+        w.site_type = {p: st[p] for p in window_snvs if p in st}
         windows.append(w)
         window_idx += 1
 
@@ -2651,7 +2660,7 @@ def link_windows(
     # non-informative positions are removed.
     site_type_all: dict[int, str] = {}
     for wr in sorted_results:
-        site_type_all.update(getattr(wr.window, "site_type", {}) or {})
+        site_type_all.update(wr.window.site_type)
     markers = variable_marker_positions(
         (hap.consensus for wr in sorted_results for hap in wr.haplotypes),
         site_type_all,
