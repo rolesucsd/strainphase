@@ -90,10 +90,12 @@ def cmd_longitudinal(args: argparse.Namespace) -> int:
     from strainphase import HaplotyperConfig
     from strainphase.longitudinal import (
         build_lineage_table,
+        build_window_tables,
         load_allowed_contigs,
         parse_reference_contigs,
         process_mag_longitudinal,
         write_lineage_tables,
+        write_window_tables,
     )
 
     # Parse samples
@@ -147,6 +149,17 @@ def cmd_longitudinal(args: argparse.Namespace) -> int:
         min_depth_site=args.min_depth_site,
         n_workers=max(1, getattr(args, "workers", 1)),
         validate_results=False,
+        # Depth policy + identity gates (see HaplotyperConfig for the reasoning).
+        min_reads_per_window=args.min_reads_per_window,
+        min_reads_for_rescue=args.min_reads_for_rescue,
+        min_read_window_overlap_bp=args.min_read_window_overlap_bp,
+        min_read_read_overlap_bp=args.min_read_read_overlap_bp,
+        min_entity_overlap_bp=args.min_entity_overlap_bp,
+        min_cosupported_span_frac=args.min_cosupported_span_frac,
+        max_num_diff=args.max_num_diff,
+        lineage_merge_distance=args.lineage_merge_distance,
+        min_shared_for_lineage=args.min_shared_for_lineage,
+        cross_sample_method=args.cross_sample_method,
     )
 
     # Create output directory
@@ -171,15 +184,37 @@ def cmd_longitudinal(args: argparse.Namespace) -> int:
         if integrator:
             all_integrators.append(integrator)
 
-    # Build lineage table
-    lineage_records, haplotype_records = build_lineage_table(all_results, config)
-
-    # Write outputs using shared writer (creates both lineages.tsv and haplotypes.tsv)
-    lineage_path, haplotype_path = write_lineage_tables(
-        lineage_records, haplotype_records, args.output_dir
+    # ---- Window-level tables (the deliverables) ----
+    # The final lineage table is PAUSED by default: composing the within-sample and
+    # across-sample linking axes into a lineage is an open decision, and these tables are
+    # the substrate that decision will be evaluated on.
+    hap_rows, within_rows, across_rows, edge_rows = build_window_tables(
+        all_results, config, sample_order=samples
     )
-    logging.info(f"Wrote {len(lineage_records)} lineage records to {lineage_path}")
-    logging.info(f"Wrote {len(haplotype_records)} haplotype records to {haplotype_path}")
+    write_window_tables(hap_rows, within_rows, across_rows, edge_rows, args.output_dir)
+
+    n_within = len({(r["sample"], r["contig"], r["within_sample_id"]) for r in within_rows})
+    n_mismatch = sum(1 for e in edge_rows if e["reason"] == "failed_mismatch")
+    n_noev = sum(1 for e in edge_rows if e["reason"] == "failed_no_evidence")
+    logging.info(
+        f"DONE: {len(hap_rows)} window-haplotypes | {n_within} within-sample entities | "
+        f"{len(across_rows)} across-sample window groups "
+        f"(method={config.cross_sample_method}) | comparisons: "
+        f"{len(edge_rows) - n_mismatch - n_noev} linked, {n_noev} no-evidence, "
+        f"{n_mismatch} mismatch"
+    )
+
+    if getattr(args, "build_lineages", False):
+        logging.warning(
+            "--build-lineages: running the LEGACY greedy cross-sample clustering. It is "
+            "order-dependent and accretes; it over- and under-merges simultaneously. "
+            "Retained for comparison only."
+        )
+        lineage_records, haplotype_records = build_lineage_table(all_results, config)
+        lineage_path, _ = write_lineage_tables(
+            lineage_records, haplotype_records, args.output_dir
+        )
+        logging.info(f"  legacy lineage table: {len(lineage_records)} rows -> {lineage_path}")
 
     return 0
 
@@ -344,6 +379,61 @@ Examples:
     )
     long_parser.add_argument(
         "--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"]
+    )
+    # --- depth policy ---
+    long_parser.add_argument(
+        "--min-reads-per-window", type=int, default=10,
+        help="Reads needed to PHASE a window de novo. Below this no haplotype is "
+             "invented and the trajectory carries a gap.",
+    )
+    long_parser.add_argument(
+        "--min-reads-for-rescue", type=int, default=5,
+        help="Reads needed for a window to be BUILT, so rescue can still populate it. "
+             "Clamped to --min-reads-per-window if higher.",
+    )
+    # --- identity gates ---
+    long_parser.add_argument(
+        "--min-read-window-overlap-bp", type=int, default=1000,
+        help="A read must cover this many bp of a window to be counted in it.",
+    )
+    long_parser.add_argument(
+        "--min-read-read-overlap-bp", type=int, default=1000,
+        help="Two reads must physically overlap by this much to be compared.",
+    )
+    long_parser.add_argument(
+        "--min-entity-overlap-bp", type=int, default=1000,
+        help="Min physical overlap between two entities; below it the verdict is an "
+             "explicit non-merge rather than 'unknown'.",
+    )
+    long_parser.add_argument(
+        "--min-cosupported-span-frac", type=float, default=0.25,
+        help="Min co-supported span between two haplotypes as a fraction of their "
+             "shared region. 0.25 rejects ~16%% of adjacent-window pairs; 0.50 rejects ~30%%.",
+    )
+    long_parser.add_argument(
+        "--max-num-diff", type=int, default=1,
+        help="Max ABSOLUTE mismatches. The rate gate is a floor, so it already forces 0 "
+             "mismatches below n_shared=100; this cap is what binds at high n_shared.",
+    )
+    long_parser.add_argument(
+        "--lineage-merge-distance", type=float, default=0.01,
+        help="Max mismatch RATE to group haplotypes.",
+    )
+    long_parser.add_argument(
+        "--min-shared-for-lineage", type=int, default=3,
+        help="Min shared identity markers to compare two haplotypes across samples.",
+    )
+    long_parser.add_argument(
+        "--cross-sample-method", choices=["clique", "reciprocal"], default="clique",
+        help="How haplotypes are grouped across samples at a fixed window. 'clique' = "
+             "complete linkage, no time axis, immune to irregular timepoint spacing. "
+             "'reciprocal' = unique-best + mutual between consecutive samples; requires "
+             "--samples in true chronological order.",
+    )
+    long_parser.add_argument(
+        "--build-lineages", action="store_true",
+        help="Also run the LEGACY greedy cross-sample lineage clustering. Off by "
+             "default; for comparison only.",
     )
     long_parser.set_defaults(func=cmd_longitudinal)
 
