@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import tempfile
 
-from strainphase.core import DEFAULT_CONFIG, HaplotyperConfig, make_windows_lazy, process_contig
+from strainphase.core import HaplotyperConfig, make_windows_lazy, process_contig
 from strainphase.sv_encoding import (
     _SIDECAR_CACHE,
     SVRecord,

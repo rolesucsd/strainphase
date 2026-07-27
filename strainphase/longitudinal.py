@@ -794,7 +794,7 @@ def build_window_tables(
                 entities: dict[str, list[tuple[WindowResult, Haplotype, int]]] = defaultdict(list)
 
                 for wr in window_results:
-                    site_type_all.update(getattr(wr.window, "site_type", {}) or {})
+                    site_type_all.update(wr.window.site_type)
                     n_reads_w = getattr(wr, "n_reads_examined", len(wr.window.reads))
                     junk_col = wr.gamma.shape[1] - 1
                     n_junk_w = int((wr.gamma[:, junk_col] >= 0.5).sum())

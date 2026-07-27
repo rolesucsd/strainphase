@@ -321,3 +321,29 @@ def test_read_overlap_unknown_is_minus_one_not_zero():
     a = Read(id="a", contig="c1", mapq=60)
     b = Read(id="b", contig="c1", mapq=60, ref_start=1, ref_end=100)
     assert a.overlap_bp(b) == -1
+
+
+# --------------------------------------------------------------------------- #
+# SV site types must survive from the VCF to the identity code
+# --------------------------------------------------------------------------- #
+
+
+def test_window_carries_site_type():
+    """REGRESSION: Window must expose site_type.
+
+    The SV-exclusion rule reads it off the Window. When the field did not exist, the
+    lookup used a getattr default and silently returned {} - so the exclusion no-opped
+    and inversions were being used as identity markers after all. A getattr with a
+    default cannot distinguish "no SVs here" from "the plumbing is missing".
+    """
+    from strainphase.core import Window
+
+    w = Window(contig="c1", start=1, end=100)
+    assert hasattr(w, "site_type")
+    assert w.site_type == {}
+
+    w.site_type = {10: "snv", 50: "sv"}
+    markers = variable_marker_positions(
+        [{10: "A", 50: "ev.INV.1"}, {10: "T", 50: "ev.INV.2"}], w.site_type
+    )
+    assert markers == {10}, "SV position must not become an identity marker"
