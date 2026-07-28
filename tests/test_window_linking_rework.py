@@ -21,7 +21,7 @@ from strainphase.core import (
     unique_best_matches,
     variable_marker_positions,
 )
-from strainphase.longitudinal import _window_conditional_abundance, _weighted_median
+from strainphase.longitudinal import _window_conditional_abundance
 from strainphase.window_groups import WindowHaplotype, group_window_across_samples
 
 
@@ -337,16 +337,6 @@ def test_measurable_window_is_conditioned_on_non_junk():
     assert got == pytest.approx(0.4 / 0.6)
 
 
-def test_zero_leak_would_have_dragged_the_median_down():
-    """Why None matters: the aggregate is a weighted MEDIAN, a selection operator that
-    returns one input verbatim, so an injected 0.0 can become the reported value."""
-    real = [0.8, 0.82, 0.79]
-    weights = [30.0, 30.0, 30.0]
-    assert _weighted_median(real, weights) == pytest.approx(0.8, abs=0.03)
-    leaked = _weighted_median([0.0] + real, [90.0] + weights)
-    assert leaked == 0.0
-
-
 # --------------------------------------------------------------------------- #
 # Read coordinates
 # --------------------------------------------------------------------------- #
@@ -642,3 +632,38 @@ def test_id_scheme_is_uniform_and_self_contained():
     # the group's members carry the full sample_contig_window form, so the member list
     # joins straight back to haplotypes.tsv
     assert {m.haplotype_id for m in groups[0].members} == {"s1_c1_10001_H0", "s2_c1_10001_H0"}
+
+
+def test_step1_refuses_to_link_incompatible_abundances():
+    """ABUNDANCE AS AN ELIMINATOR AT STEP 1 (author's rule, 2026-07-28).
+
+    Within ONE sample two adjacent windows are the same timepoint, so a genome cannot sit
+    at two different frequencies across them. Identical alleles are therefore not enough:
+    a haplotype at 95% in one window and 5% in the next is not the same entity.
+
+    Eliminator only - agreement never scores, and the test runs on RAW COUNTS because the
+    derived abundance is quantised onto unit fractions by a median denominator of 9.
+    """
+    from strainphase.core import Haplotype, Window, WindowResult, link_windows
+
+    shared = {12000: "A", 14000: "C", 16000: "G", 18000: "T"}
+
+    def wr(start, reads, n_junk=0, n_total=100):
+        w = Window(contig="c1", start=start, end=start + 20000)
+        w.snv_pos = sorted(shared)
+        g = np.zeros((n_total, 2))
+        g[:n_total - n_junk, 0] = 1.0
+        g[n_total - n_junk:, 1] = 1.0
+        return WindowResult(window=w, haplotypes=[Haplotype(consensus=dict(shared),
+                                                            supporting_reads=reads)],
+                            gamma=g, pi=np.array([1.0, 0.0]), log_likelihood=0.0,
+                            assignments=[], converged=True, iterations=1)
+
+    # 95/100 next to 5/100 - alleles identical, shares incompatible
+    a = link_windows([wr(1, 95), wr(10001, 5)], cfg())
+    assert len({h.track_id for r in a for h in r.haplotypes}) == 2, \
+        "incompatible shares must not be linked"
+
+    # same alleles, compatible shares -> linked
+    b = link_windows([wr(1, 95), wr(10001, 93)], cfg())
+    assert len({h.track_id for r in b for h in r.haplotypes}) == 1
