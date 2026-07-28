@@ -974,11 +974,13 @@ def write_window_tables(
     os.makedirs(output_dir, exist_ok=True)
     written: dict[str, str] = {}
 
+    # window_comparisons.tsv is NOT written: it was ~144 MB for a single MAG (1.27M
+    # rows), i.e. ~30 GB across a 233-MAG cohort, and its diagnostic value is fully
+    # captured by the outcome counts logged below.
     tables = [
         ("haplotypes.tsv", haplotype_rows),
         ("windows_within_sample.tsv", within_rows),
         ("windows_across_samples.tsv", across_rows),
-        ("window_comparisons.tsv", edge_rows),
     ]
     for name, rows in tables:
         path = os.path.join(output_dir, name)
