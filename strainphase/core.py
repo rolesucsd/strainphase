@@ -2672,6 +2672,7 @@ def compare_consensus(
     region: tuple[int, int] | None = None,
     min_cospan_frac: float | None = None,
     max_rate: float | None = None,
+    allow_fallback: bool = True,
 ) -> GateResult:
     """Apply the full identity gate stack to two consensus dicts.
 
@@ -2681,6 +2682,12 @@ def compare_consensus(
 
     The overlap gate asks only "how much sequence did both haplotypes cover", never
     where the markers within it happen to fall.
+
+    ``allow_fallback=False`` forbids the clonal fallback, so the verdict rests only on
+    genuinely discriminating markers. Use it whenever a NEGATIVE verdict will be treated
+    as absolute: the fallback pads the comparison with positions that are invariant in
+    scope and therefore cannot disagree, which is harmless for a merge but would let a
+    mismatch be declared off evidence that was never discriminating.
 
     The absolute cap and the rate guard opposite ends of the range: the rate is applied
     as a floor, so it already forces zero mismatches below n_shared=100, while at
@@ -2702,7 +2709,7 @@ def compare_consensus(
     shared = _restrict(a.keys() & b.keys() & markers)
     used_fallback = False
 
-    if len(shared) < min_shared:
+    if len(shared) < min_shared and allow_fallback:
         # No DISCRIMINATING markers between these two. Absence of discriminating
         # evidence is not evidence of difference: a clonal locus legitimately has no
         # variable positions at all, and a clonal SAMPLE can have almost none - 85% of

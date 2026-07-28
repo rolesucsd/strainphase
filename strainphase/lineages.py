@@ -1,137 +1,78 @@
 #!/usr/bin/env python3
 """Lineages: chain cross-sample window groups along the genome.
 
-This is the third and last linking step. The first two are settled:
+This is the third and last linking step:
 
-    step 1  link_windows              within ONE sample, across adjacent windows
-    step 2  window_groups.group_all_windows
-                                      across samples, at ONE fixed window
-    step 3  THIS MODULE               chain step-2 groups across adjacent windows
+    step 1  link_windows                     within ONE sample, across adjacent windows
+    step 2  window_groups.group_all_windows  across samples, at ONE fixed window
+    step 3  THIS MODULE                      chain step-2 groups along the genome
 
-A 20 kb window is a computational tile, not a biological boundary — a strain extends
-across it — so the entities produced by step 2 have to be chained into something that
-spans the genome. Because step-2 groups already span samples, a lineage built here has one
-identity across every sample at once; only its genomic *extent* can vary by timepoint.
+A 20 kb window is a computational tile, not a biological boundary, so the entities step 2
+produces have to be chained into something that spans the genome. Because step-2 groups
+already span samples, a lineage built here has one identity across every sample at once;
+only its genomic *extent* can vary by timepoint.
 
-Three rules, all deliberate:
+⚠️ THE STANDING CAVEAT — everything here assumes step 2 got the unit right
+=========================================================================
+This module chains step-2 GROUPS. If two haplotypes at one window should have been one
+group and were not, that error is invisible from here and propagates into every lineage
+built on them. Known causes, none fully resolved:
 
-**Same identity gates as everywhere else.** Adjacent windows overlap by 50%, so two groups
-are compared on the markers falling in that shared interval, through the same
-``compare_consensus`` gate stack link_windows and step 2 use. No bespoke thresholds.
+  * haplotypes with disjoint marker footprints are never comparable, so complete linkage
+    scores them distance 1.0 - an explicit NON-merge - having shown nothing to differ
+  * a strain carrying a divergent segment used to be split across it entirely; merging
+    split molecules at load time fixes the common case, not necessarily all of it
+
+The symptom to watch for is a lineage that *ought* to hold two groups at one window. This
+module makes that structurally impossible (see below), which is correct if step 2 is right
+and a silent loss if it is not. Troubleshoot at the step that owns it - see S2-6 in
+FIGURE4 STRAINPHASE_TROUBLESHOOTING.md - not by loosening the rules here.
+
+THE RULES
+=========
+
+**Candidacy is PROXIMITY.** Every (group at W, group at W+step) pair is a candidate because
+the windows are adjacent. Nothing has to pass a genotype test to be considered.
+
+**Identity is a VETO, never the evidence for.** ``failed_mismatch`` refuses the join
+outright - one sample is enough, and it outranks any number of votes. ``failed_no_evidence``
+refuses nothing: 46% of windows carry no discriminating position in the forward overlap, so
+gating on it would discard those joins wholesale. A veto is computed on real markers with
+the clonal fallback DISABLED, because a negative verdict must not rest on positions that
+were incapable of disagreeing.
 
 **Abundance is an ELIMINATOR, not an INDICATOR.** A strain sits at the same frequency in
-every window it occupies, so two groups whose within-window shares genuinely disagree
-cannot be one biological unit — that is a sound veto. But *agreeing* on frequency is weak
-evidence in favour, because many haplotypes sit at similar frequencies: measured on the
-union run, 57% of groups had more than one abundance-compatible partner, so scoring on it
-only manufactures ambiguity. It therefore vetoes joins and never scores them.
+every window it occupies, so genuinely disagreeing shares cannot be one unit. But *agreeing*
+is weak evidence in favour - 57% of groups had more than one abundance-compatible partner -
+so it vetoes and never scores.
 
-**Reciprocal best match, never greedy.** Each group's best continuation is taken only when
-the choice is mutual and unambiguous on both sides — the same ``unique_best_matches`` rule
-as step 1 and step 2. A tie contributes no edge. This is what keeps a lineage from
-accreting: every node has at most one predecessor and one successor, so a chain is a PATH
-and its length is bounded by the number of windows rather than by a threshold.
+**Step-1 votes are the only score.** A vote is a sample whose ``link_windows`` chain holds a
+member of BOTH groups: direct read-level evidence that they continue into each other. Zero
+votes is not a join. Sample count, identity distance and abundance never score.
 
+**Reciprocal best match, never greedy.** A join is kept only when each side's best partner
+is the other and the best is a strict winner. A tie contributes NO edge.
 
-THE FULL RULE SET
-=================
+Reciprocity is what bounds the result. Every node has at most one partner in each
+direction, so a component is a PATH; every edge advances exactly one window, so a lineage
+holds exactly ONE group per window and ``|lineage| <= n_windows`` by construction rather
+than by tuning. That also satisfies step 2's cannot-link constraints for free - measured on
+000066952_0, zero unions refused against 16,412 constraints - because a strain has one
+haplotype at a locus, so two groups of one lineage at one window would be a contradiction
+between the two steps.
 
-Every gate below must pass for two groups to be joined. They are applied in this order,
-and the first failure is recorded as the edge's ``reason``.
-
-1. WHAT COUNTS AS A COMPARABLE POSITION
-   marker set            a position is an identity marker only if >=2 distinct alleles are
-                         observed across the whole contig, across all samples. A position
-                         where everything agrees carries no identity information yet still
-                         dilutes the mismatch rate (42.6% of emitted positions were
-                         invariant MAG-wide on 000089747_1).
-   SVs are markers       ``exclude_sv_from_identity=False`` (author's decision). Structural
-                         variants are never excluded: the trajectory of a flip is a result
-                         we want, not noise. An invertible element that flips therefore
-                         yields TWO entities whose frequencies trade off over time, and
-                         that pair IS the flip trajectory.
-   clonal fallback       if fewer than ``min_shared`` MARKERS are shared, fall back to all
-                         co-covered positions. A clonal locus genuinely has no variable
-                         sites; absence of discriminating evidence is not evidence of
-                         difference, and without this every clonal lineage shatters into
-                         singletons (85% of windows hold one haplotype).
-
-2. IS THERE ENOUGH EVIDENCE TO COMPARE AT ALL?  -> ``failed_no_evidence``
-   min overlapping positions
-                         ``min_shared_for_lineage``, default **3**. Fewer shared markers
-                         than this and the pair is not compared. (Runs to date pass 2.)
-   min physical overlap  ``min_entity_overlap_bp``, default **1000 bp** between the first
-                         and last shared marker. Below it the verdict is an explicit
-                         NON-MERGE, not "unknown" — Strainy's ``I = 1000``. (Runs pass 500.)
-   shared interval       adjacent windows overlap by 50% (``step = window_size // 2``,
-                         i.e. 10 kb of a 20 kb window). ONLY markers inside that interval
-                         are eligible; the region is passed explicitly, which is why the
-                         co-supported-span fraction (``min_cosupported_span_frac``, 0.25
-                         at step 1) is set to 0 here — the region already IS the constraint.
-
-3. DO THE ALLELES AGREE?  -> ``failed_mismatch``
-   max absolute mismatches
-                         ``max_num_diff``. HARD CAP: no more than this many differing
-                         positions regardless of how long the comparison is. Library
-                         default **1**; runs to date pass **3**. This is the gate that
-                         binds at high evidence — the rate below is applied as a FLOOR
-                         (``int(rate * n_shared)``), so at n_shared=1172 a 1% rate alone
-                         would tolerate 11 mismatches. The two guard opposite ends: the
-                         rate forces 0 mismatches below n_shared=100, the cap takes over
-                         above n_shared=200.
-   max mismatch rate     ``lineage_merge_distance``, default **0.01** (1%).
-
-4. DO THE ABUNDANCES ALLOW IT?  -> ``failed_abundance``   (ELIMINATOR ONLY)
-   test                  Fisher's exact on the RAW counts ``[[k_a, n_a-k_a], [k_b, n_b-k_b]]``
-                         per sample where both groups are observed. Never on the derived
-                         ``abundance``, which is already quantised by
-                         ``pi_k / (1 - pi_junk)``.
-   significance          ``abundance_coherence_alpha``, default **0.01**.
-   min depth to test     ``min_reads_for_coherence``, default **10** non-junk reads on BOTH
-                         sides. A likelihood test rather than a fixed threshold, so the
-                         rule self-tightens with depth instead of rejecting real merges at
-                         low coverage.
-   veto threshold        ``max_bad_frac``, default **0.30** — the join is vetoed when more
-                         than 30% of testable samples disagree.
-   min testable samples  ``min_samples_for_veto``, default **3**. Below this the veto does
-                         NOT fire and the identity gates decide alone: an eliminator must
-                         not block on absence of evidence.
-
-5. IS THE CHOICE UNAMBIGUOUS?  -> ``failed_not_mutual``
-   reciprocal best       each side's best partner must be the other, and the best must be
-                         a strict winner. A TIE CONTRIBUTES NO EDGE.
-   score                 STEP-1 LINK VOTES first, identity mismatch rate as the tiebreak,
-                         encoded as one "lower is better" number
-                         (``-votes * 1000 + rate``) so an exact tie on both still yields
-                         no edge. A vote is a sample whose link_windows chain contains a
-                         member of BOTH groups — direct read-level evidence that the two
-                         continue into each other. Abundance never scores and sample count
-                         never scores. With no votes anywhere the score degrades to the
-                         identity rate alone, which is the sensible fallback.
-                         Length is preferred implicitly: a chain extends as far as the
-                         evidence unambiguously supports and stops at the first ambiguity,
-                         never guessing between two candidates.
+The alternative considered and not taken was a vote floor with constrained union-find
+(§5.2 of the troubleshooting doc): it links more (29.1% vs 21.5% multi-window) but produces
+48-group components, needs the constraints actively enforced, and its size bound is
+empirical rather than structural.
 
 BOTH EXISTING TABLES ARE USED AS EVIDENCE; NEITHER IS RECOMPUTED
-   step 1  ``windows_within_sample.tsv`` -> which haplotypes a sample's own reads already
-           chained across adjacent windows. Reaches this module through
+   step 1  ``windows_within_sample.tsv`` -> which haplotypes a sample's own reads chained
+           across adjacent windows. Reaches this module through
            ``WindowHaplotype.within_sample_id`` and becomes the join SCORE.
-   step 2  ``windows_across_samples.tsv`` -> which haplotypes are the same entity across
-           samples at one window. These groups are the nodes being chained.
-   So both ends are already joined, and step 3 only has to decide which pairing is the
-   consistent one.
-
-UPSTREAM GATES THAT SHAPE THE INPUT (not applied here, but they decide what exists)
-   window_size 20000, step 10000        50% overlap so adjacent windows share markers
-   min_reads_per_window 10              reads needed to PHASE a window de novo
-   min_reads_for_rescue 5               reads needed to BUILD one, so rescue can fill it
-   max_reads_per_window 500             subsample cap
-   min_read_window_overlap_bp 1000      a read must cover this much of a window to count
-   min_read_read_overlap_bp 1000        two reads must overlap this much to be compared
-   min_shared_snvs_for_edge 3           read-read graph, seeds the EM
-   min_shared_snvs_for_link 3           step 1: window-level shared SNV positions
-   min_shared_calls_for_link 3          step 1: haplotype-level shared actual calls
-   max_link_distance 0.01               step 1: mismatch rate
+           ``mismatches_within_sample.tsv`` -> the pairs it found to genuinely disagree,
+           passed in as ``step1_mismatches`` and used as an absolute veto.
+   step 2  ``windows_across_samples.tsv`` -> the groups being chained, i.e. the nodes.
 """
 
 from __future__ import annotations
@@ -264,17 +205,27 @@ def build_lineages(
     max_bad_frac: float = 0.30,
     min_samples_for_veto: int = 3,
     lineage_prefix: str = "LIN",
+    markers: set[int] | None = None,
+    step1_mismatches: set[frozenset[str]] | None = None,
 ) -> tuple[list[Lineage], list[LineageEdge]]:
-    """Chain window groups into lineages by reciprocal best match.
+    """Chain window groups into lineages by reciprocal best match on step-1 votes.
 
-    ``step`` is the window stride (defaults to ``window_size // 2``, i.e. 50% overlap).
-    ``max_bad_frac`` is the share of testable samples that may disagree on abundance
-    before the join is vetoed.
+    ``markers`` is the identity marker set, computed at the WIDEST scope available (all
+    haplotypes on the contig, every sample - the same set step 2 used). Passing None
+    reproduces the old behaviour of comparing on every co-covered position, which made
+    the marker restriction a no-op.
+
+    ``step1_mismatches`` are ``{haplotype_id_a, haplotype_id_b}`` pairs that link_windows
+    compared and found to GENUINELY DISAGREE. One is enough to veto a join: a sample's own
+    reads saying two haplotypes are not the same genome outranks any number of votes.
 
     Returns the lineages and EVERY attempted continuation with its outcome.
     """
     if step is None:
         step = config.window_size // 2
+    if markers is None:
+        markers = {p for g in groups for m in g.members for p in m.consensus}
+    mismatched = step1_mismatches or set()
 
     by_key: dict[tuple[str, int], list[WindowGroup]] = defaultdict(list)
     for g in groups:
@@ -300,6 +251,7 @@ def build_lineages(
 
     cons = {g.group_id: _group_consensus(g) for g in groups}
     counts = {g.group_id: _group_counts(g) for g in groups}
+    hap_ids = {g.group_id: {m.haplotype_id for m in g.members} for g in groups}
     edges: list[LineageEdge] = []
     graph = nx.Graph()
     graph.add_nodes_from(g.group_id for g in groups)
@@ -317,15 +269,29 @@ def build_lineages(
 
         for ga in left:
             for gb in right:
+                # CANDIDACY IS PROXIMITY ALONE. The identity comparison below is a VETO,
+                # not the gate that admits a pair: `failed_no_evidence` must not block,
+                # because 46% of windows carry no discriminating position in the forward
+                # overlap and gating on it discards those joins outright.
                 gate = compare_consensus(
-                    cons[ga.group_id], cons[gb.group_id], set(cons[ga.group_id]),
+                    cons[ga.group_id], cons[gb.group_id], markers,
                     config, min_shared=config.min_shared_for_lineage, region=region,
                     min_cospan_frac=0.0,       # the region IS the constraint here
+                    allow_fallback=False,      # a veto may not rest on padded evidence
                 )
                 e = LineageEdge(contig, w, w + step, ga.group_id, gb.group_id,
                                 gate.reason, round(gate.rate, 6), gate.n_shared,
                                 gate.n_diff, 0, 0)
-                if not gate.passed:
+                if gate.reason == "failed_mismatch":
+                    edges.append(e)
+                    continue
+                # A single sample whose OWN reads disagree across this boundary vetoes the
+                # join outright, however many other samples vote for it.
+                if mismatched and any(
+                    frozenset((a, b)) in mismatched
+                    for a in hap_ids[ga.group_id] for b in hap_ids[gb.group_id]
+                ):
+                    e.reason = "failed_mismatch"
                     edges.append(e)
                     continue
                 veto, tested, bad = _abundance_incompatible(
@@ -336,14 +302,16 @@ def build_lineages(
                     e.reason = "failed_abundance"
                     edges.append(e)
                     continue
-                # SCORE: step-1 link votes first (direct read-level evidence that these
-                # two continue into each other), identity distance as the tiebreak.
-                # Abundance never scores - it only eliminates. Sample count never scores.
-                # Encoded as one "lower is better" number so an exact tie on both still
-                # yields no edge.
+                # SCORE: step-1 link votes and nothing else. Identity has already had its
+                # say as a veto, abundance only eliminates, and sample count never scores.
+                # No votes means no read ever chained these two - not a join.
                 votes = link_votes.get((ga.group_id, gb.group_id), 0)
                 e.n_link_votes = votes
-                score = -votes * 1000.0 + gate.rate
+                if votes == 0:
+                    e.reason = "failed_no_votes"
+                    edges.append(e)
+                    continue
+                score = -float(votes)   # unique_best_matches takes lower-is-better
                 forward.setdefault(ga.group_id, []).append((score, gb.group_id))
                 backward.setdefault(gb.group_id, []).append((score, ga.group_id))
                 pending[(ga.group_id, gb.group_id)] = e
@@ -369,6 +337,19 @@ def build_lineages(
         members = [gmap[x] for x in comp]
         lineages.append(Lineage(f"{lineage_prefix}{i:06d}", members[0].contig,
                                 sorted(members, key=lambda g: g.window_start)))
+
+    # Reciprocity makes every component a PATH, and every edge advances one window, so a
+    # lineage can never hold two groups at the same window. That is what satisfies the
+    # step-2 cannot-link constraints for free (measured: 0 unions refused against 16,412
+    # constraints on 000066952_0) - a strain has ONE haplotype at a locus, so two groups
+    # of one lineage at one window would mean a contradiction between the two steps.
+    for lin in lineages:
+        per_window = Counter(g.window_start for g in lin.groups)
+        if per_window and max(per_window.values()) > 1:  # pragma: no cover - invariant
+            raise AssertionError(
+                f"{lin.lineage_id} holds {max(per_window.values())} groups at one window; "
+                "reciprocal best match should make this impossible"
+            )
 
     linked = [e for e in edges if e.reason == "linked"]
     reasons = Counter(e.reason for e in edges)
