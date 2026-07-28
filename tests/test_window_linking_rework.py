@@ -667,3 +667,27 @@ def test_step1_refuses_to_link_incompatible_abundances():
     # same alleles, compatible shares -> linked
     b = link_windows([wr(1, 95), wr(10001, 93)], cfg())
     assert len({h.track_id for r in b for h in r.haplotypes}) == 1
+
+
+def test_lineage_abundance_pools_counts_rather_than_averaging_ratios():
+    """A lineage's per-sample abundance is Sum(reads)/Sum(total_reads) over its windows.
+
+    The distinction is not cosmetic. Here one window is deep and the strain is rare in it
+    (5/100), the other is shallow and the strain takes the whole window (3/3). The mean of
+    the ratios is 0.53 and the median 0.53; the pooled estimate is 8/103 = 0.078, which is
+    what the reads actually say. The shallow window's 1.000 is an artefact of nothing else
+    resolving there, and 46% of real windows hold exactly one haplotype.
+    """
+    from strainphase.lineages import build_lineages
+
+    shared = {12000: "A", 15000: "C", 18000: "G"}
+    a = _grp("A", 1, [_mem("t0", dict(shared), reads=5, total=100)])
+    b = _grp("B", 10001, [_mem("t0", dict(shared), reads=3, total=3)])
+    lins, _ = build_lineages([a, b], _lcfg())
+    assert len(lins) == 1
+
+    ab, reads, total, n_win = lins[0].abundance_by_sample()["t0"]
+    assert (reads, total, n_win) == (8, 103, 2)
+    assert ab == pytest.approx(8 / 103)
+    naive = (5 / 100 + 3 / 3) / 2
+    assert abs(naive - ab) > 0.4, "averaging the ratios gives a very different answer"
