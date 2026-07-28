@@ -347,3 +347,102 @@ def test_window_carries_site_type():
         [{10: "A", 50: "ev.INV.1"}, {10: "T", 50: "ev.INV.2"}], w.site_type
     )
     assert markers == {10}, "SV position must not become an identity marker"
+
+
+# --------------------------------------------------------------------------- #
+# STEP 3: chaining window groups into lineages
+# --------------------------------------------------------------------------- #
+
+
+def _grp(gid, wstart, members):
+    from strainphase.window_groups import WindowGroup
+    return WindowGroup(group_id=gid, contig="c1", window_start=wstart,
+                       window_end=wstart + 20000, members=members)
+
+
+def _mem(sample, consensus, reads=30, total=60):
+    return WindowHaplotype(sample=sample, contig="c1", window_start=0, window_end=20000,
+                           haplotype_id=f"{sample}|h", consensus=consensus,
+                           reads=reads, total_reads=total, abundance=reads / total)
+
+
+def _lcfg(**kw):
+    base = {"window_size": 20000, "min_shared_for_lineage": 3,
+            "min_entity_overlap_bp": 0, "min_cosupported_span_frac": 0.0}
+    base.update(kw)
+    return HaplotyperConfig(**base)
+
+
+def test_lineage_chains_matching_groups_across_windows():
+    """Two groups agreeing in the 50% overlap interval become one lineage."""
+    from strainphase.lineages import build_lineages
+    shared = {12000: "A", 15000: "C", 18000: "G"}
+    a = _grp("A", 1, [_mem(f"t{i}", {**shared, 3000: "T"}) for i in range(4)])
+    b = _grp("B", 10001, [_mem(f"t{i}", {**shared, 25000: "T"}) for i in range(4)])
+    lins, edges = build_lineages([a, b], _lcfg())
+    assert len(lins) == 1
+    assert lins[0].n_windows == 2
+    assert [e.reason for e in edges if e.reason == "linked"]
+
+
+def test_lineage_does_not_chain_divergent_groups():
+    from strainphase.lineages import build_lineages
+    a = _grp("A", 1, [_mem(f"t{i}", {12000: "A", 15000: "C", 18000: "G"}) for i in range(4)])
+    b = _grp("B", 10001, [_mem(f"t{i}", {12000: "T", 15000: "A", 18000: "C"}) for i in range(4)])
+    lins, edges = build_lineages([a, b], _lcfg())
+    assert len(lins) == 2
+    assert any(e.reason == "failed_mismatch" for e in edges)
+
+
+def test_abundance_eliminates_a_join_that_identity_would_accept():
+    """The ELIMINATOR: identical markers, but the shares genuinely disagree."""
+    from strainphase.lineages import build_lineages
+    shared = {12000: "A", 15000: "C", 18000: "G"}
+    a = _grp("A", 1, [_mem(f"t{i}", shared, reads=95, total=100) for i in range(5)])
+    b = _grp("B", 10001, [_mem(f"t{i}", shared, reads=5, total=100) for i in range(5)])
+    lins, edges = build_lineages([a, b], _lcfg())
+    assert any(e.reason == "failed_abundance" for e in edges)
+    assert len(lins) == 2, "incompatible shares must not merge"
+
+
+def test_abundance_agreement_does_not_rescue_a_failed_identity():
+    """Abundance is an eliminator, NOT an indicator: matching shares earn no credit."""
+    from strainphase.lineages import build_lineages
+    a = _grp("A", 1, [_mem(f"t{i}", {12000: "A", 15000: "C", 18000: "G"}) for i in range(5)])
+    b = _grp("B", 10001, [_mem(f"t{i}", {12000: "T", 15000: "A", 18000: "C"}) for i in range(5)])
+    lins, _ = build_lineages([a, b], _lcfg())          # identical abundances throughout
+    assert len(lins) == 2
+
+
+def test_ambiguous_continuation_contributes_no_edge():
+    """RECIPROCAL BEST, not greedy: two equally good successors -> neither is chosen."""
+    from strainphase.lineages import build_lineages
+    shared = {12000: "A", 15000: "C", 18000: "G"}
+    a = _grp("A", 1, [_mem(f"t{i}", shared) for i in range(4)])
+    b1 = _grp("B1", 10001, [_mem(f"t{i}", dict(shared)) for i in range(4)])
+    b2 = _grp("B2", 10001, [_mem(f"t{i}", dict(shared)) for i in range(4)])
+    lins, edges = build_lineages([a, b1, b2], _lcfg())
+    assert len(lins) == 3, "a tie must stop the chain, not pick a winner"
+    assert any(e.reason == "failed_not_mutual" for e in edges)
+
+
+def test_lineage_length_is_bounded_by_the_window_count():
+    """Reciprocity makes each component a PATH, so a lineage cannot accrete."""
+    from strainphase.lineages import build_lineages
+    shared_pat = {"a": "A", "b": "C", "c": "G"}
+    gs = []
+    for i in range(5):
+        w = 1 + i * 10000
+        cons = {w + 12000: shared_pat["a"], w + 15000: shared_pat["b"], w + 18000: shared_pat["c"],
+                w + 2000: shared_pat["a"], w + 5000: shared_pat["b"], w + 8000: shared_pat["c"]}
+        gs.append(_grp(f"G{i}", w, [_mem(f"t{j}", cons) for j in range(4)]))
+    lins, _ = build_lineages(gs, _lcfg())
+    assert max(x.n_windows for x in lins) <= 5
+
+
+def test_marker_span_reports_what_was_actually_resolved():
+    from strainphase.lineages import build_lineages
+    shared = {12000: "A", 15000: "C", 18000: "G"}
+    a = _grp("A", 1, [_mem(f"t{i}", shared) for i in range(4)])
+    lins, _ = build_lineages([a], _lcfg())
+    assert lins[0].marker_span == (12000, 18000)
