@@ -31,6 +31,90 @@ the choice is mutual and unambiguous on both sides — the same ``unique_best_ma
 as step 1 and step 2. A tie contributes no edge. This is what keeps a lineage from
 accreting: every node has at most one predecessor and one successor, so a chain is a PATH
 and its length is bounded by the number of windows rather than by a threshold.
+
+
+THE FULL RULE SET
+=================
+
+Every gate below must pass for two groups to be joined. They are applied in this order,
+and the first failure is recorded as the edge's ``reason``.
+
+1. WHAT COUNTS AS A COMPARABLE POSITION
+   marker set            a position is an identity marker only if >=2 distinct alleles are
+                         observed across the whole contig, across all samples. A position
+                         where everything agrees carries no identity information yet still
+                         dilutes the mismatch rate (42.6% of emitted positions were
+                         invariant MAG-wide on 000089747_1).
+   SV exclusion          ``exclude_sv_from_identity=True``. Structural variants are loaded,
+                         phased and reported, but never used as identity markers: an
+                         invertible promoter at af~0.5 flips independently of strain
+                         background, so it would split a lineage every time it flips.
+   clonal fallback       if fewer than ``min_shared`` MARKERS are shared, fall back to all
+                         co-covered positions. A clonal locus genuinely has no variable
+                         sites; absence of discriminating evidence is not evidence of
+                         difference, and without this every clonal lineage shatters into
+                         singletons (85% of windows hold one haplotype).
+
+2. IS THERE ENOUGH EVIDENCE TO COMPARE AT ALL?  -> ``failed_no_evidence``
+   min overlapping positions
+                         ``min_shared_for_lineage``, default **3**. Fewer shared markers
+                         than this and the pair is not compared. (Runs to date pass 2.)
+   min physical overlap  ``min_entity_overlap_bp``, default **1000 bp** between the first
+                         and last shared marker. Below it the verdict is an explicit
+                         NON-MERGE, not "unknown" — Strainy's ``I = 1000``. (Runs pass 500.)
+   shared interval       adjacent windows overlap by 50% (``step = window_size // 2``,
+                         i.e. 10 kb of a 20 kb window). ONLY markers inside that interval
+                         are eligible; the region is passed explicitly, which is why the
+                         co-supported-span fraction (``min_cosupported_span_frac``, 0.25
+                         at step 1) is set to 0 here — the region already IS the constraint.
+
+3. DO THE ALLELES AGREE?  -> ``failed_mismatch``
+   max absolute mismatches
+                         ``max_num_diff``. HARD CAP: no more than this many differing
+                         positions regardless of how long the comparison is. Library
+                         default **1**; runs to date pass **3**. This is the gate that
+                         binds at high evidence — the rate below is applied as a FLOOR
+                         (``int(rate * n_shared)``), so at n_shared=1172 a 1% rate alone
+                         would tolerate 11 mismatches. The two guard opposite ends: the
+                         rate forces 0 mismatches below n_shared=100, the cap takes over
+                         above n_shared=200.
+   max mismatch rate     ``lineage_merge_distance``, default **0.01** (1%).
+
+4. DO THE ABUNDANCES ALLOW IT?  -> ``failed_abundance``   (ELIMINATOR ONLY)
+   test                  Fisher's exact on the RAW counts ``[[k_a, n_a-k_a], [k_b, n_b-k_b]]``
+                         per sample where both groups are observed. Never on the derived
+                         ``abundance``, which is already quantised by
+                         ``pi_k / (1 - pi_junk)``.
+   significance          ``abundance_coherence_alpha``, default **0.01**.
+   min depth to test     ``min_reads_for_coherence``, default **10** non-junk reads on BOTH
+                         sides. A likelihood test rather than a fixed threshold, so the
+                         rule self-tightens with depth instead of rejecting real merges at
+                         low coverage.
+   veto threshold        ``max_bad_frac``, default **0.30** — the join is vetoed when more
+                         than 30% of testable samples disagree.
+   min testable samples  ``min_samples_for_veto``, default **3**. Below this the veto does
+                         NOT fire and the identity gates decide alone: an eliminator must
+                         not block on absence of evidence.
+
+5. IS THE CHOICE UNAMBIGUOUS?  -> ``failed_not_mutual``
+   reciprocal best       each side's best partner must be the other, and the best must be
+                         a strict winner. A TIE CONTRIBUTES NO EDGE. Score is the identity
+                         mismatch rate ONLY — abundance never scores, sample count never
+                         scores. Length is therefore preferred implicitly: a chain extends
+                         as far as the markers unambiguously support and stops at the first
+                         ambiguity, never guessing between two candidates.
+
+UPSTREAM GATES THAT SHAPE THE INPUT (not applied here, but they decide what exists)
+   window_size 20000, step 10000        50% overlap so adjacent windows share markers
+   min_reads_per_window 10              reads needed to PHASE a window de novo
+   min_reads_for_rescue 5               reads needed to BUILD one, so rescue can fill it
+   max_reads_per_window 500             subsample cap
+   min_read_window_overlap_bp 1000      a read must cover this much of a window to count
+   min_read_read_overlap_bp 1000        two reads must overlap this much to be compared
+   min_shared_snvs_for_edge 3           read-read graph, seeds the EM
+   min_shared_snvs_for_link 3           step 1: window-level shared SNV positions
+   min_shared_calls_for_link 3          step 1: haplotype-level shared actual calls
+   max_link_distance 0.01               step 1: mismatch rate
 """
 
 from __future__ import annotations
