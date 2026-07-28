@@ -307,14 +307,22 @@ def _median_member_span(group) -> float:
     return float(spans[len(spans) // 2]) if spans else 0.0
 
 
-def _nonjunk_reads(wr) -> int:
-    """Reads in this window not assigned to the junk component - the denominator every
-    abundance divides by. One definition, used by both the per-window value and the
-    pooled per-track one."""
+def _read_counts(wr) -> tuple[int, int]:
+    """``(resolved, junk)`` reads in this window. One definition, used everywhere.
+
+    Both are reported because the choice of denominator is a real one and should not be
+    baked in. Dividing by RESOLVED reads alone answers "of the reads that phased, what
+    share is this haplotype" - which renormalises away the fact that a window where 10%
+    of reads resolved is far weaker evidence than one where 90% did. Including junk
+    answers "what share of the reads at this locus is this haplotype", which degrades
+    gracefully instead: a poorly-resolving window pulls the estimate down rather than
+    being silently rescaled up to look like a good one.
+    """
     n = getattr(wr, "n_reads_examined", len(wr.window.reads))
     if wr.gamma is None or wr.gamma.size == 0:
-        return n
-    return n - int((wr.gamma[:, wr.gamma.shape[1] - 1] >= 0.5).sum())
+        return n, 0
+    junk = int((wr.gamma[:, wr.gamma.shape[1] - 1] >= 0.5).sum())
+    return n - junk, junk
 
 
 def build_window_tables(
@@ -455,6 +463,7 @@ def build_window_tables(
                                 "abundance": abundance,
                                 "reads": hap.supporting_reads,
                                 "total_reads": nonjunk,
+                                "junk_reads": n_junk_w,
                                 "n_markers": len(hap.consensus),
                                 "consensus": consensus_str,
                             }
@@ -469,13 +478,17 @@ def build_window_tables(
                                 consensus=dict(hap.consensus),
                                 reads=hap.supporting_reads,
                                 total_reads=nonjunk,
+                                junk_reads=n_junk_w,
                                 abundance=abundance if abundance is not None else float("nan"),
                             )
                         )
 
                 for eid, members in entities.items():
                     track_reads = sum(h.supporting_reads for _, h, _ in members)
-                    track_total = sum(_nonjunk_reads(wr) for wr, _, _ in members)
+                    _counts = [_read_counts(wr) for wr, _, _ in members]
+                    track_total = sum(c[0] for c in _counts)
+                    track_junk = sum(c[1] for c in _counts)
+                    track_all = track_total + track_junk
                     starts = [wr.window.start for wr, _, _ in members]
                     ends = [wr.window.end for wr, _, _ in members]
                     # marker footprint across every member, vs the tiles it nominally spans
@@ -509,7 +522,13 @@ def build_window_tables(
                             # is effectively double-weighted.
                             "reads": track_reads,
                             "total_reads": track_total,
+                            "junk_reads": track_junk,
+                            # share of the reads that PHASED (renormalises away how much
+                            # of the window resolved)
                             "abundance": (track_reads / track_total) if track_total else float("nan"),
+                            # share of ALL reads at these loci - does not hide a window
+                            # where most reads went to junk
+                            "abundance_all_reads": (track_reads / track_all) if track_all else float("nan"),
                             # The SAME id as haplotypes.tsv, so the member list joins
                             # back directly. It previously used the track-prefixed form,
                             # which matched nothing in that table.
