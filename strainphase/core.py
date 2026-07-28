@@ -715,7 +715,38 @@ def _log_load_summary(vcf_path: str, contig_id: str | None, stats: dict[str, int
         )
 
 
+# One parsed VCF per (path, contig, sample, gate settings). A longitudinal run calls
+# process_contig once PER SAMPLE, and under a cohort union VCF every one of those calls
+# parses the identical file: on 000066952_0 that was the same 76,988 records re-read 146
+# times. Keyed on the settings that change what is kept, so a config change still
+# re-parses. Bounded because a run touches one contig at a time.
+_SNV_CACHE: dict[tuple, tuple] = {}
+_SNV_CACHE_MAX = 8
+
+
 def load_snvs(
+    vcf_path: str,
+    contig_id: str | None = None,
+    sample_name: str | None = None,
+    config: HaplotyperConfig = DEFAULT_CONFIG,
+):
+    """Cached wrapper - see _SNV_CACHE. Returns the SAME objects on a hit, so callers must
+    treat the result as read-only. process_contig already does: it copies what it needs
+    into per-window structures and never mutates these."""
+    key = (vcf_path, contig_id, sample_name, config.min_depth_site, config.af_range,
+           config.process_indels if hasattr(config, "process_indels") else None)
+    hit = _SNV_CACHE.get(key)
+    if hit is not None:
+        return hit
+    out = _load_snvs_uncached(vcf_path, contig_id, sample_name, config)
+    if len(_SNV_CACHE) >= _SNV_CACHE_MAX:
+        _SNV_CACHE.pop(next(iter(_SNV_CACHE)))
+    _SNV_CACHE[key] = out
+    return out
+
+
+
+def _load_snvs_uncached(
     vcf_path: str,
     contig_id: str | None = None,
     sample_name: str | None = None,

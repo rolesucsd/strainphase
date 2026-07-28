@@ -708,3 +708,37 @@ def test_both_denominators_are_reported():
     assert p.abundance == pytest.approx(5 / 8)
     assert p.abundance_all_reads == pytest.approx(5 / 100)
     assert (p.total_reads, p.junk_reads) == (8, 92)
+
+
+def test_load_snvs_is_cached_across_samples():
+    """A longitudinal run calls process_contig once PER SAMPLE, and under a cohort union
+    VCF every call parses the identical file. On 000066952_0 that was the same 76,988
+    records re-read 146 times, once per sample, for a result that cannot differ.
+
+    The cache is keyed on the settings that change what is kept, so a config change still
+    re-parses.
+    """
+    from strainphase import core
+
+    calls = {"n": 0}
+    real = core._load_snvs_uncached
+
+    def counting(*a, **k):
+        calls["n"] += 1
+        return ([1], {1: "A"}, {1: 9}, {1: 0.5}, {1: "snv"}, {}, {})
+
+    core._SNV_CACHE.clear()
+    core._load_snvs_uncached = counting
+    try:
+        for _ in range(5):
+            core.load_snvs("dummy.vcf.gz", "c1", None, cfg())
+        assert calls["n"] == 1, "identical calls must parse once"
+
+        core.load_snvs("dummy.vcf.gz", "c1", None, cfg(min_depth_site=99))
+        assert calls["n"] == 2, "a gate change must re-parse"
+
+        core.load_snvs("dummy.vcf.gz", "c2", None, cfg())
+        assert calls["n"] == 3, "a different contig must re-parse"
+    finally:
+        core._load_snvs_uncached = real
+        core._SNV_CACHE.clear()
