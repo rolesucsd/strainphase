@@ -3,7 +3,6 @@
 Tests for strainphase.longitudinal module.
 
 Covers:
-- _weighted_median
 - LongitudinalIntegrator.build_anchor_panel_for_key
 - LongitudinalIntegrator.count_timepoints_for_haplotype
 - LongitudinalIntegrator.rescue_window_result (basic)
@@ -19,7 +18,6 @@ from strainphase.core import (
     WindowResult,
     LongitudinalIntegrator,
 )
-from strainphase.longitudinal import _weighted_median
 
 
 def _make_window_result(haplotypes, snv_pos=None, start=0, end=1000):
@@ -37,32 +35,6 @@ def _make_window_result(haplotypes, snv_pos=None, start=0, end=1000):
         window=window, haplotypes=haplotypes, gamma=gamma, pi=pi,
         log_likelihood=-10.0, assignments=[], converged=True, iterations=5,
     )
-
-
-class TestLongitudinalWeightedMedian(unittest.TestCase):
-    """Test the _weighted_median helper in longitudinal.py."""
-
-    def test_single_value(self):
-        self.assertAlmostEqual(_weighted_median([0.4], [1.0]), 0.4)
-
-    def test_equal_weights_three_values(self):
-        result = _weighted_median([0.1, 0.5, 0.9], [1.0, 1.0, 1.0])
-        self.assertAlmostEqual(result, 0.5)
-
-    def test_heavy_weight_on_low_value(self):
-        result = _weighted_median([0.1, 0.9], [0.9, 0.1])
-        self.assertAlmostEqual(result, 0.1)
-
-    def test_empty_returns_zero(self):
-        self.assertEqual(_weighted_median([], []), 0.0)
-
-    def test_zero_weights_returns_zero(self):
-        self.assertEqual(_weighted_median([0.3, 0.7], [0.0, 0.0]), 0.0)
-
-    def test_result_clamped_to_unit_interval(self):
-        result = _weighted_median([0.5], [1.0])
-        self.assertGreaterEqual(result, 0.0)
-        self.assertLessEqual(result, 1.0)
 
 
 class TestBuildAnchorPanel(unittest.TestCase):

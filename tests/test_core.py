@@ -23,7 +23,6 @@ from strainphase.core import (
     link_windows,
     process_window,
     results_to_dataframe,
-    _weighted_median,
 )
 from strainphase.simulation.synthetic_data import (
     SyntheticDataGenerator
@@ -630,36 +629,6 @@ class TestSyntheticDataGenerator(unittest.TestCase):
                 self.assertGreater(len(window.reads), 0)
 
 
-class TestWeightedMedian(unittest.TestCase):
-    """Test the _weighted_median utility."""
-
-    def test_single_value(self):
-        """Single value returns itself."""
-        self.assertAlmostEqual(_weighted_median([0.3], [1.0]), 0.3)
-
-    def test_equal_weights(self):
-        """Equal weights: median is middle value."""
-        result = _weighted_median([0.1, 0.5, 0.9], [1.0, 1.0, 1.0])
-        self.assertAlmostEqual(result, 0.5)
-
-    def test_skewed_weights(self):
-        """Heavy weight on one value pulls median there."""
-        result = _weighted_median([0.1, 0.9], [0.9, 0.1])
-        self.assertAlmostEqual(result, 0.1)
-
-    def test_empty_returns_zero(self):
-        self.assertEqual(_weighted_median([], []), 0.0)
-
-    def test_zero_weights_returns_zero(self):
-        self.assertEqual(_weighted_median([0.5, 0.8], [0.0, 0.0]), 0.0)
-
-    def test_clamps_to_unit_interval(self):
-        """Result is always clamped to [0, 1]."""
-        result = _weighted_median([0.5], [1.0])
-        self.assertGreaterEqual(result, 0.0)
-        self.assertLessEqual(result, 1.0)
-
-
 class TestAssignReads(unittest.TestCase):
     """Test PostProcessor.assign_reads directly."""
 
@@ -960,7 +929,6 @@ def run_tests(verbosity: int = 2) -> unittest.TestResult:
     suite.addTests(loader.loadTestsFromTestCase(TestEMHaplotyper))
     suite.addTests(loader.loadTestsFromTestCase(TestPostProcessor))
     suite.addTests(loader.loadTestsFromTestCase(TestWindowLinking))
-    suite.addTests(loader.loadTestsFromTestCase(TestWeightedMedian))
     suite.addTests(loader.loadTestsFromTestCase(TestAssignReads))
     suite.addTests(loader.loadTestsFromTestCase(TestEMPiNormalization))
     suite.addTests(loader.loadTestsFromTestCase(TestProcessWindow))

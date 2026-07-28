@@ -2816,11 +2816,20 @@ def link_windows(
     Link haplotypes across overlapping windows based on consensus similarity.
 
     Since windows overlap by 50%, adjacent windows share SNV positions.
-    Haplotypes are linked (assigned the same track_id) if their consensus
-    agrees on the shared SNVs.
+    Haplotypes are linked (assigned the same track_id) if their consensus agrees on the
+    shared SNVs AND their within-window shares are compatible.
+
+    The abundance check is an ELIMINATOR, never an indicator: two adjacent windows in one
+    sample are the same timepoint, so a genome cannot sit at two frequencies across them,
+    and a genuine disagreement means they are not one entity. Agreement earns no credit
+    and cannot rescue a failed identity gate. Tested on RAW COUNTS - the derived abundance
+    is already quantised onto unit fractions by a median denominator of 9 non-junk reads.
 
     This modifies haplotypes in-place by setting their track_id field.
     """
+    # Deferred: strainphase.coherence imports HaplotyperConfig from this module, so a
+    # top-level import here would be circular. The cost is one lookup per call.
+    from strainphase.coherence import abundance_coherent
     if len(results) < 2:
         # Single window: each haplotype is its own track.
         track_counter = 0
@@ -2897,6 +2906,17 @@ def link_windows(
             # Full gate stack: shared markers >= min_shared_calls_for_link, co-supported
             # span >= 25% of the shared region, num_diff <= 1, rate <= max_link_distance.
             candidates: list[tuple[int, int, float, int]] = []
+
+            # Non-junk read count per window - the denominator the abundance eliminator
+            # tests against. Same definition build_window_tables uses for `total_reads`.
+            def _nonjunk(wr) -> int:
+                if wr.gamma is None or wr.gamma.size == 0:
+                    return 0
+                junk = wr.gamma.shape[1] - 1
+                return int(wr.gamma.shape[0] - (wr.gamma[:, junk] >= 0.5).sum())
+
+            n_curr, n_next = _nonjunk(curr_wr), _nonjunk(next_wr)
+
             # per-haplotype footprints, clipped to the shared region, hoisted out of the
             # pairwise loop (see consensus_footprint)
             span_i = [consensus_footprint(h.consensus, region) for h in curr_wr.haplotypes]
@@ -2915,6 +2935,31 @@ def link_windows(
                         b_span=span_j[hj],
                     )
                     if gate.passed:
+                        # ABUNDANCE AS AN ELIMINATOR (author's rule, 2026-07-28).
+                        #
+                        # This is a SINGLE-TIMEPOINT comparison - one sample, two adjacent
+                        # windows - so it is exactly the case the coherence test is for: a
+                        # genome cannot sit at two different frequencies at one moment.
+                        # Two window-haplotypes whose shares genuinely disagree are not the
+                        # same entity, however well their alleles match.
+                        #
+                        # ELIMINATOR ONLY. Agreement never scores and never rescues a
+                        # failed identity gate; it can only refuse. And the test is run on
+                        # RAW COUNTS, never the derived abundance, which is already
+                        # quantised onto unit fractions by a median denominator of 9.
+                        if not abundance_coherent(
+                            [(hap_i.supporting_reads, n_curr),
+                             (hap_j.supporting_reads, n_next)], config
+                        ).coherent:
+                            record_debug(curr_wr, {
+                                "contig": curr_wr.window.contig,
+                                "window_start": curr_wr.window.start,
+                                "next_window_start": next_wr.window.start,
+                                "hap_i": hi, "hap_j": hj,
+                                "decision": "refused",
+                                "reason": "incompatible_abundance",
+                            })
+                            continue
                         candidates.append((hi, hj, gate.rate, gate.n_shared))
                     elif gate.reason == "failed_mismatch":
                         curr_wr.link_mismatches.append(
@@ -3228,23 +3273,6 @@ def process_mag_longitudinal(*args, **kwargs):
 # =============================================================================
 
 
-def _weighted_median(values: list[float], weights: list[float]) -> float:
-    """Weighted median of *values* with corresponding *weights*."""
-    if not values:
-        return 0.0
-    total = sum(weights)
-    if total <= 0:
-        return 0.0
-    paired = sorted(zip(values, weights))  # noqa: B905
-    cumulative = 0.0
-    half = total / 2.0
-    for val, w in paired:
-        cumulative += w
-        if cumulative >= half:
-            return max(0.0, min(1.0, val))
-    return max(0.0, min(1.0, paired[-1][0]))
-
-
 def results_to_dataframe(results: dict[str, list[WindowResult]]) -> list[dict]:
     """
     Convert results to track-based records for DataFrame.
@@ -3331,7 +3359,8 @@ def results_to_dataframe(results: dict[str, list[WindowResult]]) -> list[dict]:
                     "span_bp": span_end - span_start,
                     "n_windows": n_windows,
                     "n_snvs": len(merged_consensus),
-                    "mean_weight": _weighted_median(window_abundances, window_read_weights),
+                    "mean_weight": (sum(window_abundances) / len(window_abundances)
+                                    if window_abundances else 0.0),
                     "total_supporting_reads": total_reads,
                     "mean_confidence": np.mean(confidences) if confidences else 0.0,
                     "consensus": "|".join(

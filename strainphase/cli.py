@@ -89,12 +89,10 @@ def cmd_longitudinal(args: argparse.Namespace) -> int:
 
     from strainphase import HaplotyperConfig
     from strainphase.longitudinal import (
-        build_lineage_table,
         build_window_tables,
         load_allowed_contigs,
         parse_reference_contigs,
         process_mag_longitudinal,
-        write_lineage_tables,
         write_window_tables,
     )
 
@@ -210,17 +208,6 @@ def cmd_longitudinal(args: argparse.Namespace) -> int:
         f"{n_mismatch} mismatch"
     )
 
-    if getattr(args, "build_lineages", False):
-        logging.warning(
-            "--build-lineages: running the LEGACY greedy cross-sample clustering. It is "
-            "order-dependent and accretes; it over- and under-merges simultaneously. "
-            "Retained for comparison only."
-        )
-        lineage_records, haplotype_records = build_lineage_table(all_results, config)
-        lineage_path, _ = write_lineage_tables(
-            lineage_records, haplotype_records, args.output_dir
-        )
-        logging.info(f"  legacy lineage table: {len(lineage_records)} rows -> {lineage_path}")
 
     return 0
 
@@ -451,11 +438,6 @@ Examples:
              "complete linkage, no time axis, immune to irregular timepoint spacing. "
              "'reciprocal' = unique-best + mutual between consecutive samples; requires "
              "--samples in true chronological order.",
-    )
-    long_parser.add_argument(
-        "--build-lineages", action="store_true",
-        help="Also run the LEGACY greedy cross-sample lineage clustering. Off by "
-             "default; for comparison only.",
     )
     long_parser.set_defaults(func=cmd_longitudinal)
 
