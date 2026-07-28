@@ -272,7 +272,7 @@ def group_window_across_samples(
         group = by_label.get(label)
         if group is None:
             group = WindowGroup(
-                group_id=f"{group_prefix}{hap.window_start}_{label}",
+                group_id=f"{group_prefix}{hap.window_start}_H{label}",
                 contig=hap.contig,
                 window_start=hap.window_start,
                 window_end=hap.window_end,
@@ -322,7 +322,7 @@ def group_all_windows(
                 markers,
                 config,
                 sample_order=sample_order,
-                group_prefix=f"{contig}_W",
+                group_prefix=f"{contig}_",
             )
             groups.extend(window_groups)
             edges.extend(window_edges)

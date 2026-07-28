@@ -574,3 +574,32 @@ def test_step1_records_mismatches_but_not_dropouts():
     # identical haplotypes link and record nothing
     quiet = link_windows([wr(1, [shared]), wr(10001, [dict(shared)])], cfg())
     assert not [m for r in quiet for m in r.link_mismatches]
+
+
+def test_id_scheme_is_uniform_and_self_contained():
+    """Every id carries the scope it is unique within, so none needs a companion column.
+
+    step 0  haplotype  sample_contig_window_H<idx>
+    step 1  track      sample_contig_T<idx>
+    step 2  group      contig_window_H<idx>
+
+    The raw counters underneath do NOT have this property: link_windows assigns track_id
+    per (sample, contig), so a bare "T0001" recurred in every sample and every contig.
+    Joining haplotypes.tsv to windows_within_sample.tsv on it inflated 26,650 rows to
+    2,509,579 (94x) on 000066952_0.
+    """
+    from strainphase.window_groups import group_window_across_samples
+
+    haps = [
+        WindowHaplotype(sample=s, contig="c1", window_start=10001, window_end=30001,
+                        haplotype_id=f"{s}_c1_10001_H0",
+                        consensus={12000: "A", 15000: "C", 18000: "G"}, reads=20,
+                        total_reads=40)
+        for s in ("s1", "s2")
+    ]
+    groups, _ = group_window_across_samples(haps, {12000, 15000, 18000}, cfg(),
+                                            group_prefix="c1_")
+    assert groups[0].group_id.startswith("c1_10001_H"), groups[0].group_id
+    # the group's members carry the full sample_contig_window form, so the member list
+    # joins straight back to haplotypes.tsv
+    assert {m.haplotype_id for m in groups[0].members} == {"s1_c1_10001_H0", "s2_c1_10001_H0"}
