@@ -2638,6 +2638,28 @@ def variable_marker_positions(
     return markers
 
 
+def consensus_footprint(
+    consensus: dict[int, str], region: tuple[int, int] | None = None
+) -> tuple[int, int]:
+    """First and last position a consensus covers, optionally clipped to *region*.
+
+    Returned as (lo, hi) with hi < lo when nothing falls inside the region, so callers can
+    test emptiness without a second pass. Deliberately avoids materialising a set: this is
+    called once per haplotype per comparison batch, not once per pair.
+    """
+    if region is None:
+        return (min(consensus), max(consensus)) if consensus else (1, 0)
+    lo_r, hi_r = region
+    lo = hi = None
+    for p in consensus:
+        if lo_r <= p <= hi_r:
+            if lo is None or p < lo:
+                lo = p
+            if hi is None or p > hi:
+                hi = p
+    return (lo, hi) if lo is not None else (1, 0)
+
+
 @dataclass
 class GateResult:
     """Outcome of one identity comparison.
@@ -2673,6 +2695,8 @@ def compare_consensus(
     min_cospan_frac: float | None = None,
     max_rate: float | None = None,
     allow_fallback: bool = True,
+    a_span: tuple[int, int] | None = None,
+    b_span: tuple[int, int] | None = None,
 ) -> GateResult:
     """Apply the full identity gate stack to two consensus dicts.
 
@@ -2682,6 +2706,10 @@ def compare_consensus(
 
     The overlap gate asks only "how much sequence did both haplotypes cover", never
     where the markers within it happen to fall.
+
+    ``a_span``/``b_span`` are precomputed ``consensus_footprint`` results. Pass them when
+    comparing many pairs - the footprint does not depend on the partner, and recomputing it
+    per pair dominates the cost.
 
     ``allow_fallback=False`` forbids the clonal fallback, so the verdict rests only on
     genuinely discriminating markers. Use it whenever a NEGATIVE verdict will be treated
@@ -2702,7 +2730,8 @@ def compare_consensus(
 
     def _restrict(positions):
         if region is None:
-            return set(positions)
+            # already a set from the & below; copying it was pure overhead
+            return positions if isinstance(positions, set) else set(positions)
         lo, hi = region
         return {p for p in positions if lo <= p <= hi}
 
@@ -2734,11 +2763,13 @@ def compare_consensus(
     # 1,100 bp apart passed. Measured on 000066952_0: at window 1,880,001 every one of
     # the 703 pairs overlapped by 6,126 bp yet had its 2 markers only 190 bp apart, so
     # all 703 were rejected and a 2-genotype locus was emitted as 38 singleton groups.
-    a_pos, b_pos = _restrict(a.keys()), _restrict(b.keys())
-    if a_pos and b_pos:
-        overlap = min(max(a_pos), max(b_pos)) - max(min(a_pos), min(b_pos))
-    else:
-        overlap = 0
+    # A footprint is a property of ONE haplotype, so it must not be recomputed per pair.
+    # Building the two position sets here cost 77% of this function's runtime and scaled
+    # as O(n^2 * positions) per window; `consensus_footprint` is O(positions) and callers
+    # that compare many pairs should hoist it out of the loop entirely (see a_span/b_span).
+    lo_a, hi_a = a_span if a_span is not None else consensus_footprint(a, region)
+    lo_b, hi_b = b_span if b_span is not None else consensus_footprint(b, region)
+    overlap = (min(hi_a, hi_b) - max(lo_a, lo_b)) if (hi_a >= lo_a and hi_b >= lo_b) else 0
     if overlap < config.min_entity_overlap_bp:
         return GateResult(False, "failed_no_evidence", 1.0, n_shared, 0, used_fallback)
     if region is not None:
@@ -2866,6 +2897,10 @@ def link_windows(
             # Full gate stack: shared markers >= min_shared_calls_for_link, co-supported
             # span >= 25% of the shared region, num_diff <= 1, rate <= max_link_distance.
             candidates: list[tuple[int, int, float, int]] = []
+            # per-haplotype footprints, clipped to the shared region, hoisted out of the
+            # pairwise loop (see consensus_footprint)
+            span_i = [consensus_footprint(h.consensus, region) for h in curr_wr.haplotypes]
+            span_j = [consensus_footprint(h.consensus, region) for h in next_wr.haplotypes]
             for hi, hap_i in enumerate(curr_wr.haplotypes):
                 for hj, hap_j in enumerate(next_wr.haplotypes):
                     gate = compare_consensus(
@@ -2876,6 +2911,8 @@ def link_windows(
                         min_shared=config.min_shared_calls_for_link,
                         region=region,
                         max_rate=config.max_link_distance,
+                        a_span=span_i[hi],
+                        b_span=span_j[hj],
                     )
                     if gate.passed:
                         candidates.append((hi, hj, gate.rate, gate.n_shared))

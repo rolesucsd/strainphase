@@ -958,7 +958,7 @@ def build_window_tables(
                     )
 
     # ---- vertical axis: group across samples at each fixed window ----
-    groups, edges = group_all_windows(
+    groups, edges, edge_counts = group_all_windows(
         window_haps, config, sample_order=sample_order, site_type=site_type_all
     )
 
@@ -983,6 +983,7 @@ def build_window_tables(
             }
         )
 
+    # `edges` now holds ONLY mismatches - the other outcomes are counted, not stored.
     edge_rows = [
         {
             "contig": e.contig,
@@ -999,7 +1000,8 @@ def build_window_tables(
         for e in edges
     ]
 
-    return haplotype_rows, within_rows, across_rows, edge_rows, within_mismatch_rows
+    return (haplotype_rows, within_rows, across_rows, edge_rows,
+            within_mismatch_rows, edge_counts)
 
 
 def write_window_tables(
@@ -1027,13 +1029,12 @@ def write_window_tables(
     # The FULL comparison log is still not written: it was ~144 MB for a single MAG
     # (1.27M rows), ~30 GB across a 233-MAG cohort, and almost all of it is
     # failed_no_evidence. Only the mismatches are kept - 11% of rows on 000089747_1.
-    mismatch_across = [e for e in edge_rows if e.get("reason") == "failed_mismatch"]
     tables = [
         ("haplotypes.tsv", haplotype_rows),
         ("windows_within_sample.tsv", within_rows),
         ("windows_across_samples.tsv", across_rows),
         ("mismatches_within_sample.tsv", within_mismatch_rows or []),
-        ("mismatches_across_samples.tsv", mismatch_across),
+        ("mismatches_across_samples.tsv", edge_rows),
     ]
     for name, rows in tables:
         path = os.path.join(output_dir, name)
@@ -1426,7 +1427,8 @@ def main():
     # the legacy greedy clustering anyway; it is retained only for comparison and is known
     # to over- and under-merge simultaneously.
     logging.info("Building window tables across processed MAGs")
-    hap_rows, within_rows, across_rows, edge_rows, mismatch_rows = build_window_tables(
+    (hap_rows, within_rows, across_rows, edge_rows, mismatch_rows,
+     edge_counts) = build_window_tables(
         all_results, config, sample_order=samples
     )
     write_window_tables(
@@ -1435,13 +1437,14 @@ def main():
 
     n_within = len({(r["sample"], r["contig"], r["within_sample_id"]) for r in within_rows})
     n_across = len(across_rows)
-    n_failed_mismatch = sum(1 for e in edge_rows if e["reason"] == "failed_mismatch")
-    n_failed_evidence = sum(1 for e in edge_rows if e["reason"] == "failed_no_evidence")
+    n_failed_mismatch = edge_counts.get("failed_mismatch", 0)
+    n_failed_evidence = edge_counts.get("failed_no_evidence", 0)
+    n_linked = edge_counts.get("linked", 0)
     logging.info(
         f"DONE: {len(mags_to_process)} MAGs | {len(hap_rows)} window-haplotypes | "
         f"{n_within} within-sample entities | {n_across} across-sample window groups "
         f"(method={config.cross_sample_method}) | comparisons: "
-        f"{len(edge_rows) - n_failed_mismatch - n_failed_evidence} linked, "
+        f"{n_linked} linked, "
         f"{n_failed_evidence} no-evidence, {n_failed_mismatch} mismatch | "
         f"mismatches written: {len(mismatch_rows)} within-sample, "
         f"{n_failed_mismatch} across-sample"
