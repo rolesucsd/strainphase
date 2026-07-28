@@ -84,7 +84,8 @@ class WindowHaplotype:
     haplotype_id: str
     consensus: dict[int, str]
     reads: int = 0
-    total_reads: int = 0
+    total_reads: int = 0        # reads that PHASED in this window
+    junk_reads: int = 0         # reads that did not; carried so the denominator is a choice
     abundance: float = 0.0
     # The step-1 entity this haplotype belongs to (link_windows' track id, unique within a
     # sample+contig). Carried through so step 3 can use the WITHIN-sample chaining as

@@ -66,6 +66,26 @@ The alternative considered and not taken was a vote floor with constrained union
 48-group components, needs the constraints actively enforced, and its size bound is
 empirical rather than structural.
 
+ABUNDANCE: POOLED COUNTS, TWO DENOMINATORS
+   ``Lineage.abundance_by_sample()`` returns, per sample, Sum(reads) / Sum(denominator)
+   over the windows this lineage occupies in that sample - the same estimator step 1 uses
+   for a track, inherited one level up rather than redefined.
+
+   Never a mean or median of the per-window abundances. Each window carries its own
+   denominator (median 9 phased reads, varying ~4x across one sample's windows), 46% of
+   windows hold a single haplotype whose abundance is 1.000 by construction, and the
+   window set changes between timepoints - so an average over it moves with the window set
+   rather than with the biology. That is what produced the sawtooth.
+
+   Both denominators are reported. ``abundance`` divides by the reads that PHASED, which
+   renormalises away how much of a window resolved; ``abundance_all_reads`` divides by
+   every read at those loci, so a poorly-resolving window pulls the estimate down instead
+   of being rescaled up to look like a good one.
+
+   CAVEAT: adjacent windows overlap by 50%, so a read spanning the overlap is counted in
+   both. Numerator and denominator inflate together and the ratio holds, but the
+   overlapping region is effectively double-weighted.
+
 BOTH EXISTING TABLES ARE USED AS EVIDENCE; NEITHER IS RECOMPUTED
    step 1  ``windows_within_sample.tsv`` -> which haplotypes a sample's own reads chained
            across adjacent windows. Reaches this module through
@@ -93,7 +113,26 @@ from strainphase.core import (
 )
 from strainphase.window_groups import WindowGroup
 
-__all__ = ["Lineage", "LineageEdge", "build_lineages"]
+__all__ = ["Lineage", "LineageEdge", "PooledAbundance", "build_lineages"]
+
+
+@dataclass
+class PooledAbundance:
+    """One lineage's pooled read counts in one sample, with both denominators.
+
+    Counts are pooled, never averaged: Sum(reads) / Sum(denominator) over the windows the
+    lineage occupies in that sample. A mean or median of the per-window abundances would
+    be wrong because each window carries its own denominator (median 9 phased reads,
+    varying ~4x across one sample's windows), 46% of windows hold a single haplotype whose
+    abundance is 1.000 by construction, and the window set changes between timepoints.
+    """
+
+    abundance: float            # reads / phased reads
+    abundance_all_reads: float  # reads / (phased + junk)
+    reads: int
+    total_reads: int
+    junk_reads: int
+    n_windows: int
 
 
 @dataclass
@@ -120,8 +159,8 @@ class Lineage:
     def samples(self) -> set[str]:
         return {m.sample for g in self.groups for m in g.members}
 
-    def abundance_by_sample(self) -> dict[str, tuple[float, int, int, int]]:
-        """Pooled abundance per sample: ``{sample: (abundance, reads, total_reads, n_win)}``.
+    def abundance_by_sample(self) -> dict[str, "PooledAbundance"]:
+        """Pooled abundance per sample, both denominators.
 
         POOLED COUNTS, never an average of per-window ratios. ``Sum(supporting reads) /
         Sum(non-junk reads)`` over the windows this lineage occupies IN THAT SAMPLE - the
@@ -134,8 +173,14 @@ class Lineage:
         between timepoints, so any average over it moves with the window set rather than
         with the biology. That last one is what produced the sawtooth.
 
-        ``n_win`` is returned so a consumer can require a minimum, and ``total_reads`` so a
-        ratio of small numbers is visible as such rather than being taken at face value.
+        TWO denominators are returned because the choice is a real one.
+        ``abundance`` divides by the reads that PHASED, which renormalises away how much
+        of the window resolved - a window where 10% of reads phased scores the same as one
+        where 90% did. ``abundance_all_reads`` divides by every read at those loci, so a
+        poorly-resolving window pulls the estimate down instead of being rescaled up.
+
+        ``n_windows`` is returned so a consumer can require a minimum, and the raw counts
+        so a ratio of small numbers is visible as such rather than taken at face value.
 
         CAVEAT: adjacent windows overlap by 50%, so a read spanning the overlap is counted
         in both. Numerator and denominator inflate together and the ratio holds, but the
@@ -144,12 +189,18 @@ class Lineage:
         acc: dict[str, list[int]] = {}
         for g in self.groups:
             for m in g.members:
-                a = acc.setdefault(m.sample, [0, 0, 0])
+                a = acc.setdefault(m.sample, [0, 0, 0, 0])
                 a[0] += m.reads
                 a[1] += m.total_reads
-                a[2] += 1
-        return {s: ((k / n) if n else float("nan"), k, n, w)
-                for s, (k, n, w) in acc.items()}
+                a[2] += m.junk_reads
+                a[3] += 1
+        out = {}
+        for smp, (k, n, j, w) in acc.items():
+            out[smp] = PooledAbundance(
+                abundance=(k / n) if n else float("nan"),
+                abundance_all_reads=(k / (n + j)) if (n + j) else float("nan"),
+                reads=k, total_reads=n, junk_reads=j, n_windows=w)
+        return out
 
     @property
     def marker_span(self) -> tuple[int, int]:

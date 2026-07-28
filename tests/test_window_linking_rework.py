@@ -686,8 +686,25 @@ def test_lineage_abundance_pools_counts_rather_than_averaging_ratios():
     lins, _ = build_lineages([a, b], _lcfg())
     assert len(lins) == 1
 
-    ab, reads, total, n_win = lins[0].abundance_by_sample()["t0"]
-    assert (reads, total, n_win) == (8, 103, 2)
-    assert ab == pytest.approx(8 / 103)
+    p = lins[0].abundance_by_sample()["t0"]
+    assert (p.reads, p.total_reads, p.n_windows) == (8, 103, 2)
+    assert p.abundance == pytest.approx(8 / 103)
     naive = (5 / 100 + 3 / 3) / 2
-    assert abs(naive - ab) > 0.4, "averaging the ratios gives a very different answer"
+    assert abs(naive - p.abundance) > 0.4, "averaging the ratios gives a very different answer"
+
+
+def test_both_denominators_are_reported():
+    """Dividing by PHASED reads renormalises away how much of a window resolved; dividing
+    by all reads does not. A window where 8 of 100 reads phased and this haplotype holds 5
+    of them is 0.62 of what resolved but 0.05 of what is there - the choice is the
+    consumer's, so both are emitted."""
+    from strainphase.lineages import build_lineages
+
+    shared = {12000: "A", 15000: "C", 18000: "G"}
+    m = _mem("t0", dict(shared), reads=5, total=8)
+    m.junk_reads = 92
+    lins, _ = build_lineages([_grp("A", 1, [m])], _lcfg())
+    p = lins[0].abundance_by_sample()["t0"]
+    assert p.abundance == pytest.approx(5 / 8)
+    assert p.abundance_all_reads == pytest.approx(5 / 100)
+    assert (p.total_reads, p.junk_reads) == (8, 92)
