@@ -120,6 +120,37 @@ class Lineage:
     def samples(self) -> set[str]:
         return {m.sample for g in self.groups for m in g.members}
 
+    def abundance_by_sample(self) -> dict[str, tuple[float, int, int, int]]:
+        """Pooled abundance per sample: ``{sample: (abundance, reads, total_reads, n_win)}``.
+
+        POOLED COUNTS, never an average of per-window ratios. ``Sum(supporting reads) /
+        Sum(non-junk reads)`` over the windows this lineage occupies IN THAT SAMPLE - the
+        same estimator step 1 uses for a track, inherited one level up.
+
+        Averaging the per-window abundances instead would be wrong for three measured
+        reasons: each window carries its own denominator (median 9 non-junk reads, varying
+        ~4x across one sample's windows); 46% of windows hold a single haplotype whose
+        abundance is 1.000 by construction; and the window set a lineage occupies changes
+        between timepoints, so any average over it moves with the window set rather than
+        with the biology. That last one is what produced the sawtooth.
+
+        ``n_win`` is returned so a consumer can require a minimum, and ``total_reads`` so a
+        ratio of small numbers is visible as such rather than being taken at face value.
+
+        CAVEAT: adjacent windows overlap by 50%, so a read spanning the overlap is counted
+        in both. Numerator and denominator inflate together and the ratio holds, but the
+        overlapping region is effectively double-weighted.
+        """
+        acc: dict[str, list[int]] = {}
+        for g in self.groups:
+            for m in g.members:
+                a = acc.setdefault(m.sample, [0, 0, 0])
+                a[0] += m.reads
+                a[1] += m.total_reads
+                a[2] += 1
+        return {s: ((k / n) if n else float("nan"), k, n, w)
+                for s, (k, n, w) in acc.items()}
+
     @property
     def marker_span(self) -> tuple[int, int]:
         """First and last MARKER position, which is what the lineage actually resolves —

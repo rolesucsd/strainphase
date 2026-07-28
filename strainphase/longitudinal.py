@@ -307,6 +307,16 @@ def _median_member_span(group) -> float:
     return float(spans[len(spans) // 2]) if spans else 0.0
 
 
+def _nonjunk_reads(wr) -> int:
+    """Reads in this window not assigned to the junk component - the denominator every
+    abundance divides by. One definition, used by both the per-window value and the
+    pooled per-track one."""
+    n = getattr(wr, "n_reads_examined", len(wr.window.reads))
+    if wr.gamma is None or wr.gamma.size == 0:
+        return n
+    return n - int((wr.gamma[:, wr.gamma.shape[1] - 1] >= 0.5).sum())
+
+
 def build_window_tables(
     all_results: dict[str, dict[str, dict[str, list[WindowResult]]]],
     config: HaplotyperConfig,
@@ -464,6 +474,8 @@ def build_window_tables(
                         )
 
                 for eid, members in entities.items():
+                    track_reads = sum(h.supporting_reads for _, h, _ in members)
+                    track_total = sum(_nonjunk_reads(wr) for wr, _, _ in members)
                     starts = [wr.window.start for wr, _, _ in members]
                     ends = [wr.window.end for wr, _, _ in members]
                     # marker footprint across every member, vs the tiles it nominally spans
@@ -483,7 +495,21 @@ def build_window_tables(
                             "hap_end": he,
                             "hap_span_bp": he - hs,
                             "n_markers": len(set(mpos)),
-                            "reads": sum(h.supporting_reads for _, h, _ in members),
+                            # POOLED READ COUNTS, not an average of per-window ratios.
+                            # Sum(supporting) / Sum(non-junk) over the track's windows is
+                            # a proper pooled estimate; a mean or median of the per-window
+                            # abundances is not, because each window has its own
+                            # denominator (median 9 non-junk reads, varying ~4x across one
+                            # sample's windows) and 46% of windows hold a single haplotype
+                            # whose abundance is 1.000 by construction.
+                            #
+                            # CAVEAT: adjacent windows overlap by 50%, so a read spanning
+                            # the overlap is counted in both. Numerator and denominator
+                            # inflate together so the ratio holds, but the overlap region
+                            # is effectively double-weighted.
+                            "reads": track_reads,
+                            "total_reads": track_total,
+                            "abundance": (track_reads / track_total) if track_total else float("nan"),
                             # The SAME id as haplotypes.tsv, so the member list joins
                             # back directly. It previously used the track-prefixed form,
                             # which matched nothing in that table.
