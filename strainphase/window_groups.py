@@ -84,6 +84,12 @@ class WindowHaplotype:
     reads: int = 0
     total_reads: int = 0
     abundance: float = 0.0
+    # The step-1 entity this haplotype belongs to (link_windows' track id, unique within a
+    # sample+contig). Carried through so step 3 can use the WITHIN-sample chaining as
+    # direct evidence that two step-2 groups continue into each other: if a sample's
+    # link_windows entity contains a haplotype from group A at window W and one from group
+    # B at W+step, that sample is a vote for joining A and B.
+    within_sample_id: str = ""
 
 
 @dataclass

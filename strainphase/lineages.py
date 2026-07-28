@@ -98,11 +98,27 @@ and the first failure is recorded as the edge's ``reason``.
 
 5. IS THE CHOICE UNAMBIGUOUS?  -> ``failed_not_mutual``
    reciprocal best       each side's best partner must be the other, and the best must be
-                         a strict winner. A TIE CONTRIBUTES NO EDGE. Score is the identity
-                         mismatch rate ONLY — abundance never scores, sample count never
-                         scores. Length is therefore preferred implicitly: a chain extends
-                         as far as the markers unambiguously support and stops at the first
-                         ambiguity, never guessing between two candidates.
+                         a strict winner. A TIE CONTRIBUTES NO EDGE.
+   score                 STEP-1 LINK VOTES first, identity mismatch rate as the tiebreak,
+                         encoded as one "lower is better" number
+                         (``-votes * 1000 + rate``) so an exact tie on both still yields
+                         no edge. A vote is a sample whose link_windows chain contains a
+                         member of BOTH groups — direct read-level evidence that the two
+                         continue into each other. Abundance never scores and sample count
+                         never scores. With no votes anywhere the score degrades to the
+                         identity rate alone, which is the sensible fallback.
+                         Length is preferred implicitly: a chain extends as far as the
+                         evidence unambiguously supports and stops at the first ambiguity,
+                         never guessing between two candidates.
+
+BOTH EXISTING TABLES ARE USED AS EVIDENCE; NEITHER IS RECOMPUTED
+   step 1  ``windows_within_sample.tsv`` -> which haplotypes a sample's own reads already
+           chained across adjacent windows. Reaches this module through
+           ``WindowHaplotype.within_sample_id`` and becomes the join SCORE.
+   step 2  ``windows_across_samples.tsv`` -> which haplotypes are the same entity across
+           samples at one window. These groups are the nodes being chained.
+   So both ends are already joined, and step 3 only has to decide which pairing is the
+   consistent one.
 
 UPSTREAM GATES THAT SHAPE THE INPUT (not applied here, but they decide what exists)
    window_size 20000, step 10000        50% overlap so adjacent windows share markers
@@ -194,6 +210,9 @@ class LineageEdge:
     n_diff: int
     n_samples_tested: int
     n_samples_incompatible: int
+    # samples whose step-1 (within-sample) chain contains a haplotype from BOTH groups —
+    # direct read-level evidence that these two continue into each other
+    n_link_votes: int = 0
 
 
 def _group_consensus(group: WindowGroup) -> dict[int, str]:
@@ -260,6 +279,24 @@ def build_lineages(
     for g in groups:
         by_key[(g.contig, g.window_start)].append(g)
 
+    # ---- step-1 evidence: which groups does a within-sample chain already connect? ----
+    # link_windows chained haplotypes across adjacent windows inside each sample. Step 2
+    # then assigned each of those haplotypes to a cross-sample group. So a sample whose
+    # chain holds a member of group A at W and a member of group B at W+step is a direct
+    # read-level vote that A continues into B. Both existing tables are used as evidence;
+    # nothing is recomputed.
+    chain_pos: dict[tuple[str, str, str], dict[int, str]] = defaultdict(dict)
+    for g in groups:
+        for m in g.members:
+            if m.within_sample_id:
+                chain_pos[(m.sample, g.contig, m.within_sample_id)][g.window_start] = g.group_id
+    link_votes: Counter = Counter()
+    for (_sample, _contig, _eid), wins in chain_pos.items():
+        for w, ga in wins.items():
+            gb = wins.get(w + step)
+            if gb is not None and gb != ga:
+                link_votes[(ga, gb)] += 1
+
     cons = {g.group_id: _group_consensus(g) for g in groups}
     counts = {g.group_id: _group_counts(g) for g in groups}
     edges: list[LineageEdge] = []
@@ -298,9 +335,16 @@ def build_lineages(
                     e.reason = "failed_abundance"
                     edges.append(e)
                     continue
-                # score is the identity distance ONLY - abundance never scores
-                forward.setdefault(ga.group_id, []).append((gate.rate, gb.group_id))
-                backward.setdefault(gb.group_id, []).append((gate.rate, ga.group_id))
+                # SCORE: step-1 link votes first (direct read-level evidence that these
+                # two continue into each other), identity distance as the tiebreak.
+                # Abundance never scores - it only eliminates. Sample count never scores.
+                # Encoded as one "lower is better" number so an exact tie on both still
+                # yields no edge.
+                votes = link_votes.get((ga.group_id, gb.group_id), 0)
+                e.n_link_votes = votes
+                score = -votes * 1000.0 + gate.rate
+                forward.setdefault(ga.group_id, []).append((score, gb.group_id))
+                backward.setdefault(gb.group_id, []).append((score, ga.group_id))
                 pending[(ga.group_id, gb.group_id)] = e
 
         best_f = unique_best_matches(forward)
@@ -325,7 +369,13 @@ def build_lineages(
         lineages.append(Lineage(f"{lineage_prefix}{i:06d}", members[0].contig,
                                 sorted(members, key=lambda g: g.window_start)))
 
+    linked = [e for e in edges if e.reason == "linked"]
     reasons = Counter(e.reason for e in edges)
+    if linked:
+        logging.info(
+            f"  step-1 backing: {sum(1 for e in linked if e.n_link_votes)}/{len(linked)} "
+            f"accepted joins carry a within-sample chain link"
+        )
     logging.info(
         f"  lineages: {len(lineages)} from {len(groups)} window groups | "
         f"continuations: {dict(reasons)}"
