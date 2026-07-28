@@ -48,16 +48,21 @@ def test_marker_set_keeps_only_variable_positions():
     assert variable_marker_positions(consensuses) == {20}
 
 
-def test_marker_set_excludes_sv_sites():
-    """SVs stay loaded and reported, but must never drive identity: an invertible
-    promoter flips independently of strain background."""
+def test_sv_sites_are_identity_markers_by_default():
+    """AUTHOR'S DECISION: SVs are NEVER excluded from identity. Capturing the trajectory
+    of a flip is a goal of the analysis, so an inversion is a marker like any other. The
+    flip then shows up as two entities trading frequency, which IS the trajectory.
+
+    The exclusion path is still reachable so the effect can be measured, but it must not
+    be the default - it was set True in code while diagnosis §6 #16 was still open.
+    """
     consensuses = [{10: "A", 99: "ev.INV.1"}, {10: "T", 99: "ev.INV.2"}]
     site_type = {10: "snv", 99: "sv"}
-    assert variable_marker_positions(consensuses, site_type) == {10}
-    keep = variable_marker_positions(
-        consensuses, site_type, cfg(exclude_sv_from_identity=False)
+    assert variable_marker_positions(consensuses, site_type) == {10, 99}
+    dropped = variable_marker_positions(
+        consensuses, site_type, cfg(exclude_sv_from_identity=True)
     )
-    assert keep == {10, 99}
+    assert dropped == {10}
 
 
 def test_marker_set_is_empty_for_a_clonal_locus():
@@ -123,6 +128,34 @@ def test_min_entity_overlap_is_an_explicit_non_merge():
     gate = compare_consensus(a, b, set(), cfg(min_entity_overlap_bp=1000))
     assert not gate.passed
     assert gate.reason == "failed_no_evidence"
+
+
+def test_overlap_gate_ignores_where_the_markers_sit():
+    """REGRESSION: the overlap gate asks how much SEQUENCE was compared, never how
+    spread out the markers are.
+
+    It used to measure ``max(shared) - min(shared)`` over the MARKER subset. On
+    000066952_0 window 1,880,001 that rejected all 703 pairs - each overlapped by
+    6,126 bp, but its only 2 markers sat 190 bp apart - and emitted a 2-genotype locus
+    as 38 singleton groups. Clustered variation (recombination tracts, hypervariable
+    loci) is exactly where markers bunch up, so the old rule penalised the most
+    informative sites.
+    """
+    # Both cover 1000..7000 (6 kb of shared sequence); the only two markers are the
+    # adjacent positions 3000/3190, 190 bp apart.
+    a = {1000: "A", 3000: "G", 3190: "G", 7000: "T"}
+    b = {1000: "A", 3000: "G", 3190: "G", 7000: "T"}
+    gate = compare_consensus(a, b, {3000, 3190}, cfg(min_entity_overlap_bp=1000),
+                             min_shared=2)
+    assert gate.passed, "6 kb of shared sequence must not be rejected for tight markers"
+
+    # ...and the gate still bites when the FOOTPRINTS barely overlap, even though the
+    # pair clears min_shared. Only the sequence overlap decides this.
+    c = {1000: "A", 2950: "G", 3000: "C"}
+    d = {2950: "G", 3000: "C", 9000: "T"}
+    gate = compare_consensus(c, d, {2950, 3000}, cfg(min_entity_overlap_bp=1000),
+                             min_shared=2)
+    assert not gate.passed and gate.n_shared == 2, "50 bp of overlap must be rejected"
 
 
 def test_cosupported_span_fraction_gate():
@@ -343,10 +376,14 @@ def test_window_carries_site_type():
     assert w.site_type == {}
 
     w.site_type = {10: "snv", 50: "sv"}
-    markers = variable_marker_positions(
-        [{10: "A", 50: "ev.INV.1"}, {10: "T", 50: "ev.INV.2"}], w.site_type
-    )
-    assert markers == {10}, "SV position must not become an identity marker"
+    consensuses = [{10: "A", 50: "ev.INV.1"}, {10: "T", 50: "ev.INV.2"}]
+    # The plumbing must REACH the exclusion path - a getattr default returning {} could
+    # not be told apart from "no SVs here". Exercised with the flag forced on, since the
+    # shipping default keeps SVs as markers (see test_sv_sites_are_identity_markers).
+    assert variable_marker_positions(
+        consensuses, w.site_type, cfg(exclude_sv_from_identity=True)
+    ) == {10}
+    assert variable_marker_positions(consensuses, w.site_type) == {10, 50}
 
 
 # --------------------------------------------------------------------------- #
@@ -446,3 +483,94 @@ def test_marker_span_reports_what_was_actually_resolved():
     a = _grp("A", 1, [_mem(f"t{i}", shared) for i in range(4)])
     lins, _ = build_lineages([a], _lcfg())
     assert lins[0].marker_span == (12000, 18000)
+
+
+# --------------------------------------------------------------------------- #
+# SPLIT MOLECULES: re-assembly + the BREAK marker (troubleshooting U1)
+# --------------------------------------------------------------------------- #
+
+
+def _seg(name, rs, re_, alleles):
+    from strainphase.core import Read
+    r = Read(id=name, contig="c1", mapq=60, ref_start=rs, ref_end=re_)
+    r.alleles = dict(alleles)
+    r.quals = dict.fromkeys(alleles, 30)
+    return r
+
+
+def test_split_molecule_becomes_one_read_carrying_both_sides():
+    """The whole point: a molecule the aligner split is ONE observation of ONE strain.
+
+    Kept apart, its two halves phase into two haplotypes and the window's mixture weight
+    is divided between fragments of the same strain. Merged, the read spans the break and
+    the halves cannot come apart.
+    """
+    from strainphase.core import _merge_split_reads
+
+    merged, breaks = _merge_split_reads([
+        _seg("mol1", 1000, 2000, {1100: "A", 1900: "C"}),
+        _seg("mol1", 3000, 4000, {3100: "G", 3900: "T"}),
+    ])
+    assert len(merged) == 1, "two segments of one molecule must not stay two reads"
+    r = merged[0]
+    assert r.ref_start == 1000 and r.ref_end == 4000, "span must cover the whole molecule"
+    for p in (1100, 1900, 3100, 3900):
+        assert p in r.alleles, "alleles from BOTH sides must survive the merge"
+    assert breaks == {1999}, "break anchors at the last aligned base of the left segment"
+
+
+def test_break_is_a_discriminating_allele_not_a_hole():
+    """BRK<resume> vs CONT is what makes the SV trackable rather than missing data."""
+    from strainphase.core import BREAK_PREFIX, CONTINUOUS, _merge_split_reads
+
+    split = [_seg("split", 1000, 2000, {1100: "A"}), _seg("split", 3000, 4000, {3100: "G"})]
+    whole = _seg("whole", 1000, 4000, {1100: "A", 3100: "G"})
+    merged, breaks = _merge_split_reads([*split, whole])
+
+    by_id = {r.id: r for r in merged}
+    bp = breaks.pop()
+    assert by_id["split"].alleles[bp] == f"{BREAK_PREFIX}3000"
+    # the unbroken read spans the position, so it is evidence AGAINST the event - without
+    # this the marker cannot discriminate, since only one side would carry a call
+    assert by_id["whole"].alleles[bp] == CONTINUOUS
+
+
+def test_unsplit_reads_are_untouched_and_overlapping_segments_make_no_break():
+    from strainphase.core import _merge_split_reads
+
+    merged, breaks = _merge_split_reads([_seg("solo", 1000, 2000, {1100: "A"})])
+    assert len(merged) == 1 and breaks == set()
+
+    # segments that overlap have no unplaceable gap between them
+    merged, breaks = _merge_split_reads([
+        _seg("m", 1000, 2500, {1100: "A"}),
+        _seg("m", 2000, 3000, {2900: "G"}),
+    ])
+    assert len(merged) == 1 and breaks == set(), "overlapping segments are not a breakpoint"
+
+
+def test_step1_records_mismatches_but_not_dropouts():
+    """Only a genuine allele disagreement is reported. A dropout is a measurement hole -
+    recording those is what made the full comparison log unaffordable, and it buries the
+    finding."""
+    from strainphase.core import Haplotype, Window, WindowResult, link_windows
+
+    def wr(start, cons_list):
+        w = Window(contig="c1", start=start, end=start + 20000)
+        w.snv_pos = sorted({p for c in cons_list for p in c})
+        haps = [Haplotype(consensus=dict(c), supporting_reads=20) for c in cons_list]
+        return WindowResult(window=w, haplotypes=haps, gamma=np.zeros((1, len(haps) + 1)),
+                            pi=np.zeros(len(haps) + 1), log_likelihood=0.0,
+                            assignments=[], converged=True, iterations=1)
+
+    shared = {12000: "A", 14000: "C", 16000: "G", 18000: "T"}
+    flipped = {p: {"A": "T", "C": "G", "G": "C", "T": "A"}[b] for p, b in shared.items()}
+    results = link_windows([wr(1, [shared]), wr(10001, [flipped])], cfg())
+
+    rec = [m for r in results for m in r.link_mismatches]
+    assert rec, "a genuine disagreement must reach the output"
+    assert rec[0]["n_diff"] > 0 and rec[0]["n_shared"] >= 3
+
+    # identical haplotypes link and record nothing
+    quiet = link_windows([wr(1, [shared]), wr(10001, [dict(shared)])], cfg())
+    assert not [m for r in quiet for m in r.link_mismatches]

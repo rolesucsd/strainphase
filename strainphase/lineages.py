@@ -45,10 +45,11 @@ and the first failure is recorded as the edge's ``reason``.
                          where everything agrees carries no identity information yet still
                          dilutes the mismatch rate (42.6% of emitted positions were
                          invariant MAG-wide on 000089747_1).
-   SV exclusion          ``exclude_sv_from_identity=True``. Structural variants are loaded,
-                         phased and reported, but never used as identity markers: an
-                         invertible promoter at af~0.5 flips independently of strain
-                         background, so it would split a lineage every time it flips.
+   SVs are markers       ``exclude_sv_from_identity=False`` (author's decision). Structural
+                         variants are never excluded: the trajectory of a flip is a result
+                         we want, not noise. An invertible element that flips therefore
+                         yields TWO entities whose frequencies trade off over time, and
+                         that pair IS the flip trajectory.
    clonal fallback       if fewer than ``min_shared`` MARKERS are shared, fall back to all
                          co-covered positions. A clonal locus genuinely has no variable
                          sites; absence of discriminating evidence is not evidence of
