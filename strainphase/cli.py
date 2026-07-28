@@ -191,7 +191,8 @@ def cmd_longitudinal(args: argparse.Namespace) -> int:
     # The final lineage table is PAUSED by default: composing the within-sample and
     # across-sample linking axes into a lineage is an open decision, and these tables are
     # the substrate that decision will be evaluated on.
-    hap_rows, within_rows, across_rows, edge_rows, mismatch_rows = build_window_tables(
+    (hap_rows, within_rows, across_rows, edge_rows, mismatch_rows,
+     edge_counts) = build_window_tables(
         all_results, config, sample_order=samples
     )
     write_window_tables(
@@ -199,7 +200,7 @@ def cmd_longitudinal(args: argparse.Namespace) -> int:
     )
 
     n_within = len({(r["sample"], r["contig"], r["within_sample_id"]) for r in within_rows})
-    n_mismatch = sum(1 for e in edge_rows if e["reason"] == "failed_mismatch")
+    n_mismatch = edge_counts.get("failed_mismatch", 0)
     n_noev = sum(1 for e in edge_rows if e["reason"] == "failed_no_evidence")
     logging.info(
         f"DONE: {len(hap_rows)} window-haplotypes | {n_within} within-sample entities | "

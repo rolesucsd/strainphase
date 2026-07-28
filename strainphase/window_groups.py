@@ -48,6 +48,7 @@ that simply returns nothing cannot be told apart from one that was never attempt
 from __future__ import annotations
 
 import logging
+from collections import Counter
 from dataclasses import dataclass, field
 
 import networkx as nx
@@ -58,6 +59,7 @@ from strainphase.core import (
     DEFAULT_CONFIG,
     HaplotyperConfig,
     compare_consensus,
+    consensus_footprint,
     unique_best_matches,
     variable_marker_positions,
 )
@@ -138,14 +140,30 @@ def _pairwise(
     haps: list[WindowHaplotype],
     markers: set[int],
     config: HaplotyperConfig,
-) -> tuple[dict[tuple[int, int], object], list[GroupEdge]]:
-    """Compare every pair once. Returns the gate results plus the recorded edges."""
+) -> tuple[dict[tuple[int, int], object], list[GroupEdge], "Counter"]:
+    """Compare every pair once.
+
+    Returns the gate results, the MISMATCH edges only, and a count of every outcome.
+
+    Only mismatches are materialised. They are the sole verdict written out, and holding
+    all of them cost ~2.4 GB of GroupEdge objects for a single MAG (3,988,701 comparisons
+    on 000066952_0) which were then copied into dicts and filtered at write time. The
+    outcome counts preserve everything the logs reported.
+    """
     gates: dict[tuple[int, int], object] = {}
     edges: list[GroupEdge] = []
+    counts: Counter = Counter()
+    # Footprints are per-haplotype, so they are computed ONCE here rather than inside the
+    # O(n^2) loop - this is the difference between O(n^2 * positions) and O(n * positions).
+    spans = [consensus_footprint(h.consensus) for h in haps]
     for i in range(len(haps)):
         for j in range(i + 1, len(haps)):
-            gate = compare_consensus(haps[i].consensus, haps[j].consensus, markers, config)
+            gate = compare_consensus(haps[i].consensus, haps[j].consensus, markers, config,
+                                     a_span=spans[i], b_span=spans[j])
             gates[(i, j)] = gate
+            counts[gate.reason] += 1
+            if gate.reason != "failed_mismatch":
+                continue
             edges.append(
                 GroupEdge(
                     contig=haps[i].contig,
@@ -160,7 +178,7 @@ def _pairwise(
                     n_diff=gate.n_diff,
                 )
             )
-    return gates, edges
+    return gates, edges, counts
 
 
 def _labels_clique(
@@ -249,15 +267,15 @@ def group_window_across_samples(
     config: HaplotyperConfig = DEFAULT_CONFIG,
     sample_order: list[str] | None = None,
     group_prefix: str = "G",
-) -> tuple[list[WindowGroup], list[GroupEdge]]:
+) -> tuple[list[WindowGroup], list[GroupEdge], Counter]:
     """Group the haplotypes at ONE window across samples.
 
-    Returns the groups and every recorded comparison (passed and failed alike).
+    Returns the groups, the MISMATCH comparisons, and a count of every outcome.
     """
     if not haps:
-        return [], []
+        return [], [], Counter()
 
-    gates, edges = _pairwise(haps, markers, config)
+    gates, edges, counts = _pairwise(haps, markers, config)
 
     if config.cross_sample_method == "clique":
         labels = _labels_clique(haps, gates)
@@ -281,7 +299,7 @@ def group_window_across_samples(
             by_label[label] = group
         group.members.append(hap)
 
-    return list(by_label.values()), edges
+    return list(by_label.values()), edges, counts
 
 
 def group_all_windows(
@@ -289,7 +307,7 @@ def group_all_windows(
     config: HaplotyperConfig = DEFAULT_CONFIG,
     sample_order: list[str] | None = None,
     site_type: dict[int, str] | None = None,
-) -> tuple[list[WindowGroup], list[GroupEdge]]:
+) -> tuple[list[WindowGroup], list[GroupEdge], Counter]:
     """Group every window of every contig, across samples.
 
     The marker set is computed ONCE PER CONTIG over every haplotype in every sample -
@@ -302,6 +320,7 @@ def group_all_windows(
 
     groups: list[WindowGroup] = []
     edges: list[GroupEdge] = []
+    counts: Counter = Counter()
 
     for contig, contig_haps in sorted(by_contig.items()):
         markers = variable_marker_positions(
@@ -317,7 +336,7 @@ def group_all_windows(
             by_window.setdefault(hap.window_start, []).append(hap)
 
         for window_start in sorted(by_window):
-            window_groups, window_edges = group_window_across_samples(
+            window_groups, window_edges, window_counts = group_window_across_samples(
                 by_window[window_start],
                 markers,
                 config,
@@ -326,5 +345,6 @@ def group_all_windows(
             )
             groups.extend(window_groups)
             edges.extend(window_edges)
+            counts.update(window_counts)
 
-    return groups, edges
+    return groups, edges, counts

@@ -206,7 +206,7 @@ def _hap(sample, hid, consensus, window_start=1, reads=20, total=40):
 def test_identical_haplotypes_group_together(method):
     cons = {100: "A", 2000: "C", 5000: "G"}
     haps = [_hap(f"t{i}", f"h{i}", dict(cons)) for i in range(4)]
-    groups, edges = group_window_across_samples(
+    groups, edges, _ = group_window_across_samples(
         haps, markers=set(), config=cfg(cross_sample_method=method)
     )
     assert len(groups) == 1
@@ -219,7 +219,7 @@ def test_divergent_haplotypes_stay_separate(method):
     a = {100: "A", 2000: "C", 5000: "G"}
     b = {100: "T", 2000: "A", 5000: "C"}
     haps = [_hap("t0", "h0", a), _hap("t1", "h1", b)]
-    groups, edges = group_window_across_samples(
+    groups, edges, _ = group_window_across_samples(
         haps, markers={100, 2000, 5000}, config=cfg(cross_sample_method=method)
     )
     assert len(groups) == 2
@@ -234,21 +234,30 @@ def test_clique_refuses_to_chain():
     c = {100: "A", 2000: "A", 5000: "T", 8000: "T"}  # 1 diff from b, 2 from a
     haps = [_hap("t0", "ha", a), _hap("t1", "hb", b), _hap("t2", "hc", c)]
     markers = variable_marker_positions([a, b, c])
-    groups, _ = group_window_across_samples(
+    groups, _, _ = group_window_across_samples(
         haps, markers, cfg(cross_sample_method="clique", max_num_diff=1)
     )
     labels = {m.haplotype_id: g.group_id for g in groups for m in g.members}
     assert labels["ha"] != labels["hc"], "a and c differ by 2 and must not share a group"
 
 
-def test_edges_record_every_comparison_including_failures():
-    """A discarded comparison is indistinguishable from one never made."""
+def test_only_mismatches_are_materialised_but_every_outcome_is_counted():
+    """Mismatches are the only verdict written out, so they are the only ones kept.
+
+    Holding every comparison cost ~2.4 GB of GroupEdge objects for ONE mag (3,988,701
+    comparisons on 000066952_0), which were then copied into dicts and filtered at write
+    time. The counts preserve everything the logs reported, at no memory cost.
+    """
     a = {100: "A", 2000: "C", 5000: "G"}
     b = {100: "T", 2000: "A", 5000: "C"}
     haps = [_hap("t0", "h0", a), _hap("t1", "h1", b), _hap("t2", "h2", dict(a))]
-    _, edges = group_window_across_samples(haps, {100, 2000, 5000}, cfg())
-    assert len(edges) == 3  # all pairs, not just successes
-    assert {e.reason for e in edges} == {"linked", "failed_mismatch"}
+    _, edges, counts = group_window_across_samples(haps, {100, 2000, 5000}, cfg())
+
+    assert {e.reason for e in edges} == {"failed_mismatch"}
+    assert len(edges) == 2, "h0-h1 and h1-h2 disagree; h0-h2 is identical"
+    # every pair is still accounted for, just not stored
+    assert sum(counts.values()) == 3
+    assert counts["failed_mismatch"] == 2 and counts["linked"] == 1
 
 
 # --------------------------------------------------------------------------- #
@@ -627,7 +636,7 @@ def test_id_scheme_is_uniform_and_self_contained():
                         total_reads=40)
         for s in ("s1", "s2")
     ]
-    groups, _ = group_window_across_samples(haps, {12000, 15000, 18000}, cfg(),
+    groups, _, _ = group_window_across_samples(haps, {12000, 15000, 18000}, cfg(),
                                             group_prefix="c1_")
     assert groups[0].group_id.startswith("c1_10001_H"), groups[0].group_id
     # the group's members carry the full sample_contig_window form, so the member list

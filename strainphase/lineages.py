@@ -88,6 +88,7 @@ from strainphase.core import (
     DEFAULT_CONFIG,
     HaplotyperConfig,
     compare_consensus,
+    consensus_footprint,
     unique_best_matches,
 )
 from strainphase.window_groups import WindowGroup
@@ -263,6 +264,8 @@ def build_lineages(
         # markers must fall in the interval the two windows SHARE
         region = (w + step, min(g.window_end for g in left) - 1)
 
+        span = {g.group_id: consensus_footprint(cons[g.group_id], region)
+                for g in (*left, *right)}
         forward: dict[str, list[tuple[float, str]]] = {}
         backward: dict[str, list[tuple[float, str]]] = {}
         pending: dict[tuple[str, str], LineageEdge] = {}
@@ -278,6 +281,7 @@ def build_lineages(
                     config, min_shared=config.min_shared_for_lineage, region=region,
                     min_cospan_frac=0.0,       # the region IS the constraint here
                     allow_fallback=False,      # a veto may not rest on padded evidence
+                    a_span=span[ga.group_id], b_span=span[gb.group_id],
                 )
                 e = LineageEdge(contig, w, w + step, ga.group_id, gb.group_id,
                                 gate.reason, round(gate.rate, 6), gate.n_shared,
