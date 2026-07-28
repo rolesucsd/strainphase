@@ -707,7 +707,8 @@ def build_lineage_table(
                         hap_consensus_str = "|".join(
                             f"{pos}:{base}" for pos, base in sorted(hap.consensus.items())
                         )
-                        hap_id = f"{track_id}_W{wr.window.start}_H{hap_idx}"
+                        # Same scheme as build_window_tables (legacy path).
+                        hap_id = f"{sample_id}_{contig_id}_{wr.window.start}_H{hap_idx}"
                         n_reads_w = getattr(wr, "n_reads_examined", len(wr.window.reads))
                         junk_col_w = wr.gamma.shape[1] - 1
                         n_junk_w = int((wr.gamma[:, junk_col_w] >= 0.5).sum())
@@ -852,20 +853,24 @@ def build_window_tables(
                     for h_idx, hap in enumerate(wr.haplotypes):
                         if hap.supporting_reads == 0:
                             continue
-                        eid = hap.track_id or f"unlinked_W{wr.window.start}"
+                        raw_eid = hap.track_id or f"unlinked_{wr.window.start}"
+                        eid = f"{sample_id}_{contig_id}_{raw_eid}"
                         entities[eid].append((wr, hap, h_idx))
 
                         abundance = _window_conditional_abundance(
                             getattr(wr, "pi", None), h_idx
                         )
-                        # GLOBALLY unique. `eid` comes from link_windows' track_id, which
-                        # is assigned per (sample, contig) and therefore RESTARTS at T0001
-                        # in every sample - so "T0001_W10001_H0" recurred in 14 different
-                        # samples on 000089747_1. That made the `haplotype_ids` member list
-                        # in windows_across_samples.tsv impossible to join back to
-                        # haplotypes.tsv without silently fanning out. Sample and contig
-                        # are part of the identity, so they belong in the id.
-                        hap_id = f"{sample_id}|{contig_id}|{eid}_W{wr.window.start}_H{h_idx}"
+                        # UNIFORM ID SCHEME (author's, 2026-07-28). Every id carries the
+                        # scope it is unique within, so no id needs a companion column to
+                        # be a key:
+                        #   step 0  haplotype  sample_contig_window_H<idx>
+                        #   step 1  track      sample_contig_T<idx>
+                        #   step 2  group      contig_window_H<idx>
+                        # Nothing here restarts per scope the way the raw counters do -
+                        # link_windows assigns track_id per (sample, contig), so bare
+                        # "T0001" recurred in every sample AND every contig, and joining
+                        # on it inflated haplotypes.tsv x windows_within_sample.tsv 94x.
+                        hap_id = f"{sample_id}_{contig_id}_{wr.window.start}_H{h_idx}"
                         consensus_str = "|".join(
                             f"{p}:{b}" for p, b in sorted(hap.consensus.items())
                         )
@@ -942,8 +947,12 @@ def build_window_tables(
                             "hap_span_bp": he - hs,
                             "n_markers": len(set(mpos)),
                             "reads": sum(h.supporting_reads for _, h, _ in members),
-                            "haplotype_ids": ";".join(
-                                f"{eid}_W{wr.window.start}_H{i}" for wr, _, i in members
+                            # The SAME id as haplotypes.tsv, so the member list joins
+                            # back directly. It previously used the track-prefixed form,
+                            # which matched nothing in that table.
+                            "haplotype_ids": ",".join(
+                                f"{sample_id}_{contig_id}_{wr.window.start}_H{i}"
+                                for wr, _, i in members
                             ),
                         }
                     )
@@ -968,8 +977,8 @@ def build_window_tables(
                 "hap_span_bp": _group_marker_span(g)[1] - _group_marker_span(g)[0],
                 "median_member_span_bp": _median_member_span(g),
                 "n_markers": len({p for m in g.members for p in m.consensus}),
-                "samples": ";".join(sorted({m.sample for m in g.members})),
-                "haplotype_ids": ";".join(m.haplotype_id for m in g.members),
+                "samples": ",".join(sorted({m.sample for m in g.members})),
+                "haplotype_ids": ",".join(m.haplotype_id for m in g.members),
                 "method": config.cross_sample_method,
             }
         )
