@@ -752,6 +752,23 @@ def build_lineage_table(
     return records, haplotype_records
 
 
+def _group_marker_span(group) -> tuple[int, int]:
+    """Marker footprint of a window group: min/max marker position over all its members."""
+    pos = [p for m in group.members for p in m.consensus]
+    return (min(pos), max(pos)) if pos else (0, 0)
+
+
+def _median_member_span(group) -> float:
+    """Median marker span of the INDIVIDUAL members.
+
+    Distinguishes a group whose members each cover the whole window from one where every
+    member covers a sliver and only the union looks wide - which is the difference between
+    a haplotype that can chain into the next window and one that cannot.
+    """
+    spans = sorted(max(m.consensus) - min(m.consensus) for m in group.members if m.consensus)
+    return float(spans[len(spans) // 2]) if spans else 0.0
+
+
 def build_window_tables(
     all_results: dict[str, dict[str, dict[str, list[WindowResult]]]],
     config: HaplotyperConfig,
@@ -820,6 +837,20 @@ def build_window_tables(
                         consensus_str = "|".join(
                             f"{p}:{b}" for p, b in sorted(hap.consensus.items())
                         )
+                        # Footprint the haplotype's MARKERS actually occupy, as distinct
+                        # from the window tile it sits in. A haplotype can carry 3 markers
+                        # across 200 bp inside a 20 kb window, and reporting only the tile
+                        # makes that indistinguishable from one spanning the whole window.
+                        # That distinction is what separates "linking failed" from "there
+                        # was no variation here to link on" - the latter is a fact about
+                        # the biology, not a defect.
+                        if hap.consensus:
+                            hap_start = min(hap.consensus)
+                            hap_end = max(hap.consensus)
+                            hap_span = hap_end - hap_start
+                        else:
+                            hap_start = hap_end = hap_span = 0
+                        win_bp = max(wr.window.end - wr.window.start, 1)
                         haplotype_rows.append(
                             {
                                 "haplotype_id": hap_id,
@@ -828,6 +859,14 @@ def build_window_tables(
                                 "sample": sample_id,
                                 "window_start": wr.window.start,
                                 "window_end": wr.window.end,
+                                "hap_start": hap_start,
+                                "hap_end": hap_end,
+                                "hap_span_bp": hap_span,
+                                "hap_span_frac": round(hap_span / win_bp, 4),
+                                "markers_per_kb": (
+                                    round(len(hap.consensus) / (hap_span / 1000.0), 3)
+                                    if hap_span else 0.0
+                                ),
                                 "within_sample_id": eid,
                                 "abundance": abundance,
                                 "reads": hap.supporting_reads,
@@ -853,6 +892,9 @@ def build_window_tables(
                 for eid, members in entities.items():
                     starts = [wr.window.start for wr, _, _ in members]
                     ends = [wr.window.end for wr, _, _ in members]
+                    # marker footprint across every member, vs the tiles it nominally spans
+                    mpos = [p for _, h, _ in members for p in h.consensus]
+                    hs, he = (min(mpos), max(mpos)) if mpos else (0, 0)
                     within_rows.append(
                         {
                             "within_sample_id": eid,
@@ -863,6 +905,10 @@ def build_window_tables(
                             "window_min": min(starts),
                             "window_max": max(ends),
                             "span_bp": max(ends) - min(starts),
+                            "hap_start": hs,
+                            "hap_end": he,
+                            "hap_span_bp": he - hs,
+                            "n_markers": len(set(mpos)),
                             "reads": sum(h.supporting_reads for _, h, _ in members),
                             "haplotype_ids": ";".join(
                                 f"{eid}_W{wr.window.start}_H{i}" for wr, _, i in members
@@ -885,6 +931,11 @@ def build_window_tables(
                 "window_end": g.window_end,
                 "n_members": g.n_members,
                 "n_samples": g.n_samples,
+                "hap_start": _group_marker_span(g)[0],
+                "hap_end": _group_marker_span(g)[1],
+                "hap_span_bp": _group_marker_span(g)[1] - _group_marker_span(g)[0],
+                "median_member_span_bp": _median_member_span(g),
+                "n_markers": len({p for m in g.members for p in m.consensus}),
                 "samples": ";".join(sorted({m.sample for m in g.members})),
                 "haplotype_ids": ";".join(m.haplotype_id for m in g.members),
                 "method": config.cross_sample_method,
