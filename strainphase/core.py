@@ -145,12 +145,19 @@ class HaplotyperConfig:
     # Minimum physical overlap between two entities, below which the verdict is an
     # explicit NON-MERGE rather than "unknown" (Strainy's I = 1000).
     min_entity_overlap_bp: int = 1000
-    # Structural variants are ALWAYS loaded, phased and reported, but are excluded from
-    # the identity distance: an invertible promoter at af ~0.5 flips independently of
-    # strain background, so using it as an identity marker splits a lineage in two every
-    # time the inversion flips - destroying the very trajectory it is there to show.
-    # (FIGURE4 diagnosis §6 #16.)
-    exclude_sv_from_identity: bool = True
+    # AUTHOR'S DECISION: structural variants are NEVER excluded from identity. Capturing
+    # the trajectory of a flip is a goal of the analysis, not noise to be filtered, so an
+    # inversion is a first-class marker like any other.
+    #
+    # The consequence is deliberate and worth stating: when an invertible element flips,
+    # the two orientations become genotypically distinct and are reported as two entities
+    # whose frequencies trade off over time. That IS the flip trajectory - it is recorded
+    # as a pair of anti-correlated entities rather than as one entity changing state.
+    #
+    # Left as a knob only so the effect can be measured; do not flip the default. The
+    # earlier True default was set in code while FIGURE4 diagnosis §6 #16 was still an
+    # open author decision.
+    exclude_sv_from_identity: bool = False
 
     # =========== EM PARAMETERS ===========
     em_max_iter: int = 30
@@ -196,6 +203,11 @@ class HaplotyperConfig:
     #   "reciprocal" - unique-best-on-both-sides + mutual between consecutive samples,
     #                  with a per-haplotype dropout skip. Requires a correct
     #                  chronological sample order to mean anything.
+    # SPLIT MOLECULES (troubleshooting U1). A molecule the aligner had to split across a
+    # divergent segment is re-assembled into one Read, and the breakpoint is registered as
+    # a site carrying BRK<resume_pos> / CONT. Off only to measure the difference.
+    merge_split_reads: bool = True
+
     cross_sample_method: str = "clique"
 
     # =========== ABUNDANCE COHERENCE ===========
@@ -463,6 +475,12 @@ class WindowResult:
     converged: bool
     iterations: int
     linking_debug: list[dict] = field(default_factory=list)
+    # Step-1 comparisons that failed on a GENUINE ALLELE DISAGREEMENT, recorded so the
+    # verdict survives to the output. Only `failed_mismatch` is kept: it is a real
+    # genotypic wall (a candidate recombination breakpoint) and is the one negative the
+    # merge rules treat as absolute. `failed_no_evidence` is a measurement hole and is
+    # deliberately NOT recorded - reporting absence of coverage would bury the signal.
+    link_mismatches: list[dict] = field(default_factory=list)
     n_reads_examined: int = 0
     reads_within_mismatch_per_hap: list[int] = field(default_factory=list)
 
@@ -994,7 +1012,10 @@ def make_windows_lazy(
 
         # pysam fetch uses 0-based coordinates
         for aln in bam.fetch(contig_id, start - 1, end - 1):
-            if aln.is_secondary or aln.is_supplementary or aln.is_unmapped:
+            # SECONDARY stays out: an alternative placement of sequence already counted.
+            # SUPPLEMENTARY is kept - it is a different PART of the same molecule, and
+            # the segments are merged back into ONE Read below. See _merge_split_reads.
+            if aln.is_secondary or aln.is_unmapped:
                 continue
             if aln.mapping_quality < config.min_mapq:
                 continue
@@ -1160,6 +1181,19 @@ def make_windows_lazy(
 
             if has_overlap:
                 reads.append(r)
+
+        # Re-assemble split molecules into single reads, and register the breakpoints
+        # they reveal as sites. Done before subsampling so the cap counts molecules.
+        if config.merge_split_reads:
+            reads, break_sites = _merge_split_reads(reads, config)
+            for bp in break_sites:
+                if bp not in snv_set and start <= bp < end:
+                    window_snvs.append(bp)
+                    snv_set.add(bp)
+                    ref_alleles[bp] = CONTINUOUS
+                    st[bp] = "sv"
+            if break_sites:
+                window_snvs.sort()
 
         # Subsample if needed (reproducible)
         if config.max_reads_per_window and len(reads) > config.max_reads_per_window:
@@ -2482,6 +2516,89 @@ def process_window(
     return result
 
 
+
+# =============================================================================
+# SPLIT MOLECULES: re-assembly and the BREAK marker
+# =============================================================================
+
+# Allele values at a breakpoint site. A read that crosses the position with a continuous
+# alignment carries CONTINUOUS; one whose alignment is split there carries
+# BREAK_PREFIX + the coordinate it resumes at, so two different events at the same left
+# coordinate stay distinct alleles. Same shape as the INS<len> / DEL<len> encoding.
+CONTINUOUS = "CONT"
+BREAK_PREFIX = "BRK"
+
+
+def _merge_split_reads(
+    reads: list[Read], config: HaplotyperConfig = DEFAULT_CONFIG
+) -> tuple[list[Read], set[int]]:
+    """Re-assemble split alignments into one Read each, and report the breakpoints.
+
+    When a strain carries a segment the aligner cannot place - a divergent cassette, an
+    insertion, a rearrangement - the molecule is emitted as a primary alignment plus one
+    or more supplementary ones, with the unplaceable part clipped. Those segments are ONE
+    molecule and therefore one strain, so they are merged back into a single Read.
+
+    Two things follow, and both matter:
+
+    1. The merged read carries alleles from BOTH sides of the break, so it links them in
+       the read graph and the EM assigns the whole molecule to one haplotype. The
+       fragments never form. Previously the segments were discarded outright and one
+       strain was emitted as several haplotypes, each handed a share of the window's
+       mixture weight (troubleshooting U1).
+    2. The break itself becomes a POSITIVE identity marker. A strain carrying the cassette
+       reads ``BRK<resume_pos>``; a strain without it reads ``CONT``. That is a
+       discriminating allele like any other, so the structural variant is tracked rather
+       than being a hole in the data - which is the point of not excluding SVs from
+       identity.
+
+    The breakpoint is anchored at the LAST aligned reference position of the preceding
+    segment. Returns the merged reads and the set of breakpoint positions.
+    """
+    by_molecule: dict[str, list[Read]] = defaultdict(list)
+    for r in reads:
+        by_molecule[r.id].append(r)
+
+    merged: list[Read] = []
+    breaks: set[int] = set()
+    qual = config.default_base_quality
+
+    for segs in by_molecule.values():
+        if len(segs) == 1:
+            merged.append(segs[0])
+            continue
+        segs.sort(key=lambda r: (r.ref_start, r.ref_end))
+        whole = segs[0]
+        for seg in segs[1:]:
+            whole.alleles.update(seg.alleles)
+            whole.quals.update(seg.quals)
+        # Set the break markers AFTER the union so they cannot be overwritten by a
+        # later segment that happens to have a call at the same position.
+        for prev, nxt in zip(segs, segs[1:]):  # noqa: B905
+            if nxt.ref_start <= prev.ref_end:
+                continue  # overlapping segments: no gap, nothing to mark
+            anchor = prev.ref_end - 1
+            whole.alleles[anchor] = f"{BREAK_PREFIX}{nxt.ref_start}"
+            whole.quals[anchor] = qual
+            breaks.add(anchor)
+        whole.ref_start = min(s.ref_start for s in segs)
+        whole.ref_end = max(s.ref_end for s in segs)
+        merged.append(whole)
+
+    # A read that spans a breakpoint with an unbroken alignment is evidence AGAINST the
+    # event, not absence of evidence. Without this the marker cannot discriminate: only
+    # the broken strain would carry a call and compare_consensus scores solely positions
+    # where both sides have one.
+    for pos in breaks:
+        for r in merged:
+            if pos in r.alleles or not (r.ref_start <= pos < r.ref_end):
+                continue
+            r.alleles[pos] = CONTINUOUS
+            r.quals[pos] = qual
+
+    return merged, breaks
+
+
 # =============================================================================
 # IDENTITY: marker set + the shared gate stack
 # =============================================================================
@@ -2504,9 +2621,11 @@ def variable_marker_positions(
       * window linking within a sample -> every haplotype in that sample/contig
       * grouping across samples        -> every haplotype in every sample, that contig
 
-    Structural-variant sites are excluded when ``config.exclude_sv_from_identity`` is set.
-    They remain loaded, phased and reported - they are simply not identity markers,
-    because an invertible promoter flips independently of strain background.
+    Structural variants ARE identity markers (``exclude_sv_from_identity`` defaults to
+    False, author's decision): capturing the trajectory of a flip is a goal of the
+    analysis. When an invertible element flips, the two orientations are reported as two
+    entities trading frequency over time, which is the trajectory. The flag exists only
+    so that effect can be measured.
     """
     seen: dict[int, set[str]] = defaultdict(set)
     for consensus in consensuses:
@@ -2556,9 +2675,12 @@ def compare_consensus(
 ) -> GateResult:
     """Apply the full identity gate stack to two consensus dicts.
 
-    Gates, in order: shared markers >= ``min_shared``; co-supported span >=
-    ``min_cospan_frac`` of ``region`` (and >= ``min_entity_overlap_bp``); absolute
-    mismatches <= ``max_num_diff``; mismatch rate <= ``lineage_merge_distance``.
+    Gates, in order: the two footprints must overlap by >= ``min_entity_overlap_bp``
+    (and >= ``min_cospan_frac`` of ``region``); shared markers >= ``min_shared``;
+    absolute mismatches <= ``max_num_diff``; mismatch rate <= ``lineage_merge_distance``.
+
+    The overlap gate asks only "how much sequence did both haplotypes cover", never
+    where the markers within it happen to fall.
 
     The absolute cap and the rate guard opposite ends of the range: the rate is applied
     as a floor, so it already forces zero mismatches below n_shared=100, while at
@@ -2592,17 +2714,36 @@ def compare_consensus(
             shared, used_fallback = fallback, True
 
     n_shared = len(shared)
-    if n_shared < min_shared:
-        return GateResult(False, "failed_no_evidence", 1.0, n_shared, 0, used_fallback)
 
-    # Co-supported span: the stretch over which BOTH haplotypes actually have calls.
-    cospan = max(shared) - min(shared)
-    if cospan < config.min_entity_overlap_bp:
+    # HOW MUCH SEQUENCE DID WE ACTUALLY COMPARE? The stretch over which BOTH haplotypes
+    # have calls - their footprints' intersection. This is deliberately independent of
+    # WHERE the markers sit.
+    #
+    # It used to be `max(shared) - min(shared)`, the span of the marker subset, which
+    # measures how spread out the informative positions happen to be rather than how
+    # much sequence was jointly observed. That penalises exactly the loci where variation
+    # clusters (recombination tracts, hypervariable and phase-variable regions) and is
+    # backwards on evidence: 50 markers packed into 300 bp failed, while 2 markers
+    # 1,100 bp apart passed. Measured on 000066952_0: at window 1,880,001 every one of
+    # the 703 pairs overlapped by 6,126 bp yet had its 2 markers only 190 bp apart, so
+    # all 703 were rejected and a 2-genotype locus was emitted as 38 singleton groups.
+    a_pos, b_pos = _restrict(a.keys()), _restrict(b.keys())
+    if a_pos and b_pos:
+        overlap = min(max(a_pos), max(b_pos)) - max(min(a_pos), min(b_pos))
+    else:
+        overlap = 0
+    if overlap < config.min_entity_overlap_bp:
         return GateResult(False, "failed_no_evidence", 1.0, n_shared, 0, used_fallback)
     if region is not None:
         lo, hi = region
-        if hi > lo and cospan < min_cospan_frac * (hi - lo):
+        if hi > lo and overlap < min_cospan_frac * (hi - lo):
             return GateResult(False, "failed_no_evidence", 1.0, n_shared, 0, used_fallback)
+
+    # ...AND WAS ANY OF IT INFORMATIVE? Separate question, separate gate. These two were
+    # previously tangled into one number, which is also why min_shared ended up doubling
+    # as the trigger for the clonal fallback above.
+    if n_shared < min_shared:
+        return GateResult(False, "failed_no_evidence", 1.0, n_shared, 0, used_fallback)
 
     n_diff = sum(1 for p in shared if a[p] != b[p])
     rate = n_diff / n_shared
@@ -2731,6 +2872,20 @@ def link_windows(
                     )
                     if gate.passed:
                         candidates.append((hi, hj, gate.rate, gate.n_shared))
+                    elif gate.reason == "failed_mismatch":
+                        curr_wr.link_mismatches.append(
+                            {
+                                "contig": curr_wr.window.contig,
+                                "window_a": curr_wr.window.start,
+                                "hap_a_idx": hi,
+                                "window_b": next_wr.window.start,
+                                "hap_b_idx": hj,
+                                "rate": round(gate.rate, 6),
+                                "n_shared": gate.n_shared,
+                                "n_diff": gate.n_diff,
+                                "used_fallback": gate.used_fallback,
+                            }
+                        )
 
             if not candidates:
                 if config.linking_debug:

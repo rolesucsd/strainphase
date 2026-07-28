@@ -803,12 +803,44 @@ def build_window_tables(
     within_rows: list[dict] = []
     window_haps: list[WindowHaplotype] = []
     site_type_all: dict[int, str] = {}
+    within_mismatch_rows: list[dict] = []
 
     for mag_name, mag_results in all_results.items():
         for sample_id, contig_results in mag_results.items():
             for contig_id, window_results in contig_results.items():
                 # Group by the within-sample entity id assigned by link_windows.
                 entities: dict[str, list[tuple[WindowResult, Haplotype, int]]] = defaultdict(list)
+
+                # Step-1 mismatches, resolved to the same haplotype ids used above so
+                # they join back to haplotypes.tsv. Only genuine allele disagreements are
+                # here; dropouts are not recorded (see WindowResult.link_mismatches).
+                by_start = {wr.window.start: wr for wr in window_results}
+
+                def _hid(win_start: int, h_idx: int, _bs=by_start,
+                         _s=sample_id, _c=contig_id) -> str:
+                    wr_ = _bs.get(win_start)
+                    if wr_ is None or h_idx >= len(wr_.haplotypes):
+                        return ""
+                    eid_ = wr_.haplotypes[h_idx].track_id or f"unlinked_W{win_start}"
+                    return f"{_s}|{_c}|{eid_}_W{win_start}_H{h_idx}"
+
+                for wr in window_results:
+                    for m in getattr(wr, "link_mismatches", []):
+                        within_mismatch_rows.append(
+                            {
+                                "mag": mag_name,
+                                "contig": m["contig"],
+                                "sample": sample_id,
+                                "window_a": m["window_a"],
+                                "window_b": m["window_b"],
+                                "haplotype_a": _hid(m["window_a"], m["hap_a_idx"]),
+                                "haplotype_b": _hid(m["window_b"], m["hap_b_idx"]),
+                                "rate": m["rate"],
+                                "n_shared": m["n_shared"],
+                                "n_diff": m["n_diff"],
+                                "used_fallback": m["used_fallback"],
+                            }
+                        )
 
                 for wr in window_results:
                     site_type_all.update(wr.window.site_type)
@@ -958,7 +990,7 @@ def build_window_tables(
         for e in edges
     ]
 
-    return haplotype_rows, within_rows, across_rows, edge_rows
+    return haplotype_rows, within_rows, across_rows, edge_rows, within_mismatch_rows
 
 
 def write_window_tables(
@@ -967,20 +999,32 @@ def write_window_tables(
     across_rows: list[dict],
     edge_rows: list[dict],
     output_dir: str,
+    within_mismatch_rows: list[dict] | None = None,
 ) -> dict[str, str]:
-    """Write the three window-level tables plus the comparison log."""
+    """Write the window-level tables, plus the two MISMATCH tables.
+
+    A link that was not made for lack of shared markers is a measurement hole and is not
+    reported - there is nothing to say about it, and at cohort scale those rows are what
+    made the full comparison log unaffordable. A link that was not made because the
+    alleles genuinely DISAGREE is a finding: a candidate recombination breakpoint, and
+    the one negative the merge rules treat as absolute. Those are written, from both
+    linking steps.
+    """
     import csv as _csv
 
     os.makedirs(output_dir, exist_ok=True)
     written: dict[str, str] = {}
 
-    # window_comparisons.tsv is NOT written: it was ~144 MB for a single MAG (1.27M
-    # rows), i.e. ~30 GB across a 233-MAG cohort, and its diagnostic value is fully
-    # captured by the outcome counts logged below.
+    # The FULL comparison log is still not written: it was ~144 MB for a single MAG
+    # (1.27M rows), ~30 GB across a 233-MAG cohort, and almost all of it is
+    # failed_no_evidence. Only the mismatches are kept - 11% of rows on 000089747_1.
+    mismatch_across = [e for e in edge_rows if e.get("reason") == "failed_mismatch"]
     tables = [
         ("haplotypes.tsv", haplotype_rows),
         ("windows_within_sample.tsv", within_rows),
         ("windows_across_samples.tsv", across_rows),
+        ("mismatches_within_sample.tsv", within_mismatch_rows or []),
+        ("mismatches_across_samples.tsv", mismatch_across),
     ]
     for name, rows in tables:
         path = os.path.join(output_dir, name)
@@ -1373,10 +1417,12 @@ def main():
     # the legacy greedy clustering anyway; it is retained only for comparison and is known
     # to over- and under-merge simultaneously.
     logging.info("Building window tables across processed MAGs")
-    hap_rows, within_rows, across_rows, edge_rows = build_window_tables(
+    hap_rows, within_rows, across_rows, edge_rows, mismatch_rows = build_window_tables(
         all_results, config, sample_order=samples
     )
-    write_window_tables(hap_rows, within_rows, across_rows, edge_rows, args.output_dir)
+    write_window_tables(
+        hap_rows, within_rows, across_rows, edge_rows, args.output_dir, mismatch_rows
+    )
 
     n_within = len({(r["sample"], r["contig"], r["within_sample_id"]) for r in within_rows})
     n_across = len(across_rows)
@@ -1387,7 +1433,9 @@ def main():
         f"{n_within} within-sample entities | {n_across} across-sample window groups "
         f"(method={config.cross_sample_method}) | comparisons: "
         f"{len(edge_rows) - n_failed_mismatch - n_failed_evidence} linked, "
-        f"{n_failed_evidence} no-evidence, {n_failed_mismatch} mismatch"
+        f"{n_failed_evidence} no-evidence, {n_failed_mismatch} mismatch | "
+        f"mismatches written: {len(mismatch_rows)} within-sample, "
+        f"{n_failed_mismatch} across-sample"
     )
 
     if args.build_lineages:
