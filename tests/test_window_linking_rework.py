@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from collections import Counter
 
+import os
+
 import numpy as np
 import pytest
 
@@ -769,3 +771,53 @@ def test_lineage_rows_are_one_per_lineage_sample_with_everything_on_them():
     # membership is on the row, joinable back to haplotypes.tsv
     assert r["haplotype_ids"].count(",") == 1
     assert r["window_group_ids"] == "A,B"
+
+
+def test_a_run_writes_lineages_tsv_and_puts_diagnostics_in_tmp(tmp_path):
+    """END TO END: build_window_tables -> write_window_tables produces the deliverables in
+    output_dir and the diagnostics in output_dir/tmp.
+
+    Guards the wiring, not the algorithm: step 3 was previously never called by the
+    pipeline at all, so a run produced no lineage output.
+    """
+    import numpy as np
+
+    from strainphase.core import Haplotype, Window, WindowResult
+    from strainphase.longitudinal import build_window_tables, write_window_tables
+
+    shared = {12000: "A", 15000: "C", 18000: "G"}
+
+    def wr(start, sample, extra):
+        w = Window(contig="c1", start=start, end=start + 20000)
+        w.snv_pos = sorted({**shared, **extra})
+        g = np.zeros((20, 2))
+        g[:18, 0] = 1.0
+        g[18:, 1] = 1.0
+        h = Haplotype(consensus={**shared, **extra}, supporting_reads=9)
+        h.track_id = "T0001"
+        return WindowResult(window=w, haplotypes=[h], gamma=g,
+                            pi=np.array([0.9, 0.1]), log_likelihood=0.0,
+                            assignments=[], converged=True, iterations=1)
+
+    all_results = {"MAG1": {s: {"c1": [wr(1, s, {3000: "T"}), wr(10001, s, {25000: "T"})]}
+                            for s in ("t0", "t1", "t2")}}
+    out = str(tmp_path / "run")
+    rows = build_window_tables(out, all_results, _lcfg(), sample_order=["t0", "t1", "t2"])
+    write_window_tables(rows[0], rows[1], rows[2], rows[3], out, rows[4], rows[6])
+
+    assert os.path.exists(os.path.join(out, "lineages.tsv")), "the deliverable must exist"
+    for name in ("haplotypes.tsv", "windows_within_sample.tsv",
+                 "windows_across_samples.tsv"):
+        assert os.path.exists(os.path.join(out, name))
+    for name in ("mismatches_within_sample.tsv", "mismatches_across_samples.tsv"):
+        assert os.path.exists(os.path.join(out, "tmp", name)), f"{name} belongs in tmp/"
+        assert not os.path.exists(os.path.join(out, name)), f"{name} must NOT be a deliverable"
+
+    with open(os.path.join(out, "lineages.tsv")) as f:
+        head, *body = [ln.rstrip("\n").split("\t") for ln in f if ln.strip()]
+    assert body, "lineages.tsv must not be empty"
+    for col in ("lineage_id", "sample", "abundance", "abundance_all_reads",
+                "reads", "total_reads", "junk_reads", "haplotype_ids"):
+        assert col in head, f"lineages.tsv is missing {col}"
+    # one row per (lineage, sample); all three samples represented
+    assert {r[head.index("sample")] for r in body} == {"t0", "t1", "t2"}
