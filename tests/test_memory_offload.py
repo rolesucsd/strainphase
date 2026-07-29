@@ -306,3 +306,126 @@ def test_spilling_is_on_by_default_and_no_spill_turns_it_off(tmp_path, monkeypat
 
     off = _run_cli(tmp_path, monkeypatch, ["--no-spill"])["config"]
     assert off.spill_results_to_disk is False
+
+
+# ---------------------------------------------------------------------------
+# Spill failure modes
+# ---------------------------------------------------------------------------
+# offload_heavy() detaches the reads BEFORE the write is attempted, so a failed
+# write means they are gone. Continuing from there does not crash - rescue just
+# runs on read-less windows and emits different numbers. On shared scratch a full
+# disk is realistic, so both directions must fail loudly or recover, never degrade.
+
+
+def test_a_failed_spill_write_keeps_the_reads_in_memory(dataset, monkeypatch, tmp_path):
+    """Disk full mid-run must cost memory, not correctness."""
+    from strainphase.longitudinal import _SpillStore
+
+    tmp, bams, vcfs = dataset
+    real_open = open
+
+    def exploding_open(path, mode="r", *a, **k):
+        if "reads.pkl" in str(path) and "w" in mode:
+            raise OSError(28, "No space left on device")
+        return real_open(path, mode, *a, **k)
+
+    monkeypatch.setattr("builtins.open", exploding_open)
+    store = _SpillStore(str(tmp_path / "spill"))
+
+    class FakeWR:
+        def __init__(self):
+            self.reads = ["r1", "r2"]
+            self.restored = False
+
+        def offload_heavy(self):
+            out, self.reads = self.reads, []
+            return out
+
+        def restore_heavy(self, reads):
+            self.reads = reads
+            self.restored = True
+
+    wrs = [FakeWR(), FakeWR()]
+    store.offload("s1", {"c1": wrs})
+
+    assert all(w.restored for w in wrs), "reads were dropped instead of kept in memory"
+    assert all(w.reads == ["r1", "r2"] for w in wrs), "reads came back wrong"
+    assert ("s1", "c1") not in store._paths, (
+        "a failed write must not register a path - restore() would then expect a file "
+        "that does not exist"
+    )
+
+
+def test_an_unreadable_spill_file_raises_rather_than_silently_dropping_reads(tmp_path):
+    """If the reads cannot come back, there is no correct way to continue."""
+    from strainphase.longitudinal import _SpillStore
+
+    store = _SpillStore(str(tmp_path / "spill"))
+
+    class FakeWR:
+        def __init__(self):
+            self.reads = ["r1"]
+
+        def offload_heavy(self):
+            out, self.reads = self.reads, []
+            return out
+
+        def restore_heavy(self, reads):
+            self.reads = reads
+
+    wrs = [FakeWR()]
+    store.offload("s1", {"c1": wrs})
+    path = store._paths[("s1", "c1")]
+    with open(path, "wb") as fh:          # corrupt it
+        fh.write(b"not a pickle")
+
+    with pytest.raises(RuntimeError, match="could not be read back"):
+        store.restore("s1", "c1", wrs)
+
+
+def test_spill_round_trips_reads_unchanged(tmp_path):
+    from strainphase.longitudinal import _SpillStore
+
+    store = _SpillStore(str(tmp_path / "spill"))
+
+    class FakeWR:
+        def __init__(self, r):
+            self.reads = r
+
+        def offload_heavy(self):
+            out, self.reads = self.reads, []
+            return out
+
+        def restore_heavy(self, reads):
+            self.reads = reads
+
+    wrs = [FakeWR([{"id": "a"}]), FakeWR([{"id": "b"}, {"id": "c"}])]
+    store.offload("s1", {"c1": wrs})
+    assert all(w.reads == [] for w in wrs), "offload did not detach"
+    store.restore("s1", "c1", wrs)
+    assert wrs[0].reads == [{"id": "a"}]
+    assert wrs[1].reads == [{"id": "b"}, {"id": "c"}]
+
+
+def test_the_real_cli_actually_writes_spill_files(dataset, monkeypatch):
+    """End-to-end proof that spilling happens through `strainphase longitudinal`.
+
+    This is the test that would have caught cmd_longitudinal dropping output_dir: it
+    watches the spill directory being used during a real run rather than inspecting
+    kwargs. The directory is cleaned up on success, so the check hooks the write.
+    """
+    import strainphase.longitudinal as L
+
+    tmp, bams, vcfs = dataset
+    seen_paths = []
+    real_offload = L._SpillStore.offload
+
+    def spy(self, sample_id, contig_map):
+        real_offload(self, sample_id, contig_map)
+        seen_paths.extend(self._paths.values())
+
+    monkeypatch.setattr(L._SpillStore, "offload", spy)
+    out, _results, _tables = _run(tmp, bams, vcfs, _cfg(spill_results_to_disk=True), "cli_spill")
+
+    assert seen_paths, "no spill file was ever written - spilling is not active"
+    assert all("spill" in p for p in seen_paths)
