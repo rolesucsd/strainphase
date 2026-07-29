@@ -190,11 +190,12 @@ def cmd_longitudinal(args: argparse.Namespace) -> int:
     # across-sample linking axes into a lineage is an open decision, and these tables are
     # the substrate that decision will be evaluated on.
     (hap_rows, within_rows, across_rows, edge_rows, mismatch_rows,
-     edge_counts) = build_window_tables(
+     edge_counts, lineage_rows) = build_window_tables(
         all_results, config, sample_order=samples
     )
     write_window_tables(
-        hap_rows, within_rows, across_rows, edge_rows, args.output_dir, mismatch_rows
+        hap_rows, within_rows, across_rows, edge_rows, args.output_dir, mismatch_rows,
+        lineage_rows
     )
 
     n_within = len({(r["sample"], r["contig"], r["within_sample_id"]) for r in within_rows})

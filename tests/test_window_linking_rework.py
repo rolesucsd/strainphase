@@ -742,3 +742,30 @@ def test_load_snvs_is_cached_across_samples():
     finally:
         core._load_snvs_uncached = real
         core._SNV_CACHE.clear()
+
+
+def test_lineage_rows_are_one_per_lineage_sample_with_everything_on_them():
+    """lineages.tsv is ONE file at the (lineage, sample) grain - identity, pooled
+    abundance and membership together, so nothing has to be joined to be useful.
+
+    Lineage-level fields repeat down the rows; abundance is that sample's pooled estimate;
+    haplotype_ids lists that sample's members so the row joins back to haplotypes.tsv.
+    """
+    from strainphase.lineages import build_lineages
+    from strainphase.longitudinal import _lineage_rows
+
+    shared = {12000: "A", 15000: "C", 18000: "G"}
+    a = _grp("A", 1, [_mem(s, dict(shared), reads=5, total=20) for s in ("t0", "t1")])
+    b = _grp("B", 10001, [_mem(s, dict(shared), reads=3, total=10) for s in ("t0", "t1")])
+    lins, _ = build_lineages([a, b], _lcfg())
+    rows = _lineage_rows(lins, "MAG1")
+
+    assert len(rows) == 2, "one row per (lineage, sample)"
+    r = next(x for x in rows if x["sample"] == "t0")
+    assert r["mag"] == "MAG1" and r["n_windows_lineage"] == 2
+    # pooled, not averaged: 8 reads over 30, not mean(5/20, 3/10)
+    assert r["reads"] == 8 and r["total_reads"] == 30
+    assert r["abundance"] == pytest.approx(8 / 30)
+    # membership is on the row, joinable back to haplotypes.tsv
+    assert r["haplotype_ids"].count(",") == 1
+    assert r["window_group_ids"] == "A,B"

@@ -48,7 +48,9 @@ from strainphase.core import (
     link_windows,
     make_worker_pool,
     process_contig,
+    variable_marker_positions,
 )
+from strainphase.lineages import build_lineages
 from strainphase.window_groups import WindowHaplotype, group_all_windows
 
 # -----------------------------------------------------------------------------#
@@ -325,6 +327,73 @@ def _read_counts(wr) -> tuple[int, int]:
     return n - junk, junk
 
 
+def _lineage_rows(lineages, mag_name: str) -> list[dict]:
+    """ONE row per (lineage, sample) - the grain where identity, abundance and membership
+    all fit in a single table.
+
+    Lineage-level fields repeat down the rows; ``abundance`` is that sample's POOLED
+    estimate (Sum reads / Sum denominator over the windows this lineage occupies in that
+    sample, never an average of per-window ratios); ``haplotype_ids`` lists that sample's
+    members so the row joins straight back to haplotypes.tsv.
+    """
+    rows: list[dict] = []
+    for lin in lineages:
+        ab = lin.abundance_by_sample()
+        ms, me = lin.marker_span
+        by_sample: dict[str, list] = {}
+        for g in lin.groups:
+            for m in g.members:
+                by_sample.setdefault(m.sample, []).append((g, m))
+        for sample_id, pairs in sorted(by_sample.items()):
+            p = ab[sample_id]
+            rows.append({
+                "lineage_id": lin.lineage_id,
+                "mag": mag_name,
+                "contig": lin.contig,
+                "sample": sample_id,
+                "n_windows_lineage": lin.n_windows,
+                "n_samples_lineage": len(lin.samples),
+                "window_start": lin.window_start,
+                "window_end": lin.window_end,
+                "marker_start": ms,
+                "marker_end": me,
+                "marker_span_bp": me - ms,
+                "n_windows": p.n_windows,
+                "abundance": p.abundance,
+                "abundance_all_reads": p.abundance_all_reads,
+                "reads": p.reads,
+                "total_reads": p.total_reads,
+                "junk_reads": p.junk_reads,
+                "window_group_ids": ",".join(g.group_id for g, _ in sorted(
+                    pairs, key=lambda x: x[0].window_start)),
+                "haplotype_ids": ",".join(m.haplotype_id for _, m in sorted(
+                    pairs, key=lambda x: x[0].window_start)),
+            })
+    return rows
+
+
+def _write_lineage_edges(edges) -> None:
+    """Every attempted continuation with its outcome, to a TEMP file.
+
+    Diagnostic only - which joins were refused and why is what distinguishes a
+    recombination breakpoint from a coverage hole - but it is O(groups^2) and is not a
+    deliverable, so it does not go in the output directory.
+    """
+    import csv as _csv
+    import tempfile
+
+    if not edges:
+        return
+    path = os.path.join(tempfile.gettempdir(), "strainphase_lineage_edges.tsv")
+    with open(path, "w", newline="") as f:
+        w = _csv.DictWriter(f, fieldnames=list(vars(edges[0]).keys()), delimiter="\t")
+        w.writeheader()
+        w.writerows(vars(e) for e in edges)
+    from collections import Counter as _C
+    logging.info(f"  lineage edges (temp, diagnostic): {len(edges)} -> {path} | "
+                 f"{dict(_C(e.reason for e in edges))}")
+
+
 def build_window_tables(
     all_results: dict[str, dict[str, dict[str, list[WindowResult]]]],
     config: HaplotyperConfig,
@@ -360,10 +429,12 @@ def build_window_tables(
     window_haps: list[WindowHaplotype] = []
     site_type_all: dict[int, str] = {}
     within_mismatch_rows: list[dict] = []
+    mag_of_contig: dict[str, str] = {}
 
     for mag_name, mag_results in all_results.items():
         for sample_id, contig_results in mag_results.items():
             for contig_id, window_results in contig_results.items():
+                mag_of_contig[contig_id] = mag_name
                 # Group by the within-sample entity id assigned by link_windows.
                 entities: dict[str, list[tuple[WindowResult, Haplotype, int]]] = defaultdict(list)
 
@@ -544,6 +615,30 @@ def build_window_tables(
         window_haps, config, sample_order=sample_order, site_type=site_type_all
     )
 
+    # ---- step 3: chain those groups along the genome into lineages ----
+    #
+    # Run here rather than from a separate driver because everything it needs is already
+    # in memory: the groups, the contig-wide marker set, and step 1's mismatch verdicts.
+    # Driving it externally meant re-reading a 224 MB haplotypes.tsv and, historically,
+    # meant the pipeline shipped a lineage table built by a different algorithm.
+    lineage_rows: list[dict] = []
+    if config.build_lineages:
+        step1_mm = {frozenset((r["haplotype_a"], r["haplotype_b"]))
+                    for r in within_mismatch_rows if r["haplotype_a"] and r["haplotype_b"]}
+        by_contig: dict[str, list] = defaultdict(list)
+        for g in groups:
+            by_contig[g.contig].append(g)
+        lineage_edges: list = []
+        for contig_id_, cgroups in sorted(by_contig.items()):
+            markers = variable_marker_positions(
+                (m.consensus for g in cgroups for m in g.members), site_type_all, config)
+            lins, ledges = build_lineages(
+                cgroups, config, markers=markers, step1_mismatches=step1_mm,
+                lineage_prefix=f"{contig_id_}_LIN")
+            lineage_edges.extend(ledges)
+            lineage_rows.extend(_lineage_rows(lins, mag_of_contig.get(contig_id_, "")))
+        _write_lineage_edges(lineage_edges)
+
     across_rows: list[dict] = []
     for g in groups:
         across_rows.append(
@@ -583,7 +678,7 @@ def build_window_tables(
     ]
 
     return (haplotype_rows, within_rows, across_rows, edge_rows,
-            within_mismatch_rows, edge_counts)
+            within_mismatch_rows, edge_counts, lineage_rows)
 
 
 def write_window_tables(
@@ -593,6 +688,7 @@ def write_window_tables(
     edge_rows: list[dict],
     output_dir: str,
     within_mismatch_rows: list[dict] | None = None,
+    lineage_rows: list[dict] | None = None,
 ) -> dict[str, str]:
     """Write the window-level tables, plus the two MISMATCH tables.
 
@@ -617,6 +713,7 @@ def write_window_tables(
         ("windows_across_samples.tsv", across_rows),
         ("mismatches_within_sample.tsv", within_mismatch_rows or []),
         ("mismatches_across_samples.tsv", edge_rows),
+        ("lineages.tsv", lineage_rows or []),
     ]
     for name, rows in tables:
         path = os.path.join(output_dir, name)
@@ -884,11 +981,12 @@ def main():
     # axes into a lineage is an open decision (FIGURE4 diagnosis §6 #9), and these tables
     logging.info("Building window tables across processed MAGs")
     (hap_rows, within_rows, across_rows, edge_rows, mismatch_rows,
-     edge_counts) = build_window_tables(
+     edge_counts, lineage_rows) = build_window_tables(
         all_results, config, sample_order=samples
     )
     write_window_tables(
-        hap_rows, within_rows, across_rows, edge_rows, args.output_dir, mismatch_rows
+        hap_rows, within_rows, across_rows, edge_rows, args.output_dir, mismatch_rows,
+        lineage_rows
     )
 
     n_within = len({(r["sample"], r["contig"], r["within_sample_id"]) for r in within_rows})
@@ -903,7 +1001,9 @@ def main():
         f"{n_linked} linked, "
         f"{n_failed_evidence} no-evidence, {n_failed_mismatch} mismatch | "
         f"mismatches written: {len(mismatch_rows)} within-sample, "
-        f"{n_failed_mismatch} across-sample"
+        f"{n_failed_mismatch} across-sample | "
+        f"lineages: {len({r['lineage_id'] for r in lineage_rows})} over "
+        f"{len(lineage_rows)} (lineage, sample) rows"
     )
 
 
