@@ -323,7 +323,11 @@ Examples:
         help="Min VCF DP to load a site. Set 1 for pre-called SNV lists (e.g. "
         "SNooPy) where the BAM re-genotyping is the real depth gate.",
     )
-    run_parser.add_argument("--seed", type=int, help="Random seed")
+    run_parser.add_argument(
+        "--seed", type=int, default=42,
+        help="Random seed. Seeded by default: it drives both read subsampling above "
+        "--max-reads and Louvain read clustering, so an unseeded run is not reproducible.",
+    )
     run_parser.add_argument("--no-validate", action="store_true", help="Skip result validation")
     run_parser.add_argument(
         "--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"]

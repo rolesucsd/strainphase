@@ -35,6 +35,8 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import pickle
+import shutil
 import sys
 from collections import defaultdict
 
@@ -160,6 +162,112 @@ def parse_reference_contigs(
 
 
 # -----------------------------------------------------------------------------#
+# Read spilling
+# -----------------------------------------------------------------------------#
+
+
+class _SpillStore:
+    """Parks per-sample read lists on disk between the phasing pass and the rescue pass.
+
+    Only ``window.reads`` moves - see WindowResult.offload_heavy for why that is the
+    field worth moving and why the WindowResult objects themselves must stay resident.
+
+    Reads are spilled rather than re-read from the BAM because re-deriving them would
+    have to reproduce the per-window subsample exactly (make_windows_lazy draws
+    max_reads_per_window with config.get_rng()); any drift there would silently change
+    which haplotypes are called. Round-tripping the objects cannot drift.
+
+    ``_NullSpill`` is the same interface with every method a no-op, used when spilling is
+    switched off or no output directory is available (tests, library callers).
+    """
+
+    def __init__(self, root: str):
+        self.root = root
+        self._paths: dict[tuple[str, str], str] = {}
+        self._n = 0
+        os.makedirs(root, exist_ok=True)
+
+    @staticmethod
+    def create(config, output_dir: str | None, mag_label: str):
+        if not getattr(config, "spill_results_to_disk", True) or not output_dir:
+            return _NullSpill()
+        root = os.path.join(output_dir, "tmp", "spill", mag_label)
+        try:
+            return _SpillStore(root)
+        except OSError as e:
+            logging.warning(f"Cannot create spill dir {root} ({e}); keeping reads in memory")
+            return _NullSpill()
+
+    def _path(self, sample_id: str, contig_id: str) -> str:
+        key = (sample_id, contig_id)
+        if key not in self._paths:
+            self._n += 1
+            self._paths[key] = os.path.join(self.root, f"{self._n:06d}.reads.pkl")
+        return self._paths[key]
+
+    def offload(self, sample_id: str, contig_map: dict[str, list]) -> None:
+        """Detach and persist every contig's reads for one sample."""
+        for contig_id, window_results in contig_map.items():
+            payload = [wr.offload_heavy() for wr in window_results]
+            if not any(payload):
+                continue
+            try:
+                with open(self._path(sample_id, contig_id), "wb") as fh:
+                    pickle.dump(payload, fh, protocol=pickle.HIGHEST_PROTOCOL)
+            except OSError as e:
+                # Losing a spill file is not fatal: rescue simply sees a read-less window
+                # and skips it, exactly as it would for a window with no coverage.
+                logging.warning(f"Spill write failed for {sample_id}/{contig_id}: {e}")
+
+    def restore(self, sample_id: str, contig_id: str, window_results: list) -> None:
+        path = self._paths.get((sample_id, contig_id))
+        if not path or not os.path.exists(path):
+            return
+        try:
+            with open(path, "rb") as fh:
+                payload = pickle.load(fh)
+        except (OSError, pickle.UnpicklingError) as e:
+            logging.warning(f"Spill read failed for {sample_id}/{contig_id}: {e}")
+            return
+        if len(payload) != len(window_results):
+            logging.warning(
+                f"Spill length mismatch for {sample_id}/{contig_id}: "
+                f"{len(payload)} payloads vs {len(window_results)} windows; skipping restore"
+            )
+            return
+        for wr, reads in zip(window_results, payload):  # noqa: B905
+            wr.restore_heavy(reads)
+
+    def discard(self, sample_id: str, contig_id: str) -> None:
+        path = self._paths.pop((sample_id, contig_id), None)
+        if path and os.path.exists(path):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+    def cleanup(self) -> None:
+        shutil.rmtree(self.root, ignore_errors=True)
+        self._paths.clear()
+
+
+class _NullSpill:
+    """No-op spill store: reads stay in memory (previous behaviour)."""
+
+    def offload(self, sample_id: str, contig_map: dict[str, list]) -> None:
+        pass
+
+    def restore(self, sample_id: str, contig_id: str, window_results: list) -> None:
+        pass
+
+    def discard(self, sample_id: str, contig_id: str) -> None:
+        pass
+
+    def cleanup(self) -> None:
+        pass
+
+
+# -----------------------------------------------------------------------------#
 # Core longitudinal logic
 # -----------------------------------------------------------------------------#
 
@@ -172,11 +280,19 @@ def process_mag_longitudinal(
     vcf_paths: dict[str, str],
     config: HaplotyperConfig,
     sv_sidecar_paths: dict[str, str] | None = None,
+    output_dir: str | None = None,
 ) -> tuple[dict[str, dict[str, list[WindowResult]]], LongitudinalIntegrator | None]:
     """
     Process a single MAG across all samples with longitudinal rescue.
 
     Haplotypes are linked across windows after processing and after rescue.
+
+    Reads and gamma are offloaded to ``<output_dir>/tmp/spill`` as each sample finishes
+    (config.spill_results_to_disk) and reloaded one sample at a time during rescue.
+    Without that, every sample's reads stay resident until the whole MAG is done, which
+    on a 146-sample variant-dense MAG is what runs the job out of memory. The
+    WindowResult objects themselves stay in RAM - the rescue panel holds references to
+    their Haplotype objects and mutates weights in place, so they must not be replaced.
 
     Returns:
         Tuple of:
@@ -197,6 +313,8 @@ def process_mag_longitudinal(
     # once with `config`; process_contig forwards `pool` and uses it directly.
     n_workers = max(1, getattr(config, "n_workers", 1))
     worker_pool = make_worker_pool(n_workers, config) if n_workers > 1 else None
+
+    spill = _SpillStore.create(config, output_dir, mag_label)
 
     for sample_id in samples:
         logging.info(f"  Sample {sample_id}: initial contig processing")
@@ -229,6 +347,9 @@ def process_mag_longitudinal(
             except Exception as e:
                 logging.warning(f"    Error on contig {contig_id} in {sample_id}: {e}")
                 continue
+
+        # Park this sample's reads + gamma on disk before starting the next one.
+        spill.offload(sample_id, all_results[sample_id])
 
     # ------------------ Second pass: cross-timepoint rescue -------------------
     integrator = None
@@ -266,13 +387,30 @@ def process_mag_longitudinal(
                     f"haplotypes={total_haps}, junk_reads={total_junk_reads}/{total_reads} ({junk_pct:.1f}%)"
                 )
 
-                # Apply rescue
-                rescued = integrator.rescue_low_abundance(results_by_timepoint)
-
-                # Update results and re-link windows (rescue may add new haplotypes)
-                for sample_id, window_results in rescued.items():
-                    window_results = link_windows(window_results, config)
-                    all_results[sample_id][contig_id] = window_results
+                # Apply rescue. One sample is resident at a time: every OTHER sample
+                # contributes only its haplotypes to the anchor panel, which survives
+                # offloading. Iteration order matches the all-at-once call, so the
+                # in-place weight updates propagate through the panel identically.
+                for sample_id in samples:
+                    originals = results_by_timepoint.get(sample_id)
+                    if originals is None:
+                        continue
+                    spill.restore(sample_id, contig_id, originals)
+                    rescued = integrator.rescue_low_abundance(
+                        results_by_timepoint, only_sample=sample_id
+                    )
+                    window_results = rescued.get(sample_id)
+                    if window_results is not None:
+                        # Re-link windows (rescue may add new haplotypes).
+                        all_results[sample_id][contig_id] = link_windows(window_results, config)
+                    # `results_by_timepoint` deliberately keeps pointing at the PRE-rescue
+                    # objects, so later samples see the same panel the all-at-once call
+                    # gave them: weights mutated in place, newly rescued haplotypes not
+                    # yet included. Their reads are finished with - the panel needs only
+                    # haplotypes - so drop them for good rather than re-spilling.
+                    for wr in originals:
+                        wr.offload_heavy()
+                    spill.discard(sample_id, contig_id)
 
         # Log rescue statistics
         n_rescued = sum(1 for s in integrator.rescue_statistics if s.was_rescued)
@@ -288,6 +426,10 @@ def process_mag_longitudinal(
     if worker_pool is not None:
         worker_pool.close()
         worker_pool.join()
+
+    # Anything still parked (contigs that never entered rescue, single-timepoint runs)
+    # is finished with - the output tables need haplotypes and gamma, not reads.
+    spill.cleanup()
 
     return all_results, integrator
 
@@ -787,7 +929,11 @@ def main():
         "(default: 1 = sequential). Set this to --cpus-per-task so reserved "
         "cores are actually used; useful for large/high-coverage MAGs.",
     )
-    parser.add_argument("--seed", type=int, help="Random seed")
+    parser.add_argument(
+        "--seed", type=int, default=42,
+        help="Random seed. Seeded by default: it drives both read subsampling above "
+        "--max-reads and Louvain read clustering, so an unseeded run is not reproducible.",
+    )
     parser.add_argument(
         "--validate-results",
         action="store_true",
@@ -854,6 +1000,28 @@ def main():
         type=int,
         default=1000,
         help="Two reads must physically overlap by at least this much to be compared",
+    )
+    parser.add_argument(
+        "--keep-read-assignments",
+        action="store_true",
+        help="Retain the per-read hard assignments on every WindowResult. Debug only: "
+        "they are written to no output file and read by no other code, and on a "
+        "many-sample MAG they are tens of millions of dicts held for nothing.",
+    )
+    parser.add_argument(
+        "--no-spill",
+        action="store_true",
+        help="Keep every sample's reads in memory until the whole MAG finishes (the old "
+        "behaviour). By default reads are parked in <output-dir>/tmp/spill after each "
+        "sample is phased and reloaded one sample at a time for the rescue pass.",
+    )
+    parser.add_argument(
+        "--window-batch-factor",
+        type=int,
+        default=4,
+        help="Windows are dispatched to the worker pool in batches of workers * this. "
+        "Lower it to cut peak memory on variant-dense contigs; raise it to cut "
+        "scheduling overhead.",
     )
     parser.add_argument(
         "--cross-sample-method",
@@ -943,6 +1111,9 @@ def main():
         min_read_read_overlap_bp=args.min_read_read_overlap_bp,
         cross_sample_method=args.cross_sample_method,
         n_workers=max(1, args.workers),
+        keep_read_assignments=args.keep_read_assignments,
+        spill_results_to_disk=not args.no_spill,
+        window_batch_factor=args.window_batch_factor,
     )
 
     # Get MAG -> contigs map, optionally filtered by allowed_contigs
@@ -980,6 +1151,7 @@ def main():
             vcf_paths=vcf_paths,
             config=config,
             sv_sidecar_paths=sv_sidecar_paths,
+            output_dir=args.output_dir,
         )
         all_results[mag_name] = mag_results
         if integrator:

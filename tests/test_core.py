@@ -633,7 +633,9 @@ class TestAssignReads(unittest.TestCase):
     """Test PostProcessor.assign_reads directly."""
 
     def setUp(self):
-        self.config = HaplotyperConfig()
+        # assign_reads is a debugging aid and is off by default (keep_read_assignments);
+        # these tests exercise the function itself, so they opt in explicitly.
+        self.config = HaplotyperConfig(keep_read_assignments=True)
         self.post = PostProcessor(self.config)
         self.reads = [
             Read(id=f"r{i}", contig="test", mapq=60, alleles={}, quals={})
