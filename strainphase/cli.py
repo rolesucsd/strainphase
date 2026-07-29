@@ -191,7 +191,7 @@ def cmd_longitudinal(args: argparse.Namespace) -> int:
     # the substrate that decision will be evaluated on.
     (hap_rows, within_rows, across_rows, edge_rows, mismatch_rows,
      edge_counts, lineage_rows) = build_window_tables(
-        all_results, config, sample_order=samples
+        args.output_dir, all_results, config, sample_order=samples
     )
     write_window_tables(
         hap_rows, within_rows, across_rows, edge_rows, args.output_dir, mismatch_rows,
