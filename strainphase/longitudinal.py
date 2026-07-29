@@ -372,19 +372,21 @@ def _lineage_rows(lineages, mag_name: str) -> list[dict]:
     return rows
 
 
-def _write_lineage_edges(edges) -> None:
-    """Every attempted continuation with its outcome, to a TEMP file.
+def _write_lineage_edges(edges, output_dir: str) -> None:
+    """Every attempted continuation with its outcome, into ``<output_dir>/tmp``.
 
-    Diagnostic only - which joins were refused and why is what distinguishes a
-    recombination breakpoint from a coverage hole - but it is O(groups^2) and is not a
-    deliverable, so it does not go in the output directory.
+    Diagnostic, not a deliverable: which joins were refused and why is what distinguishes
+    a recombination breakpoint from a coverage hole, but it is O(groups^2). It lives
+    beside the run it describes rather than in a system temp directory, so it is findable,
+    cleanable, and cannot collide between concurrent runs.
     """
     import csv as _csv
-    import tempfile
 
     if not edges:
         return
-    path = os.path.join(tempfile.gettempdir(), "strainphase_lineage_edges.tsv")
+    tmp = os.path.join(output_dir, "tmp")
+    os.makedirs(tmp, exist_ok=True)
+    path = os.path.join(tmp, "lineage_edges.tsv")
     with open(path, "w", newline="") as f:
         w = _csv.DictWriter(f, fieldnames=list(vars(edges[0]).keys()), delimiter="\t")
         w.writeheader()
@@ -395,6 +397,7 @@ def _write_lineage_edges(edges) -> None:
 
 
 def build_window_tables(
+    output_dir: str,
     all_results: dict[str, dict[str, dict[str, list[WindowResult]]]],
     config: HaplotyperConfig,
     sample_order: list[str] | None = None,
@@ -637,7 +640,7 @@ def build_window_tables(
                 lineage_prefix=f"{contig_id_}_LIN")
             lineage_edges.extend(ledges)
             lineage_rows.extend(_lineage_rows(lins, mag_of_contig.get(contig_id_, "")))
-        _write_lineage_edges(lineage_edges)
+        _write_lineage_edges(lineage_edges, output_dir)
 
     across_rows: list[dict] = []
     for g in groups:
@@ -702,21 +705,27 @@ def write_window_tables(
     import csv as _csv
 
     os.makedirs(output_dir, exist_ok=True)
+    tmp_dir = os.path.join(output_dir, "tmp")
+    os.makedirs(tmp_dir, exist_ok=True)
     written: dict[str, str] = {}
 
     # The FULL comparison log is still not written: it was ~144 MB for a single MAG
     # (1.27M rows), ~30 GB across a 233-MAG cohort, and almost all of it is
     # failed_no_evidence. Only the mismatches are kept - 11% of rows on 000089747_1.
+    # DELIVERABLES in output_dir; DIAGNOSTICS in output_dir/tmp beside the run they
+    # describe, so they are findable and cleanable and cannot collide between concurrent
+    # runs. The mismatch tables are diagnostics: they carry the cannot-link constraints
+    # step 3 consumes internally, and at 2.3M rows for one MAG they are not a deliverable.
     tables = [
-        ("haplotypes.tsv", haplotype_rows),
-        ("windows_within_sample.tsv", within_rows),
-        ("windows_across_samples.tsv", across_rows),
-        ("mismatches_within_sample.tsv", within_mismatch_rows or []),
-        ("mismatches_across_samples.tsv", edge_rows),
-        ("lineages.tsv", lineage_rows or []),
+        ("haplotypes.tsv", haplotype_rows, output_dir),
+        ("windows_within_sample.tsv", within_rows, output_dir),
+        ("windows_across_samples.tsv", across_rows, output_dir),
+        ("lineages.tsv", lineage_rows or [], output_dir),
+        ("mismatches_within_sample.tsv", within_mismatch_rows or [], tmp_dir),
+        ("mismatches_across_samples.tsv", edge_rows, tmp_dir),
     ]
-    for name, rows in tables:
-        path = os.path.join(output_dir, name)
+    for name, rows, dest in tables:
+        path = os.path.join(dest, name)
         with open(path, "w", newline="") as f:
             if rows:
                 writer = _csv.DictWriter(f, fieldnames=list(rows[0].keys()), delimiter="\t")
@@ -982,7 +991,7 @@ def main():
     logging.info("Building window tables across processed MAGs")
     (hap_rows, within_rows, across_rows, edge_rows, mismatch_rows,
      edge_counts, lineage_rows) = build_window_tables(
-        all_results, config, sample_order=samples
+        args.output_dir, all_results, config, sample_order=samples
     )
     write_window_tables(
         hap_rows, within_rows, across_rows, edge_rows, args.output_dir, mismatch_rows,
