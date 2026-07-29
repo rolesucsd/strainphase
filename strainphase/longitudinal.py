@@ -195,46 +195,72 @@ class _SpillStore:
         try:
             return _SpillStore(root)
         except OSError as e:
-            logging.warning(f"Cannot create spill dir {root} ({e}); keeping reads in memory")
+            # Not a warning: the resource tiers are sized on the assumption that reads
+            # are spilled. Falling back to holding them all makes an OOM likely, so say
+            # so at ERROR rather than burying it in an INFO-level log.
+            logging.error(
+                f"Cannot create spill dir {root} ({e}); keeping every sample's reads in "
+                f"memory. Expect much higher peak memory and possible OOM."
+            )
             return _NullSpill()
 
-    def _path(self, sample_id: str, contig_id: str) -> str:
-        key = (sample_id, contig_id)
-        if key not in self._paths:
-            self._n += 1
-            self._paths[key] = os.path.join(self.root, f"{self._n:06d}.reads.pkl")
-        return self._paths[key]
-
     def offload(self, sample_id: str, contig_map: dict[str, list]) -> None:
-        """Detach and persist every contig's reads for one sample."""
+        """Detach and persist every contig's reads for one sample.
+
+        A failed write must NOT be shrugged off. offload_heavy() has already detached
+        the reads by the time the write is attempted, so silently continuing would leave
+        rescue running against read-less windows - which does not crash, it just quietly
+        produces different numbers. On a shared scratch filesystem a full disk is a
+        realistic event, so the reads go back into memory instead: the run then costs
+        more memory (the old behaviour) but stays correct.
+        """
         for contig_id, window_results in contig_map.items():
             payload = [wr.offload_heavy() for wr in window_results]
             if not any(payload):
                 continue
+            tmp_path = os.path.join(self.root, f"{self._n + 1:06d}.reads.pkl")
             try:
-                with open(self._path(sample_id, contig_id), "wb") as fh:
+                with open(tmp_path, "wb") as fh:
                     pickle.dump(payload, fh, protocol=pickle.HIGHEST_PROTOCOL)
-            except OSError as e:
-                # Losing a spill file is not fatal: rescue simply sees a read-less window
-                # and skips it, exactly as it would for a window with no coverage.
-                logging.warning(f"Spill write failed for {sample_id}/{contig_id}: {e}")
+            except (OSError, pickle.PicklingError) as e:
+                logging.error(
+                    f"Spill write failed for {sample_id}/{contig_id} ({e}); keeping "
+                    f"these reads in memory instead - peak memory will be higher"
+                )
+                for wr, reads in zip(window_results, payload):  # noqa: B905
+                    if reads:
+                        wr.restore_heavy(reads)
+                continue
+            # Registered only AFTER a successful write, so a key in _paths means
+            # "a file really is on disk" and restore() can treat a miss as an error.
+            self._n += 1
+            self._paths[(sample_id, contig_id)] = tmp_path
 
     def restore(self, sample_id: str, contig_id: str, window_results: list) -> None:
+        """Re-attach reads spilled for one sample+contig.
+
+        Raises rather than degrading. If a spill file was written but cannot be read
+        back, the reads are gone and there is no correct way to continue: rescue would
+        run on empty windows and emit plausible-looking but wrong abundances. Failing
+        loudly is the only safe option.
+        """
         path = self._paths.get((sample_id, contig_id))
-        if not path or not os.path.exists(path):
-            return
+        if path is None:
+            return  # nothing was ever spilled for this pair (no reads to begin with)
         try:
             with open(path, "rb") as fh:
                 payload = pickle.load(fh)
         except (OSError, pickle.UnpicklingError) as e:
-            logging.warning(f"Spill read failed for {sample_id}/{contig_id}: {e}")
-            return
+            raise RuntimeError(
+                f"spilled reads for {sample_id}/{contig_id} could not be read back "
+                f"from {path}: {e}. Refusing to continue - rescue would silently run "
+                f"on read-less windows and produce wrong abundances."
+            ) from e
         if len(payload) != len(window_results):
-            logging.warning(
-                f"Spill length mismatch for {sample_id}/{contig_id}: "
-                f"{len(payload)} payloads vs {len(window_results)} windows; skipping restore"
+            raise RuntimeError(
+                f"spill length mismatch for {sample_id}/{contig_id}: {len(payload)} "
+                f"payloads vs {len(window_results)} windows. Refusing to continue."
             )
-            return
         for wr, reads in zip(window_results, payload):  # noqa: B905
             wr.restore_heavy(reads)
 
