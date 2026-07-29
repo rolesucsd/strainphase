@@ -219,3 +219,90 @@ def test_reads_are_released_after_the_run(dataset):
         for wr in wrs
     )
     assert resident == 0, f"{resident} reads still resident after the run"
+
+
+# ---------------------------------------------------------------------------
+# CLI wiring
+# ---------------------------------------------------------------------------
+# The tests above call process_mag_longitudinal directly, so they all passed while
+# `strainphase longitudinal` was in fact running with spilling DISABLED: cli.py's
+# cmd_longitudinal never forwarded output_dir, so _SpillStore.create fell back to
+# _NullSpill and every sample's reads stayed resident. Nothing caught it because
+# nothing exercised the console-script path. These tests do.
+
+
+def _run_cli(tmp_path, monkeypatch, extra):
+    """Drive the real `strainphase longitudinal ...` entry point and capture the kwargs
+    that reach process_mag_longitudinal.
+
+    Deliberately goes through cli.main rather than hand-building a Namespace: a
+    hand-built one silently drifts from the parser (it grows attributes the test does
+    not know about), and it would not catch an 'unrecognized arguments' failure at all -
+    which is precisely how --seed reached a cluster run before dying.
+    """
+    import strainphase.cli as cli
+    import strainphase.longitudinal as L
+
+    for name in ("a.bam", "b.bam", "v.vcf.gz", "ref.fa"):
+        (tmp_path / name).write_text("")
+
+    seen = {}
+
+    def fake(**kwargs):
+        seen.update(kwargs)
+        raise SystemExit(99)  # stop before any real work
+
+    monkeypatch.setattr(L, "process_mag_longitudinal", fake)
+    monkeypatch.setattr(L, "parse_reference_contigs", lambda *a, **k: {"MAG1": {"c1": 1000}})
+
+    argv = ["longitudinal",
+            "--samples", "a,b",
+            "--bams", str(tmp_path / "{sample}.bam"),
+            "--vcfs", str(tmp_path / "v.vcf.gz"),
+            "--reference", str(tmp_path / "ref.fa"),
+            "--output-dir", str(tmp_path / "OUTDIR"),
+            "--mags", "MAG1"] + extra
+    with pytest.raises(SystemExit) as exc:
+        cli.main(argv)
+    # 2 is argparse's "bad command line"; anything else means we got past parsing.
+    assert exc.value.code != 2, f"argparse rejected: {' '.join(argv)}"
+    return seen
+
+
+def test_longitudinal_subcommand_accepts_the_memory_and_seed_flags(tmp_path, monkeypatch):
+    """`strainphase longitudinal --seed ...` must not die with 'unrecognized arguments'.
+
+    cli.py's long_parser and longitudinal.py's parser are two hand-maintained arg lists
+    over one config; a flag added to only the second is accepted by
+    `python -m strainphase.longitudinal` and rejected by `strainphase longitudinal`.
+    That mismatch shipped --seed to a cluster run that died on it immediately.
+    """
+    seen = _run_cli(tmp_path, monkeypatch,
+                    ["--seed", "7", "--window-batch-factor", "2", "--keep-read-assignments"])
+    cfg = seen.get("config")
+    assert cfg is not None, "process_mag_longitudinal was never reached"
+    assert cfg.random_seed == 7
+    assert cfg.window_batch_factor == 2
+    assert cfg.keep_read_assignments is True
+
+
+def test_cmd_longitudinal_forwards_output_dir_so_spilling_is_actually_on(
+    tmp_path, monkeypatch
+):
+    """The regression that mattered: without output_dir the spill store is a no-op, so
+    every sample's reads stay resident and the OOM the spill work exists to prevent
+    comes straight back - with every unit test still green."""
+    seen = _run_cli(tmp_path, monkeypatch, [])
+    assert seen.get("output_dir") == str(tmp_path / "OUTDIR"), (
+        "cmd_longitudinal did not forward output_dir -> _SpillStore falls back to "
+        "_NullSpill and reads are never spilled"
+    )
+
+
+def test_spilling_is_on_by_default_and_no_spill_turns_it_off(tmp_path, monkeypatch):
+    on = _run_cli(tmp_path, monkeypatch, [])["config"]
+    assert on.spill_results_to_disk is True, "spilling must be the default"
+    assert on.random_seed == 42, "the run must be seeded even with no --seed"
+
+    off = _run_cli(tmp_path, monkeypatch, ["--no-spill"])["config"]
+    assert off.spill_results_to_disk is False
