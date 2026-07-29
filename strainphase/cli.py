@@ -161,6 +161,10 @@ def cmd_longitudinal(args: argparse.Namespace) -> int:
         lineage_merge_distance=args.lineage_merge_distance,
         min_shared_for_lineage=args.min_shared_for_lineage,
         cross_sample_method=args.cross_sample_method,
+        random_seed=args.seed,
+        keep_read_assignments=args.keep_read_assignments,
+        spill_results_to_disk=not args.no_spill,
+        window_batch_factor=args.window_batch_factor,
     )
 
     # Create output directory
@@ -180,6 +184,10 @@ def cmd_longitudinal(args: argparse.Namespace) -> int:
             vcf_paths=vcf_paths,
             config=config,
             sv_sidecar_paths=sv_sidecar_paths,
+            # REQUIRED for read spilling. Without it _SpillStore falls back to
+            # _NullSpill and every sample's reads stay resident for the whole MAG,
+            # which is the OOM the spill work exists to prevent.
+            output_dir=args.output_dir,
         )
         all_results[mag_name] = results
         if integrator:
@@ -443,6 +451,32 @@ Examples:
              "complete linkage, no time axis, immune to irregular timepoint spacing. "
              "'reciprocal' = unique-best + mutual between consecutive samples; requires "
              "--samples in true chronological order.",
+    )
+    # Keep these in step with the same flags on strainphase/longitudinal.py's parser -
+    # they are two hand-maintained arg lists over one HaplotyperConfig, and a flag added
+    # to only one of them is accepted by `python -m strainphase.longitudinal` but
+    # rejected by `strainphase longitudinal`. That is exactly how --seed broke.
+    long_parser.add_argument(
+        "--seed", type=int, default=42,
+        help="Random seed. Seeded by default: it drives both read subsampling above "
+             "--max-reads and Louvain read clustering, so an unseeded run is not "
+             "reproducible.",
+    )
+    long_parser.add_argument(
+        "--keep-read-assignments", action="store_true",
+        help="Retain per-read hard assignments on every WindowResult. Debug only: they "
+             "are written to no output file and read by no other code.",
+    )
+    long_parser.add_argument(
+        "--no-spill", action="store_true",
+        help="Keep every sample's reads in memory until the whole MAG finishes (the old "
+             "behaviour). By default reads are parked in <output-dir>/tmp/spill after "
+             "each sample is phased and reloaded one sample at a time for rescue.",
+    )
+    long_parser.add_argument(
+        "--window-batch-factor", type=int, default=4,
+        help="Windows are dispatched to the worker pool in batches of workers * this. "
+             "Lower it to cut peak memory on variant-dense contigs.",
     )
     long_parser.set_defaults(func=cmd_longitudinal)
 
