@@ -208,6 +208,10 @@ class HaplotyperConfig:
     # a site carrying BRK<resume_pos> / CONT. Off only to measure the difference.
     merge_split_reads: bool = True
 
+    # Step 3 runs inside the pipeline. Off only to skip it on a run that is producing the
+    # window tables for something else.
+    build_lineages: bool = True
+
     cross_sample_method: str = "clique"
 
     # =========== ABUNDANCE COHERENCE ===========
