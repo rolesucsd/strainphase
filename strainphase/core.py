@@ -29,7 +29,7 @@ import logging
 import os
 import warnings
 from collections import defaultdict
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from multiprocessing import Pool
 
@@ -112,6 +112,22 @@ class HaplotyperConfig:
     # Two reads must physically overlap by at least this much to be compared at all
     # (FIGURE4 diagnosis §6 #8, LEVEL 1).
     min_read_read_overlap_bp: int = 1000
+
+    # =========== MEMORY ===========
+    # Per-read hard assignments (WindowResult.assignments) are a debugging aid: one dict
+    # per read per window, never written to any output file and never read by any other
+    # function in the package. On a 146-sample MAG that is tens of millions of dicts
+    # retained for nothing, so they are off by default. Turn on to inspect them.
+    keep_read_assignments: bool = False
+    # Spill per-sample WindowResults to <output_dir>/tmp during the first pass instead of
+    # holding every sample's reads in RAM until the rescue pass. Cross-sample rescue only
+    # ever reads `.haplotypes` off OTHER samples (build_anchor_panel_for_key /
+    # count_timepoints_for_haplotype), so the heavy fields can live on disk and be
+    # reloaded one sample at a time. See longitudinal.process_mag_longitudinal.
+    spill_results_to_disk: bool = True
+    # Windows are handed to the worker pool in batches of n_workers * this, so the input
+    # list for a contig is never fully materialised at once.
+    window_batch_factor: int = 4
 
     # =========== VARIANT FILTERING ===========
     min_depth_site: int = 3
@@ -246,7 +262,16 @@ class HaplotyperConfig:
     min_cosupported_span_frac: float = 0.25
 
     # =========== RUNTIME PARAMETERS ===========
-    random_seed: int | None = None
+    # Seeded by DEFAULT, not None. Two things consume randomness and both change which
+    # haplotypes get called:
+    #   - make_windows_lazy subsamples to max_reads_per_window with config.get_rng(), so
+    #     an unseeded run draws a DIFFERENT set of reads in every window above the cap;
+    #   - Louvain read clustering (GraphInitializer) is handed this seed as random_state.
+    # Leaving this None made reruns disagree - identical inputs gave abundances that
+    # differed in the 8th decimal, and different subsampled reads above the cap. Set an
+    # explicit integer to vary it deliberately (e.g. to check a result is not an artefact
+    # of one draw); None restores the old unseeded behaviour.
+    random_seed: int | None = 42
     validate_results: bool = False  # Set False for production runs
     n_workers: int = 1  # Number of parallel workers for window processing (1=sequential)
 
@@ -487,6 +512,52 @@ class WindowResult:
     link_mismatches: list[dict] = field(default_factory=list)
     n_reads_examined: int = 0
     reads_within_mismatch_per_hap: list[int] = field(default_factory=list)
+    # Scalar summaries of `gamma`, recorded before the heavy fields are offloaded so the
+    # output tables can still be built while reads/gamma live on disk. -1 = not recorded.
+    n_reads_total: int = -1
+    n_junk_reads: int = -1
+    heavy_offloaded: bool = False
+
+    # ---------------- Heavy-field offload ----------------
+    # `window.reads` is ~99% of a WindowResult's footprint: a Read holds two
+    # position-keyed dicts, and on a contig with a variant every ~25 bp a single 15 kb
+    # HiFi read costs ~90 KB. Reads are needed only while the window's OWN sample is
+    # being phased or rescued - cross-sample rescue reads nothing but `.haplotypes` off
+    # other samples. `gamma` is ~1000x smaller and IS still read when the output tables
+    # are built, so it stays resident.
+    #
+    # The WindowResult object itself stays resident too, and that is deliberate: the
+    # rescue panel holds references to these very Haplotype objects and mutates their
+    # weights in place, so replacing the objects would change results.
+
+    def offload_heavy(self) -> list:
+        """Detach and return this window's reads, recording the read-count summaries."""
+        if self.heavy_offloaded:
+            return []
+        self.n_reads_total, self.n_junk_reads = self.junk_read_counts()
+        reads = self.window.reads
+        self.window.reads = []
+        self.window._pos_sets = None
+        self.assignments = []
+        self.heavy_offloaded = True
+        return reads
+
+    def restore_heavy(self, reads: list) -> None:
+        """Re-attach reads detached by :meth:`offload_heavy`."""
+        self.window.reads = reads
+        self.window._pos_sets = None
+        self.heavy_offloaded = False
+
+    def junk_read_counts(self) -> tuple[int, int]:
+        """``(n_reads_total, n_junk_reads)`` whether or not gamma is resident."""
+        if self.gamma is not None and self.gamma.size:
+            return (
+                int(self.gamma.shape[0]),
+                int((self.gamma[:, self.gamma.shape[1] - 1] >= 0.5).sum()),
+            )
+        if self.n_reads_total >= 0:
+            return self.n_reads_total, self.n_junk_reads
+        return 0, 0
 
     def validate(self) -> bool:
         """Validate internal consistency."""
@@ -968,23 +1039,62 @@ def make_windows_lazy(
     ins_len: dict[int, int] | None = None,
     sv_support: dict[int, dict[str, set[str]]] | None = None,
 ) -> list[Window]:
+    """Eager wrapper around :func:`iter_windows_lazy`, kept for callers that want the
+    whole contig's windows at once (tests, ad-hoc scripts).
+
+    Prefer the iterator in production: materialising every window for a contig means
+    holding every window's reads simultaneously, which on a variant-dense contig is the
+    single largest allocation in the run.
     """
-    Create overlapping windows with lazy per-window read loading.
+    return list(
+        iter_windows_lazy(
+            bam_path,
+            contig_id,
+            contig_length,
+            snv_positions,
+            ref_alleles,
+            config,
+            sample_id,
+            site_type=site_type,
+            del_span=del_span,
+            ins_len=ins_len,
+            sv_support=sv_support,
+        )
+    )
+
+
+def iter_windows_lazy(
+    bam_path: str,
+    contig_id: str,
+    contig_length: int,
+    snv_positions: list[int],
+    ref_alleles: dict[int, str],
+    config: HaplotyperConfig = DEFAULT_CONFIG,
+    sample_id: str | None = None,
+    site_type: dict[int, str] | None = None,
+    del_span: dict[int, tuple[int, int]] | None = None,
+    ins_len: dict[int, int] | None = None,
+    sv_support: dict[int, dict[str, set[str]]] | None = None,
+) -> Iterator[Window]:
+    """
+    Yield overlapping windows with lazy per-window read loading.
 
     Windows overlap by 50% (step = window_size / 2) to enable linking
     of haplotypes across window boundaries via shared SNVs.
 
     This is O(W * reads_per_window) instead of O(W * total_reads),
     and uses O(window) memory instead of O(contig).
+
+    Yielding rather than returning a list means the caller can process (and release) each
+    window before the next one's reads are pulled from the BAM.
     """
     if not HAS_PYSAM:
         raise ImportError("pysam required for BAM parsing")
 
     snv_pos_sorted = sorted([p for p in snv_positions if 0 < p <= contig_length])
     if not snv_pos_sorted:
-        return []
+        return
 
-    windows = []
     rng = config.get_rng()
 
     bam = pysam.AlignmentFile(bam_path, "rb")
@@ -1250,11 +1360,10 @@ def make_windows_lazy(
         # Carry the site types through. The identity code needs them to exclude SV
         # positions from the distance; if they stop here the exclusion silently no-ops.
         w.site_type = {p: st[p] for p in window_snvs if p in st}
-        windows.append(w)
+        yield w
         window_idx += 1
 
     bam.close()
-    return windows
 
 
 # =============================================================================
@@ -1371,8 +1480,12 @@ class GraphInitializer:
             return [], []
 
         # Partition reads into clusters.
-        # Louvain community detection for read clustering.
-        partition = community_louvain.best_partition(graph, weight="weight")
+        # Louvain community detection for read clustering. random_state is passed
+        # explicitly: without it python-louvain draws from the unseeded global `random`,
+        # which made two runs of an identical config disagree on abundance at ~1e-7.
+        partition = community_louvain.best_partition(
+            graph, weight="weight", random_state=self.config.random_seed
+        )
 
         # Group by cluster
         clusters = defaultdict(list)
@@ -1795,7 +1908,15 @@ class PostProcessor:
         return new_haplotypes, new_gamma, new_pi
 
     def assign_reads(self, reads: list[Read], gamma: np.ndarray, pi: np.ndarray) -> list[dict]:
-        """Hard assignment of reads."""
+        """Hard assignment of reads.
+
+        Skipped entirely unless ``config.keep_read_assignments`` is set - see that flag.
+        Returns ``[]`` in that case, which is what every downstream consumer already
+        tolerates (nothing reads this field).
+        """
+        if not self.config.keep_read_assignments:
+            return []
+
         assignments = []
         n_reads, k_eff = gamma.shape
         junk_idx = k_eff - 1
@@ -2255,9 +2376,20 @@ class LongitudinalIntegrator:
         return gamma
 
     def rescue_low_abundance(
-        self, results_by_timepoint: dict[str, list[WindowResult]]
+        self,
+        results_by_timepoint: dict[str, list[WindowResult]],
+        only_sample: str | None = None,
     ) -> dict[str, list[WindowResult]]:
-        """Rescue low-abundance haplotypes across timepoints."""
+        """Rescue low-abundance haplotypes across timepoints.
+
+        ``only_sample`` restricts the rescue to that one sample, returning just its
+        rescued windows. Every other sample still contributes to the anchor panel, which
+        needs nothing but their ``.haplotypes`` - so their reads and gamma may be
+        offloaded (see WindowResult.offload_heavy). Calling this once per sample in the
+        same iteration order is equivalent to the all-samples call: the panel is indexed
+        from the same WindowResult objects and rescue mutates haplotype weights in place
+        either way.
+        """
         if len(results_by_timepoint) < 2:
             return results_by_timepoint
 
@@ -2279,9 +2411,9 @@ class LongitudinalIntegrator:
             if len(sample_results) >= 2:
                 n_windows_with_multiple_timepoints += 1
             for _sample_id, wr in sample_results.items():
-                n_reads = wr.gamma.shape[0]
-                junk_idx = wr.gamma.shape[1] - 1
-                junk_reads = (wr.gamma[:, junk_idx] > 0.5).sum()
+                # Works whether or not gamma is resident (offloaded samples carry the
+                # scalar summary instead).
+                n_reads, junk_reads = wr.junk_read_counts()
                 total_reads += n_reads
                 total_junk_reads += junk_reads
                 n_anchors += sum(1 for h in wr.haplotypes if h.weight >= self.config.min_weight_for_anchor)
@@ -2298,6 +2430,8 @@ class LongitudinalIntegrator:
 
         for _window_key, sample_results in windows_by_position.items():
             for sample_id, wr in sample_results.items():
+                if only_sample is not None and sample_id != only_sample:
+                    continue
                 # Build anchor panel excluding the current sample to avoid self-rescue.
                 anchor_haps, anchor_samples = self.build_anchor_panel_for_key(
                     sample_results, exclude_sample=sample_id
@@ -3186,7 +3320,9 @@ def process_contig(
         return []
 
     # 2) Create overlapping windows with lazy read loading.
-    windows = make_windows_lazy(
+    #    This is an ITERATOR: windows are pulled from the BAM a batch at a time so the
+    #    whole contig's reads are never resident at once (see iter_windows_lazy).
+    window_iter = iter_windows_lazy(
         bam_path,
         contig_id,
         contig_length,
@@ -3200,40 +3336,73 @@ def process_contig(
         sv_support=sv_support,
     )
 
-    if not windows:
+    # 3) Process windows (parallel if a pool is supplied or n_workers > 1).
+    #    Batching serves memory, not scheduling: pool.map over the full window list
+    #    pickles every window out and every result back with both copies alive in the
+    #    parent. Feeding batches caps that transient at batch_size windows.
+    n_workers = config.n_workers
+    own_pool = None
+    if pool is not None:
+        active_pool, n_pool_workers = pool, getattr(pool, "_processes", 1)
+    elif n_workers > 1:
+        own_pool = active_pool = make_worker_pool(n_workers, config)
+        n_pool_workers = n_workers
+    else:
+        active_pool, n_pool_workers = None, 1
+
+    batch_size = max(1, n_pool_workers * max(1, config.window_batch_factor))
+    results: list[WindowResult] = []
+    n_windows = 0
+    try:
+        for batch in _batched(window_iter, batch_size):
+            if n_windows == 0:
+                # Logged on dispatch, not on completion: a variant-dense contig can take
+                # many minutes and this is the line that shows the run is alive. The
+                # total is not known up front - windows arrive from an iterator.
+                logging.info(
+                    f"Processing windows on {contig_id} with {n_pool_workers} shared "
+                    f"workers in batches of {batch_size}"
+                )
+            n_windows += len(batch)
+            if active_pool is not None and (len(batch) > 1 or n_windows > 1):
+                chunksize = max(1, len(batch) // n_pool_workers)
+                results.extend(
+                    active_pool.map(_process_window_wrapper, batch, chunksize=chunksize)
+                )
+            else:
+                results.extend(process_window(w, config) for w in batch)
+            # Drop this batch's Window references before the next one is pulled. The
+            # results still hold their own window (rescue needs the reads), but the
+            # input list must not pin a second copy.
+            batch.clear()
+    finally:
+        if own_pool is not None:
+            own_pool.close()
+            own_pool.join()
+
+    if not results:
         logging.warning(f"No valid windows for contig {contig_id}")
         return []
 
-    # 3) Process windows (parallel if a pool is supplied or n_workers > 1).
-    n_workers = config.n_workers
-    if pool is not None and len(windows) > 1:
-        # Reuse a caller-owned pool. Workers must already have been initialized
-        # with this config via _init_worker (see make_worker_pool).
-        n_pool_workers = getattr(pool, "_processes", 1)
-        chunksize = max(1, len(windows) // (n_pool_workers * 4))
-        logging.info(
-            f"Processing {len(windows)} windows on {contig_id} with {n_pool_workers} shared workers"
-        )
-        results = pool.map(_process_window_wrapper, windows, chunksize=chunksize)
-    elif n_workers > 1 and len(windows) > 1:
-        # No pool supplied: spin up a one-shot pool. Initializer ships config
-        # to workers exactly once instead of re-pickling it with every task.
-        n_workers = min(n_workers, len(windows))
-        logging.info(f"Processing {len(windows)} windows with {n_workers} workers")
-        chunksize = max(1, len(windows) // (n_workers * 4))
-        with make_worker_pool(n_workers, config) as p:
-            results = p.map(_process_window_wrapper, windows, chunksize=chunksize)
-    else:
-        # Sequential processing
-        results = []
-        for window in windows:
-            result = process_window(window, config)
-            results.append(result)
+    logging.info(f"Processed {n_windows} windows on {contig_id}")
 
     # 4) Link haplotypes across overlapping windows into tracks.
     results = link_windows(results, config)
 
     return results
+
+
+def _batched(iterable: Iterable, n: int) -> Iterator[list]:
+    """Yield successive lists of up to *n* items. Local stand-in for
+    itertools.batched (3.12+) so this runs on the cluster's interpreter."""
+    batch: list = []
+    for item in iterable:
+        batch.append(item)
+        if len(batch) >= n:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
 
 
 _WORKER_CONFIG: HaplotyperConfig | None = None
@@ -3427,7 +3596,10 @@ if __name__ == "__main__":
     parser.add_argument("--sample", help="Sample ID")
     parser.add_argument("--vcf-sample", help="Sample name in VCF")
     parser.add_argument("--output", default="haplotypes.tsv")
-    parser.add_argument("--seed", type=int, help="Random seed for reproducibility")
+    parser.add_argument(
+        "--seed", type=int, default=42,
+        help="Random seed for reproducibility. Seeded by default - see HaplotyperConfig.random_seed.",
+    )
     parser.add_argument("--window-size", type=int, default=20000)
     parser.add_argument("--max-reads", type=int, default=10000)
     parser.add_argument("--no-validate", action="store_true", help="Disable result validation")
