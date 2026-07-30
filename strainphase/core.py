@@ -764,17 +764,26 @@ def _log_load_summary(vcf_path: str, contig_id: str | None, stats: dict[str, int
         k: v for k, v in stats.items() if k.startswith("skip_") or k in (
             "position_conflict",
             "duplicate_site",
+            # A position may now hold several edits, so these are the only two
+            # ways an allele can still be lost or an input can be inconsistent.
+            # They MUST be listed here or the loss goes unreported.
+            "allele_collapsed_same_key",
+            "anchor_base_conflict",
         )
     }
     where = f" [{contig_id}]" if contig_id else ""
     loaded_str = " ".join(f"{k}={v}" for k, v in sorted(loaded.items())) or "none"
     logging.info(
-        "load_snvs%s %s: %d records seen -> %d sites (%s); "
+        # "edits" not "sites": one position may hold several (an SNV and a
+        # deletion, or two deletion lengths), so the per-kind counts sum to more
+        # than the number of positions. Both numbers are reported.
+        "load_snvs%s %s: %d records seen -> %d edits at %d positions (%s); "
         "mnp_atomized=%d multiallelic_records=%d",
         where,
         os.path.basename(vcf_path),
         stats.get("records_seen", 0),
         n_sites,
+        stats.get("n_positions", 0),
         loaded_str,
         stats.get("mnp_atomized", 0),
         stats.get("multiallelic_records", 0),
@@ -832,8 +841,9 @@ def _load_snvs_uncached(
     dict[int, int],
     dict[int, float | None],
     dict[int, str],
-    dict[int, tuple[int, int]],
-    dict[int, int],
+    dict[int, frozenset[str]],
+    dict[int, set[tuple[int, int]]],
+    dict[int, set[int]],
 ]:
     """Load variants from a VCF.
 
@@ -852,17 +862,29 @@ def _load_snvs_uncached(
     snv_pos
         Sorted list of variant positions (1-based VCF anchor position).
     ref_alleles
-        Per-position REF allele string from the VCF (for SNVs one base; for
-        indels the full anchor+changed sequence).
+        Per-position single-base REFERENCE base at the anchor. NOT the record's
+        full REF string: reads only ever carry one base or an indel token, so a
+        multi-base REF could never equal a read's allele and made every read a
+        mismatch at every deletion site.
     depth, af
         Per-position site depth and alt-allele frequency (AF may be ``None``).
     site_type
-        Per-position type: ``"snv"`` / ``"del"`` / ``"ins"``.
+        Per-position type of the FIRST variant registered there: ``"snv"`` /
+        ``"del"`` / ``"ins"`` (``"sv"`` is added later by the SV sidecar merge,
+        which drops anchors colliding with a called variant, so an ``"sv"``
+        position never holds another kind). Kept a plain ``str`` so
+        ``site_type[p] == "sv"`` tests stay correct; use ``site_kinds`` to ask
+        what a position holds.
+    site_kinds
+        Per-position set of ALL variant kinds registered there. A position may
+        be e.g. ``{"snv", "del"}``.
     del_span
-        For ``"del"`` sites only: the inclusive 1-based deleted-base footprint
-        on the reference, ``(start, end)``.
+        For deletion sites: the SET of inclusive 1-based deleted-base footprints
+        ``(start, end)`` anchored here. More than one length may share an anchor;
+        each becomes its own ``DEL<len>`` allele.
     ins_len
-        For ``"ins"`` sites only: the number of inserted bases.
+        For insertion sites: the SET of inserted lengths anchored here. Each
+        becomes its own ``INS<len>`` allele.
 
     Notes
     -----
@@ -884,9 +906,20 @@ def _load_snvs_uncached(
     ``docs/MUTATION_HANDLING.md``).
 
     Quality gates (FILTER!=PASS, missing/low DP, optional AF band) still apply,
-    but each rejection is COUNTED and logged, never silent. When two atomic
-    variants collide on one position, the first wins and the collision is counted
-    (``position_conflict``) — again, logged, not silent.
+    but each rejection is COUNTED and logged, never silent.
+
+    **A position may hold more than one variant.** Two deletions of different
+    length anchored on the same base, or an SNV and an indel at one position,
+    are all registered; each distinct edit becomes its own allele downstream
+    (``DEL<len>`` / ``INS<len>`` / a base), so they separate haplotypes instead
+    of one silently displacing the others.
+
+    One collapse remains and is counted as ``allele_collapsed_same_key``: two
+    insertions of the SAME length at the same anchor differing only in inserted
+    SEQUENCE. The allele token is ``INS<len>`` and the read-match key is
+    ``(anchor, length)``, so sequence-level insertion identity is not
+    representable. Making it representable means putting the sequence in the
+    token, which is a separate decision.
     """
     if not HAS_PYSAM:
         raise ImportError("pysam required for VCF parsing")
@@ -897,42 +930,82 @@ def _load_snvs_uncached(
     depth: dict[int, int] = {}
     af: dict[int, float | None] = {}
     site_type: dict[int, str] = {}
-    del_span: dict[int, tuple[int, int]] = {}
-    ins_len: dict[int, int] = {}
+    site_kinds: dict[int, set[str]] = {}
+    del_span: dict[int, set[tuple[int, int]]] = {}
+    ins_len: dict[int, set[int]] = {}
 
     # Full accounting so no variant is ever dropped silently.
     stats: dict[str, int] = defaultdict(int)
 
     def _register(apos: int, aref: str, aalt: str, stype: str, dp, site_af) -> bool:
-        """Record one atomic variant. Dedup by position (first-write-wins with a
-        counted, non-silent conflict). Returns True if newly registered."""
+        """Record one atomic variant.
+
+        A position may hold MORE THAN ONE variant. Each distinct edit at a
+        position becomes its own allele downstream (``DEL<len>`` / ``INS<len>``
+        / a base), so a 1bp and a 2bp deletion sharing an anchor are two
+        alleles rather than one surviving the other. Returns True if this
+        variant added a new allele-defining edit.
+
+        ``ref_alleles[apos]`` holds the single-base REFERENCE base at the
+        anchor, NOT the record's full REF string. Reads carry either an indel
+        token or one base, so a multi-base REF ("TG") could never equal
+        anything a read holds and every read scored as a mismatch at every
+        deletion site. The anchor base is what makes reference-likeness
+        answerable at a position that is both an SNV and an indel.
+        """
         if apos <= 0:
             stats["skip_out_of_bounds"] += 1
             return False
-        if apos in seen_pos:
-            if site_type.get(apos) != stype or ref_alleles.get(apos) != aref:
-                stats["position_conflict"] += 1
-            else:
-                stats["duplicate_site"] += 1
-            return False
-        seen_pos.add(apos)
-        snv_pos.append(apos)
-        ref_alleles[apos] = aref
-        depth[apos] = dp
-        af[apos] = site_af
-        site_type[apos] = stype
+
+        anchor = aref[0]
+        if apos not in seen_pos:
+            seen_pos.add(apos)
+            snv_pos.append(apos)
+            ref_alleles[apos] = anchor
+            depth[apos] = dp
+            af[apos] = site_af
+            site_type[apos] = stype  # FIRST kind wins; see site_kinds for all of them
+            site_kinds[apos] = set()
+        elif ref_alleles[apos] != anchor:
+            # The reference base at a position is a property of the reference,
+            # so records disagreeing about it means inconsistent input.
+            stats["anchor_base_conflict"] += 1
+
         # After ``bcftools norm``, indels are left-anchored: REF starts with the
         # anchor base(s) matching ALT, then deletes (REF longer) / inserts (ALT
         # longer) the trailing bases. Positions are trusted exactly.
+        added = False
         if stype == "del":
             del_start = apos + len(aalt)
             del_end = apos + len(aref) - 1
             if del_end >= del_start:
-                del_span[apos] = (del_start, del_end)
+                spans = del_span.setdefault(apos, set())
+                added = (del_start, del_end) not in spans
+                spans.add((del_start, del_end))
+            else:
+                stats["skip_degenerate_del"] += 1
         elif stype == "ins":
-            ins_len[apos] = len(aalt) - len(aref)
-        stats[f"loaded_{stype}"] += 1
-        return True
+            lens = ins_len.setdefault(apos, set())
+            ilen = len(aalt) - len(aref)
+            added = ilen not in lens
+            if not added:
+                # Same anchor AND same inserted length, different sequence. The
+                # allele token is INS<len> and the match key is (anchor, length),
+                # so these genuinely cannot be told apart. Counted, not silent.
+                stats["allele_collapsed_same_key"] += 1
+            lens.add(ilen)
+        else:  # snv — multiple ALTs at one position need no extra bookkeeping,
+            # the read supplies whichever base it carries.
+            added = "snv" not in site_kinds[apos]
+            if not added:
+                stats["duplicate_site"] += 1
+
+        if stype == "del" and not added:
+            stats["duplicate_site"] += 1
+        site_kinds[apos].add(stype)
+        if added:
+            stats[f"loaded_{stype}"] += 1
+        return added
 
     vcf = pysam.VariantFile(vcf_path)
 
@@ -1022,8 +1095,13 @@ def _load_snvs_uncached(
 
     vcf.close()
 
+    stats["n_positions"] = len(seen_pos)
     _log_load_summary(vcf_path, contig_id, stats)
-    return snv_pos, ref_alleles, depth, af, site_type, del_span, ins_len
+    return (
+        snv_pos, ref_alleles, depth, af, site_type,
+        {p: frozenset(k) for p, k in site_kinds.items()},
+        del_span, ins_len,
+    )
 
 
 def make_windows_lazy(
@@ -1035,8 +1113,9 @@ def make_windows_lazy(
     config: HaplotyperConfig = DEFAULT_CONFIG,
     sample_id: str | None = None,
     site_type: dict[int, str] | None = None,
-    del_span: dict[int, tuple[int, int]] | None = None,
-    ins_len: dict[int, int] | None = None,
+    site_kinds: dict[int, frozenset[str]] | None = None,
+    del_span: dict[int, set[tuple[int, int]]] | None = None,
+    ins_len: dict[int, set[int]] | None = None,
     sv_support: dict[int, dict[str, set[str]]] | None = None,
 ) -> list[Window]:
     """Eager wrapper around :func:`iter_windows_lazy`, kept for callers that want the
@@ -1056,6 +1135,7 @@ def make_windows_lazy(
             config,
             sample_id,
             site_type=site_type,
+            site_kinds=site_kinds,
             del_span=del_span,
             ins_len=ins_len,
             sv_support=sv_support,
@@ -1072,8 +1152,9 @@ def iter_windows_lazy(
     config: HaplotyperConfig = DEFAULT_CONFIG,
     sample_id: str | None = None,
     site_type: dict[int, str] | None = None,
-    del_span: dict[int, tuple[int, int]] | None = None,
-    ins_len: dict[int, int] | None = None,
+    site_kinds: dict[int, frozenset[str]] | None = None,
+    del_span: dict[int, set[tuple[int, int]]] | None = None,
+    ins_len: dict[int, set[int]] | None = None,
     sv_support: dict[int, dict[str, set[str]]] | None = None,
 ) -> Iterator[Window]:
     """
@@ -1123,6 +1204,10 @@ def iter_windows_lazy(
         # Partition window sites by type for fast lookup during extraction.
         # Sites without a recorded type default to "snv" (back-compat).
         st = site_type or {}
+        # Fall back to one kind per position rather than an empty map: a caller
+        # that passes site_type but not site_kinds must get the old single-kind
+        # behaviour, NOT silently lose all indel parsing.
+        sk = site_kinds or {p: frozenset({t}) for p, t in st.items()}
         ds = del_span or {}
         il = ins_len or {}
         sv_sup = sv_support or {}
@@ -1133,27 +1218,34 @@ def iter_windows_lazy(
         # Both keys are SIZE-specific, so a <len>-bp indel is its own allele
         # (DEL<len> / INS<len>) rather than collapsing every indel here to a
         # generic "DEL"/"INS" — mirrors the per-event SV encoding.
-        indel_site_set = {p for p in window_snvs if st.get(p, "snv") in ("del", "ins")}
+        # Membership is decided by site_kinds, not site_type: a position may be
+        # both an SNV and an indel, and it must reach the CIGAR walk to have its
+        # indel alleles read. Reads without the indel fall through to the anchor
+        # base, which is how the co-located SNV allele is still captured.
+        indel_site_set = {
+            p for p in window_snvs
+            if sk.get(p, frozenset()) & {"del", "ins"}
+        }
         # SV pseudo-sites: the "present" allele is the UNIQUE event ID (from
         # Sniffles' supporting-read set; see strainphase.sv_encoding), NOT a
         # generic INS/DEL token — distinct events stay distinct alleles so reads
         # cluster only when they carry the identical event. Kept separate from
         # indel_site_set so the D/I exact-match logic never touches them.
-        sv_site_set = {p for p in window_snvs if st.get(p, "snv") == "sv"}
+        sv_site_set = {p for p in window_snvs if st.get(p, "snv") == "sv"}  # SV anchors never co-occur with a called variant (see process_contig)
         # Sites parsed outside the base-by-base SNV loop (indels + SVs).
         special_site_set = indel_site_set | sv_site_set
         del_key_to_pos: dict[tuple[int, int], int] = {}
         ins_key_to_pos: dict[tuple[int, int], int] = {}
         for p in indel_site_set:
-            stype_p = st[p]
-            if stype_p == "del" and p in ds:
-                d_start, d_end = ds[p]
-                d_len = d_end - d_start + 1
-                del_key_to_pos[(d_start, d_len)] = p
-            elif stype_p == "ins" and p in il:
+            # ds[p] / il[p] are SETS: one anchor may carry several edits, and
+            # each gets its own key so it becomes its own DEL<len>/INS<len>
+            # allele. A position can appear in both loops.
+            for d_start, d_end in ds.get(p, ()):
+                del_key_to_pos[(d_start, d_end - d_start + 1)] = p
+            for ilen in il.get(p, ()):
                 # (anchor, inserted length): a read only matches an insertion of
                 # the SAME size, so different-size insertions stay distinct.
-                ins_key_to_pos[(p, il[p])] = p
+                ins_key_to_pos[(p, ilen)] = p
 
         # pysam fetch uses 0-based coordinates
         for aln in bam.fetch(contig_id, start - 1, end - 1):
@@ -1355,7 +1447,10 @@ def iter_windows_lazy(
 
         w = Window(contig=contig_id, start=start, end=end, sample=sample_id, window_idx=window_idx)
         w.snv_pos = window_snvs
-        w.ref_alleles = {p: ref_alleles[p] for p in window_snvs}
+        # Guarded: every registered position gets an anchor base, and SV
+        # pseudo-sites get one at merge time, but a caller supplying positions
+        # without one must not take the whole contig down here.
+        w.ref_alleles = {p: ref_alleles[p] for p in window_snvs if p in ref_alleles}
         w.reads = reads
         # Carry the site types through. The identity code needs them to exclude SV
         # positions from the distance; if they stop here the exclusion silently no-ops.
@@ -3286,9 +3381,9 @@ def process_contig(
     SNV/indel-only behavior.
     """
     # 1) Load SNVs (and indels, if enabled) for this contig from the VCF.
-    snv_pos, ref_alleles, depth, af, site_type, del_span, ins_len = load_snvs(
-        vcf_path, contig_id, vcf_sample_name, config
-    )
+    (
+        snv_pos, ref_alleles, depth, af, site_type, site_kinds, del_span, ins_len
+    ) = load_snvs(vcf_path, contig_id, vcf_sample_name, config)
 
     # 1b) Merge SV pseudo-sites from the sidecar (if provided). Anchors that
     # collide with a real variant are dropped to avoid clobbering (caveat 7).
@@ -3306,8 +3401,9 @@ def process_contig(
                 sv_support.pop(p, None)
                 continue
             snv_pos.append(p)
-            ref_alleles[p] = sv_ref[p]
+            ref_alleles[p] = sv_ref[p]  # "N" placeholder; SV sites are scored by event id
             site_type[p] = sv_stype[p]
+            site_kinds[p] = frozenset({sv_stype[p]})
             n_added += 1
         if n_added or n_collision:
             logging.info(
@@ -3331,6 +3427,7 @@ def process_contig(
         config,
         sample_id,
         site_type=site_type,
+        site_kinds=site_kinds,
         del_span=del_span,
         ins_len=ins_len,
         sv_support=sv_support,
