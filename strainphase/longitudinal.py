@@ -722,6 +722,12 @@ def build_window_tables(
                                 total_reads=nonjunk,
                                 junk_reads=n_junk_w,
                                 abundance=abundance if abundance is not None else float("nan"),
+                                # Step 1's chain id. Step 3 votes on this to join two
+                                # window groups; without it every edge is
+                                # `failed_no_votes` and NO lineage can span more than a
+                                # single window. It was written to the TSV above but
+                                # never onto the object step 3 actually reads.
+                                within_sample_id=eid,
                             )
                         )
 
