@@ -255,22 +255,32 @@ def _group_counts(group: WindowGroup) -> dict[str, tuple[int, int]]:
     return {m.sample: (m.reads, m.total_reads) for m in group.members}
 
 
-def _abundance_incompatible(
-    counts_a: dict[str, tuple[int, int]],
-    counts_b: dict[str, tuple[int, int]],
+def _shares_incompatible(
+    per_sample: dict[str, list[tuple[int, int]]],
     config: HaplotyperConfig,
     max_bad_frac: float,
     min_tested: int,
 ) -> tuple[bool, int, int]:
-    """Do these two groups' shares genuinely disagree? (the ELIMINATOR)
+    """Do these per-sample share observations genuinely disagree? (the ELIMINATOR)
 
-    Per sample where both are observed with enough depth, Fisher's exact test on the raw
-    counts. Too few testable samples means we cannot eliminate, which is NOT the same as
+    ``per_sample`` maps a sample to the raw ``(supporting_reads, non_junk_reads)``
+    counts being compared in it — two of them for one candidate join, N of them for
+    a whole lineage. Fisher's exact test per sample via ``abundance_coherent``;
+    samples where the test has no power (windows below ``min_reads_for_coherence``)
+    report ``n_tested == 0`` and are skipped rather than failed.
+
+    Too few testable samples means we cannot eliminate, which is NOT the same as
     passing — it returns no veto, and the identity gates carry the decision alone.
+
+    This is the ONE place the tally-and-threshold lives; both the pairwise gate and
+    the end-to-end chain check are thin adapters over it, so they can never drift
+    apart.
     """
     tested = bad = 0
-    for s in counts_a.keys() & counts_b.keys():
-        res = abundance_coherent([counts_a[s], counts_b[s]], config)
+    for counts in per_sample.values():
+        if len(counts) < 2:
+            continue
+        res = abundance_coherent(counts, config)
         if res.n_tested == 0:
             continue
         tested += 1
@@ -281,12 +291,114 @@ def _abundance_incompatible(
     return (bad / tested) > max_bad_frac, tested, bad
 
 
+def _abundance_incompatible(
+    counts_a: dict[str, tuple[int, int]],
+    counts_b: dict[str, tuple[int, int]],
+    config: HaplotyperConfig,
+    max_bad_frac: float,
+    min_tested: int,
+) -> tuple[bool, int, int]:
+    """PAIRWISE adapter: do these two groups' shares disagree, per sample?"""
+    per_sample = {
+        s: [counts_a[s], counts_b[s]] for s in counts_a.keys() & counts_b.keys()
+    }
+    return _shares_incompatible(per_sample, config, max_bad_frac, min_tested)
+
+
+def _lineage_abundance_incompatible(
+    groups: list[WindowGroup],
+    config: HaplotyperConfig,
+    max_bad_frac: float,
+    min_tested: int,
+) -> tuple[bool, int, int]:
+    """END-TO-END adapter: do a WHOLE chain's windows disagree, per sample?
+
+    The pairwise gate only ever compares two ADJACENT groups, so A-B and B-C can
+    each pass while A and C are never compared and drift accumulates along the
+    chain. On 000089747_1 that showed up as a lineage's own windows disagreeing by
+    more than the noise floor at 34.2% of shared timepoints, while the median
+    pairwise disagreement was ~0. Pooling every window of the chain into one
+    per-sample comparison catches what no adjacent pair could.
+    """
+    per_sample: dict[str, list[tuple[int, int]]] = defaultdict(list)
+    for g in groups:
+        for m in g.members:
+            per_sample[m.sample].append((m.reads, m.total_reads))
+    return _shares_incompatible(per_sample, config, max_bad_frac, min_tested)
+
+
+def _split_incoherent_lineage(
+    groups: list[WindowGroup],
+    votes: dict[tuple[str, str], int],
+    config: HaplotyperConfig,
+    max_bad_frac: float,
+    min_tested: int,
+) -> list[list[WindowGroup]]:
+    """Cut an end-to-end-incoherent chain at its weakest link, then re-test.
+
+    Reciprocal best match makes every component a PATH (asserted below), so the
+    chain has a well-defined ordering and cutting it is unambiguous: remove the
+    internal edge with the fewest step-1 link votes — the least-supported join —
+    and re-test both halves. Recurses until every piece is coherent or is a
+    single window.
+
+    Splitting, rather than discarding, is deliberate: the windows are still real
+    observations, and a chain that drifts is two lineages mis-joined, not noise.
+    """
+    ordered = sorted(groups, key=lambda g: g.window_start)
+    if len(ordered) < 2:
+        return [ordered]
+    bad, _, _ = _lineage_abundance_incompatible(ordered, config, max_bad_frac, min_tested)
+    if not bad:
+        return [ordered]
+
+    cut = min(
+        range(len(ordered) - 1),
+        key=lambda i: votes.get((ordered[i].group_id, ordered[i + 1].group_id), 0),
+    )
+    left, right = ordered[: cut + 1], ordered[cut + 1:]
+    return (
+        _split_incoherent_lineage(left, votes, config, max_bad_frac, min_tested)
+        + _split_incoherent_lineage(right, votes, config, max_bad_frac, min_tested)
+    )
+
+
 def build_lineages(
     groups: list[WindowGroup],
     config: HaplotyperConfig = DEFAULT_CONFIG,
     step: int | None = None,
-    max_bad_frac: float = 0.30,
-    min_samples_for_veto: int = 3,
+    # ZERO TOLERANCE, matching step 1 (author's choice, 2026-07-30). One sample
+    # whose shares genuinely disagree refuses the join, however many others vote
+    # for it — the same rule link_windows already applied within a sample.
+    #
+    # Measured on 000089747_1, sweeping this value:
+    #     0.30  1,256 lineages  316 multi-window  largest 16 windows  32.6% disagree
+    #     0.20  1,299           344               largest 12          27.6%
+    #     0.10  1,380           340               largest  7          21.6%
+    #     0.00  1,425           337               largest  4          22.5%
+    # Multi-window lineages are NOT lost by tightening (316 -> 337); long chains
+    # are. The 16-window chain at 0.30 survived only because 30% of its samples
+    # were allowed to disagree at every link.
+    #
+    # ⚠️ ~22% of shared timepoints still disagree by more than the noise floor at
+    # ZERO tolerance, so this cannot be closed from here. The residual is upstream
+    # in step-2 grouping (S2-6), not in how step 3 chains.
+    max_bad_frac: float = 0.0,
+    # Was 3. Any testable sample may now veto: requiring three shared samples
+    # before a disagreement could count made the veto unreachable for a third of
+    # accepted joins. See `require_abundance_evidence` for the accept side.
+    min_samples_for_veto: int = 1,
+    # DEFAULT OFF, and deliberately so. Rejecting a join because the abundance
+    # test had no testable sample sounds cautious, but `tested == 0` overwhelmingly
+    # means the windows were below `min_reads_for_coherence` (10), i.e. the test
+    # had no POWER — not that the join is doubtful. 46% of real windows hold
+    # exactly one haplotype, so a shallow window reading 1.000 is the normal case,
+    # not a disagreement (see test_lineage_abundance_pools_counts_rather_than_
+    # averaging_ratios). Turning this on discards joins precisely where coverage is
+    # thinnest and the lineage layer is most needed: it would reject 42 of 582
+    # accepted joins on 000089747_1. Exposed as a knob, not a default.
+    require_abundance_evidence: bool = False,
+    transitive_abundance_check: bool = True,
     lineage_prefix: str = "LIN",
     markers: set[int] | None = None,
     step1_mismatches: set[frozenset[str]] | None = None,
@@ -388,6 +500,16 @@ def build_lineages(
                     e.reason = "failed_abundance"
                     edges.append(e)
                     continue
+                # Require at least ONE sample where the abundance test could run.
+                # Previously a join needed >= min_samples_for_veto testable samples
+                # to be REJECTED, which meant a join with zero testable samples was
+                # accepted on identity alone: 33% of accepted joins on 000089747_1
+                # could not be vetoed at all, 42 of them having no testable sample
+                # whatsoever. Absence of evidence is not evidence of continuation.
+                if require_abundance_evidence and tested == 0:
+                    e.reason = "failed_no_abundance_evidence"
+                    edges.append(e)
+                    continue
                 # SCORE: step-1 link votes and nothing else. Identity has already had its
                 # say as a veto, abundance only eliminates, and sample count never scores.
                 # No votes means no read ever chained these two - not a join.
@@ -418,9 +540,28 @@ def build_lineages(
                 edges.append(e)
 
     gmap = {g.group_id: g for g in groups}
-    lineages: list[Lineage] = []
-    for i, comp in enumerate(nx.connected_components(graph)):
+    # Each component is a chain of pairwise-approved joins. Re-test each one END TO
+    # END and cut any that drifts; a chain of individually-fine links can still be
+    # incoherent overall (see _lineage_abundance_incompatible).
+    chains: list[list[WindowGroup]] = []
+    n_split = 0
+    for comp in nx.connected_components(graph):
         members = [gmap[x] for x in comp]
+        if transitive_abundance_check and len(members) > 1:
+            pieces = _split_incoherent_lineage(
+                members, link_votes, config, max_bad_frac, min_samples_for_veto)
+            if len(pieces) > 1:
+                n_split += 1
+            chains.extend(pieces)
+        else:
+            chains.append(sorted(members, key=lambda g: g.window_start))
+    if n_split:
+        logging.info(
+            f"  transitive abundance check split {n_split} chain(s) into "
+            f"{len(chains)} piece(s)")
+
+    lineages: list[Lineage] = []
+    for i, members in enumerate(chains):
         lineages.append(Lineage(f"{lineage_prefix}{i:06d}", members[0].contig,
                                 sorted(members, key=lambda g: g.window_start)))
 

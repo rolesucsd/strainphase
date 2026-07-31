@@ -821,3 +821,103 @@ def test_a_run_writes_lineages_tsv_and_puts_diagnostics_in_tmp(tmp_path):
         assert col in head, f"lineages.tsv is missing {col}"
     # one row per (lineage, sample); all three samples represented
     assert {r[head.index("sample")] for r in body} == {"t0", "t1", "t2"}
+
+
+def test_transitive_abundance_check_splits_a_drifting_chain():
+    """A-B and B-C each pass pairwise, but A vs C is incoherent -> the chain is cut.
+
+    The pairwise veto only ever compares adjacent groups, so drift accumulates
+    along a chain: on 000089747_1 a lineage's own windows disagreed by more than
+    the noise floor at 34.2% of shared timepoints while the median PAIRWISE
+    disagreement was ~0. The end-to-end test catches what no adjacent pair could.
+    """
+    from strainphase.lineages import build_lineages
+
+    shared = {12000: "A", 15000: "C", 18000: "G"}
+    # A GENTLE monotone drift, 140/200 down to 70/200 in six steps. Every ADJACENT
+    # pair is comfortably coherent (min Fisher p = 0.17, well above alpha=0.01), so
+    # the pairwise veto passes all of them; but 10 of the 15 pairs across the whole
+    # chain are incoherent, so end to end it is not one entity.
+    ks = [140, 126, 112, 98, 84, 70]
+    grps = [
+        _grp(chr(65 + w), 1 + w * 10000,
+             [_mem(f"t{i}", dict(shared), reads=k, total=200) for i in range(4)])
+        for w, k in enumerate(ks)
+    ]
+
+    joined, edges = build_lineages(grps, _lcfg(), transitive_abundance_check=False)
+    assert not any(e.reason == "failed_abundance" for e in edges), \
+        "the pairwise veto must pass every adjacent pair, or this tests nothing"
+    split, _ = build_lineages(grps, _lcfg(), transitive_abundance_check=True)
+    assert sum(len(l.groups) for l in joined) == sum(len(l.groups) for l in split), \
+        "splitting must preserve every window group, never discard one"
+    assert max(len(l.groups) for l in split) < max(len(l.groups) for l in joined), \
+        "the drifting chain should be cut into shorter pieces"
+
+
+def test_any_testable_sample_may_veto():
+    """min_samples_for_veto=1: one shared sample with a real disagreement is enough.
+
+    It was 3, which made the veto unreachable for a third of accepted joins on
+    000089747_1 (42 of them had no testable sample at all).
+    """
+    from strainphase.lineages import build_lineages
+
+    shared = {12000: "A", 15000: "C", 18000: "G"}
+    # ONE sample, both windows deep enough to test, shares wildly different
+    a = _grp("A", 1, [_mem("t0", dict(shared), reads=95, total=100)])
+    b = _grp("B", 10001, [_mem("t0", dict(shared), reads=5, total=100)])
+
+    old, old_e = build_lineages([a, b], _lcfg(), min_samples_for_veto=3)
+    new, new_e = build_lineages([a, b], _lcfg(), min_samples_for_veto=1)
+    assert len(old) == 1, "with min_tested=3 a single sample could never veto"
+    assert len(new) == 2 and any(e.reason == "failed_abundance" for e in new_e)
+
+
+def test_require_abundance_evidence_is_off_by_default():
+    """`tested == 0` means the test had no POWER, not that the join is doubtful.
+
+    Windows below min_reads_for_coherence are excluded from the test, and 46% of
+    real windows hold exactly one haplotype, so a shallow window reading 1.000 is
+    the normal case. Defaulting this on would discard joins where coverage is
+    thinnest.
+    """
+    from strainphase.lineages import build_lineages
+
+    shared = {12000: "A", 15000: "C", 18000: "G"}
+    a = _grp("A", 1, [_mem("t0", dict(shared), reads=5, total=100)])
+    b = _grp("B", 10001, [_mem("t0", dict(shared), reads=3, total=3)])  # below the floor
+
+    default, _ = build_lineages([a, b], _lcfg())
+    strict, edges = build_lineages([a, b], _lcfg(), require_abundance_evidence=True)
+    assert len(default) == 1, "the shallow window must not block the join by default"
+    assert len(strict) == 2
+    assert any(e.reason == "failed_no_abundance_evidence" for e in edges)
+
+
+def test_step3_abundance_is_zero_tolerance_like_step1():
+    """ONE sample whose shares disagree refuses the join, however many agree.
+
+    Step 1 already worked this way within a sample: a genome cannot sit at two
+    frequencies at one moment, so a single incoherent pair is disqualifying.
+    Step 3 tolerated up to 30% of samples disagreeing, which let a 16-window chain
+    survive on 000089747_1 that no adjacent link could justify. Author's choice
+    2026-07-30: match step 1.
+    """
+    from strainphase.lineages import build_lineages
+
+    shared = {12000: "A", 15000: "C", 18000: "G"}
+    # nine samples agree exactly; ONE disagrees flatly (95/100 vs 5/100)
+    ma = [_mem(f"t{i}", dict(shared), reads=50, total=100) for i in range(9)]
+    mb = [_mem(f"t{i}", dict(shared), reads=50, total=100) for i in range(9)]
+    ma.append(_mem("t9", dict(shared), reads=95, total=100))
+    mb.append(_mem("t9", dict(shared), reads=5, total=100))
+    a, b = _grp("A", 1, ma), _grp("B", 10001, mb)
+
+    lins, edges = build_lineages([a, b], _lcfg())
+    assert len(lins) == 2, "one disagreeing sample in ten must refuse the join"
+    assert any(e.reason == "failed_abundance" for e in edges)
+
+    # and the old 30% tolerance would have accepted it — 1 bad of 10 is under 0.30
+    tolerant, _ = build_lineages([a, b], _lcfg(), max_bad_frac=0.30)
+    assert len(tolerant) == 1
