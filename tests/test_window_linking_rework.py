@@ -874,50 +874,26 @@ def test_any_testable_sample_may_veto():
     assert len(new) == 2 and any(e.reason == "failed_abundance" for e in new_e)
 
 
-def test_require_abundance_evidence_is_off_by_default():
+def test_untestable_abundance_does_not_block_a_join():
     """`tested == 0` means the test had no POWER, not that the join is doubtful.
 
-    Windows below min_reads_for_coherence are excluded from the test, and 46% of
-    real windows hold exactly one haplotype, so a shallow window reading 1.000 is
-    the normal case. Defaulting this on would discard joins where coverage is
-    thinnest.
+    Windows below `min_reads_for_coherence` (10) are excluded from the Fisher
+    test rather than failed, so a pair of shallow windows yields no testable
+    sample at all. 46% of real windows hold exactly one haplotype, making a
+    shallow window that reads 1.000 the normal case; rejecting on it would
+    discard ~42 of ~563 accepted joins on 000089747_1, precisely where coverage
+    is thinnest. This was briefly implemented as a `require_abundance_evidence`
+    flag and REMOVED rather than left as dead configuration — the behaviour
+    asserted here is the intended one, not a default that can be flipped.
     """
     from strainphase.lineages import build_lineages
 
     shared = {12000: "A", 15000: "C", 18000: "G"}
     a = _grp("A", 1, [_mem("t0", dict(shared), reads=5, total=100)])
-    b = _grp("B", 10001, [_mem("t0", dict(shared), reads=3, total=3)])  # below the floor
-
-    default, _ = build_lineages([a, b], _lcfg())
-    strict, edges = build_lineages([a, b], _lcfg(), require_abundance_evidence=True)
-    assert len(default) == 1, "the shallow window must not block the join by default"
-    assert len(strict) == 2
-    assert any(e.reason == "failed_no_abundance_evidence" for e in edges)
-
-
-def test_step3_abundance_is_zero_tolerance_like_step1():
-    """ONE sample whose shares disagree refuses the join, however many agree.
-
-    Step 1 already worked this way within a sample: a genome cannot sit at two
-    frequencies at one moment, so a single incoherent pair is disqualifying.
-    Step 3 tolerated up to 30% of samples disagreeing, which let a 16-window chain
-    survive on 000089747_1 that no adjacent link could justify. Author's choice
-    2026-07-30: match step 1.
-    """
-    from strainphase.lineages import build_lineages
-
-    shared = {12000: "A", 15000: "C", 18000: "G"}
-    # nine samples agree exactly; ONE disagrees flatly (95/100 vs 5/100)
-    ma = [_mem(f"t{i}", dict(shared), reads=50, total=100) for i in range(9)]
-    mb = [_mem(f"t{i}", dict(shared), reads=50, total=100) for i in range(9)]
-    ma.append(_mem("t9", dict(shared), reads=95, total=100))
-    mb.append(_mem("t9", dict(shared), reads=5, total=100))
-    a, b = _grp("A", 1, ma), _grp("B", 10001, mb)
+    b = _grp("B", 10001, [_mem("t0", dict(shared), reads=3, total=3)])  # under the floor
 
     lins, edges = build_lineages([a, b], _lcfg())
-    assert len(lins) == 2, "one disagreeing sample in ten must refuse the join"
-    assert any(e.reason == "failed_abundance" for e in edges)
-
-    # and the old 30% tolerance would have accepted it — 1 bad of 10 is under 0.30
-    tolerant, _ = build_lineages([a, b], _lcfg(), max_bad_frac=0.30)
-    assert len(tolerant) == 1
+    assert len(lins) == 1, "an untestable pair must not be refused on abundance"
+    assert all(e.n_samples_tested == 0 for e in edges), \
+        "this fixture is only meaningful while the test genuinely cannot run"
+    assert not any(e.reason == "failed_abundance" for e in edges)

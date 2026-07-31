@@ -386,18 +386,17 @@ def build_lineages(
     max_bad_frac: float = 0.0,
     # Was 3. Any testable sample may now veto: requiring three shared samples
     # before a disagreement could count made the veto unreachable for a third of
-    # accepted joins. See `require_abundance_evidence` for the accept side.
+    # accepted joins.
+    #
+    # There is deliberately NO matching rule on the accept side: a join with
+    # `tested == 0` still proceeds. `tested == 0` means the test had no POWER —
+    # both windows below `min_reads_for_coherence` (10) — not that the join is
+    # doubtful, and 46% of real windows hold a single haplotype, so a shallow
+    # window reading 1.000 is the normal case rather than a disagreement.
+    # Rejecting on it would discard ~42 of ~563 accepted joins on 000089747_1,
+    # concentrated exactly where coverage is thinnest. Tried as a flag and
+    # removed rather than left as dead configuration (S3-5).
     min_samples_for_veto: int = 1,
-    # DEFAULT OFF, and deliberately so. Rejecting a join because the abundance
-    # test had no testable sample sounds cautious, but `tested == 0` overwhelmingly
-    # means the windows were below `min_reads_for_coherence` (10), i.e. the test
-    # had no POWER — not that the join is doubtful. 46% of real windows hold
-    # exactly one haplotype, so a shallow window reading 1.000 is the normal case,
-    # not a disagreement (see test_lineage_abundance_pools_counts_rather_than_
-    # averaging_ratios). Turning this on discards joins precisely where coverage is
-    # thinnest and the lineage layer is most needed: it would reject 42 of 582
-    # accepted joins on 000089747_1. Exposed as a knob, not a default.
-    require_abundance_evidence: bool = False,
     transitive_abundance_check: bool = True,
     lineage_prefix: str = "LIN",
     markers: set[int] | None = None,
@@ -498,16 +497,6 @@ def build_lineages(
                 e.n_samples_tested, e.n_samples_incompatible = tested, bad
                 if veto:
                     e.reason = "failed_abundance"
-                    edges.append(e)
-                    continue
-                # Require at least ONE sample where the abundance test could run.
-                # Previously a join needed >= min_samples_for_veto testable samples
-                # to be REJECTED, which meant a join with zero testable samples was
-                # accepted on identity alone: 33% of accepted joins on 000089747_1
-                # could not be vetoed at all, 42 of them having no testable sample
-                # whatsoever. Absence of evidence is not evidence of continuation.
-                if require_abundance_evidence and tested == 0:
-                    e.reason = "failed_no_abundance_evidence"
                     edges.append(e)
                     continue
                 # SCORE: step-1 link votes and nothing else. Identity has already had its
