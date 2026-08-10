@@ -38,6 +38,18 @@ def main(argv: list[str] | None = None) -> int:
     p_eval = sub.add_parser("evaluate", help="Score existing predictions and write the report")
     _add_common(p_eval)
 
+    p_plan = sub.add_parser(
+        "plan", help="List the (dataset, tool) work units, for cluster submission"
+    )
+    p_plan.add_argument("--config", "-c", required=True)
+    p_plan.add_argument(
+        "--count", action="store_true", help="Print only the number of units"
+    )
+
+    p_one = sub.add_parser("run-one", help="Run a single work unit by index (SLURM array task)")
+    _add_common(p_one)
+    p_one.add_argument("--index", "-i", type=int, required=True)
+
     p_report = sub.add_parser("report", help="Rebuild the report from an existing results dir")
     p_report.add_argument("--results", "-r", default="results/results")
     p_report.add_argument("--output", "-o")
@@ -66,6 +78,10 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_simulate(args)
     if args.command == "evaluate":
         return _cmd_evaluate(args)
+    if args.command == "plan":
+        return _cmd_plan(args)
+    if args.command == "run-one":
+        return _cmd_run_one(args)
     if args.command == "report":
         return _cmd_report(args)
     if args.command == "check-tools":
@@ -115,6 +131,39 @@ def _cmd_evaluate(args) -> int:
     write_report(results)
     write_figures(results)
     print(f"Results: {results}")
+    return 0
+
+
+def _cmd_plan(args) -> int:
+    """Enumerate work units. `--count` gives a SLURM array upper bound."""
+    from spbench.config import BenchmarkConfig
+    from spbench.runner import plan_units
+
+    units = plan_units(BenchmarkConfig.load(args.config))
+    if args.count:
+        print(len(units))
+        return 0
+    try:
+        print("index\tdataset\ttool")
+        for unit in units:
+            print(f"{unit['index']}\t{unit['dataset']}\t{unit['tool']}")
+        sys.stdout.flush()
+    except BrokenPipeError:
+        # `spbench plan | head` is the obvious way to look at a large config.
+        # Closing the fd keeps the interpreter from re-reporting the broken pipe
+        # on shutdown, which would look like a crash.
+        import os
+
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+    return 0
+
+
+def _cmd_run_one(args) -> int:
+    from spbench.config import BenchmarkConfig
+    from spbench.runner import run_unit
+
+    outdir = run_unit(BenchmarkConfig.load(args.config), Path(args.workdir), args.index)
+    print(outdir)
     return 0
 
 
