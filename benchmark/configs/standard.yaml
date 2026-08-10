@@ -1,0 +1,99 @@
+# Standard tier: the configuration behind the reported figures.
+#
+# Sweeps the three axes that actually change the answer - how many strains, how
+# divergent they are, and how deeply they were sequenced - with three replicate
+# seeds each so differences between tools can be separated from differences
+# between random draws.
+#
+# Cost: 3 seeds x 9 datasets x N tools. On 8 cores this is a few hours with the
+# built-in tools, longer with Floria/Strainy/devider installed. Run
+# `spbench check-tools -c configs/standard.yaml` first.
+
+name: standard
+description: >
+  Strain count x divergence x coverage sweep, four timepoints, three replicate
+  seeds. Every dataset contains one strain that blooms at a single timepoint and
+  sits near the single-sample detection floor at the others.
+
+seeds: [0, 1, 2]
+threads: 8
+match_threshold: 0.99
+min_shared_sites: 10
+
+tools:
+  # Baseline floor. If a method cannot beat this, the dataset is too easy.
+  - naive-greedy
+  # The like-for-like row: strainphase with cross-timepoint rescue off.
+  - strainphase-single
+  # The claim.
+  - strainphase-longitudinal
+  # Third-party single-sample phasers. Skipped with a message if not installed.
+  - floria
+  - strainy
+  - devider
+  # Diploid phaser, meaningful only at n_strains = 2. Included because the
+  # question "why not just use a standard phaser" deserves a measured answer.
+  - whatshap-diploid
+
+datasets:
+  # --- strain count, at fixed divergence and coverage -----------------------
+  - name: k2-div5-cov30
+    n_strains: 2
+    n_mutations: 1000
+    contig_length: 200000
+    coverage: 30
+  - name: k4-div5-cov30
+    n_strains: 4
+    n_mutations: 1000
+    contig_length: 200000
+    coverage: 30
+  - name: k8-div5-cov30
+    n_strains: 8
+    n_mutations: 1000
+    contig_length: 200000
+    coverage: 30
+
+  # --- divergence, at fixed strain count and coverage -----------------------
+  # 200 mutations over 200 kb is ~0.1% divergence: close to the resolution limit
+  # for read-based phasing and the regime where methods separate.
+  - name: k4-div1-cov30
+    n_strains: 4
+    n_mutations: 200
+    contig_length: 200000
+    coverage: 30
+  - name: k4-div10-cov30
+    n_strains: 4
+    n_mutations: 2000
+    contig_length: 200000
+    coverage: 30
+
+  # --- coverage, at fixed strain count and divergence -----------------------
+  - name: k4-div5-cov10
+    n_strains: 4
+    n_mutations: 1000
+    contig_length: 200000
+    coverage: 10
+  - name: k4-div5-cov60
+    n_strains: 4
+    n_mutations: 1000
+    contig_length: 200000
+    coverage: 60
+
+  # --- indels, to exercise the CIGAR-aware paths ---------------------------
+  - name: k4-div5-cov30-indels
+    n_strains: 4
+    n_mutations: 1000
+    contig_length: 200000
+    coverage: 30
+    indel_fraction: 0.1
+
+  # --- perfect variant calls, as an ablation of the calling step ------------
+  # Everything else uses a simulated caller with realistic false negatives at
+  # low abundance. This row isolates how much of each tool's low-abundance loss
+  # comes from the caller rather than from the phasing.
+  - name: k4-div5-cov30-truthvcf
+    n_strains: 4
+    n_mutations: 1000
+    contig_length: 200000
+    coverage: 30
+    vcf_mode: truth

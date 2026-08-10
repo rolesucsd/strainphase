@@ -1,0 +1,68 @@
+# Real-genome tier. Run `make genomes` first.
+#
+# Same mixtures as the standard tier, but built on real bacterial assemblies
+# instead of random sequence. The difference that matters is repeat content:
+# random sequence has none, so every read maps uniquely and no method ever has
+# to resolve an ambiguous placement. Real genomes reintroduce that, and the gap
+# between this tier and the standard tier is a direct measure of how much of
+# each tool's score came from the simulation being clean.
+#
+# Reads are still emitted at their true coordinates rather than aligned, so this
+# tier narrows the gap to real data without closing it. See the caveats section
+# of the generated report.
+
+name: real-genomes
+description: >
+  Four species x strain-count sweep on complete RefSeq assemblies, four
+  timepoints, three replicate seeds.
+
+seeds: [0, 1, 2]
+threads: 8
+match_threshold: 0.99
+min_shared_sites: 10
+
+tools:
+  - naive-greedy
+  - strainphase-single
+  - strainphase-longitudinal
+  - floria
+  - strainy
+  - devider
+
+datasets:
+  - name: ecoli-k4
+    reference_fasta: genomes/ecoli_k12.fna.gz
+    contig_length: 500000
+    n_strains: 4
+    n_mutations: 2500
+    coverage: 30
+  - name: bfragilis-k4
+    reference_fasta: genomes/bfragilis_nctc9343.fna.gz
+    contig_length: 500000
+    n_strains: 4
+    n_mutations: 2500
+    coverage: 30
+  - name: amuciniphila-k4
+    reference_fasta: genomes/amuciniphila_baa835.fna.gz
+    contig_length: 500000
+    n_strains: 4
+    n_mutations: 2500
+    coverage: 30
+  - name: blongum-k4
+    reference_fasta: genomes/blongum_ncc2705.fna.gz
+    contig_length: 500000
+    n_strains: 4
+    n_mutations: 2500
+    coverage: 30
+  - name: ecoli-k8
+    reference_fasta: genomes/ecoli_k12.fna.gz
+    contig_length: 500000
+    n_strains: 8
+    n_mutations: 2500
+    coverage: 30
+  - name: bfragilis-k8
+    reference_fasta: genomes/bfragilis_nctc9343.fna.gz
+    contig_length: 500000
+    n_strains: 8
+    n_mutations: 2500
+    coverage: 30

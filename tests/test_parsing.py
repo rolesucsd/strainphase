@@ -676,9 +676,27 @@ def test_default_config_is_indel_aware():
 
 # ============================================================================
 # Simulator: indel injection round-trip
+#
+# These exercise the private ``validation/`` simulator, which is not part of the
+# distributed repository. They skip on a fresh clone rather than failing it. The
+# equivalent public coverage lives in ``benchmark/tests/test_simulate.py``,
+# which checks the same properties against the shipped simulator.
 # ============================================================================
 
+try:
+    import validation.simulate_reads  # noqa: F401
 
+    _HAS_PRIVATE_SIMULATOR = True
+except ImportError:
+    _HAS_PRIVATE_SIMULATOR = False
+
+requires_private_simulator = pytest.mark.skipif(
+    not _HAS_PRIVATE_SIMULATOR,
+    reason="private validation/ simulator not present in this checkout",
+)
+
+
+@requires_private_simulator
 def test_simulator_emits_indel_cigar():
     """``simulate_read`` emits D and I CIGAR ops when the strain carries indels."""
     import numpy as np
@@ -701,6 +719,7 @@ def test_simulator_emits_indel_cigar():
     assert len(quals) == 200
 
 
+@requires_private_simulator
 def test_simulator_writes_canonical_indel_vcf(tmp_path):
     """``write_vcf`` emits indels in canonical left-anchored form."""
     from validation.simulate_reads import Strain, write_vcf
