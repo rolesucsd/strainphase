@@ -180,8 +180,14 @@ pip install -e .. -e .      # strainphase + the harness
 make smoke                  # ~5 minutes, no downloads, no external tools
 ```
 
-That writes `results/smoke/results/report.md`. To include the third-party
-comparators, install them from `benchmark/envs/` and run `make standard`.
+That writes `results/smoke/results/report.md`. The suite needs no input data —
+it simulates its own reference, reads, variant calls and ground truth from a
+seed. To include the third-party comparators, install them from
+`benchmark/envs/` (one conda environment each) and run `make standard`.
+
+On a cluster, `benchmark/scripts/slurm/submit.sh` submits the same run as three
+dependent SLURM stages — simulate, an array over `(dataset, tool)` pairs, then
+scoring.
 
 ### What it compares
 

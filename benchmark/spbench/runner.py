@@ -234,6 +234,65 @@ def _cpu_count() -> int:
         return __import__("os").cpu_count() or 1
 
 
+# --------------------------------------------------------------------------- #
+# Work units, for cluster execution
+# --------------------------------------------------------------------------- #
+#
+# A (dataset, tool) pair is the natural unit of parallelism: independent, and
+# the only stage that costs real time. Enumerating them lets a SLURM array map
+# one task per pair without the harness knowing anything about SLURM.
+#
+# The enumeration is deterministic - sorted by dataset then by the tool's order
+# in the config - so an array index means the same thing on resubmission. A task
+# that failed can be rerun by index alone.
+
+
+def plan_units(config: BenchmarkConfig) -> list[dict]:
+    """Every (dataset, tool) pair, in a stable order."""
+    units = []
+    for sim_config in config.expand():
+        for spec in config.tools:
+            units.append(
+                {
+                    "index": len(units),
+                    "dataset": sim_config.name,
+                    "tool": spec.name,
+                    "options": spec.options,
+                }
+            )
+    return units
+
+
+def simulate_only(config: BenchmarkConfig, workdir: Path, force: bool = False) -> list[Path]:
+    """Simulation as a standalone stage.
+
+    On a cluster this must run to completion before the array starts. Letting
+    array tasks simulate on demand would have several of them writing the same
+    dataset directory at once; the fix is a dependency, not a lock.
+    """
+    return simulate_all(config, workdir, force=force)
+
+
+def run_unit(config: BenchmarkConfig, workdir: Path, index: int) -> Path:
+    """Run exactly one (dataset, tool) pair. The body of a SLURM array task."""
+    units = plan_units(config)
+    if not 0 <= index < len(units):
+        raise IndexError(f"unit index {index} out of range (0..{len(units) - 1})")
+    unit = units[index]
+
+    root = Path(workdir) / "datasets" / unit["dataset"]
+    if not (root / "manifest.json").exists():
+        raise FileNotFoundError(
+            f"dataset {unit['dataset']} has not been simulated yet at {root}. "
+            f"Run `spbench simulate` first - on a cluster, as a job the array "
+            f"depends on."
+        )
+
+    spec = next(t for t in config.tools if t.name == unit["tool"])
+    run_tools(config, Path(workdir), [root], only=[spec.name])
+    return Path(workdir) / "predictions" / unit["dataset"] / spec.name
+
+
 def run_all(
     config_path: str | Path,
     workdir: str | Path,

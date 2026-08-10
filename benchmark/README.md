@@ -66,6 +66,84 @@ recall cheaply - which is why the report prints haplotype counts next to recall.
 
 ---
 
+## What you have to supply
+
+**Nothing.** That is the point, and it is the main thing the previous benchmark
+setup got wrong: it needed a `$GENOME_SOURCE` directory that was never
+specified, so even with the code in hand nobody could reproduce a number.
+
+`make smoke` and `make standard` generate their own reference sequence, their
+own reads, their own variant calls and their own ground truth from a seed. No
+downloads, no BAM you have to find, no reference you have to stage.
+
+The only optional input is real assemblies for the `real-genomes` tier, and
+`make genomes` fetches those from the accessions in `data/genomes.tsv`.
+
+### What a generated dataset looks like
+
+Each `(dataset, seed)` pair becomes one self-contained directory:
+
+```
+results/standard/datasets/k4-div5-cov30.seed0/
+├── reference.fasta            (+ .fai)
+├── bam/
+│   ├── T1.bam                 (+ .bai)  coordinate-sorted, one per timepoint
+│   ├── T2.bam
+│   └── ...
+├── variants/
+│   ├── T1.vcf.gz              (+ .tbi)  per-timepoint calls, DP/AF populated
+│   ├── ...
+│   └── union.vcf.gz           every site called in any timepoint
+├── truth/
+│   ├── sites.tsv              contig, pos, ref, alt
+│   ├── strains.tsv            each strain's true haplotype
+│   ├── abundance.tsv          strain x timepoint, sums to 1 per timepoint
+│   └── read_origins.tsv       which strain every read really came from
+└── manifest.json              the full config, plus a fingerprint
+```
+
+`bam/`, `variants/` and `reference.fasta` are exactly what you would hand any of
+these tools on real data. `truth/` is never shown to an adapter - only the
+evaluator reads it.
+
+### Pointing it at your own data
+
+Two supported ways to make the simulation resemble your study:
+
+**Use your own reference.** Any dataset entry accepts `reference_fasta`, so you
+can build mixtures on one of your own MAG bins rather than on random sequence or
+a RefSeq isolate:
+
+```yaml
+datasets:
+  - name: my-mag-k6
+    reference_fasta: /path/to/BF_MAG_01.fasta
+    contig_length: 500000      # 0 keeps the full contig
+    n_contigs: 1
+    n_strains: 6
+    n_mutations: 2500
+    n_timepoints: 8            # match your study design
+    coverage: 30
+```
+
+**Match your sequencing.** `coverage`, `mean_read_length`, `read_length_sd`,
+`error_rate` and `n_timepoints` should be set from your real runs. Defaults are
+HiFi-shaped (15 kb mean, 0.1% error) but the honest thing is to use your own
+numbers - a benchmark run at 30x says nothing about a study sequenced at 8x.
+
+Every key in `SimConfig` (`spbench/simulate.py`) is settable from a dataset
+entry, and an unrecognised key is a hard error rather than a silent default.
+
+### What is *not* supported, and why
+
+Running the suite on your real longitudinal samples to get accuracy numbers.
+There is no ground truth for those, so precision and recall are undefined. You
+could compare tools for *concordance* on real data, and that is worth doing, but
+it answers a different question and is not implemented here. The nearest honest
+substitute is a sequenced mock community - see the limitations section.
+
+---
+
 ## What gets measured
 
 | Family | Metrics | Applies to |
@@ -165,6 +243,58 @@ regenerates those whose config changed.
 
 ---
 
+## Running on a cluster
+
+The standard tier is 189 `(dataset, tool)` pairs. Those are independent, so they
+map onto a SLURM array:
+
+```bash
+cp scripts/slurm/env.sh.example scripts/slurm/env.sh
+$EDITOR scripts/slurm/env.sh          # conda activation, comparator PATHs
+
+scripts/slurm/submit.sh \
+    -c configs/standard.yaml \
+    -w /scratch/$USER/spbench-standard \
+    --env-setup scripts/slurm/env.sh \
+    --partition compute --account mylab \
+    --threads 8 --run-mem 32G --max-concurrent 20
+```
+
+That submits three dependent jobs:
+
+| Stage | Shape | Why |
+|---|---|---|
+| `spb-sim` | one job | Datasets must exist before the array starts. Array tasks share dataset directories, so simulating on demand would have several processes writing the same files. |
+| `spb-run` | array, one task per pair | The only stage that costs real time. Index-to-unit mapping is stable, so a failed task is rerun by index. |
+| `spb-eval` | one job, `afterany` | Scores whatever is on disk. `afterany`, not `afterok`: one tool crashing on one dataset should not cost you the other 188 results. |
+
+Add `--dry-run` to print the `sbatch` commands without submitting.
+
+```bash
+spbench plan -c configs/standard.yaml       # the index -> (dataset, tool) mapping
+spbench plan -c configs/standard.yaml --count
+```
+
+Failed units appear in `results/runs.tsv` with `status=failed` and the error
+message. Rerun just those, then rescore:
+
+```bash
+sbatch --array=17,31,44 ... scripts/slurm/run_unit.sbatch
+spbench evaluate -c configs/standard.yaml -w /scratch/$USER/spbench-standard
+```
+
+Because scoring reads only the common-format prediction files, `spbench
+evaluate` can also be rerun with a different `match_threshold` without
+re-running a single tool.
+
+Sizing: strainphase's longitudinal mode holds all timepoints for one MAG in
+memory at once and is the peak-RSS driver; 32 GB is comfortable for the standard
+tier's 200 kb contigs at 60x. Strainy is the wall-time driver because it runs an
+assembler. Both defaults in `submit.sh` are deliberately generous - check
+`results/runs.tsv` after a first run and tighten from measured numbers.
+
+---
+
 ## Layout
 
 ```
@@ -176,8 +306,10 @@ benchmark/
 │   └── real-genomes.yaml    the same on real RefSeq assemblies
 ├── envs/                    one conda environment per comparator, and why
 ├── data/genomes.tsv         accessions + checksums for the real-genome tier
-├── scripts/fetch_genomes.py downloader with checksum verification
 ├── expected/smoke.json      regression bounds checked by CI
+├── scripts/
+│   ├── fetch_genomes.py     downloader with checksum verification
+│   └── slurm/               three-stage cluster submission
 ├── spbench/
 │   ├── formats.py           the common intermediate format both sides agree on
 │   ├── simulate.py          ground-truth simulator

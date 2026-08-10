@@ -7,16 +7,21 @@
 #   make genomes    fetch reference genomes for the real-genome tier
 #   make real       the real-genome tier (needs `make genomes` first)
 #   make test       unit tests for the simulator and the metrics
+#   make plan       list the (dataset, tool) work units
 #   make clean      remove generated results
+#
+# On a cluster, use scripts/slurm/submit.sh instead of `make standard`; see
+# scripts/slurm/README.md.
 
 PYTHON ?= python
 RESULTS ?= results
 THREADS ?= 4
+CONFIG ?= configs/standard.yaml
 
-.PHONY: install smoke check standard genomes real test verify clean help
+.PHONY: install smoke check standard genomes real test verify plan clean help
 
 help:
-	@sed -n '3,12p' $(MAKEFILE_LIST) | sed 's/^# \{0,1\}//'
+	@sed -n '3,17p' $(MAKEFILE_LIST) | sed 's/^# \{0,1\}//'
 
 install:
 	$(PYTHON) -m pip install -e .. -e .
@@ -53,6 +58,9 @@ real: genomes
 
 test:
 	$(PYTHON) -m pytest tests -v
+
+plan:
+	$(PYTHON) -m spbench.cli plan -c $(CONFIG)
 
 verify:
 	$(PYTHON) -m spbench.cli verify -r $(RESULTS)/smoke/results -e expected/smoke.json
