@@ -1,0 +1,18 @@
+# The benchmark harness itself, plus strainphase. No third-party phasing tool
+# is included here; each of those gets its own environment (see README.md).
+name: spbench
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - python=3.11
+  - numpy>=1.24
+  - scipy>=1.10
+  - pandas>=2.0
+  - networkx>=3.0
+  - matplotlib-base>=3.7
+  - pyyaml>=6.0
+  - pysam>=0.22
+  - python-louvain>=0.16
+  - pytest>=7.4
+  - pip

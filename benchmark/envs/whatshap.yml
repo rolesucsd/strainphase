@@ -1,0 +1,13 @@
+# whatshap: diploid read-backed phasing. Not a metagenomic method; included as
+# the "why not just use a standard phaser" control, meaningful only at two
+# strains.
+#   Patterson et al., J Comput Biol 22, 2015.
+name: whatshap
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - python=3.11
+  - whatshap>=2.2
+  - samtools>=1.17
+  - htslib>=1.17

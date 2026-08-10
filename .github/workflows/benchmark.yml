@@ -1,0 +1,83 @@
+name: Benchmark
+
+# Runs the smoke tier of the public benchmark suite on every push and PR.
+#
+# This is a guard on the *harness*, not a measurement of any tool. It proves
+# three things a reader of the results needs to be able to assume:
+#   1. `make smoke` works on a clean clone with nothing but pip.
+#   2. The simulator, the allele extractor and the metrics still agree with
+#      `benchmark/expected/smoke.json`, so a silent change to any of them fails
+#      the build instead of quietly moving every published number.
+#   3. The run is reproducible: it is executed twice and the result tables must
+#      be byte-identical.
+#
+# Third-party comparators are not installed here (they are conda-only binaries),
+# so they appear as `skipped` rows. That path is exercised too - it must not
+# crash the run.
+
+on:
+  push:
+    branches: [ master, main, develop ]
+  pull_request:
+    branches: [ master, main, develop ]
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    name: Benchmark smoke tier
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install strainphase and the benchmark harness
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[all]"
+          pip install -e ./benchmark
+
+      - name: Unit tests for the simulator and the metrics
+        working-directory: benchmark
+        run: pytest tests -v
+
+      - name: Which comparators are visible here
+        working-directory: benchmark
+        run: spbench check-tools
+
+      - name: Run the smoke benchmark
+        working-directory: benchmark
+        run: make smoke RESULTS=results
+
+      - name: Re-run and require identical results
+        working-directory: benchmark
+        run: |
+          spbench run -c configs/smoke.yaml -w results-repeat
+          for table in per_sample longitudinal detection; do
+            if ! diff -q "results/smoke/results/$table.tsv" "results-repeat/results/$table.tsv"; then
+              echo "::error::$table.tsv differs between two runs of the same config."
+              echo "The benchmark must be reproducible; an unseeded source of randomness has crept in."
+              diff "results/smoke/results/$table.tsv" "results-repeat/results/$table.tsv" | head -40
+              exit 1
+            fi
+          done
+          echo "Both runs produced identical result tables."
+
+      - name: Print the report
+        if: always()
+        working-directory: benchmark
+        run: cat results/smoke/results/report.md || true
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-smoke-results
+          path: benchmark/results/smoke/results/
+          retention-days: 14

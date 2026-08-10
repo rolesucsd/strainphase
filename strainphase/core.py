@@ -983,7 +983,14 @@ class GraphInitializer:
 
         # Partition reads into clusters.
         # Louvain community detection for read clustering.
-        partition = community_louvain.best_partition(graph, weight="weight")
+        #
+        # Louvain visits nodes in a shuffled order, so without a seed the same
+        # input can yield different communities run to run. Threading
+        # random_seed through makes a --seed run reproducible end to end; left
+        # unset, behaviour is unchanged.
+        partition = community_louvain.best_partition(
+            graph, weight="weight", random_state=self.config.random_seed
+        )
 
         # Group by cluster
         clusters = defaultdict(list)

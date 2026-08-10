@@ -1,0 +1,12 @@
+# Floria: single-sample strain haplotyping via MEC read clustering and a
+# strain-preserving network flow model.
+#   Shaw, Boucher, Yu, Noyes & Li. Bioinformatics 40(Suppl 1), 2024.
+#   https://github.com/bluenote-1577/floria
+name: floria
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - floria=0.0.4
+  - samtools>=1.17
+  - minimap2>=2.24
