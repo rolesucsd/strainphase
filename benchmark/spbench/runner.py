@@ -167,6 +167,8 @@ def _stamp(rows: list[dict], dataset: Dataset, spec) -> list[dict]:
         "error_rate": sim.get("error_rate"),
         "indel_fraction": sim.get("indel_fraction"),
         "vcf_mode": sim.get("vcf_mode"),
+        "read_model": sim.get("read_model"),
+        "aligner": sim.get("aligner"),
         "tool_options": json.dumps(spec.options, sort_keys=True) if spec.options else "",
     }
     return [{**row, **extra} for row in rows]
