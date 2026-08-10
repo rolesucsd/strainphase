@@ -17,6 +17,14 @@ description: >
 
 seeds: [0, 1, 2]
 threads: 8
+
+# Reads are given HiFi-shaped error (homopolymer-concentrated indels plus
+# substitutions), sequenced from both strands, and aligned back to the reference
+# with minimap2. Placement, CIGAR and MAPQ come from the aligner, so indel
+# placement ambiguity and soft clipping are present and identical for every
+# tool. See spbench/hifi.py for what this models and what it still does not.
+read_model: &read_model hifi
+aligner: &aligner minimap2
 match_threshold: 0.99
 min_shared_sites: 10
 
@@ -42,16 +50,22 @@ datasets:
     n_mutations: 1000
     contig_length: 200000
     coverage: 30
+    read_model: *read_model
+    aligner: *aligner
   - name: k4-div5-cov30
     n_strains: 4
     n_mutations: 1000
     contig_length: 200000
     coverage: 30
+    read_model: *read_model
+    aligner: *aligner
   - name: k8-div5-cov30
     n_strains: 8
     n_mutations: 1000
     contig_length: 200000
     coverage: 30
+    read_model: *read_model
+    aligner: *aligner
 
   # --- divergence, at fixed strain count and coverage -----------------------
   # 200 mutations over 200 kb is ~0.1% divergence: close to the resolution limit
@@ -61,11 +75,15 @@ datasets:
     n_mutations: 200
     contig_length: 200000
     coverage: 30
+    read_model: *read_model
+    aligner: *aligner
   - name: k4-div10-cov30
     n_strains: 4
     n_mutations: 2000
     contig_length: 200000
     coverage: 30
+    read_model: *read_model
+    aligner: *aligner
 
   # --- coverage, at fixed strain count and divergence -----------------------
   - name: k4-div5-cov10
@@ -73,11 +91,15 @@ datasets:
     n_mutations: 1000
     contig_length: 200000
     coverage: 10
+    read_model: *read_model
+    aligner: *aligner
   - name: k4-div5-cov60
     n_strains: 4
     n_mutations: 1000
     contig_length: 200000
     coverage: 60
+    read_model: *read_model
+    aligner: *aligner
 
   # --- indels, to exercise the CIGAR-aware paths ---------------------------
   - name: k4-div5-cov30-indels
@@ -86,6 +108,8 @@ datasets:
     contig_length: 200000
     coverage: 30
     indel_fraction: 0.1
+    read_model: *read_model
+    aligner: *aligner
 
   # --- perfect variant calls, as an ablation of the calling step ------------
   # Everything else uses a simulated caller with realistic false negatives at
@@ -97,3 +121,22 @@ datasets:
     contig_length: 200000
     coverage: 30
     vcf_mode: truth
+    read_model: *read_model
+    aligner: *aligner
+
+  # --- realism ablation ----------------------------------------------------
+  # Identical to k4-div5-cov30 except that reads are emitted at their true
+  # coordinates with exact CIGARs and substitution-only error, the way most
+  # phasing benchmarks (including this project's previous one) simulate.
+  #
+  # The gap between this row and k4-div5-cov30 is the answer to "how much of
+  # each tool's score came from the simulation being clean?" - which is the
+  # question a reviewer should ask of any simulated phasing benchmark, and one
+  # almost none of them answer.
+  - name: k4-div5-cov30-exactreads
+    n_strains: 4
+    n_mutations: 1000
+    contig_length: 200000
+    coverage: 30
+    read_model: exact
+    aligner: exact

@@ -113,11 +113,51 @@ class SimConfig:
     error_rate: float = 0.001
     mapq: int = 60
 
+    # Read realism. See spbench/hifi.py for what each path does and does not
+    # model.
+    #
+    #   read_model "exact"  - substitution-only error, reads emitted at their
+    #                         true coordinates with exact CIGARs. Fast, needs no
+    #                         extra packages, deterministic. Right for CI and for
+    #                         developing metrics. Not what HiFi data looks like.
+    #   read_model "hifi"   - homopolymer-aware indel error plus substitutions,
+    #                         reads reverse-complemented half the time and
+    #                         aligned back to the reference with minimap2. This
+    #                         is the path for numbers that go in a paper.
+    #
+    # "hifi" requires minimap2 alignment: the whole point of simulating
+    # homopolymer slippage is that an aligner has to place it, and handing over
+    # the true CIGAR would remove exactly the difficulty being tested. The two
+    # settings are validated against each other below.
+    read_model: str = "exact"
+    aligner: str = "exact"  # "exact" | "minimap2"
+    minimap2_preset: str = "map-hifi"
+    hifi_substitution_fraction: float = 0.35
+    hifi_homopolymer_min_length: int = 4
+    hifi_homopolymer_exponent: float = 2.0
+    hifi_quality_penalty: float = 4.0
+    hifi_max_indel_error_length: int = 2
+
     # Variant calling simulation
     vcf_mode: str = "called"  # "called" | "truth"
     call_min_alt_reads: int = 3
     call_min_af: float = 0.02
     call_fp_rate: float = 2e-5  # false-positive sites per bp per sample
+
+    def __post_init__(self) -> None:
+        if self.read_model not in ("exact", "hifi"):
+            raise ValueError(f"read_model must be 'exact' or 'hifi', got {self.read_model!r}")
+        if self.aligner not in ("exact", "minimap2"):
+            raise ValueError(f"aligner must be 'exact' or 'minimap2', got {self.aligner!r}")
+        if self.read_model == "hifi" and self.aligner != "minimap2":
+            raise ValueError(
+                "read_model='hifi' requires aligner='minimap2'. Simulating "
+                "homopolymer indel error and then handing over the true CIGAR "
+                "would remove the placement ambiguity that is the entire reason "
+                "to simulate it."
+            )
+        if self.vcf_mode not in ("called", "truth"):
+            raise ValueError(f"vcf_mode must be 'called' or 'truth', got {self.vcf_mode!r}")
 
     @property
     def resolved_rare_abundance(self) -> float:
@@ -405,10 +445,13 @@ class SimulatedRead:
     cigar: list[tuple[int, int]]
     strain_id: str
     n_mismatches: int
+    mapq: int = 60
+    is_reverse: bool = False
 
     @property
     def ref_end(self) -> int:
-        span = sum(length for op, length in self.cigar if op in (0, 2))
+        """0-based exclusive reference end. Soft clips consume no reference."""
+        span = sum(length for op, length in self.cigar if op in (0, 2, 7, 8))
         return self.ref_start + span
 
 
@@ -512,8 +555,15 @@ def simulate_reads_for_sample(
     strains: list[Strain],
     contigs: dict[str, str],
     abundance: dict[tuple[str, str], float],
+    aligner=None,
+    strain_sequences: dict[tuple[str, str], str] | None = None,
 ) -> list[SimulatedRead]:
     """Simulate one timepoint's worth of reads across all contigs."""
+    if config.read_model == "hifi":
+        return _simulate_reads_hifi(
+            rng, config, sample, strains, contigs, abundance, aligner, strain_sequences or {}
+        )
+
     weights = np.array([abundance[(sample, s.strain_id)] for s in strains], dtype=float)
     weights = weights / weights.sum()
 
@@ -550,6 +600,109 @@ def simulate_reads_for_sample(
     return reads
 
 
+def _simulate_reads_hifi(
+    rng: np.random.Generator,
+    config: SimConfig,
+    sample: str,
+    strains: list[Strain],
+    contigs: dict[str, str],
+    abundance: dict[tuple[str, str], float],
+    aligner,
+    strain_sequences: dict[tuple[str, str], str],
+) -> list[SimulatedRead]:
+    """Realistic path: sample from strain genomes, corrupt, align back.
+
+    Reads are drawn from the *strain's* coordinate system, given HiFi-shaped
+    error, reverse-complemented half the time, and then aligned to the reference
+    with minimap2. Their placement, CIGAR and mapping quality come from the
+    aligner, not from the simulator - so indel placement ambiguity, soft
+    clipping and mismapping are all present and are the same for every tool
+    scored downstream.
+
+    Reads that fail to align are dropped and counted. Losing a small percentage
+    is what happens on real data.
+    """
+    from spbench.hifi import HiFiErrorModel, apply_hifi_errors, reverse_complement
+
+    model = HiFiErrorModel(
+        error_rate=config.error_rate,
+        substitution_fraction=config.hifi_substitution_fraction,
+        homopolymer_min_length=config.hifi_homopolymer_min_length,
+        homopolymer_exponent=config.hifi_homopolymer_exponent,
+        quality_penalty_in_homopolymer=config.hifi_quality_penalty,
+        max_indel_error_length=config.hifi_max_indel_error_length,
+    )
+
+    weights = np.array([abundance[(sample, s.strain_id)] for s in strains], dtype=float)
+    weights = weights / weights.sum()
+
+    reads: list[SimulatedRead] = []
+    counter = 0
+    unaligned = 0
+
+    for contig, ref_seq in contigs.items():
+        n_reads = int(round(config.coverage * len(ref_seq) / config.mean_read_length))
+        for _ in range(n_reads):
+            strain = strains[int(rng.choice(len(strains), p=weights))]
+            strain_seq = strain_sequences[(strain.strain_id, contig)]
+            if len(strain_seq) < config.min_read_length:
+                continue
+
+            length = int(
+                np.clip(
+                    rng.normal(config.mean_read_length, config.read_length_sd),
+                    config.min_read_length,
+                    config.max_read_length,
+                )
+            )
+            length = min(length, len(strain_seq))
+            start = int(rng.integers(0, max(1, len(strain_seq) - length)))
+            template = strain_seq[start : start + length]
+
+            corrupted, quals = apply_hifi_errors(template, rng, model)
+            if not corrupted:
+                continue
+            # Half the molecules are sequenced from the other strand. The
+            # aligner recovers the orientation; nothing downstream is told it.
+            if rng.random() < 0.5:
+                corrupted = reverse_complement(corrupted)
+                quals = list(reversed(quals))
+
+            counter += 1
+            read_id = f"{sample}_read_{counter:07d}"
+            alignment = aligner.align(corrupted, quals)
+            if alignment is None:
+                unaligned += 1
+                continue
+
+            reads.append(
+                SimulatedRead(
+                    read_id=read_id,
+                    contig=alignment.contig,
+                    ref_start=alignment.ref_start,
+                    sequence=alignment.sequence,
+                    qualities=alignment.qualities,
+                    cigar=alignment.cigar,
+                    strain_id=strain.strain_id,
+                    n_mismatches=alignment.nm,
+                    mapq=alignment.mapq,
+                    is_reverse=alignment.is_reverse,
+                )
+            )
+
+    if unaligned:
+        logger.info(
+            "%s: %d/%d reads failed to align and were dropped (%.1f%%)",
+            sample,
+            unaligned,
+            counter,
+            100.0 * unaligned / max(1, counter),
+        )
+
+    reads.sort(key=lambda r: (r.contig, r.ref_start))
+    return reads
+
+
 # --------------------------------------------------------------------------- #
 # BAM / VCF output
 # --------------------------------------------------------------------------- #
@@ -574,10 +727,10 @@ def write_bam(path: Path, contigs: dict[str, str], reads: list[SimulatedRead]) -
             aln.query_qualities = pysam.qualitystring_to_array(
                 "".join(chr(q + 33) for q in read.qualities)
             )
-            aln.flag = 0
+            aln.flag = 16 if read.is_reverse else 0
             aln.reference_id = order[read.contig]
             aln.reference_start = read.ref_start
-            aln.mapping_quality = 60
+            aln.mapping_quality = read.mapq
             aln.cigartuples = read.cigar
             aln.next_reference_id = -1
             aln.next_reference_start = -1
@@ -704,9 +857,34 @@ def simulate(config: SimConfig, outdir: str | Path) -> Path:
     samples = sorted({sample for sample, _ in abundance})
 
     # 3. Reads, BAMs, VCFs
+    #
+    # The realistic path needs each strain's genome materialised (to sample
+    # reads from) and a minimap2 index over the reference (to align them back).
+    # Both are built once and reused across timepoints.
+    aligner = None
+    strain_sequences: dict[tuple[str, str], str] = {}
+    if config.read_model == "hifi" or config.aligner == "minimap2":
+        from spbench.hifi import Minimap2Aligner, build_strain_sequence
+
+        aligner = Minimap2Aligner.from_fasta(
+            str(outdir / "reference.fasta"), preset=config.minimap2_preset
+        )
+        for strain in strains:
+            for contig, ref_seq in contigs.items():
+                on_contig = {
+                    pos: variant
+                    for pos, variant in strain.variants.items()
+                    if pos in all_variants.get(contig, {})
+                }
+                strain_sequences[(strain.strain_id, contig)] = build_strain_sequence(
+                    ref_seq, on_contig
+                )
+
     truth_reads: list[dict] = []
     for sample in samples:
-        reads = simulate_reads_for_sample(rng, config, sample, strains, contigs, abundance)
+        reads = simulate_reads_for_sample(
+            rng, config, sample, strains, contigs, abundance, aligner, strain_sequences
+        )
         write_bam(outdir / "bam" / f"{sample}.bam", contigs, reads)
 
         records: list[tuple[str, Variant, int, int]] = []

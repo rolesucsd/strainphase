@@ -94,7 +94,7 @@ def build_report(results_dir: str | Path) -> str:
     parts.append(_longitudinal_section(longitudinal, per_sample))
     parts.append(_depth_section(results_dir))
     parts.append(_resources_section(runs))
-    parts.append(_caveats_section())
+    parts.append(_caveats_section(per_sample))
     return "\n\n".join(p for p in parts if p)
 
 
@@ -356,17 +356,51 @@ def _resources_section(runs: pd.DataFrame) -> str:
     )
 
 
-def _caveats_section() -> str:
-    return (
-        "## What this benchmark does not show\n\n"
-        "- **Simulated alignments are exact.** Reads are emitted at their true "
-        "coordinates rather than aligned with minimap2, so no tool pays for "
-        "alignment error or for indel placement ambiguity in repeats. Real "
-        "performance will be lower for every tool, and not necessarily by the "
-        "same amount.\n"
-        "- **Sequencing error is substitution-only.** HiFi homopolymer indel "
-        "error is not modelled; see the module docstring in `spbench/simulate.py` "
-        "for why simulating it badly was judged worse than omitting it.\n"
+def _caveats_section(per_sample: pd.DataFrame) -> str:
+    """Limitations, phrased against the read model these results actually used.
+
+    Printing "alignments are exact" under results generated with minimap2 would
+    be worse than printing nothing, so this section reads the run rather than
+    asserting a fixed set of caveats.
+    """
+    models = (
+        sorted({str(m) for m in per_sample["read_model"].dropna().unique()})
+        if "read_model" in per_sample
+        else []
+    )
+    has_exact = "exact" in models or not models
+    has_hifi = "hifi" in models
+
+    lines = ["## What this benchmark does not show", ""]
+
+    if has_hifi:
+        lines.append(
+            "- **Reads were aligned, not placed.** Datasets using `read_model: "
+            "hifi` give reads homopolymer-concentrated indel error plus "
+            "substitutions, sequence them from both strands, and align them back "
+            "with minimap2, so placement ambiguity, soft clipping and mapping "
+            "quality are real. What is still missing is a true CCS error model: "
+            "the error parameters are literature-shaped approximations, not "
+            "fitted to an instrument. For higher fidelity, simulate per-strain "
+            "reads with PBSIM3 and feed those in."
+        )
+    if has_exact:
+        lines.append(
+            "- **Some datasets use exact alignments.** Rows with `read_model: "
+            "exact` emit reads at their true coordinates with exact CIGARs and "
+            "substitution-only error, so no tool pays for alignment error or "
+            "indel placement ambiguity. Those numbers are optimistic for every "
+            "tool and are not directly comparable to the `hifi` rows."
+        )
+    if has_exact and has_hifi:
+        lines.append(
+            "- **The gap between the two is itself a result.** Comparing the same "
+            "condition under both read models measures how much of a tool's score "
+            "came from the simulation being clean. Slice `per_sample.tsv` on "
+            "`read_model` to see it."
+        )
+
+    lines.append(
         "- **One reference per dataset.** Cross-species mismapping, a major "
         "source of false haplotypes in real metagenomes, is absent by "
         "construction.\n"
@@ -380,7 +414,11 @@ def _caveats_section() -> str:
         "for any tool, including strainphase. Tuning strainphase alone would "
         "invalidate the comparison; tuning all of them fairly is a larger "
         "exercise than this suite performs.\n"
+        "- **No real-data track with independent ground truth.** A sequenced "
+        "mock community or defined isolate mixture would test what simulation "
+        "cannot. This is the largest remaining gap."
     )
+    return "\n".join(lines)
 
 
 def write_report(results_dir: str | Path, output: str | Path | None = None) -> Path:

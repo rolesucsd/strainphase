@@ -222,6 +222,13 @@ Detection sensitivity is reported stratified by true abundance *and* by absolute
 strain depth (`abundance × coverage`), which separates "the method missed it"
 from "the reads were not there".
 
+Reads for the reported tier are given HiFi-shaped error — indel slippage
+concentrated in homopolymers, plus substitutions — sequenced from both strands,
+and **aligned back to the reference with minimap2**, so placement ambiguity,
+soft clipping and MAPQ are real rather than assumed away. One dataset differs
+only in using exact coordinates, which makes the cost of that shortcut
+measurable.
+
 Runs are seeded end to end and reproducible; `results/provenance.json` records
 the commit, platform, package versions, seeds and thresholds behind every table.
 CI runs the smoke tier twice on every push and fails if the two runs disagree.

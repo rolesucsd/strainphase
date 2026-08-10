@@ -198,6 +198,38 @@ is `-10 log10` of that probability, and the base is corrupted with exactly that
 probability. A simulator emitting a flat Q40 would hand an unearned advantage to
 quality-weighted methods, strainphase among them.
 
+**Reads are aligned, not placed.** There are two read models, and the choice
+matters more than any other setting in the suite:
+
+| `read_model` | Error | Placement | Use |
+|---|---|---|---|
+| `exact` | substitution-only, uniform | true coordinates, exact CIGAR | smoke tier and CI: fast, no extra deps, deterministic |
+| `hifi` | homopolymer-concentrated indels + substitutions | **minimap2**, both strands | `standard.yaml` and anything going in a paper |
+
+`exact` is the model most published phasing benchmarks use, including this
+project's previous one, and it is misleading in a specific way: HiFi error is
+dominated by indel slippage in homopolymers, and those errors matter chiefly
+because an *aligner* has to place them. Emitting the true CIGAR removes exactly
+the difficulty the indel axis is meant to test.
+
+So `hifi` gives reads context-aware error, reverse-complements half of them, and
+aligns them back to the reference with minimap2 through the `mappy` bindings.
+Placement, CIGAR, MAPQ and soft clipping all come from the aligner; nothing tells
+it where a read came from. `standard.yaml` also includes a
+`k4-div5-cov30-exactreads` dataset identical to `k4-div5-cov30` except for the
+read model, so the cost of the shortcut is itself measurable — slice
+`per_sample.tsv` on `read_model`.
+
+What `hifi` still does **not** model: a true CCS error process. The parameters
+(`hifi_substitution_fraction`, `hifi_homopolymer_exponent`, and the rest) are
+literature-shaped approximations, not fitted to an instrument, and every one is
+configurable. If you need more fidelity than that, simulate per-strain reads
+with PBSIM3 (multi-pass CLR then `ccs`) — the read-to-strain mapping survives
+because each strain is simulated separately. Note also that random reference
+sequence contains far fewer long homopolymers than a real genome, which is
+another reason to run the real-genome tier or point `reference_fasta` at your
+own MAG.
+
 **Variant calls are simulated, not handed over.** By default the tools receive a
 *called* VCF derived from the simulated reads - a site is called only if enough
 reads actually carry the alt allele. Handing every tool the exact truth site
@@ -384,14 +416,13 @@ parse produces a `failed` row carrying the error.
 
 Stated here and reprinted at the bottom of every generated report:
 
-- **Alignments are exact.** Reads are emitted at their true coordinates rather
-  than aligned with minimap2, so no tool pays for alignment error or for indel
-  placement ambiguity in repeats. Real performance is lower for every tool, and
-  not necessarily by the same amount.
-- **Sequencing error is substitution-only.** HiFi indel error is dominated by
-  homopolymer slippage, and its interaction with aligner placement cannot be
-  modelled honestly without a real aligner. Germline indel *variants* are
-  simulated; indel *errors* are not.
+- **No true CCS error model.** `read_model: hifi` aligns with real minimap2 and
+  concentrates indel error in homopolymers, but its error parameters are
+  literature-shaped approximations rather than a fit to an instrument. PBSIM3
+  per strain is the higher-fidelity option.
+- **`read_model: exact` datasets are optimistic.** They emit reads at their true
+  coordinates, so no tool pays for alignment error. The smoke tier uses this;
+  the reported tier does not, and the two are not directly comparable.
 - **One reference per dataset.** Cross-species mismapping, a major source of
   false haplotypes in real metagenomes, is absent by construction.
 - **Consensus is harness-derived.** Uniform across tools by design, but these
