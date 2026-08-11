@@ -235,7 +235,8 @@ CI runs the smoke tier twice on every push and fails if the two runs disagree.
 
 See [`benchmark/README.md`](benchmark/README.md) for the metric definitions, the
 simulator's design decisions, how to add a tool, and the suite's known
-limitations.
+limitations, and [`benchmark/PIPELINE.md`](benchmark/PIPELINE.md) for the exact
+parameter-level specification of what runs.
 
 ## License
 

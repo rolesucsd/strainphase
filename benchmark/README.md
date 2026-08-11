@@ -22,6 +22,10 @@ make check                    # which comparators can I see?
 make standard                 # the full sweep
 ```
 
+**[`PIPELINE.md`](PIPELINE.md) is the exact specification** — every parameter,
+every command, every metric definition as committed. It is the source for a
+methods section; this README is the orientation.
+
 ---
 
 ## The problem this suite has to solve
