@@ -1,19 +1,16 @@
 name: Benchmark
 
-# Runs the smoke tier of the public benchmark suite on every push and PR.
+# Unit tests for the benchmark harness.
 #
-# This is a guard on the *harness*, not a measurement of any tool. It proves
-# three things a reader of the results needs to be able to assume:
-#   1. `make smoke` works on a clean clone with nothing but pip.
-#   2. The simulator, the allele extractor and the metrics still agree with
-#      `benchmark/expected/smoke.json`, so a silent change to any of them fails
-#      the build instead of quietly moving every published number.
-#   3. The run is reproducible: it is executed twice and the result tables must
-#      be byte-identical.
+# The benchmark itself cannot run here: simulation invokes Badread, minimap2 and
+# a variant caller, all conda-only. Rather than keep a parallel pure-Python
+# imitation of that pipeline alive purely so CI has something to run, CI tests
+# the parts that are computation and leaves the pipeline to `spbench check-env`
+# on a machine that actually has it.
 #
-# Third-party comparators are not installed here (they are conda-only binaries),
-# so they appear as `skipped` rows. That path is exercised too - it must not
-# crash the run.
+# What is covered here is the part where a silent bug would be invisible in a
+# results table: the metrics, the abundance archetypes, and the derivation of
+# ground truth from assembly-to-reference alignment.
 
 on:
   push:
@@ -23,8 +20,8 @@ on:
   workflow_dispatch:
 
 jobs:
-  smoke:
-    name: Benchmark smoke tier
+  harness-tests:
+    name: Benchmark harness tests
     runs-on: ubuntu-latest
 
     steps:
@@ -43,41 +40,16 @@ jobs:
           pip install -e ".[all]"
           pip install -e ./benchmark
 
-      - name: Unit tests for the simulator and the metrics
+      - name: Unit tests
         working-directory: benchmark
         run: pytest tests -v
 
-      - name: Which comparators are visible here
-        working-directory: benchmark
-        run: spbench check-tools
-
-      - name: Run the smoke benchmark
-        working-directory: benchmark
-        run: make smoke RESULTS=results
-
-      - name: Re-run and require identical results
+      - name: Config files parse and expand
         working-directory: benchmark
         run: |
-          spbench run -c configs/smoke.yaml -w results-repeat
-          for table in per_sample longitudinal detection; do
-            if ! diff -q "results/smoke/results/$table.tsv" "results-repeat/results/$table.tsv"; then
-              echo "::error::$table.tsv differs between two runs of the same config."
-              echo "The benchmark must be reproducible; an unseeded source of randomness has crept in."
-              diff "results/smoke/results/$table.tsv" "results-repeat/results/$table.tsv" | head -40
-              exit 1
-            fi
-          done
-          echo "Both runs produced identical result tables."
+          python -m spbench.cli plan -c configs/example.yaml
+          echo "work units: $(python -m spbench.cli plan -c configs/example.yaml --count)"
 
-      - name: Print the report
-        if: always()
+      - name: Comparator adapters resolve
         working-directory: benchmark
-        run: cat results/smoke/results/report.md || true
-
-      - name: Upload results
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: benchmark-smoke-results
-          path: benchmark/results/smoke/results/
-          retention-days: 14
+        run: python -m spbench.cli check-tools || true

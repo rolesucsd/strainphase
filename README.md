@@ -169,74 +169,54 @@ Options:
 
 ## Benchmarking
 
-A public, reproducible benchmark suite lives in [`benchmark/`](benchmark/). It
-compares strainphase against other long-read strain phasing tools on simulated
-longitudinal mixtures with known ground truth, and it is designed so that anyone
-who clones this repository can rerun it.
+A public benchmark suite lives in [`benchmark/`](benchmark/). It compares
+strainphase against [Floria](https://github.com/bluenote-1577/floria) and
+[Strainy](https://github.com/katerinakazantseva/strainy) on longitudinal
+mixtures built from **real strain assemblies** — the genomes and their
+differences are not simulated, only the abundances over time are.
 
 ```bash
-cd benchmark
-pip install -e .. -e .      # strainphase + the harness
-make smoke                  # ~5 minutes, no downloads, no external tools
+conda env create -f benchmark/envs/spbench.yml && conda activate spbench
+cd benchmark && pip install -e .. -e .
+
+cp configs/example.yaml configs/mine.yaml    # point at your assemblies
+make check CONFIG=configs/mine.yaml
+make run   CONFIG=configs/mine.yaml
 ```
 
-That writes `results/smoke/results/report.md`. The suite needs no input data —
-it simulates its own reference, reads, variant calls and ground truth from a
-seed. To include the third-party comparators, install them from
-`benchmark/envs/` (one conda environment each) and run `make standard`.
+### How a dataset is built
 
-On a cluster, `benchmark/scripts/slurm/submit.sh` submits the same run as three
-dependent SLURM stages — simulate, an array over `(dataset, tool)` pairs, then
-scoring.
-
-### What it compares
-
-| Tool | Task it was built for |
-|------|-----------------------|
-| `strainphase-longitudinal` | Multi-timepoint reconstruction with cross-timepoint rescue and stable lineage identity |
-| `strainphase-single` | The same method with rescue disabled — the like-for-like row |
-| [`floria`](https://github.com/bluenote-1577/floria) | Single-sample strain haplotyping (MEC clustering + network flow) |
-| [`strainy`](https://github.com/katerinakazantseva/strainy) | Single-sample phasing and assembly of strain haplotypes |
-| [`devider`](https://github.com/bluenote-1577/devider) | Haplotyping short spans at high coverage |
-| `whatshap-diploid` | Diploid phasing — the "why not a standard phaser" control |
-| `naive-greedy` | A floor. Greedy Hamming clustering, no model |
+1. **Strains** — a group of closely related assemblies. One is drawn as the
+   reference; the rest are the mixture. True haplotypes come from
+   `minimap2 -cx asm5` of each assembly against that reference.
+2. **Abundances** — simulated from named biological archetypes: `stable`,
+   `bloom`, `colonisation` (starts at exactly 0, logistic growth), `decline`,
+   and a crossing `sweep` pair.
+3. **Reads** — Badread, run per strain at its abundance × coverage. Badread is
+   what Strainy's own HiFi benchmark used.
+4. **Alignment and calling** — your commands, declared in the config, so every
+   tool receives the BAMs and VCFs your real pipeline produces.
 
 ### How the comparison stays fair
 
-strainphase uses several timepoints at once; the tools above phase one sample in
-isolation. Three design choices keep the comparison meaningful rather than
-rhetorical:
+strainphase uses several timepoints at once; Floria and Strainy phase one sample
+in isolation. Three design choices keep that meaningful:
 
-1. **Every tool is scored on its read partition**, not on its own output format.
-   The harness derives consensus haplotypes from each tool's read clusters with
-   the same code for all of them, so the comparison is not confounded by four
-   different consensus callers.
-2. **strainphase competes against itself.** `strainphase-single` is the row that
-   sits next to the single-sample tools; the longitudinal claim is measured as
-   the gap between it and `strainphase-longitudinal` — one flag apart.
-3. **Unclaimed columns read `n/a`, not zero.** Cross-timepoint identity is scored
-   only for tools that claim it, and each tool's intended scope is printed next
-   to its results.
+1. **Every tool is scored on its read partition**, with consensus haplotypes
+   derived by the same code for all of them — so the comparison is not
+   confounded by three different consensus callers.
+2. **strainphase competes against itself.** `strainphase-single` (rescue
+   disabled) is the row beside Floria and Strainy; the longitudinal claim is the
+   gap to `strainphase-longitudinal`, one flag apart.
+3. **Unclaimed columns read `n/a`, not zero.** Cross-timepoint identity is
+   scored only for tools that claim it.
 
 Detection sensitivity is reported stratified by true abundance *and* by absolute
 strain depth (`abundance × coverage`), which separates "the method missed it"
 from "the reads were not there".
 
-Reads for the reported tier are given HiFi-shaped error — indel slippage
-concentrated in homopolymers, plus substitutions — sequenced from both strands,
-and **aligned back to the reference with minimap2**, so placement ambiguity,
-soft clipping and MAPQ are real rather than assumed away. One dataset differs
-only in using exact coordinates, which makes the cost of that shortcut
-measurable.
-
-Runs are seeded end to end and reproducible; `results/provenance.json` records
-the commit, platform, package versions, seeds and thresholds behind every table.
-CI runs the smoke tier twice on every push and fails if the two runs disagree.
-
 See [`benchmark/README.md`](benchmark/README.md) for the metric definitions, the
-simulator's design decisions, how to add a tool, and the suite's known
-limitations, and [`benchmark/PIPELINE.md`](benchmark/PIPELINE.md) for the exact
-parameter-level specification of what runs.
+abundance archetypes, how to add a tool, and the suite's known limitations.
 
 ## License
 

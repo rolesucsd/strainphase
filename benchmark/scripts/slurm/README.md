@@ -54,7 +54,10 @@ Defaults in `submit.sh` are deliberately generous. Tighten them from measured
 numbers after a first run — `results/runs.tsv` carries wall time and peak RSS
 per unit.
 
-- **Memory** is driven by `strainphase-longitudinal`, which holds every
+- **The simulate stage is now the heavy one** — it runs Badread, alignment and
+  variant calling for every timepoint of every dataset. Give it hours, not
+  minutes, and enough memory for your variant caller.
+- **Memory** in the array is driven by `strainphase-longitudinal`, which holds every
   timepoint for one MAG at once. 32 GB is comfortable for the standard tier.
 - **Wall time** is driven by Strainy, which runs an assembler internally.
 - **`--max-concurrent`** throttles the array. Raise it if your partition allows;

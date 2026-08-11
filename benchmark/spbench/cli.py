@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import sys
 from pathlib import Path
@@ -59,11 +58,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_check.add_argument("--config", "-c", help="Only check tools named in this config")
 
-    p_verify = sub.add_parser(
-        "verify", help="Compare results against a stored expectations file"
+    p_env = sub.add_parser(
+        "check-env", help="Report whether the configured pipeline commands can run"
     )
-    p_verify.add_argument("--results", "-r", default="results/results")
-    p_verify.add_argument("--expected", "-e", required=True)
+    p_env.add_argument("--config", "-c", required=True)
 
     args = parser.parse_args(argv)
     logging.basicConfig(
@@ -86,8 +84,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_report(args)
     if args.command == "check-tools":
         return _cmd_check_tools(args)
-    if args.command == "verify":
-        return _cmd_verify(args)
+    if args.command == "check-env":
+        return _cmd_check_env(args)
     parser.error(f"unknown command {args.command}")
     return 2
 
@@ -213,45 +211,32 @@ def _cmd_check_tools(args) -> int:
     return 0
 
 
-def _cmd_verify(args) -> int:
-    """Check results against stored expectations.
+def _cmd_check_env(args) -> int:
+    """Are the configured read / align / call commands runnable here?
 
-    This is what CI runs. It guards the *harness*, not the tools: if a change to
-    the simulator or the metrics moves the baseline's score outside tolerance,
-    that is a bug in this directory, and it should fail loudly rather than
-    quietly rebase the published numbers.
+    Worth running before a cluster job. A wrong command or a missing binary
+    fails every dataset identically, and finding that out from 200 array task
+    logs is a bad afternoon.
     """
-    import pandas as pd
+    from spbench.config import BenchmarkConfig
+    from spbench.simulate import check_environment, required_binaries
 
-    expected = json.loads(Path(args.expected).read_text())
-    per_sample = pd.read_csv(Path(args.results) / "per_sample.tsv", sep="\t")
-    per_sample = per_sample[per_sample["representation"] == "derived"]
-
-    failures = []
-    for check in expected["checks"]:
-        subset = per_sample[per_sample["tool"] == check["tool"]]
-        if "dataset_contains" in check:
-            subset = subset[subset["dataset"].str.contains(check["dataset_contains"])]
-        if subset.empty:
-            failures.append(f"{check['tool']}: no rows matched")
-            continue
-        value = float(subset[check["metric"]].mean())
-        low, high = check["range"]
-        mark = "ok " if low <= value <= high else "FAIL"
-        if mark == "FAIL":
-            failures.append(
-                f"{check['tool']}.{check['metric']} = {value:.4f}, expected [{low}, {high}]"
-            )
-        print(f"  [{mark}] {check['tool']:<26} {check['metric']:<22} {value:.4f}  "
-              f"expected [{low}, {high}]")
-
-    if failures:
-        print("\nFAILED:")
-        for failure in failures:
-            print(f"  - {failure}")
-        return 1
-    print("\nAll checks passed.")
-    return 0
+    config = BenchmarkConfig.load(args.config)
+    all_ok = True
+    for sim_config in config.expand():
+        missing = check_environment(sim_config)
+        needed = required_binaries(sim_config)
+        status = "ok" if not missing else f"MISSING {missing}"
+        print(f"  {sim_config.name:<28} {status}")
+        print(f"  {'':<28} needs: {', '.join(needed)}")
+        assemblies = Path(sim_config.assemblies)
+        if not assemblies.exists() and not list(Path().glob(sim_config.assemblies)):
+            print(f"  {'':<28} assemblies NOT FOUND: {sim_config.assemblies}")
+            all_ok = False
+        if missing:
+            all_ok = False
+        print()
+    return 0 if all_ok else 1
 
 
 if __name__ == "__main__":

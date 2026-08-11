@@ -189,14 +189,14 @@ def _headline_section(per_sample: pd.DataFrame) -> str:
 
 def _group_by_condition(df: pd.DataFrame):
     """Group results by simulated condition, not by individual seed."""
-    keys = [k for k in ("n_strains_config", "coverage") if k in df.columns]
+    keys = [k for k in ("n_strains", "coverage") if k in df.columns]
     if not keys:
         yield "All datasets", df
         return
     for values, group in df.groupby(keys):
         values = values if isinstance(values, tuple) else (values,)
         label = ", ".join(
-            f"{'strains' if k == 'n_strains_config' else k}={v}"
+            f"{k}={v}"
             for k, v in zip(keys, values, strict=True)
         )
         yield label, group
@@ -357,68 +357,33 @@ def _resources_section(runs: pd.DataFrame) -> str:
 
 
 def _caveats_section(per_sample: pd.DataFrame) -> str:
-    """Limitations, phrased against the read model these results actually used.
-
-    Printing "alignments are exact" under results generated with minimap2 would
-    be worse than printing nothing, so this section reads the run rather than
-    asserting a fixed set of caveats.
-    """
-    models = (
-        sorted({str(m) for m in per_sample["read_model"].dropna().unique()})
-        if "read_model" in per_sample
-        else []
-    )
-    has_exact = "exact" in models or not models
-    has_hifi = "hifi" in models
-
-    lines = ["## What this benchmark does not show", ""]
-
-    if has_hifi:
-        lines.append(
-            "- **Reads were aligned, not placed.** Datasets using `read_model: "
-            "hifi` give reads homopolymer-concentrated indel error plus "
-            "substitutions, sequence them from both strands, and align them back "
-            "with minimap2, so placement ambiguity, soft clipping and mapping "
-            "quality are real. What is still missing is a true CCS error model: "
-            "the error parameters are literature-shaped approximations, not "
-            "fitted to an instrument. For higher fidelity, simulate per-strain "
-            "reads with PBSIM3 and feed those in."
-        )
-    if has_exact:
-        lines.append(
-            "- **Some datasets use exact alignments.** Rows with `read_model: "
-            "exact` emit reads at their true coordinates with exact CIGARs and "
-            "substitution-only error, so no tool pays for alignment error or "
-            "indel placement ambiguity. Those numbers are optimistic for every "
-            "tool and are not directly comparable to the `hifi` rows."
-        )
-    if has_exact and has_hifi:
-        lines.append(
-            "- **The gap between the two is itself a result.** Comparing the same "
-            "condition under both read models measures how much of a tool's score "
-            "came from the simulation being clean. Slice `per_sample.tsv` on "
-            "`read_model` to see it."
-        )
-
-    lines.append(
-        "- **One reference per dataset.** Cross-species mismapping, a major "
-        "source of false haplotypes in real metagenomes, is absent by "
-        "construction.\n"
+    """Limitations of this design, stated where the results are read."""
+    return (
+        "## What this benchmark does not show\n\n"
+        "- **The community is one species at a time.** Each dataset is a mixture "
+        "of closely related strains of a single organism aligned to one of their "
+        "own assemblies. Cross-species mismapping, a real source of false "
+        "haplotypes in whole metagenomes, is absent by construction.\n"
+        "- **Abundances are simulated; genomes are not.** The strains and their "
+        "differences are real, and reads come from Badread. What is invented is "
+        "how much of each strain is present at each timepoint - which is the one "
+        "thing a longitudinal benchmark has to control.\n"
+        "- **Truth comes from assembly-to-reference alignment.** Regions no "
+        "`minimap2 -cx asm5` alignment covers yield no truth calls, so accessory "
+        "genome and large rearrangements are outside the scored region. Strains "
+        "carrying a third allele at a site shared with another strain are left "
+        "uncalled there rather than scored as reference.\n"
         "- **Consensus haplotypes are derived by the harness**, identically for "
-        "every tool, from the tool's read partition. This is deliberate - it "
-        "removes four different consensus callers as a confounder - but it means "
-        "these numbers are not each tool's native output quality. Rows labelled "
-        "`native` in `per_sample.tsv` report native output where a tool supplies "
-        "it.\n"
+        "every tool, from the tool's read partition. This removes each tool's "
+        "consensus caller as a confounder, but it means these numbers are not "
+        "each tool's native output quality. Rows labelled `native` in "
+        "`per_sample.tsv` report native output where a tool supplies it.\n"
         "- **Tools were run at published defaults.** No per-tool tuning was done "
-        "for any tool, including strainphase. Tuning strainphase alone would "
-        "invalidate the comparison; tuning all of them fairly is a larger "
-        "exercise than this suite performs.\n"
-        "- **No real-data track with independent ground truth.** A sequenced "
-        "mock community or defined isolate mixture would test what simulation "
-        "cannot. This is the largest remaining gap."
+        "for any tool, including strainphase.\n"
+        "- **No real sequencing run.** Reads are simulated, so no tool pays for "
+        "library artefacts, chimeras or coverage bias. A sequenced mock "
+        "community remains the strongest missing evidence."
     )
-    return "\n".join(lines)
 
 
 def write_report(results_dir: str | Path, output: str | Path | None = None) -> Path:

@@ -1,5 +1,0 @@
-accession	species	filename	url	sha256
-GCF_000005845.2	Escherichia coli K-12 MG1655	ecoli_k12.fna.gz	https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/005/845/GCF_000005845.2_ASM584v2/GCF_000005845.2_ASM584v2_genomic.fna.gz	TBD
-GCF_000009925.1	Bacteroides fragilis NCTC 9343	bfragilis_nctc9343.fna.gz	https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/009/925/GCF_000009925.1_ASM992v1/GCF_000009925.1_ASM992v1_genomic.fna.gz	TBD
-GCF_000020225.1	Akkermansia muciniphila ATCC BAA-835	amuciniphila_baa835.fna.gz	https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/020/225/GCF_000020225.1_ASM2022v1/GCF_000020225.1_ASM2022v1_genomic.fna.gz	TBD
-GCF_000007525.1	Bifidobacterium longum NCC2705	blongum_ncc2705.fna.gz	https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/007/525/GCF_000007525.1_ASM752v1/GCF_000007525.1_ASM752v1_genomic.fna.gz	TBD
