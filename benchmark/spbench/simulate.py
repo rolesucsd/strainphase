@@ -1,426 +1,272 @@
-"""Build a longitudinal dataset from real strain assemblies.
+"""Read simulation, and running strainphase.
 
-Nothing about the genomes is invented. The reference is one of the assemblies,
-the strains are the others, and their differences are whatever the organisms
-actually differ by. Three things are simulated, because they have to be:
+Both live here because both are the parts Snakemake cannot express as a plain
+shell rule: read simulation needs the per-strain plan and exact read renaming,
+and strainphase's read partition comes from the EM posteriors rather than from a
+file it writes.
 
-1. **Abundance over time** — see :mod:`spbench.abundance`.
-2. **Reads** — Badread, at each strain's abundance times the target coverage.
-   Badread is what Strainy's own HiFi benchmark used; running the comparator's
-   simulator removes an obvious objection, and it is better calibrated than
-   anything written for this repository would be.
-3. **Nothing else.** Alignment and variant calling run the same commands the
-   real analysis runs, declared in the config, so the BAMs and VCFs the tools
-   receive are produced by the pipeline being written about rather than by a
-   simulator's idea of one.
-
-Read provenance is exact despite the real aligner: Badread is invoked once per
-strain, and its reads are renamed with that strain's id before the per-sample
-FASTQs are concatenated. Every read therefore carries its true origin in its
-name, and ``truth/read_origins.tsv`` is a fact rather than an inference.
+Everything else in the pipeline — alignment, variant calling, Floria, Strainy —
+is a shell command and lives in the Snakemake rules where it belongs.
 """
 
 from __future__ import annotations
 
 import gzip
-import hashlib
-import json
 import logging
-import shlex
-import shutil
 import subprocess
-from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import numpy as np
 
-from spbench.abundance import AbundanceConfig, build_trajectories
-from spbench.formats import (
-    ABUNDANCE_COLUMNS,
-    READ_ORIGINS_COLUMNS,
-    SITES_COLUMNS,
-    STRAINS_COLUMNS,
-    encode_alleles,
-    write_table,
-)
-from spbench.strains import (
-    build_group,
-    discover_assemblies,
-    haplotype_alleles,
-    read_fasta,
-    union_sites,
-    write_fasta,
-)
+from spbench.formats import READ_ORIGINS_COLUMNS, write_table
 
 logger = logging.getLogger(__name__)
 
-#: Defaults chosen to match common practice for PacBio HiFi metagenomes.
-#: Override them in the config with the exact commands your own workflow runs —
-#: the point of this being a template is that the benchmark's BAMs and VCFs
-#: should be produced by your pipeline, not by an approximation of it.
-DEFAULT_ALIGN_CMD = (
-    "minimap2 -ax map-hifi -t {threads} --secondary=no {reference} {fastq} "
-    "| samtools sort -@ {threads} -o {bam} - && samtools index {bam}"
-)
-DEFAULT_CALL_CMD = (
-    "run_clair3.sh --bam_fn={bam} --ref_fn={reference} --threads={threads} "
-    "--platform=hifi --model_path=${{CLAIR3_MODEL_PATH}} --output={vcf_dir} "
-    "--include_all_ctgs --no_phasing_for_fa --sample_name={sample}"
-)
+#: Badread is what Strainy's own HiFi benchmark used. Placeholders are filled by
+#: name from the plan row plus the read-length settings.
 DEFAULT_READS_CMD = (
-    "badread simulate --reference {assembly} --quantity {quantity}x "
+    "badread simulate --reference {assembly} --quantity {coverage}x "
     "--error_model pacbio2021 --qscore_model pacbio2021 "
     "--identity 30,3 --length {mean_length},{length_sd} --seed {seed}"
 )
 
 
-@dataclass
-class SimConfig:
-    """Everything that determines a dataset."""
-
-    name: str = "dataset"
-    seed: int = 0
-
-    #: Directory or glob of assemblies for this strain group. Required.
-    assemblies: str = ""
-
-    # Sequencing
-    coverage: float = 60.0  # total across all strains
-    mean_read_length: int = 15_000
-    read_length_sd: int = 4_000
-
-    # Timecourse
-    n_timepoints: int = 6
-    abundance: dict = field(default_factory=dict)  # AbundanceConfig overrides
-
-    # Commands. Placeholders are filled by name; unknown placeholders are an
-    # error rather than a silently empty string.
-    reads_cmd: str = DEFAULT_READS_CMD
-    align_cmd: str = DEFAULT_ALIGN_CMD
-    call_cmd: str = DEFAULT_CALL_CMD
-    #: Path, relative to the per-sample variant directory, of the VCF the caller
-    #: produces. Clair3 writes merge_output.vcf.gz; set this to match yours.
-    call_output: str = "merge_output.vcf.gz"
-    #: Optional cohort step run ONCE across all per-sample VCFs. When set, its
-    #: output becomes the VCF handed to every tool for every sample.
-    #:
-    #: This exists because the production pipeline works that way: sites
-    #: polymorphic in any timepoint are genotyped in all of them, so a strain
-    #: that sweeps to fixation or drops out is still reported. It also matters
-    #: for fairness - a union site list is a multi-sample advantage, and it has
-    #: to be given to every tool or to none. Placeholders: {vcfs} {vcf}
-    union_cmd: str = ""
-
-    minimap2_asm_preset: str = "asm5"
-
-    def fingerprint(self) -> str:
-        payload = json.dumps(asdict(self), sort_keys=True).encode()
-        return hashlib.sha256(payload).hexdigest()[:16]
-
-
-def _run(command: str, log_path: Path, env: dict | None = None) -> None:
-    """Run a shell command, teeing output to a log, failing loudly."""
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    logger.info("$ %s", command)
-    with open(log_path, "w") as handle:
-        handle.write(f"$ {command}\n\n")
-        handle.flush()
-        proc = subprocess.run(
-            command, shell=True, stdout=handle, stderr=subprocess.STDOUT, env=env, check=False
-        )
-    if proc.returncode != 0:
-        tail = "\n".join(log_path.read_text(errors="replace").splitlines()[-25:])
-        raise RuntimeError(f"command failed (exit {proc.returncode}):\n{command}\n{tail}")
-
-
-def _format(template: str, **values) -> str:
-    try:
-        return template.format(**values)
-    except KeyError as exc:
-        raise KeyError(
-            f"command template uses unknown placeholder {exc}. Available: "
-            f"{sorted(values)}"
-        ) from exc
-
-
-#: Not worth reporting as "missing": either always present or not a program.
-_SHELL_NOISE = frozenset({"bash", "sh", "cd", "set", "export", "echo", "true", "cat"})
-
-
-def required_binaries(config: SimConfig) -> list[str]:
-    """Every program the configured commands invoke.
-
-    Each command is split on the shell operators that start a new program
-    (``|``, ``&&``, ``;``) and the leading token of each segment is taken. This
-    is a best-effort read of a shell string, not a parse — it is here so a typo
-    or an unactivated environment surfaces from ``spbench check-env`` rather
-    than from a failed cluster job, and it errs toward reporting too much.
-    """
-    binaries: set[str] = set()
-    for template in (config.reads_cmd, config.align_cmd, config.call_cmd, config.union_cmd):
-        if not template:
-            continue
-        for separator in ("&&", "||", ";", "|"):
-            template = template.replace(separator, "\n")
-        for segment in template.split("\n"):
-            try:
-                tokens = shlex.split(segment)
-            except ValueError:
-                continue
-            if not tokens:
-                continue
-            name = tokens[0]
-            # Skip paths, variable expansions and shell plumbing.
-            if name.startswith("-") or name in _SHELL_NOISE:
-                continue
-            if "/" in name or "{" in name or "$" in name:
-                continue
-            binaries.add(name)
-    return sorted(binaries)
-
-
-def check_environment(config: SimConfig) -> list[str]:
-    """Return the configured binaries that are missing from PATH."""
-    return [b for b in required_binaries(config) if shutil.which(b) is None]
-
-
 def simulate_reads(
-    config: SimConfig,
+    plan_path: str | Path,
     sample: str,
-    group,
-    abundance: dict[tuple[str, str], float],
-    outdir: Path,
-    rng: np.random.Generator,
-) -> tuple[Path, list[dict]]:
-    """One FASTQ per timepoint, plus exact read origins.
+    fastq_out: str | Path,
+    origins_out: str | Path,
+    reads_cmd: str = DEFAULT_READS_CMD,
+    mean_length: int = 15_000,
+    length_sd: int = 4_000,
+    seed: int = 0,
+) -> int:
+    """Simulate one timepoint's reads, one invocation per strain.
 
-    Badread runs once per strain at ``abundance x coverage``. A strain at zero
-    abundance is skipped entirely, so an absent strain contributes no reads at
-    all — which is what makes the colonisation and clearance archetypes a real
-    test rather than a low-abundance one.
+    Reads are renamed ``{sample}|{strain}|{n}`` before being concatenated, so
+    every read carries its true origin in its name and ``read_origins.tsv`` is a
+    fact rather than an inference. This is what keeps ground truth exact through
+    a real aligner.
     """
-    fastq_dir = outdir / "fastq"
-    fastq_dir.mkdir(parents=True, exist_ok=True)
-    combined = fastq_dir / f"{sample}.fastq.gz"
+    from spbench.formats import read_table
+
+    rows = [r for r in read_table(plan_path) if r["sample"] == sample]
+    fastq_out = Path(fastq_out)
+    fastq_out.parent.mkdir(parents=True, exist_ok=True)
+    rng = np.random.default_rng(abs(hash((seed, sample))) % (2**31))
+
     origins: list[dict] = []
-
-    if combined.exists():
-        combined.unlink()
-
-    with gzip.open(combined, "wt") as out:
-        for strain_id in group.strain_ids:
-            fraction = abundance.get((sample, strain_id), 0.0)
-            quantity = fraction * config.coverage
-            if quantity <= 0.01:
-                continue
-
-            per_strain = fastq_dir / f"{sample}.{strain_id}.fastq"
-            command = _format(
-                config.reads_cmd,
-                assembly=group.assemblies[strain_id],
-                quantity=f"{quantity:.3f}",
-                mean_length=config.mean_read_length,
-                length_sd=config.read_length_sd,
+    with gzip.open(fastq_out, "wt") as out:
+        for row in rows:
+            command = reads_cmd.format(
+                assembly=row["assembly"],
+                coverage=row["coverage"],
+                mean_length=mean_length,
+                length_sd=length_sd,
                 seed=int(rng.integers(1, 2**31 - 1)),
             )
-            _run(f"{command} > {per_strain}", outdir / "logs" / f"reads.{sample}.{strain_id}.log")
-
-            n = 0
-            with open(per_strain) as handle:
-                for i, line in enumerate(handle):
-                    if i % 4 == 0:
-                        n += 1
-                        read_id = f"{sample}|{strain_id}|{n:07d}"
-                        out.write(f"@{read_id}\n")
-                        origins.append(
-                            {
-                                "sample": sample,
-                                "read_id": read_id,
-                                "contig": "",
-                                "strain_id": strain_id,
-                                "start": "",
-                                "end": "",
-                            }
-                        )
-                    else:
-                        out.write(line)
-            per_strain.unlink()
-            logger.info("  %s / %s: %d reads at %.2fx", sample, strain_id, n, quantity)
-
-    return combined, origins
-
-
-def simulate(config: SimConfig, outdir: str | Path, threads: int = 4) -> Path:
-    """Build one complete dataset. Returns the dataset root."""
-    outdir = Path(outdir)
-    if outdir.exists():
-        shutil.rmtree(outdir)
-    outdir.mkdir(parents=True)
-
-    missing = check_environment(config)
-    if missing:
-        raise RuntimeError(
-            f"missing required binaries: {missing}. Install the benchmark "
-            f"environment (benchmark/envs/spbench.yml) or point the *_cmd "
-            f"settings at what your workflow uses."
-        )
-
-    rng = np.random.default_rng(config.seed)
-
-    # 1. Real strains, one of them the reference.
-    assemblies = discover_assemblies(config.assemblies)
-    group = build_group(config.name, assemblies, rng, preset=config.minimap2_asm_preset)
-    reference_contigs = read_fasta(group.reference_path)
-    write_fasta(outdir / "reference.fasta", reference_contigs)
-
-    sites = union_sites(group)
-    alleles = haplotype_alleles(group, sites)
-
-    # 2. Abundance over time. Only strains other than the reference vary? No -
-    #    the reference strain is a member of the community like any other, and
-    #    excluding it would make the reference-allele haplotype untestable.
-    abundance_config = AbundanceConfig(n_timepoints=config.n_timepoints, **config.abundance)
-    abundance, archetypes = build_trajectories(group.strain_ids, rng, abundance_config)
-    samples = [f"T{i + 1}" for i in range(config.n_timepoints)]
-
-    # 3. Reads, then the real alignment and calling commands.
-    all_origins: list[dict] = []
-    per_sample_vcfs: list[Path] = []
-    for sample in samples:
-        fastq, origins = simulate_reads(config, sample, group, abundance, outdir, rng)
-        all_origins.extend(origins)
-
-        bam = outdir / "bam" / f"{sample}.bam"
-        bam.parent.mkdir(parents=True, exist_ok=True)
-        _run(
-            _format(
-                config.align_cmd,
-                reference=outdir / "reference.fasta",
-                fastq=fastq,
-                bam=bam,
-                threads=threads,
-                sample=sample,
-            ),
-            outdir / "logs" / f"align.{sample}.log",
-        )
-
-        vcf_dir = outdir / "variants" / sample
-        vcf_dir.mkdir(parents=True, exist_ok=True)
-        _run(
-            _format(
-                config.call_cmd,
-                reference=outdir / "reference.fasta",
-                bam=bam,
-                vcf_dir=vcf_dir,
-                vcf=vcf_dir / "calls.vcf.gz",
-                threads=threads,
-                sample=sample,
-            ),
-            outdir / "logs" / f"call.{sample}.log",
-        )
-
-        produced = vcf_dir / config.call_output
-        target = outdir / "variants" / f"{sample}.vcf.gz"
-        if not produced.exists():
-            raise FileNotFoundError(
-                f"variant caller did not produce {produced}. Set `call_output` "
-                f"to the file your caller writes."
+            logger.info("$ %s", command)
+            proc = subprocess.run(
+                command, shell=True, capture_output=True, text=True, check=False
             )
-        shutil.copy(produced, target)
-        _index_vcf(target)
-        per_sample_vcfs.append(target)
+            if proc.returncode != 0:
+                tail = "\n".join(proc.stderr.splitlines()[-20:])
+                raise RuntimeError(f"read simulation failed:\n{command}\n{tail}")
 
-    if config.union_cmd:
-        union = outdir / "variants" / "union_sites.vcf.gz"
-        _run(
-            _format(
-                config.union_cmd,
-                vcfs=" ".join(str(v) for v in per_sample_vcfs),
-                vcf=union,
-                reference=outdir / "reference.fasta",
-                threads=threads,
-            ),
-            outdir / "logs" / "union.log",
+            strain_id = row["strain_id"]
+            n = 0
+            for i, line in enumerate(proc.stdout.splitlines()):
+                if i % 4 == 0:
+                    n += 1
+                    read_id = f"{sample}|{strain_id}|{n:07d}"
+                    out.write(f"@{read_id}\n")
+                    origins.append(
+                        {
+                            "sample": sample,
+                            "read_id": read_id,
+                            "contig": "",
+                            "strain_id": strain_id,
+                            "start": "",
+                            "end": "",
+                        }
+                    )
+                else:
+                    out.write(line + "\n")
+            logger.info("  %s / %s: %d reads at %sx", sample, strain_id, n, row["coverage"])
+
+    write_table(origins_out, READ_ORIGINS_COLUMNS, origins)
+    return len(origins)
+
+
+# --------------------------------------------------------------------------- #
+# strainphase
+# --------------------------------------------------------------------------- #
+
+
+def _config(overrides: dict | None, threads: int):
+    """A stock HaplotyperConfig, seeded.
+
+    strainphase's Louvain initialisation and read subsampling are both random;
+    unseeded, two runs on identical input give different numbers, and a
+    benchmark that cannot be re-run to the same answer is not evidence. Only
+    ``random_seed`` is forced — everything else comes from the config file, and
+    the benchmark's own config sets only window size and max reads to match the
+    production workflow.
+    """
+    from strainphase.core import HaplotyperConfig
+
+    settings = dict(overrides or {})
+    settings.setdefault("random_seed", 0)
+    config = HaplotyperConfig(**settings)
+    if hasattr(config, "n_workers"):
+        config.n_workers = threads
+    return config
+
+
+def _assign_reads(window_results, sample, cluster_of_track, confidence_threshold):
+    """Best-confidence read assignment across overlapping windows.
+
+    Windows overlap 50%, so most reads are assigned twice; taking the window
+    where the posterior is highest is the reading most favourable to
+    strainphase. Reads the model saw but would not commit to are recorded as
+    unassigned rather than dropped, so assigned_fraction reflects reality.
+    """
+    best: dict[tuple[str, str], tuple[str, float]] = {}
+    seen: set[tuple[str, str]] = set()
+
+    for result in window_results:
+        gamma = result.gamma
+        for read in result.window.reads:
+            seen.add((sample, read.id))
+        if gamma is None or gamma.size == 0 or not result.haplotypes:
+            continue
+        n_haps = len(result.haplotypes)
+        if gamma.shape[1] < n_haps:
+            continue
+        hap_gamma = gamma[:, :n_haps]
+        best_k = np.argmax(hap_gamma, axis=1)
+        best_p = hap_gamma[np.arange(hap_gamma.shape[0]), best_k]
+
+        for i, read in enumerate(result.window.reads):
+            if i >= len(best_k):
+                break
+            confidence = float(best_p[i])
+            if confidence < confidence_threshold:
+                continue
+            track_id = result.haplotypes[int(best_k[i])].track_id
+            if not track_id:
+                continue
+            key = (sample, read.id)
+            cluster = cluster_of_track(sample, result.window.contig, track_id)
+            if key not in best or confidence > best[key][1]:
+                best[key] = (cluster, confidence)
+    return best, seen
+
+
+def run_strainphase(
+    mode: str,
+    reference: str | Path,
+    bams: dict[str, str],
+    vcfs: dict[str, str],
+    contigs: dict[str, int],
+    name: str = "dataset",
+    config_overrides: dict | None = None,
+    threads: int = 1,
+    confidence_threshold: float = 0.9,
+) -> tuple[dict[tuple[str, str], str], dict[tuple[str, str], float], list]:
+    """Run strainphase and return ``(assignments, confidences, native_haplotypes)``.
+
+    ``mode="single"`` processes each timepoint independently with no
+    cross-timepoint rescue — the like-for-like row. ``mode="longitudinal"``
+    processes them jointly and uses lineage ids as cluster labels, which is the
+    only configuration that claims identity across samples.
+    """
+    from spbench.formats import UNASSIGNED, Haplotype, decode_alleles
+
+    config = _config(config_overrides, threads)
+    assignments: dict[tuple[str, str], str] = {}
+    confidences: dict[tuple[str, str], float] = {}
+    native: list[Haplotype] = []
+
+    if mode == "single":
+        from strainphase.core import process_contig
+
+        for sample in sorted(bams):
+            for contig, length in contigs.items():
+                results = process_contig(
+                    bam_path=bams[sample],
+                    vcf_path=vcfs[sample],
+                    contig_id=contig,
+                    contig_length=length,
+                    config=config,
+                    sample_id=sample,
+                )
+                if not results:
+                    continue
+                best, seen = _assign_reads(
+                    results,
+                    sample,
+                    lambda s, c, t: f"{s}:{c}:{t}",
+                    confidence_threshold,
+                )
+                for key, (cluster, confidence) in best.items():
+                    assignments[key] = cluster
+                    confidences[key] = confidence
+                for key in seen:
+                    assignments.setdefault(key, UNASSIGNED)
+
+    elif mode == "longitudinal":
+        from strainphase.longitudinal import build_lineage_table, process_mag_longitudinal
+
+        all_results, _ = process_mag_longitudinal(
+            mag_name=name,
+            mag_contigs=dict(contigs),
+            samples=sorted(bams),
+            bam_paths=dict(bams),
+            vcf_paths=dict(vcfs),
+            config=config,
         )
-        if not union.exists():
-            raise FileNotFoundError(f"union_cmd did not produce {union}")
-        # Every sample is handed the same site list, exactly as in production -
-        # and identically for every tool, so the union is not an advantage one
-        # method gets and the others do not.
-        for sample in samples:
-            target = outdir / "variants" / f"{sample}.vcf.gz"
-            target.unlink(missing_ok=True)
-            Path(str(target) + ".tbi").unlink(missing_ok=True)
-            shutil.copy(union, target)
-            _index_vcf(target)
+        lineage_records, _ = build_lineage_table({name: all_results}, config)
+        lineage_of = {
+            (r["sample"], r["contig"], r["track_id"]): r["lineage_id"]
+            for r in lineage_records
+            if r.get("track_id")
+        }
 
-    # 4. Truth tables.
-    truth_dir = outdir / "truth"
-    write_table(
-        truth_dir / "sites.tsv",
-        SITES_COLUMNS,
-        (
-            {"contig": contig, "pos": pos, "ref": ref, "alt": alt}
-            for contig, contig_sites in sites.items()
-            for pos, (ref, alt) in sorted(contig_sites.items())
-        ),
-    )
-    write_table(
-        truth_dir / "strains.tsv",
-        STRAINS_COLUMNS,
-        (
-            {
-                "strain_id": strain_id,
-                "contig": contig,
-                "n_sites": len(per_contig),
-                "alleles": encode_alleles(per_contig),
-            }
-            for strain_id, contigs in alleles.items()
-            for contig, per_contig in contigs.items()
-        ),
-    )
-    write_table(
-        truth_dir / "abundance.tsv",
-        ABUNDANCE_COLUMNS,
-        (
-            {"sample": sample, "strain_id": strain_id, "abundance": f"{value:.6f}"}
-            for (sample, strain_id), value in sorted(abundance.items())
-        ),
-    )
-    write_table(truth_dir / "read_origins.tsv", READ_ORIGINS_COLUMNS, all_origins)
+        def cluster_of_track(sample: str, contig: str, track_id: str) -> str:
+            # Fall back to the per-sample track when a track never entered a
+            # lineage; silently dropping those reads would inflate the partition
+            # scores by discarding the hardest cases.
+            return lineage_of.get((sample, contig, track_id), f"{sample}:{contig}:{track_id}")
 
-    manifest = {
-        "name": config.name,
-        "spbench_version": __import__("spbench").__version__,
-        "config": asdict(config),
-        "config_fingerprint": config.fingerprint(),
-        "samples": samples,
-        "contigs": {name: len(seq) for name, seq in reference_contigs.items()},
-        "reference_strain": group.reference_id,
-        "strains": group.strain_ids,
-        "archetypes": archetypes,
-        "n_variant_sites": sum(len(v) for v in sites.values()),
-        "assemblies": {k: str(v) for k, v in group.assemblies.items()},
-    }
-    (outdir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+        for sample, contig_results in all_results.items():
+            for results in contig_results.values():
+                best, seen = _assign_reads(
+                    results, sample, cluster_of_track, confidence_threshold
+                )
+                for key, (cluster, confidence) in best.items():
+                    assignments[key] = cluster
+                    confidences[key] = confidence
+                for key in seen:
+                    assignments.setdefault(key, UNASSIGNED)
 
-    logger.info(
-        "%s: %d strains (ref %s), %d sites, %d timepoints -> %s",
-        config.name,
-        len(group.strain_ids),
-        group.reference_id,
-        manifest["n_variant_sites"],
-        len(samples),
-        outdir,
-    )
-    return outdir
+        for record in lineage_records:
+            alleles = decode_alleles(record.get("consensus", ""))
+            if not alleles:
+                continue
+            abundance = record.get("abundance")
+            native.append(
+                Haplotype(
+                    hap_id=str(record["lineage_id"]),
+                    sample=str(record["sample"]),
+                    contig=str(record["contig"]),
+                    alleles=alleles,
+                    start=int(record.get("span_start") or 0),
+                    end=int(record.get("span_end") or 0),
+                    abundance=float(abundance) if abundance not in (None, "") else None,
+                )
+            )
+    else:
+        raise ValueError(f"mode must be 'single' or 'longitudinal', got {mode!r}")
 
-
-def _index_vcf(path: Path) -> None:
-    import pysam
-
-    try:
-        pysam.tabix_index(str(path), preset="vcf", force=True)
-    except Exception:  # noqa: BLE001 - already indexed is not an error
-        if not Path(str(path) + ".tbi").exists():
-            raise
+    return assignments, confidences, native

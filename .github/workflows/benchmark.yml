@@ -44,12 +44,30 @@ jobs:
         working-directory: benchmark
         run: pytest tests -v
 
-      - name: Config files parse and expand
+      - name: Workflow DAG builds
         working-directory: benchmark
         run: |
-          python -m spbench.cli plan -c configs/example.yaml
-          echo "work units: $(python -m spbench.cli plan -c configs/example.yaml --count)"
+          pip install snakemake
+          # Fixture assemblies: the DAG shape does not depend on their content,
+          # and the real ones are the user's data.
+          python - <<'EOF'
+          import numpy as np
+          from spbench.strains import write_fasta
+          rng = np.random.default_rng(0)
+          backbone = "".join(rng.choice(list("ACGT"), size=20000).tolist())
+          for i, name in enumerate(["s1", "s2", "s3"]):
+              seq = list(backbone)
+              for p in rng.choice(20000, size=100 * (i + 1), replace=False):
+                  seq[p] = next(b for b in "ACGT" if b != seq[p])
+              write_fasta(f"assemblies/ci/{name}.fasta", {"chr": "".join(seq)})
+          EOF
+          snakemake -s workflow/Snakefile --dry-run \
+            --config groups='{"ci": "assemblies/ci"}' seeds='[0]'
 
-      - name: Comparator adapters resolve
+      - name: Ground truth from assemblies runs end to end
         working-directory: benchmark
-        run: python -m spbench.cli check-tools || true
+        run: |
+          snakemake -s workflow/Snakefile --cores 2 \
+            --config groups='{"ci": "assemblies/ci"}' seeds='[0]' \
+            results/datasets/ci.seed0/plan.tsv
+          cat results/datasets/ci.seed0/manifest.json
