@@ -321,6 +321,23 @@ These were gaps in the previous version of the suite and have been addressed:
 2. **Read length / error rate are still fixed within a sweep.** They can be set per-run via env vars but are not Cartesian-swept by `cluster_benchmark.sh`. Same loop pattern as coverage works.
 3. **Indel injection is uniform random.** Real microbial indel hot spots (tandem repeats, IS elements) are not modeled.
 
+
+## Public benchmark suite (`benchmark/`)
+
+A separate, newer suite lives in `benchmark/` (no trailing "s"). It is a
+Snakemake workflow that compares strainphase against Floria and Strainy on
+mixtures built from **real strain assemblies** rather than simulated genomes,
+with `spbench` as its scoring library.
+
+It is **not yet tracked in git and not yet validated**: Badread, minimap2 and
+SNooPy are conda-only and the simulate-align-call-compare chain has so far only
+been dry-run. Treat its numbers as provisional until it has been run end to end
+on real assemblies. See `benchmark/README.md`.
+
+The two suites are complementary, not replacements for one another: `benchmarks/`
++ `validation/` are the internal parameter-sweep tooling, `benchmark/` is the
+external tool comparison.
+
 ## License
 
 BSD 3-Clause License - see [LICENSE](LICENSE) for details.

@@ -29,10 +29,12 @@ dist/
 .idea/
 .vscode/
 
-# Hide from GitHub
-docs/
-validation/
-benchmarks/
+# Private working directories, not distributed.
+# NOTE: the public benchmark suite lives in benchmark/ (no trailing "s") and is
+# tracked. Keep these patterns anchored so they cannot swallow it.
+/docs/
+/validation/
+/benchmarks/
 
 # Generated data
 data/
@@ -40,6 +42,13 @@ tmp/
 tmp2/
 results/
 strains/
+
+# ...but the benchmark suite's tracked data manifest is not generated data.
+!benchmark/data/
+!benchmark/data/**
+
+# Reference genomes downloaded by benchmark/scripts/fetch_genomes.py
+/benchmark/genomes/
 
 # Conda environments
 .conda/
@@ -49,3 +58,7 @@ agents.md
 future_work.md
 submit_bcf_to_vcf_array.sh
 run_bcf_to_vcf_array.sh
+# Public benchmark suite — untracked until it has been run on real assemblies
+# and verified. The work is preserved in this branch's history; it is held out
+# of the tree so an untested comparison cannot be mistaken for a finished one.
+/benchmark/
