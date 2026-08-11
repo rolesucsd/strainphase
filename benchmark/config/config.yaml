@@ -10,13 +10,13 @@
 # Strain groups: a directory of closely related assemblies per group. One is
 # drawn as the reference (by seed); the rest are the strains in the mixture.
 groups:
-  # group6: assemblies/group6
-  # group4: assemblies/group4
+  group6: assemblies/group6
+  group4: assemblies/group4
   group3: assemblies/group3
 
 # Replicate seeds. The seed picks the reference and the abundance trajectories,
 # so replicating over it averages out both.
-seeds: [0]
+seeds: [0, 1, 2]
 
 # Tools. strainphase-single is the like-for-like row beside floria and strainy;
 # strainphase-longitudinal's comparator is strainphase-single, not them.
