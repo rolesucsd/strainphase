@@ -58,7 +58,8 @@ def read_fasta(path: str | Path) -> dict[str, str]:
     return contigs
 
 
-def write_fasta(path: Path, contigs: dict[str, str], width: int = 60) -> None:
+def write_fasta(path: str | Path, contigs: dict[str, str], width: int = 60) -> None:
+    path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w") as handle:
         for name, seq in contigs.items():

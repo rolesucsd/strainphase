@@ -176,13 +176,15 @@ mixtures built from **real strain assemblies** — the genomes and their
 differences are not simulated, only the abundances over time are.
 
 ```bash
-conda env create -f benchmark/envs/spbench.yml && conda activate spbench
+conda env create -f benchmark/workflow/envs/spbench.yaml && conda activate spbench
 cd benchmark && pip install -e .. -e .
 
-cp configs/example.yaml configs/mine.yaml    # point at your assemblies
-make check CONFIG=configs/mine.yaml
-make run   CONFIG=configs/mine.yaml
+$EDITOR config/config.yaml            # point `groups` at your assembly directories
+snakemake --use-conda --cores 16      # or --profile <your-slurm-profile>
 ```
+
+Output: `results/report/report.md`. It is a Snakemake workflow, so cluster
+submission, resume and per-rule resources come from your existing profile.
 
 ### How a dataset is built
 
@@ -194,8 +196,9 @@ make run   CONFIG=configs/mine.yaml
    and a crossing `sweep` pair.
 3. **Reads** — Badread, run per strain at its abundance × coverage. Badread is
    what Strainy's own HiFi benchmark used.
-4. **Alignment and calling** — your commands, declared in the config, so every
-   tool receives the BAMs and VCFs your real pipeline produces.
+4. **Alignment and calling** — the production workflow's own commands
+   (`workflow/rules/pipeline.smk`), so every tool receives the BAMs and VCFs the
+   real pipeline produces.
 
 ### How the comparison stays fair
 
