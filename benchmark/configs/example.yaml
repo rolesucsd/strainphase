@@ -1,5 +1,13 @@
-# Benchmark config. Copy this, point `assemblies` at your strain groups, and
-# paste your own alignment and variant-calling commands into `pipeline`.
+# Benchmark config.
+#
+# The pipeline commands below are lifted from the production Snakemake workflow
+# (minimap2_align_sample / sort_bam_sample, the SNooPy path, snoopy_union_sites)
+# so the BAMs and VCFs every tool receives are produced the same way the real
+# analysis produces them. Two deliberate differences from the workflow, both
+# noted where they occur:
+#   - no `samtools fastq` step: Badread already emits FASTQ;
+#   - no per-MAG sharding for SNooPy: each dataset here is one strain group on
+#     its own reference, which is what the sharding produces anyway.
 #
 # Nothing about the genomes is simulated. Each group is a set of closely related
 # assemblies; one is drawn as the reference and the rest are the strains in the
@@ -17,40 +25,98 @@ threads: 8
 match_threshold: 0.99
 min_shared_sites: 10
 
+# ---------------------------------------------------------------------------#
+# Tools
+# ---------------------------------------------------------------------------#
+# PARAMETER POLICY (see benchmark/README.md for the reasoning):
+#
+#   Every tool runs at its published defaults FOR PACBIO HIFI. "Defaults" has to
+#   mean the documented HiFi configuration, not the literal argv-free
+#   invocation - running a HiFi dataset under a tool's Nanopore assumptions
+#   would be a strawman, not a fair test.
+#
+#   The only arguments set below are ones that describe the DATA rather than
+#   tune the METHOD. Each is justified inline. Nothing here trades accuracy for
+#   accuracy; if it did, it would belong in a sensitivity sweep instead.
+#
+#   strainphase gets no tuning either: its adapter builds a stock
+#   HaplotyperConfig and overrides only window-size / max-reads to match the
+#   production workflow, plus a fixed random seed for reproducibility.
 tools:
   # strainphase with cross-timepoint rescue OFF. This is the row that belongs
   # next to Floria and Strainy: same input, same information, same task.
-  - strainphase-single
+  - name: strainphase-single
+    options:
+      config:
+        window_size: 20000        # as in the production workflow
+        max_reads_per_window: 500 # as in the production workflow
   # The claim. Its comparator is strainphase-single, not the tools below.
-  - strainphase-longitudinal
-  - floria
-  - strainy
+  - name: strainphase-longitudinal
+    options:
+      config:
+        window_size: 20000
+        max_reads_per_window: 500
 
-# Shared settings, referenced by each dataset below.
+  - name: floria
+    options:
+      extra_args:
+        # Floria's error-rate parameter should describe the reads it is given.
+        # Badread's pacbio2021 model at --identity 30,3 is ~0.1% error; leaving
+        # this at a Nanopore-scale default would make Floria treat real strain
+        # variation as sequencing noise. This is interface, not tuning.
+        - "-e"
+        - "0.001"
+
+  - name: strainy
+    options:
+      # Strainy requires the technology up front and has no sensible default.
+      mode: hifi
+
+# ---------------------------------------------------------------------------#
+# Pipeline, from the production Snakemake workflow
+# ---------------------------------------------------------------------------#
 defaults: &defaults
-  coverage: 60            # total across all strains in the mixture
+  coverage: 60              # total across all strains in the mixture
   mean_read_length: 15000
   read_length_sd: 4000
   n_timepoints: 6
 
-  # Read simulation. Badread is what Strainy's own HiFi benchmark used.
+  # Badread: what Strainy's own HiFi benchmark used.
   reads_cmd: >-
     badread simulate --reference {assembly} --quantity {quantity}x
     --error_model pacbio2021 --qscore_model pacbio2021
     --identity 30,3 --length {mean_length},{length_sd} --seed {seed}
 
-  # >>> REPLACE THESE TWO WITH THE COMMANDS FROM YOUR SNAKEMAKE WORKFLOW <<<
-  # Whatever runs here produces the BAMs and VCFs every tool receives, so the
-  # benchmark measures your pipeline rather than an approximation of it.
-  # Placeholders: {reference} {fastq} {bam} {vcf} {vcf_dir} {sample} {threads}
+  # minimap2_align_sample + sort_bam_sample, minus the `samtools fastq` step
+  # (Badread already emits FASTQ). -N 10 keeps secondaries for multicopy MGE
+  # visibility; --MD --eqx are preserved because they change the CIGAR the
+  # downstream tools read.
   align_cmd: >-
-    minimap2 -ax map-hifi -t {threads} --secondary=no {reference} {fastq}
+    minimap2 -ax map-hifi -t {threads} -N 10 --MD --eqx {reference} {fastq}
     | samtools sort -@ {threads} -o {bam} - && samtools index {bam}
+
+  # SNooPy, the workflow's default SNV source (run_snoopy: true). No per-MAG
+  # sharding here: a dataset is already one strain group on its own reference.
+  # snoopy_to_vcf.py atomizes SNooPy's equal-length blocks (MNP -> SNVs) and
+  # keeps indels; bcftools norm -a -m - canonicalizes.
   call_cmd: >-
-    run_clair3.sh --bam_fn={bam} --ref_fn={reference} --threads={threads}
-    --platform=hifi --model_path=${{CLAIR3_MODEL_PATH}} --output={vcf_dir}
-    --include_all_ctgs --no_phasing_for_fa --sample_name={sample}
-  call_output: merge_output.vcf.gz
+    bash scripts/run_snoopy.sh {bam} {reference} {vcf_dir} {threads}
+    && python scripts/snoopy_to_vcf.py --snoopy {vcf_dir} --ref {reference}
+    --sample {sample} --output {vcf_dir}/raw.vcf.gz
+    && bcftools norm -a -m - -f {reference} -Oz -o {vcf_dir}/calls.vcf.gz
+    {vcf_dir}/raw.vcf.gz
+    && tabix -f -p vcf {vcf_dir}/calls.vcf.gz
+  call_output: calls.vcf.gz
+
+  # snoopy_union_sites: a site polymorphic in >=1 timepoint is queried in ALL of
+  # them, so a strain that sweeps to fixation or drops out keeps a full
+  # trajectory. The union is then handed to EVERY tool identically - it is a
+  # multi-sample advantage, and giving it to strainphase alone would make the
+  # comparison meaningless.
+  union_cmd: >-
+    bcftools concat -a -Ou {vcfs} | bcftools sort -Ou
+    | bcftools norm -d exact -Ou | bcftools view -G -Oz -o {vcf}
+    && tabix -f -p vcf {vcf}
 
 datasets:
   - name: group6

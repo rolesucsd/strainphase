@@ -101,6 +101,15 @@ class SimConfig:
     #: Path, relative to the per-sample variant directory, of the VCF the caller
     #: produces. Clair3 writes merge_output.vcf.gz; set this to match yours.
     call_output: str = "merge_output.vcf.gz"
+    #: Optional cohort step run ONCE across all per-sample VCFs. When set, its
+    #: output becomes the VCF handed to every tool for every sample.
+    #:
+    #: This exists because the production pipeline works that way: sites
+    #: polymorphic in any timepoint are genotyped in all of them, so a strain
+    #: that sweeps to fixation or drops out is still reported. It also matters
+    #: for fairness - a union site list is a multi-sample advantage, and it has
+    #: to be given to every tool or to none. Placeholders: {vcfs} {vcf}
+    union_cmd: str = ""
 
     minimap2_asm_preset: str = "asm5"
 
@@ -134,17 +143,40 @@ def _format(template: str, **values) -> str:
         ) from exc
 
 
+#: Not worth reporting as "missing": either always present or not a program.
+_SHELL_NOISE = frozenset({"bash", "sh", "cd", "set", "export", "echo", "true", "cat"})
+
+
 def required_binaries(config: SimConfig) -> list[str]:
-    """First token of each configured command — what must be on PATH."""
-    binaries = []
-    for template in (config.reads_cmd, config.align_cmd, config.call_cmd):
-        try:
-            tokens = shlex.split(template.split("|")[0].split("&&")[0])
-        except ValueError:
+    """Every program the configured commands invoke.
+
+    Each command is split on the shell operators that start a new program
+    (``|``, ``&&``, ``;``) and the leading token of each segment is taken. This
+    is a best-effort read of a shell string, not a parse — it is here so a typo
+    or an unactivated environment surfaces from ``spbench check-env`` rather
+    than from a failed cluster job, and it errs toward reporting too much.
+    """
+    binaries: set[str] = set()
+    for template in (config.reads_cmd, config.align_cmd, config.call_cmd, config.union_cmd):
+        if not template:
             continue
-        if tokens:
-            binaries.append(tokens[0])
-    return sorted(set(binaries))
+        for separator in ("&&", "||", ";", "|"):
+            template = template.replace(separator, "\n")
+        for segment in template.split("\n"):
+            try:
+                tokens = shlex.split(segment)
+            except ValueError:
+                continue
+            if not tokens:
+                continue
+            name = tokens[0]
+            # Skip paths, variable expansions and shell plumbing.
+            if name.startswith("-") or name in _SHELL_NOISE:
+                continue
+            if "/" in name or "{" in name or "$" in name:
+                continue
+            binaries.add(name)
+    return sorted(binaries)
 
 
 def check_environment(config: SimConfig) -> list[str]:
@@ -253,6 +285,7 @@ def simulate(config: SimConfig, outdir: str | Path, threads: int = 4) -> Path:
 
     # 3. Reads, then the real alignment and calling commands.
     all_origins: list[dict] = []
+    per_sample_vcfs: list[Path] = []
     for sample in samples:
         fastq, origins = simulate_reads(config, sample, group, abundance, outdir, rng)
         all_origins.extend(origins)
@@ -295,6 +328,31 @@ def simulate(config: SimConfig, outdir: str | Path, threads: int = 4) -> Path:
             )
         shutil.copy(produced, target)
         _index_vcf(target)
+        per_sample_vcfs.append(target)
+
+    if config.union_cmd:
+        union = outdir / "variants" / "union_sites.vcf.gz"
+        _run(
+            _format(
+                config.union_cmd,
+                vcfs=" ".join(str(v) for v in per_sample_vcfs),
+                vcf=union,
+                reference=outdir / "reference.fasta",
+                threads=threads,
+            ),
+            outdir / "logs" / "union.log",
+        )
+        if not union.exists():
+            raise FileNotFoundError(f"union_cmd did not produce {union}")
+        # Every sample is handed the same site list, exactly as in production -
+        # and identically for every tool, so the union is not an advantage one
+        # method gets and the others do not.
+        for sample in samples:
+            target = outdir / "variants" / f"{sample}.vcf.gz"
+            target.unlink(missing_ok=True)
+            Path(str(target) + ".tbi").unlink(missing_ok=True)
+            shutil.copy(union, target)
+            _index_vcf(target)
 
     # 4. Truth tables.
     truth_dir = outdir / "truth"

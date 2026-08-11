@@ -65,6 +65,52 @@ consensus with the same code for all of them.
 
 ---
 
+## Parameter policy
+
+Every tool runs at **its published defaults for PacBio HiFi**. That phrasing is
+doing work: "defaults" cannot mean the literal argument-free invocation, because
+several of these tools have separate Nanopore and HiFi configurations and
+running HiFi data under Nanopore assumptions would be a strawman, not a fair
+test.
+
+So the rule is a distinction rather than a blanket ban:
+
+| | Set it | Example |
+|---|---|---|
+| **Describes the data** | Yes — this is interface, not tuning | Strainy `--mode hifi`; Floria `-e 0.001` to match the read error rate |
+| **Trades accuracy for accuracy** | No — goes in a sensitivity sweep if anywhere | cluster-count priors, MEC thresholds, coverage cutoffs |
+
+Setting Floria's error-rate parameter to the actual error rate of the reads is
+not tuning Floria — it is telling Floria what it asks to be told. Leaving it at
+a Nanopore-scale value would make Floria treat real strain variation as
+sequencing noise, and the resulting number would say nothing about Floria.
+
+The same restraint applies to strainphase, which is the part that matters: its
+adapter builds a **stock `HaplotyperConfig`** and overrides only `window_size`
+and `max_reads_per_window` to match the production workflow, plus a fixed
+`random_seed` for reproducibility. No threshold, no merge distance, no rescue
+parameter is touched. Whatever is set for any tool is recorded verbatim in
+`runs.tsv`, so the parameters behind any number are recoverable.
+
+### The site list is a bigger fairness question than parameters
+
+The production pipeline builds a **cohort union** VCF: a site polymorphic in any
+one timepoint is genotyped in all of them, so a strain that sweeps to fixation
+or drops out keeps a full trajectory. That union is a multi-sample advantage
+that has nothing to do with the phasing algorithm.
+
+Handing it to strainphase and giving Floria and Strainy only their own
+single-sample calls would make strainphase look better for a reason unrelated to
+what it does. So the harness gives **every tool the identical VCF for a given
+sample** — including the union when `union_cmd` is configured. Floria and
+Strainy benefit from the better site list too, which is the point.
+
+If you want to know how much of any result comes from the union rather than the
+phasing, drop `union_cmd` and re-run: that is a one-line ablation and it is the
+first thing a careful reviewer will ask for.
+
+---
+
 ## Input
 
 One directory of assemblies per strain group:

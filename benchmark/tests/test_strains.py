@@ -195,3 +195,52 @@ def test_fasta_round_trip(tmp_path):
     contigs = {"c1": "ACGT" * 100, "c2": "GGGGTTTT" * 50}
     write_fasta(tmp_path / "x.fasta", contigs)
     assert read_fasta(tmp_path / "x.fasta") == contigs
+
+
+# --------------------------------------------------------------------------- #
+# CIGAR conventions the production aligner emits
+# --------------------------------------------------------------------------- #
+
+
+def test_allele_extraction_handles_eqx_cigars(tmp_path):
+    """The production workflow aligns with `minimap2 --eqx`, which emits `=`/`X`
+    operations instead of `M`.
+
+    A reader that only understood `M` would return no calls at all — and it
+    would do so for every tool equally, so the results table would look like a
+    uniformly hard dataset rather than a bug. This pins the behaviour.
+    """
+    import pysam
+
+    from spbench.reads import read_alleles
+
+    reference = "ACGT" * 500
+    header = {"HD": {"VN": "1.6", "SO": "coordinate"},
+              "SQ": [{"SN": "chr", "LN": len(reference)}]}
+
+    bam_path = tmp_path / "eqx.bam"
+    with pysam.AlignmentFile(str(bam_path), "wb", header=header) as out:
+        for i in range(6):
+            aln = pysam.AlignedSegment(out.header)
+            aln.query_name = f"read{i}"
+            # 100 bases: 49 matches, one mismatch at offset 49, 50 matches.
+            seq = list(reference[100:200])
+            seq[49] = "T" if seq[49] != "T" else "G"
+            aln.query_sequence = "".join(seq)
+            aln.query_qualities = pysam.qualitystring_to_array("I" * 100)
+            aln.flag = 0
+            aln.reference_id = 0
+            aln.reference_start = 100
+            aln.mapping_quality = 60
+            # =/X operations rather than M — what --eqx produces.
+            aln.cigartuples = [(7, 49), (8, 1), (7, 50)]
+            out.write(aln)
+    pysam.index(str(bam_path))
+
+    variant_pos = 150  # 1-based position of the mismatching base
+    sites = {variant_pos: (reference[variant_pos - 1], "T", "snv")}
+    observed = read_alleles(str(bam_path), "chr", sites)
+
+    assert len(observed) == 6, "no reads produced calls from an =/X CIGAR"
+    for calls in observed.values():
+        assert variant_pos in calls
