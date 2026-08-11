@@ -167,60 +167,6 @@ Options:
 └─────────────────────────────────────────────────────────────┘
 ```
 
-## Benchmarking
-
-A public benchmark suite lives in [`benchmark/`](benchmark/). It compares
-strainphase against [Floria](https://github.com/bluenote-1577/floria) and
-[Strainy](https://github.com/katerinakazantseva/strainy) on longitudinal
-mixtures built from **real strain assemblies** — the genomes and their
-differences are not simulated, only the abundances over time are.
-
-```bash
-conda env create -f benchmark/workflow/envs/spbench.yaml && conda activate spbench
-cd benchmark && pip install -e .. -e .
-
-$EDITOR config/config.yaml            # point `groups` at your assembly directories
-snakemake --use-conda --cores 16      # or --profile <your-slurm-profile>
-```
-
-Output: `results/report/report.md`. It is a Snakemake workflow, so cluster
-submission, resume and per-rule resources come from your existing profile.
-
-### How a dataset is built
-
-1. **Strains** — a group of closely related assemblies. One is drawn as the
-   reference; the rest are the mixture. True haplotypes come from
-   `minimap2 -cx asm5` of each assembly against that reference.
-2. **Abundances** — simulated from named biological archetypes: `stable`,
-   `bloom`, `colonisation` (starts at exactly 0, logistic growth), `decline`,
-   and a crossing `sweep` pair.
-3. **Reads** — Badread, run per strain at its abundance × coverage. Badread is
-   what Strainy's own HiFi benchmark used.
-4. **Alignment and calling** — the production workflow's own commands
-   (`workflow/rules/pipeline.smk`), so every tool receives the BAMs and VCFs the
-   real pipeline produces.
-
-### How the comparison stays fair
-
-strainphase uses several timepoints at once; Floria and Strainy phase one sample
-in isolation. Three design choices keep that meaningful:
-
-1. **Every tool is scored on its read partition**, with consensus haplotypes
-   derived by the same code for all of them — so the comparison is not
-   confounded by three different consensus callers.
-2. **strainphase competes against itself.** `strainphase-single` (rescue
-   disabled) is the row beside Floria and Strainy; the longitudinal claim is the
-   gap to `strainphase-longitudinal`, one flag apart.
-3. **Unclaimed columns read `n/a`, not zero.** Cross-timepoint identity is
-   scored only for tools that claim it.
-
-Detection sensitivity is reported stratified by true abundance *and* by absolute
-strain depth (`abundance × coverage`), which separates "the method missed it"
-from "the reads were not there".
-
-See [`benchmark/README.md`](benchmark/README.md) for the metric definitions, the
-abundance archetypes, how to add a tool, and the suite's known limitations.
-
 ## License
 
 BSD 3-Clause License - see [LICENSE](LICENSE) for details.
