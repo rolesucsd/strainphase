@@ -58,7 +58,3 @@ agents.md
 future_work.md
 submit_bcf_to_vcf_array.sh
 run_bcf_to_vcf_array.sh
-# Public benchmark suite — untracked until it has been run on real assemblies
-# and verified. The work is preserved in this branch's history; it is held out
-# of the tree so an untested comparison cannot be mistaken for a finished one.
-/benchmark/

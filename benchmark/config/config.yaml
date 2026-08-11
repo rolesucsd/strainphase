@@ -1,0 +1,61 @@
+# Benchmark configuration.
+#
+# `pipeline` holds the alignment and variant-calling commands. They are copied
+# from the production Snakemake workflow so the BAMs and VCFs every tool
+# receives are produced the way the real analysis produces them. When the
+# production Snakefile is split into rule modules, replace
+# workflow/rules/pipeline.smk with an `include:` of the real one and this block
+# goes away.
+
+# Strain groups: a directory of closely related assemblies per group. One is
+# drawn as the reference (by seed); the rest are the strains in the mixture.
+groups:
+  group6: assemblies/group6
+  group4: assemblies/group4
+  group3: assemblies/group3
+
+# Replicate seeds. The seed picks the reference and the abundance trajectories,
+# so replicating over it averages out both.
+seeds: [0, 1, 2]
+
+# Tools. strainphase-single is the like-for-like row beside floria and strainy;
+# strainphase-longitudinal's comparator is strainphase-single, not them.
+tools:
+  - strainphase-single
+  - strainphase-longitudinal
+  - floria
+  - strainy
+
+simulation:
+  coverage: 60            # total across all strains
+  n_timepoints: 6
+  mean_read_length: 15000
+  read_length_sd: 4000
+  asm_preset: asm5        # minimap2 preset for assembly-to-reference truth
+  # Badread: what Strainy's own HiFi benchmark used.
+  reads_cmd: >-
+    badread simulate --reference {assembly} --quantity {coverage}x
+    --error_model pacbio2021 --qscore_model pacbio2021
+    --identity 30,3 --length {mean_length},{length_sd} --seed {seed}
+
+scoring:
+  match_threshold: 0.99
+  min_shared_sites: 10
+
+# PARAMETER POLICY: published defaults FOR HIFI. The only arguments set are ones
+# describing the data rather than tuning the method. See benchmark/README.md.
+tool_params:
+  # Matched to the production workflow's strainphase invocation.
+  strainphase:
+    window_size: 20000
+    max_reads_per_window: 500
+  # Floria's error-rate parameter should describe the reads it is given.
+  # Badread's pacbio2021 model at --identity 30,3 is ~0.1% error.
+  floria_extra: "-e 0.001"
+  # Strainy requires the technology up front and has no sensible default.
+  strainy_mode: hifi
+
+resources:
+  align_threads: 16
+  call_threads: 8
+  tool_threads: 8

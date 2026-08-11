@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "spbench"
+version = "1.0.0"
+description = "Reproducible benchmark harness comparing strainphase with other long-read strain phasing tools"
+readme = "README.md"
+license = {text = "BSD-3-Clause"}
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.20",
+    "scipy>=1.7",
+    "pandas>=1.3",
+    "pysam>=0.19",
+    "PyYAML>=6.0",
+    # minimap2 bindings. Required by read_model: hifi, which is what the
+    # reported tier uses - reads are aligned back to the reference rather than
+    # emitted at their true coordinates.
+    "mappy>=2.24",
+]
+
+[project.optional-dependencies]
+# Figures. The report is complete without them; only the PNG is skipped.
+plots = ["matplotlib>=3.5"]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+spbench = "spbench.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["spbench*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-q"
+
+[tool.isort]
+profile = "black"
+line_length = 100
+# spbench and strainphase are installed as editable packages, so isort would
+# otherwise sort them into the third-party block alongside numpy.
+known_first_party = ["spbench", "strainphase"]
