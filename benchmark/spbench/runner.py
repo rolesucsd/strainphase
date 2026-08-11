@@ -45,7 +45,7 @@ def simulate_all(config: BenchmarkConfig, workdir: Path, force: bool = False) ->
                 roots.append(root)
                 continue
             logger.info("config changed for %s; regenerating", sim_config.name)
-        simulate(sim_config, root)
+        simulate(sim_config, root, threads=config.threads)
         roots.append(root)
     return roots
 
@@ -161,14 +161,12 @@ def _stamp(rows: list[dict], dataset: Dataset, spec) -> list[dict]:
     sim = dataset.manifest.get("config", {})
     extra = {
         "seed": sim.get("seed"),
-        "n_strains_config": sim.get("n_strains"),
+        "n_strains": len(dataset.manifest.get("strains", [])),
+        "reference_strain": dataset.manifest.get("reference_strain", ""),
         "coverage": sim.get("coverage"),
         "n_timepoints": sim.get("n_timepoints"),
-        "error_rate": sim.get("error_rate"),
-        "indel_fraction": sim.get("indel_fraction"),
-        "vcf_mode": sim.get("vcf_mode"),
-        "read_model": sim.get("read_model"),
-        "aligner": sim.get("aligner"),
+        "mean_read_length": sim.get("mean_read_length"),
+        "n_variant_sites": dataset.manifest.get("n_variant_sites"),
         "tool_options": json.dumps(spec.options, sort_keys=True) if spec.options else "",
     }
     return [{**row, **extra} for row in rows]

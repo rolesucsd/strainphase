@@ -21,10 +21,14 @@ class Dataset:
     reference: Path
     bams: dict[str, Path]
     vcfs: dict[str, Path]
-    union_vcf: Path
     samples: list[str]
     contigs: dict[str, int]
     manifest: dict
+
+    @property
+    def reference_strain(self) -> str:
+        """Which assembly was designated the reference for this dataset."""
+        return self.manifest.get("reference_strain", "")
 
     @classmethod
     def load(cls, root: str | Path) -> Dataset:
@@ -37,7 +41,6 @@ class Dataset:
             reference=root / "reference.fasta",
             bams={s: root / "bam" / f"{s}.bam" for s in samples},
             vcfs={s: root / "variants" / f"{s}.vcf.gz" for s in samples},
-            union_vcf=root / "variants" / "union.vcf.gz",
             samples=samples,
             contigs=dict(manifest["contigs"]),
             manifest=manifest,

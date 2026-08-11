@@ -1,0 +1,71 @@
+# Benchmark config. Copy this, point `assemblies` at your strain groups, and
+# paste your own alignment and variant-calling commands into `pipeline`.
+#
+# Nothing about the genomes is simulated. Each group is a set of closely related
+# assemblies; one is drawn as the reference and the rest are the strains in the
+# mixture. Their true haplotypes come from `minimap2 -cx asm5` of each assembly
+# against that reference.
+
+name: strainphase-vs-floria-strainy
+description: >
+  Three real strain groups, six timepoints, three replicate seeds. Abundance
+  trajectories follow named biological archetypes including colonisation from
+  zero.
+
+seeds: [0, 1, 2]
+threads: 8
+match_threshold: 0.99
+min_shared_sites: 10
+
+tools:
+  # strainphase with cross-timepoint rescue OFF. This is the row that belongs
+  # next to Floria and Strainy: same input, same information, same task.
+  - strainphase-single
+  # The claim. Its comparator is strainphase-single, not the tools below.
+  - strainphase-longitudinal
+  - floria
+  - strainy
+
+# Shared settings, referenced by each dataset below.
+defaults: &defaults
+  coverage: 60            # total across all strains in the mixture
+  mean_read_length: 15000
+  read_length_sd: 4000
+  n_timepoints: 6
+
+  # Read simulation. Badread is what Strainy's own HiFi benchmark used.
+  reads_cmd: >-
+    badread simulate --reference {assembly} --quantity {quantity}x
+    --error_model pacbio2021 --qscore_model pacbio2021
+    --identity 30,3 --length {mean_length},{length_sd} --seed {seed}
+
+  # >>> REPLACE THESE TWO WITH THE COMMANDS FROM YOUR SNAKEMAKE WORKFLOW <<<
+  # Whatever runs here produces the BAMs and VCFs every tool receives, so the
+  # benchmark measures your pipeline rather than an approximation of it.
+  # Placeholders: {reference} {fastq} {bam} {vcf} {vcf_dir} {sample} {threads}
+  align_cmd: >-
+    minimap2 -ax map-hifi -t {threads} --secondary=no {reference} {fastq}
+    | samtools sort -@ {threads} -o {bam} - && samtools index {bam}
+  call_cmd: >-
+    run_clair3.sh --bam_fn={bam} --ref_fn={reference} --threads={threads}
+    --platform=hifi --model_path=${{CLAIR3_MODEL_PATH}} --output={vcf_dir}
+    --include_all_ctgs --no_phasing_for_fa --sample_name={sample}
+  call_output: merge_output.vcf.gz
+
+datasets:
+  - name: group6
+    assemblies: assemblies/group6      # 6 closely related strains
+    <<: *defaults
+  - name: group4
+    assemblies: assemblies/group4      # 4 closely related strains
+    <<: *defaults
+  - name: group3
+    assemblies: assemblies/group3      # 3 closely related strains
+    <<: *defaults
+
+  # Coverage sensitivity on the largest group. Low coverage is where
+  # cross-timepoint information should matter most.
+  - name: group6-cov20
+    assemblies: assemblies/group6
+    <<: *defaults
+    coverage: 20
