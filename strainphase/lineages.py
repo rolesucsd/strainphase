@@ -187,10 +187,21 @@ class Lineage:
         overlapping region is effectively double-weighted.
         """
         acc: dict[str, list[int]] = {}
+        # The denominators are a per-(sample, window) constant - one WindowResult's
+        # non-junk and junk totals, copied onto every haplotype of that window - so they
+        # are accumulated once per window while the numerator is summed over members. A
+        # window where a strain split into two near-identical haplotypes would otherwise
+        # count its own denominator twice and report half the abundance, i.e. an error
+        # correlated with exactly the event the split represents.
+        counted: set[tuple[str, int]] = set()
         for g in self.groups:
             for m in g.members:
                 a = acc.setdefault(m.sample, [0, 0, 0, 0])
                 a[0] += m.reads
+                cell = (m.sample, g.window_start)
+                if cell in counted:
+                    continue
+                counted.add(cell)
                 a[1] += m.total_reads
                 a[2] += m.junk_reads
                 a[3] += 1
@@ -241,18 +252,45 @@ class LineageEdge:
 
 
 def _group_consensus(group: WindowGroup) -> dict[int, str]:
-    """Majority allele per position across the group's members."""
+    """Majority allele per position across the group's members. A TIE emits no call.
+
+    ``Counter.most_common`` breaks a tie on first-increment order, which here is member
+    order, which follows the order the samples were given on the command line - so the
+    same BAMs listed as ``A,B`` and ``B,A`` produced different consensus bases and, once
+    one of them fell in a forward overlap, different lineages. Dropping the position
+    instead is both deterministic and the honest reading: this consensus is only ever
+    used as a VETO, and a veto may not rest on a coin flip. A dropped position simply
+    stops being shared, which costs at worst a ``failed_no_evidence`` - and that refuses
+    nothing.
+    """
     votes: dict[int, Counter] = defaultdict(Counter)
     for m in group.members:
         for pos, base in m.consensus.items():
             votes[pos][base] += 1
-    return {p: c.most_common(1)[0][0] for p, c in votes.items()}
+    out: dict[int, str] = {}
+    for p, c in votes.items():
+        top = c.most_common(2)
+        if len(top) > 1 and top[1][1] == top[0][1]:
+            continue
+        out[p] = top[0][0]
+    return out
 
 
 def _group_counts(group: WindowGroup) -> dict[str, tuple[int, int]]:
     """sample -> (supporting reads, non-junk reads). RAW counts: the abundance veto is a
-    likelihood test on these, never on the derived (already quantised) ``abundance``."""
-    return {m.sample: (m.reads, m.total_reads) for m in group.members}
+    likelihood test on these, never on the derived (already quantised) ``abundance``.
+
+    One sample can legitimately contribute TWO members to a group -
+    ``merge_similar_haplotypes`` deliberately declines some 1-SNP pairs and both halves
+    then clear the step-2 gate - so the supporting reads are summed across them. The
+    denominator is not: it is one window's non-junk total, carried identically on every
+    member, so it is taken once.
+    """
+    acc: dict[str, list[int]] = {}
+    for m in group.members:
+        a = acc.setdefault(m.sample, [0, m.total_reads])
+        a[0] += m.reads
+    return {s: (k, n) for s, (k, n) in acc.items()}
 
 
 def _shares_incompatible(
@@ -319,11 +357,21 @@ def _lineage_abundance_incompatible(
     more than the noise floor at 34.2% of shared timepoints, while the median
     pairwise disagreement was ~0. Pooling every window of the chain into one
     per-sample comparison catches what no adjacent pair could.
+
+    One pair per WINDOW, which is what ``abundance_coherent`` is contracted on. Two
+    members of one sample inside one group are one strain that split into two
+    near-identical haplotypes, not two windows disagreeing; handing them to Fisher as
+    if they were would make any lineage carrying such a split incoherent at every cut
+    and recurse it down to singletons.
     """
-    per_sample: dict[str, list[tuple[int, int]]] = defaultdict(list)
+    per_window: dict[tuple[str, int], list[int]] = {}
     for g in groups:
         for m in g.members:
-            per_sample[m.sample].append((m.reads, m.total_reads))
+            cell = per_window.setdefault((m.sample, g.window_start), [0, m.total_reads])
+            cell[0] += m.reads
+    per_sample: dict[str, list[tuple[int, int]]] = defaultdict(list)
+    for (sample, _w), (k, n) in sorted(per_window.items()):
+        per_sample[sample].append((k, n))
     return _shares_incompatible(per_sample, config, max_bad_frac, min_tested)
 
 

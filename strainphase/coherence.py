@@ -59,8 +59,12 @@ def abundance_coherent(
     very low depth the test has no power and would wave everything through, so including
     them would dilute the result.
 
-    Returns coherent=True when fewer than half of the tested pairs are incoherent; a
-    single unlucky pair should not veto a merge.
+    Returns coherent=True unless MORE than half of the tested pairs are incoherent - at
+    exactly half it still merges. The tolerance is the point: a single unlucky pair
+    should not veto a merge, and one outlier among m windows produces m-1 incoherent
+    pairs out of m(m-1)/2, i.e. exactly half at m=4. Excluding the half case would make
+    a lone outlier veto at four windows and not at five, which is a threshold artefact
+    rather than a rule.
     """
     usable = [(k, n) for k, n in counts if n >= config.min_reads_for_coherence]
     if len(usable) < 2:

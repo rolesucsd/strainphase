@@ -36,8 +36,9 @@ available and produce identical output schemas:
 ``reciprocal``
     Unique-best-on-both-sides plus mutual agreement between consecutive samples, with a
     per-haplotype dropout skip (``t -> t+2`` attempted ONLY for haplotypes that found no
-    partner at ``t+1``, so transitive triangles cannot form). Requires a genuinely
-    chronological sample order to mean anything.
+    partner at ``t+1``, and only when the merge would not put two haplotypes of one
+    sample in one group). Requires a genuinely chronological sample order to mean
+    anything.
 
 Failed comparisons are retained, not discarded, with the reason attached
 (``failed_no_evidence`` vs ``failed_mismatch``). Downstream consumers need that
@@ -183,7 +184,9 @@ def _pairwise(
 
 
 def _labels_clique(
-    haps: list[WindowHaplotype], gates: dict[tuple[int, int], object]
+    haps: list[WindowHaplotype],
+    gates: dict[tuple[int, int], object],
+    config: HaplotyperConfig = DEFAULT_CONFIG,
 ) -> list[int]:
     """Complete-linkage clustering: every member within threshold of every other.
 
@@ -205,7 +208,13 @@ def _labels_clique(
     condensed = squareform(dist, checks=False)
     linkage_matrix = linkage(condensed, method="complete")
     # fcluster is inclusive at t, so nudge below 1.0 to keep explicit non-merges apart.
-    threshold = min(DEFAULT_CONFIG.lineage_merge_distance, 0.999)
+    # The threshold must come from the CALLER's config, not from DEFAULT_CONFIG: the gate
+    # above already ran at `config.lineage_merge_distance`, and clustering at a different
+    # value meant a raised --lineage-merge-distance admitted pairs the gate called linked
+    # and then split them anyway - steps 2 and 3 running at two different identities.
+    # How far raising it can reach is capped by `max_num_diff` regardless: a pair still
+    # needs n_diff <= 1, so beyond 1/min_shared the absolute cap binds, not the rate.
+    threshold = min(config.lineage_merge_distance, 0.999)
     return [int(x) for x in fcluster(linkage_matrix, t=threshold, criterion="distance")]
 
 
@@ -239,6 +248,11 @@ def _labels_reciprocal(
     graph.add_nodes_from(range(len(haps)))
     present = [s for s in sample_order if s in by_sample]
 
+    # Per-haplotype dropout skip: `t -> t+2` is attempted ONLY for a haplotype that found
+    # no partner at `t+1`. Gating per SAMPLE PAIR instead would make a haplotype that
+    # legitimately needs a skip lose its link whenever some other haplotype in the same
+    # sample happened to find a t+1 partner.
+    skips: list[tuple[int, int]] = []
     for t in range(len(present) - 1):
         left = by_sample[present[t]]
         pairs = matched_pairs(left, by_sample[present[t + 1]])
@@ -246,14 +260,30 @@ def _labels_reciprocal(
             graph.add_edge(a, b)
         linked = {a for a, _ in pairs}
         if t + 2 < len(present):
-            # Per-haplotype dropout skip. Gating per SAMPLE PAIR instead would make a
-            # haplotype that legitimately needs a skip lose its link whenever some other
-            # haplotype in the same sample happened to find a t+1 partner. Gating per
-            # haplotype also makes transitive triangles impossible: the source of a skip
-            # edge has no t+1 edge by definition.
-            for a, b in matched_pairs(left, by_sample[present[t + 2]]):
-                if a not in linked:
-                    graph.add_edge(a, b)
+            skips.extend(
+                (a, b)
+                for a, b in matched_pairs(left, by_sample[present[t + 2]])
+                if a not in linked
+            )
+
+    # Skip edges are applied LAST, and only when the merge they cause keeps one haplotype
+    # per sample. The consecutive-sample edges above cannot break that on their own -
+    # unique_best_matches is injective on both sides, so a component is a path visiting
+    # samples in order - and per-haplotype gating rules out transitive TRIANGLES, since
+    # the source of a skip edge has no t+1 edge by definition. Neither argument covers a
+    # longer cycle, and the labels below come from connected components, i.e. single
+    # linkage: a1~b, b~c and a skip a2~c close a 4-node cycle that puts BOTH of one
+    # sample's haplotypes in one group. That contradicts the premise the pipeline rests
+    # on - a strain has ONE haplotype at a locus - so the premise is checked directly
+    # rather than argued from the edge pattern. Deferring the skips is what makes the
+    # check meaningful: they are a repair for a dropout, so the structure they are being
+    # tested against has to be the finished one.
+    for a, b in skips:
+        merged = (nx.node_connected_component(graph, a)
+                  | nx.node_connected_component(graph, b))
+        if len({haps[i].sample for i in merged}) < len(merged):
+            continue
+        graph.add_edge(a, b)
 
     labels = [0] * len(haps)
     for k, component in enumerate(nx.connected_components(graph)):
@@ -279,7 +309,7 @@ def group_window_across_samples(
     gates, edges, counts = _pairwise(haps, markers, config)
 
     if config.cross_sample_method == "clique":
-        labels = _labels_clique(haps, gates)
+        labels = _labels_clique(haps, gates, config)
     elif config.cross_sample_method == "reciprocal":
         order = sample_order or sorted({h.sample for h in haps})
         labels = _labels_reciprocal(haps, gates, order)
