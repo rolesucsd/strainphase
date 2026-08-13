@@ -376,6 +376,18 @@ class Read:
     # skipped rather than silently rejecting everything.
     ref_start: int = 0
     ref_end: int = 0
+    # Aligned reference intervals, 1-based [start, end), one per alignment segment. Empty
+    # for a read from a single alignment, whose outer span IS its coverage. A molecule
+    # re-assembled from split alignments carries one entry per segment, because there
+    # ref_start/ref_end bracket the unaligned gap between the segments as well - asking
+    # the outer span whether the read covers a position answers yes inside its own gap.
+    segments: list[tuple[int, int]] = field(default_factory=list)
+
+    def covers(self, pos: int) -> bool:
+        """Is *pos* inside an ALIGNED part of this read? Unknown span (0, 0) is False."""
+        if self.segments:
+            return any(s <= pos < e for s, e in self.segments)
+        return self.ref_start <= pos < self.ref_end
 
     def overlap_bp(self, other: Read) -> int:
         """Physical reference overlap with *other*, in bp. -1 when either span is unknown."""
@@ -400,7 +412,13 @@ class Window:
     end: int  # 1-based, exclusive
     snv_pos: list[int] = field(default_factory=list)  # SNV positions (from VCF)
     ref_alleles: dict[int, str] = field(default_factory=dict)  # REF base per SNV (from VCF)
-    reads: list[Read] = field(default_factory=list)  # Reads overlapping this window (from BAM)
+    # Reads overlapping this window (from BAM), in gamma-row order. AFTER a
+    # WindowResult offloads its heavy fields these are id-only stand-ins
+    # (longitudinal._ReadRef) rather than Reads: the payload is released but the row
+    # order and the read ids survive, so a consumer can still say which read each gamma
+    # row belongs to. Anything needing alleles must run before the offload - which
+    # everything in this module does.
+    reads: list[Read] = field(default_factory=list)
     # Per-position site type ("snv" / "del" / "ins" / "sv") for the positions in this
     # window. Carried on the Window because the identity code downstream needs to know
     # which positions are structural variants in order to exclude them from the distance
@@ -682,6 +700,8 @@ class LogProbCache:
         self._log_match = np.zeros(max_q + 1)
         self._log_mismatch = np.zeros(max_q + 1)
         self.n_alleles = n_alleles
+        # Junk tables depend on junk_divergence_rate, which is config, not alphabet.
+        self._junk_tables: dict[float, tuple[np.ndarray, np.ndarray]] = {}
 
         denom = float(n_alleles - 1)
         for q in range(max_q + 1):
@@ -696,10 +716,139 @@ class LogProbCache:
             return self._log_match[q]
         return self._log_mismatch[q]
 
+    def log_mismatch(self, q: int) -> float:
+        """``log P(obs | the true allele is something else)`` at quality *q*."""
+        return float(self._log_mismatch[min(q, len(self._log_mismatch) - 1)])
+
+    def log_odds(self, q: int) -> float:
+        """``log P(obs | agree) - log P(obs | disagree)`` at quality *q*.
+
+        The evidence one base of quality *q* carries for the allele it calls. This is the
+        weight a consensus vote must use: it spans 6.20 nats at Q20 to 15.42 at Q60, so a
+        confident base genuinely outvotes several unreliable ones.
+        """
+        q = min(q, len(self._log_match) - 1)
+        return float(self._log_match[q] - self._log_mismatch[q])
+
+    def junk_tables(self, p_div: float) -> tuple[np.ndarray, np.ndarray]:
+        """Per-quality (log P(obs == REF), log P(obs == a given non-REF)) under the junk
+        model, cached per divergence rate.
+
+        The junk component describes a read off a genome diverged from the reference at
+        ``p_div``; what is OBSERVED is that genome seen through the same per-base error
+        channel the haplotype components use, so the two effects compose here rather than
+        junk being scored at a flat rate while every haplotype was quality-scaled. That
+        asymmetry was the defect: the softmax was comparing a model that believes in
+        sequencing error against one that does not.
+
+        It does NOT make the junk/haplotype boundary independent of base quality, and
+        should not: a likelihood ratio treats a Q60 mismatch as far stronger evidence than
+        a Q20 one, so the crossover sits at 4.25% divergence at Q20 and 1.0% at Q60 on a
+        400-site window. ``junk_divergence_rate`` is the prior on divergence, not a
+        decision threshold.
+        """
+        cached = self._junk_tables.get(p_div)
+        if cached is None:
+            n = float(self.n_alleles)
+            d = float(p_div)
+            q = np.arange(len(self._log_match))
+            e = 10.0 ** (-q / 10.0)
+            p_ref = (1.0 - d) * (1.0 - e) + d * e / (n - 1.0)
+            p_alt = (
+                (1.0 - d) * e / (n - 1.0)
+                + (d / (n - 1.0)) * (1.0 - e)
+                + (n - 2.0) * (d / (n - 1.0)) * (e / (n - 1.0))
+            )
+            cached = (np.log(p_ref + 1e-12), np.log(p_alt + 1e-12))
+            self._junk_tables[p_div] = cached
+        return cached
+
 
 # Single global cache. The alphabet is always {A,C,G,T,DEL,INS} (indels are
 # always processed — invariant), so the 6-state error model is used everywhere.
 _LOG_PROB_CACHE = LogProbCache(n_alleles=6)
+
+# log P(read allele | a component that has no allele at this position). Marginalising the
+# unknown allele over the alphabet gives exactly 1/n_alleles whatever the read carries.
+#
+# Every mixture component must be scored over the SAME set of sites or the softmax that
+# turns those scores into gamma is not a posterior. It used to score each haplotype only
+# where its own consensus reached and junk over every window site, so a narrower footprint
+# collected free likelihood: two haplotypes with identical alleles but footprints of 400
+# and 150 sites split a read 0.075 / 0.925, and at Q20 a 150-site haplotype that
+# MISMATCHED a read beat a 400-site one that matched it perfectly.
+_LOG_MISSING_SITE = float(np.log(1.0 / _LOG_PROB_CACHE.n_alleles))
+
+# The reference base an SV pseudo-site carries (strainphase.sv_encoding writes it): a
+# structural variant has no single reference allele, so the anchor gets a placeholder.
+# No read can ever equal it, which is why the junk model has to step over these sites -
+# see _log_prob_read_junk.
+_SV_PLACEHOLDER_REF = "N"
+
+
+def _read_support(read: Read, snv_set: set[int]) -> list[int]:
+    """The sites this read is scored at: its own calls that are window variant sites.
+
+    One list per read, shared by every mixture component, which is what makes the E-step
+    a comparison of like with like.
+    """
+    return [p for p in read.alleles if p in snv_set]
+
+
+def _log_prob_read_hap(
+    read: Read, consensus: dict[int, str], support: list[int], default_q: int
+) -> float | None:
+    """``log P(read | haplotype)`` over *support*.
+
+    A support position the consensus does not reach is explicit missing data, not an
+    absent term: it costs ``_LOG_MISSING_SITE``, the same constant every other component
+    pays there. ``None`` means the haplotype says nothing about this read at all (no
+    shared called site), which is the one case where it must not compete for it.
+    """
+    log_prob = 0.0
+    overlap = 0
+    for pos in support:
+        hap_base = consensus.get(pos)
+        if hap_base is None:
+            log_prob += _LOG_MISSING_SITE
+            continue
+        q = read.quals.get(pos, default_q)
+        log_prob += _LOG_PROB_CACHE.log_prob_base(hap_base, read.alleles[pos], q)
+        overlap += 1
+    return log_prob if overlap > 0 else None
+
+
+def _log_prob_read_junk(
+    read: Read,
+    support: list[int],
+    ref_alleles: dict[int, str],
+    p_div: float,
+    default_q: int,
+) -> float:
+    """``log P(read | junk)`` over the same *support* the haplotype components use.
+
+    Junk is "a genome diverged from the reference at ``p_div``", so a site with no usable
+    reference allele carries no junk evidence and takes the missing-data term instead.
+    Two kinds of site qualify: one the loader never assigned an anchor base, and an SV
+    pseudo-site, whose anchor is the ``"N"`` placeholder. Charging the placeholder as a
+    mismatch made junk pay ~3.9 nats at EVERY SV anchor whether or not the read carried
+    the event, and adding a 40-anchor sidecar to an unchanged BAM collapsed pi_junk from
+    0.178 to 0.0 - ten genuinely divergent reads absorbed by pseudo-sites no read carried.
+    Split-read breakpoints are the other SV mechanism and are NOT excluded: their anchor
+    holds CONTINUOUS, which a read crossing the position with an unbroken alignment
+    genuinely matches (see iter_windows_lazy).
+    """
+    log_ref, log_alt = _LOG_PROB_CACHE.junk_tables(p_div)
+    max_q = len(log_ref) - 1
+    log_prob = 0.0
+    for pos in support:
+        ref_base = ref_alleles.get(pos)
+        if ref_base is None or ref_base == _SV_PLACEHOLDER_REF:
+            log_prob += _LOG_MISSING_SITE
+            continue
+        q = min(read.quals.get(pos, default_q), max_q)
+        log_prob += log_ref[q] if read.alleles[pos] == ref_base else log_alt[q]
+    return float(log_prob)
 
 # Padding (bp) around an SV breakpoint anchor when deciding whether a read's
 # reference span brackets it. Absorbs Sniffles breakpoint imprecision
@@ -808,25 +957,54 @@ _SNV_CACHE: dict[tuple, tuple] = {}
 _SNV_CACHE_MAX = 8
 
 
+def _copy_snv_tables(tables: tuple) -> tuple:
+    """Shallow-copy every container in a parsed-VCF tuple.
+
+    One copy per container is enough: the callers that mutate (``process_contig``'s SV
+    merge, ``iter_windows_lazy``'s breakpoint registration) append to the position list
+    and assign into the top-level dicts. Nothing reaches into ``del_span`` / ``ins_len``'s
+    inner sets, which stay shared. Written by type rather than by position so a caller
+    stubbing out the loader with a shorter tuple still gets copies.
+    """
+    out = []
+    for t in tables:
+        if isinstance(t, list):
+            out.append(list(t))
+        elif isinstance(t, dict):
+            out.append(dict(t))
+        elif isinstance(t, set):
+            out.append(set(t))
+        else:
+            out.append(t)
+    return tuple(out)
+
+
 def load_snvs(
     vcf_path: str,
     contig_id: str | None = None,
     sample_name: str | None = None,
     config: HaplotyperConfig = DEFAULT_CONFIG,
 ):
-    """Cached wrapper - see _SNV_CACHE. Returns the SAME objects on a hit, so callers must
-    treat the result as read-only. process_contig already does: it copies what it needs
-    into per-window structures and never mutates these."""
+    """Cached wrapper - see _SNV_CACHE. Returns a FRESH SHALLOW COPY of the parsed tables
+    on every call, hit or miss, so a caller is free to mutate what it gets back.
+
+    It has to. ``process_contig`` appends SV pseudo-sites to ``snv_pos`` and writes their
+    anchor bases and site types, and ``iter_windows_lazy`` registers split-read
+    breakpoints the same way. Handing back the cached objects meant sample 1's SV anchors
+    were already present when sample 2 ran under the same union VCF, so sample 2 saw them
+    as collisions with a called variant and dropped its own SV sites - one timepoint kept
+    the event and every other timepoint lost it.
+    """
     key = (vcf_path, contig_id, sample_name, config.min_depth_site, config.af_range,
            config.process_indels if hasattr(config, "process_indels") else None)
     hit = _SNV_CACHE.get(key)
     if hit is not None:
-        return hit
+        return _copy_snv_tables(hit)
     out = _load_snvs_uncached(vcf_path, contig_id, sample_name, config)
     if len(_SNV_CACHE) >= _SNV_CACHE_MAX:
         _SNV_CACHE.pop(next(iter(_SNV_CACHE)))
     _SNV_CACHE[key] = out
-    return out
+    return _copy_snv_tables(out)
 
 
 
@@ -868,6 +1046,10 @@ def _load_snvs_uncached(
         mismatch at every deletion site.
     depth, af
         Per-position site depth and alt-allele frequency (AF may be ``None``).
+        AF is ``Number=A``, so a multi-allelic position holds the frequency of
+        the FIRST allele registered there — the value is a per-ALLELE quantity
+        and a position is not one. Nothing downstream reads it; the per-ALT
+        values are used where they belong, in the ``af_range`` gate.
     site_type
         Per-position type of the FIRST variant registered there: ``"snv"`` /
         ``"del"`` / ``"ins"`` (``"sv"`` is added later by the SV sidecar merge,
@@ -906,7 +1088,10 @@ def _load_snvs_uncached(
     ``docs/MUTATION_HANDLING.md``).
 
     Quality gates (FILTER!=PASS, missing/low DP, optional AF band) still apply,
-    but each rejection is COUNTED and logged, never silent.
+    but each rejection is COUNTED and logged, never silent. FILTER and DP are
+    record-level and reject the whole record; the AF band is per-ALLELE and
+    rejects only the allele that falls outside it, so it cannot take a
+    multi-allelic record's other alleles down with it.
 
     **A position may hold more than one variant.** Two deletions of different
     length anchored on the same base, or an SNV and an indel at one position,
@@ -1017,7 +1202,20 @@ def _load_snvs_uncached(
             f"Available: {list(vcf.header.samples)}"
         )
 
-    for record in vcf.fetch(contig=contig_id) if contig_id else vcf.fetch():
+    # A contig the VCF never declares carries no variants, which is a fact about the
+    # data, not an error: callers routinely emit ##contig lines only for the contigs they
+    # called something on, and a MAG assembly is mostly such contigs. pysam raises
+    # "invalid contig" on fetch instead, which aborted the whole run on the first
+    # variant-free contig. Ask, and take the empty answer.
+    if contig_id and contig_id not in vcf.header.contigs:
+        records = ()
+        stats["contig_not_in_vcf"] = 1
+    elif contig_id:
+        records = vcf.fetch(contig=contig_id)
+    else:
+        records = vcf.fetch()
+
+    for record in records:
         stats["records_seen"] += 1
 
         # Filter check (counted, not silent).
@@ -1054,22 +1252,18 @@ def _load_snvs_uncached(
             stats["skip_low_depth"] += 1
             continue
 
-        # Extract AF
-        site_af = None
+        # Extract AF. INFO/AF is Number=A — one frequency PER ALT — so it is kept as a
+        # per-ALT sequence rather than collapsed to element [0]. AD is Number=R (REF
+        # first), so ALT i's frequency is ad[i + 1] over the total.
+        alt_afs: tuple[float, ...] | None = None
         if "AF" in record.info:
-            site_af = record.info["AF"]
-            if isinstance(site_af, tuple):
-                site_af = site_af[0]
+            raw_af = record.info["AF"]
+            alt_afs = tuple(raw_af) if isinstance(raw_af, tuple) else (raw_af,)
         elif sample is not None and "AD" in sample:
             ad = sample["AD"]
             if ad and len(ad) >= 2 and sum(ad) > 0:
-                site_af = ad[1] / sum(ad)
-
-        # Optional AF range filter (None = no filter; the default).
-        if config.af_range is not None and site_af is not None:
-            if not (config.af_range[0] <= site_af <= config.af_range[1]):
-                stats["skip_af_band"] += 1
-                continue
+                ad_total = sum(ad)
+                alt_afs = tuple(a / ad_total for a in ad[1:])
 
         if len(alts) > 1:
             stats["multiallelic_records"] += 1
@@ -1077,7 +1271,21 @@ def _load_snvs_uncached(
         # Decompose EVERY allele into atomic primitives via the one shared
         # helper. All mutation types — SNV, MNP, insertion, deletion — and all
         # (>2) alleles are ALWAYS kept; nothing here can turn that off.
-        for alt in alts:
+        for alt_idx, alt in enumerate(alts):
+            # The AF band is a PER-ALLELE gate, applied here rather than once per record.
+            # Evaluating it on ALT-0's frequency and `continue`ing the record threw away
+            # every other allele on the record: AF=0.01,0.45 under af_range=(0.05, 0.95)
+            # lost the 45% allele on the strength of the 1% one, which contradicts the
+            # invariant two paragraphs down in this function's docstring.
+            alt_af = (
+                alt_afs[alt_idx]
+                if alt_afs is not None and alt_idx < len(alt_afs)
+                else None
+            )
+            if config.af_range is not None and alt_af is not None:
+                if not (config.af_range[0] <= alt_af <= config.af_range[1]):
+                    stats["skip_af_band"] += 1
+                    continue
             if alt is None or alt == "*" or alt.startswith("<"):
                 # Spanning-deletion star / symbolic (gVCF <*>, <DEL> …): no
                 # concrete allele to phase against.
@@ -1091,7 +1299,7 @@ def _load_snvs_uncached(
             if len(ref) == len(alt) and len(ref) > 1:
                 stats["mnp_atomized"] += 1
             for apos, aref, aalt, stype in prims:
-                _register(apos, aref, aalt, stype, site_depth, site_af)
+                _register(apos, aref, aalt, stype, site_depth, alt_af)
 
     vcf.close()
 
@@ -1329,6 +1537,14 @@ def iter_windows_lazy(
             # Otherwise, if a matched base (M/=/X) covers the anchor, record
             # it as the read's "vote against" the indel. Otherwise, no call.
             if special_site_set and aln.cigartuples:
+                # Quality attached to a DEL<len> / INS<len> / event-id token. These are
+                # not base calls, so there is no per-base Phred score for them; MAPQ used
+                # to be stored here and was then read back as one by the EM, pricing a
+                # MAPQ-60 indel disagreement at 15.42 nats against 8.52 for a Q30 SNV -
+                # one indel outweighing 1.8 SNVs, on the least reliable marker class.
+                # MAPQ is a property of the alignment and is kept where it belongs, on
+                # Read.mapq; min_mapq has already gated on it above.
+                token_qual = config.default_base_quality
                 # Single CIGAR walk: collect indel events and the matched-base
                 # ref->query mapping for indel/SV-anchor positions only.
                 ref_cursor = aln.reference_start  # 0-based
@@ -1356,7 +1572,7 @@ def iter_windows_lazy(
                         pos = del_key_to_pos.get(key)
                         if pos is not None:
                             # per-edit token: a <len>-bp deletion is its own allele.
-                            indel_calls[pos] = (f"DEL{length}", aln.mapping_quality)
+                            indel_calls[pos] = (f"DEL{length}", token_qual)
                         ref_cursor += length
                     elif op == 1:  # I
                         # Anchor is the 1-based position immediately before the
@@ -1365,7 +1581,7 @@ def iter_windows_lazy(
                         # own allele rather than collapsing to a generic "INS".
                         pos = ins_key_to_pos.get((ref_cursor, length))
                         if pos is not None:
-                            indel_calls[pos] = (f"INS{length}", aln.mapping_quality)
+                            indel_calls[pos] = (f"INS{length}", token_qual)
                         query_cursor += length
                     elif op == 3:  # N: consumes ref only
                         ref_cursor += length
@@ -1398,7 +1614,7 @@ def iter_windows_lazy(
                         for event_id, ev_reads in events.items():
                             if aln.query_name in ev_reads:
                                 r.alleles[pos] = event_id
-                                r.quals[pos] = aln.mapping_quality
+                                r.quals[pos] = token_qual
                                 has_overlap = True
                                 break
 
@@ -1422,7 +1638,7 @@ def iter_windows_lazy(
         # Re-assemble split molecules into single reads, and register the breakpoints
         # they reveal as sites. Done before subsampling so the cap counts molecules.
         if config.merge_split_reads:
-            reads, break_sites = _merge_split_reads(reads, config)
+            reads, break_sites = _merge_split_reads(reads, config, snv_set)
             for bp in break_sites:
                 if bp not in snv_set and start <= bp < end:
                     window_snvs.append(bp)
@@ -1632,39 +1848,32 @@ class EMHaplotyper:
         # Single 6-state alphabet {A,C,G,T,DEL,INS} — indels are always on.
         self._cache = _LOG_PROB_CACHE
 
+        # The site set every component is scored over, fixed for the whole run. Fixed is
+        # the point: it is what makes gamma a posterior (components compared on the same
+        # observations) and what makes the log-likelihood a function of the parameters
+        # alone, so a decreasing objective is now a real signal rather than the
+        # bookkeeping artefact of a consensus footprint that grew between iterations.
+        self._snv_set = set(window.snv_pos)
+        self._support = [_read_support(r, self._snv_set) for r in self.reads]
+
     def _compute_log_prob_read_hap(self, read: Read, haplotype: Haplotype) -> float | None:
-        """Compute log P(read | haplotype) using cached base probs."""
-        log_prob = 0.0
-        overlap = 0
-
-        for pos, read_base in read.alleles.items():
-            if pos in haplotype.consensus:
-                q = read.quals.get(pos, self.config.default_base_quality)
-                log_prob += self._cache.log_prob_base(haplotype.consensus[pos], read_base, q)
-                overlap += 1
-
-        return log_prob if overlap > 0 else None
+        """Compute log P(read | haplotype) over this read's fixed support."""
+        return _log_prob_read_hap(
+            read,
+            haplotype.consensus,
+            _read_support(read, self._snv_set),
+            self.config.default_base_quality,
+        )
 
     def _compute_log_prob_read_junk(self, read: Read) -> float:
-        """Compute log P(read | junk) using divergent reference model."""
-        p_div = self.config.junk_divergence_rate
-        n_alleles = self._cache.n_alleles
-        log_match = np.log(1.0 - p_div + 1e-12)
-        log_miss = np.log(p_div / float(n_alleles - 1) + 1e-12)
-
-        log_prob = 0.0
-        for pos, read_base in read.alleles.items():
-            if pos not in self.window.snv_pos:
-                continue
-            ref_base = self.window.ref_alleles.get(pos)
-            if ref_base is None:
-                continue
-            if read_base == ref_base:
-                log_prob += log_match
-            else:
-                log_prob += log_miss
-
-        return log_prob
+        """Compute log P(read | junk) using the divergent reference model."""
+        return _log_prob_read_junk(
+            read,
+            _read_support(read, self._snv_set),
+            self.window.ref_alleles,
+            self.config.junk_divergence_rate,
+            self.config.default_base_quality,
+        )
 
     def run(self) -> tuple[list[Haplotype], np.ndarray, np.ndarray, float, bool, int]:
         """Run EM with cached log-probability computations."""
@@ -1701,12 +1910,22 @@ class EMHaplotyper:
             logl_hap = np.full((n_reads, n_haps), -np.inf)
             logl_junk = np.zeros(n_reads)
 
+            default_q = self.config.default_base_quality
             for i, read in enumerate(reads):
+                support = self._support[i]
                 for k in range(n_haps):
-                    lp = self._compute_log_prob_read_hap(read, haplotypes[k])
+                    lp = _log_prob_read_hap(
+                        read, haplotypes[k].consensus, support, default_q
+                    )
                     if lp is not None:
                         logl_hap[i, k] = lp
-                logl_junk[i] = self._compute_log_prob_read_junk(read)
+                logl_junk[i] = _log_prob_read_junk(
+                    read,
+                    support,
+                    self.window.ref_alleles,
+                    self.config.junk_divergence_rate,
+                    default_q,
+                )
 
             # E-STEP: compute responsibilities gamma[i, k] = P(haplotype k | read i).
             for i in range(n_reads):
@@ -1750,26 +1969,49 @@ class EMHaplotyper:
                     continue
 
                 allele_votes = defaultdict(lambda: defaultdict(float))
+                # Per position: the gamma mass reaching it, and the score every candidate
+                # allele starts from (every covering read charged as a mismatch). The two
+                # together are what let a vote be compared against calling nothing.
+                cover_weight: dict[int, float] = defaultdict(float)
+                mismatch_floor: dict[int, float] = defaultdict(float)
 
                 for i, read in enumerate(reads):
                     w = gamma[i, k]
                     if w < self.config.min_gamma_for_vote:
                         continue
 
-                    for pos, base in read.alleles.items():
-                        if pos not in self.window.snv_pos:
-                            continue
+                    for pos in self._support[i]:
                         q = read.quals.get(pos, self.config.default_base_quality)
-                        q_weight = 1.0 - 10 ** (-q / 10.0)
-                        allele_votes[pos][base] += w * q_weight
+                        # The consensus that maximises the expected complete
+                        # log-likelihood weights each vote by gamma * (log P(base | agree)
+                        # - log P(base | disagree)), not by the probability the base is
+                        # correct. The latter spans only [0.99, 1.0] over the admissible
+                        # quality range, which made this a plain majority vote: six Q20
+                        # reads calling G outvoted five Q93 reads calling C, emitting a
+                        # call 39.9 nats worse under this package's own error model.
+                        allele_votes[pos][read.alleles[pos]] += w * self._cache.log_odds(q)
+                        cover_weight[pos] += w
+                        mismatch_floor[pos] += w * self._cache.log_mismatch(q)
 
                 if not allele_votes:
                     continue
 
                 new_consensus = {}
                 for pos in self.window.snv_pos:
-                    if pos in allele_votes:
-                        new_consensus[pos] = max(allele_votes[pos], key=allele_votes[pos].get)
+                    votes = allele_votes.get(pos)
+                    if not votes:
+                        continue
+                    best = max(votes, key=votes.get)
+                    # Calling NOTHING at a position is a real option and sometimes the
+                    # better one: where only a couple of reads reach, no allele need beat
+                    # marginalising over the alphabet for everyone else. Taking the
+                    # majority regardless extended footprints into positions that cost the
+                    # objective more than they earned, which is why the log-likelihood
+                    # could fall between iterations with the haplotype count unchanged.
+                    if (mismatch_floor[pos] + votes[best]
+                            <= cover_weight[pos] * _LOG_MISSING_SITE):
+                        continue
+                    new_consensus[pos] = best
 
                 if new_consensus:
                     new_haps.append(Haplotype(consensus=new_consensus))
@@ -1800,7 +2042,18 @@ class EMHaplotyper:
             gamma = gamma_new
 
             row_sums = gamma.sum(axis=1, keepdims=True)
-            row_sums[row_sums == 0] = 1.0
+            # A read whose whole responsibility sat on haplotypes this iteration pruned
+            # has nothing left. Rescaling by 1.0 left the row all zeros, which is not a
+            # distribution: validate() rejects it, and junk_read_counts scores the read as
+            # neither resolved nor junk. Junk is exactly what "no haplotype explains this
+            # read" means, so that is where the mass goes. Usually the next E-step
+            # overwrites the row anyway - unless the prune lands on the iteration that
+            # also breaks for convergence, which is when this used to escape.
+            dead_rows = (row_sums[:, 0] == 0.0)
+            if dead_rows.any():
+                gamma[dead_rows, :] = 0.0
+                gamma[dead_rows, junk_idx] = 1.0
+                row_sums[dead_rows] = 1.0
             gamma /= row_sums
 
             # Convergence check using relative change in log-likelihood.
@@ -1885,16 +2138,29 @@ class PostProcessor:
 
                 minor_count = 0
                 total_at_pos = 0
+                p_error_sum = 0.0
                 for read in window.reads:
                     if diff_pos in read.alleles:
                         total_at_pos += 1
+                        q = read.quals.get(diff_pos, self.config.default_base_quality)
+                        # /3: the null is that the minor calls are sequencing errors that
+                        # happened to produce THIS base, one of the three alternatives.
+                        p_error_sum += 10 ** (-q / 10.0) / 3.0
                         if read.alleles[diff_pos] == minor_base:
                             minor_count += 1
 
                 if total_at_pos == 0:
                     return True
 
-                p_error = 10 ** (-30 / 10.0) / 3.0
+                # The reads' own base qualities, not a fixed Q30. The bases at this
+                # position are in read.quals and min_base_quality — the gate that decided
+                # which of them got here at all — defaults to 20, so assuming Q30 asserted
+                # an accuracy the data does not have to carry. It errs towards SPLIT: at
+                # 3 minor reads of 40 in a 250-site window, Q30 gives p=3.6e-07 (split)
+                # where the reads' real Q20 gives 3.3e-04 (merge), i.e. a phantom strain
+                # above the 10% abundance floor. The binomial wants one rate, so the mean
+                # over the reads at the position stands in for the Poisson-binomial.
+                p_error = p_error_sum / total_at_pos
                 alpha_corrected = self.config.binomial_alpha / len(window.snv_pos)
                 p_value = 1 - binom.cdf(minor_count - 1, total_at_pos, p_error)
 
@@ -2050,6 +2316,11 @@ class PostProcessor:
 # OPTIMIZED LONGITUDINAL INTEGRATOR
 # =============================================================================
 
+# Weight the junk component keeps no matter what a rescue takes from it, for numerical
+# stability. A rescue is funded ENTIRELY out of junk, so this floor is also the gate on
+# whether a rescue can happen at all: below it there is nothing to fund one with.
+_MIN_JUNK_WEIGHT = 0.01
+
 
 class LongitudinalIntegrator:
     """Cross-timepoint integration with optimized anchor panel construction."""
@@ -2186,6 +2457,34 @@ class LongitudinalIntegrator:
             )
             return window_result
 
+        # A rescue is funded entirely out of junk's weight, down to _MIN_JUNK_WEIGHT.
+        # Below that floor there is nothing to fund one with, and proceeding anyway is
+        # strictly harmful: every rescued weight is scaled to 0.0, junk is INFLATED up to
+        # the floor, and every original haplotype in the window is scaled down to make
+        # room for a haplotype contributing nothing - while the statistic recorded
+        # was_rescued=True. The posterior read count (n_junk_reads) does not imply the
+        # weight is there: a handful of reads can sit above gamma 0.5 on a pi_junk of
+        # 0.002.
+        if junk_weight - _MIN_JUNK_WEIGHT <= 0.0:
+            self.rescue_statistics.append(
+                RescueStatistic(
+                    sample=current_sample,
+                    rescued_timepoint=current_sample,
+                    contig=window.contig,
+                    window_start=window.start,
+                    track_id="window",
+                    was_rescued=False,
+                    original_weight=junk_weight,
+                    rescued_weight=junk_weight,
+                    donor_timepoint="",
+                    anchor_distance=-1.0,
+                    n_shared_with_anchor=0,
+                    n_mismatched_with_anchor=0,
+                    reason="junk_below_floor",
+                )
+            )
+            return window_result
+
         # Avoid duplicating an already-present haplotype in this window.
         existing_consensuses = [h.consensus for h in haplotypes]
 
@@ -2237,6 +2536,11 @@ class LongitudinalIntegrator:
         # and have at least one uniquely assigned read.
         rescued_any = False
         new_haplotypes = []
+        # Where each rescued haplotype's statistic landed, so the weight recorded there
+        # can be corrected to the one the window actually ends up carrying. The scaling
+        # below can only shrink it, and a statistic reporting the pre-scaling figure
+        # overstates every rescue that had to compete for a limited junk budget.
+        new_hap_stat_idx: list[int] = []
 
         for anchor_idx, anchor in enumerate(anchor_haps):
             anchor_already_present = False
@@ -2283,6 +2587,7 @@ class LongitudinalIntegrator:
                     new_haplotypes.append(new_hap)
 
                     donor_timepoint = anchor_samples[anchor_idx]
+                    new_hap_stat_idx.append(len(self.rescue_statistics))
                     self.rescue_statistics.append(
                         RescueStatistic(
                             sample=current_sample,
@@ -2354,8 +2659,7 @@ class LongitudinalIntegrator:
         # This avoids zeroing out original haplotypes when rescued_min_weight or
         # (previously) double-counted reads made total_rescued_weight > old_junk_weight.
         old_junk_weight = pi[junk_idx]
-        min_junk_floor = 0.01  # Keep a small junk component for numerical stability
-        available_from_junk = max(0.0, old_junk_weight - min_junk_floor)
+        available_from_junk = max(0.0, old_junk_weight - _MIN_JUNK_WEIGHT)
 
         total_rescued_weight = sum(h.weight for h in new_haplotypes)
         if total_rescued_weight > available_from_junk and total_rescued_weight > 0:
@@ -2364,8 +2668,11 @@ class LongitudinalIntegrator:
             for h in new_haplotypes:
                 h.weight *= scale_rescued
             total_rescued_weight = available_from_junk
+            # Report what the haplotype ends up with, not what it asked for.
+            for h, stat_idx in zip(new_haplotypes, new_hap_stat_idx):
+                self.rescue_statistics[stat_idx].rescued_weight = h.weight
 
-        new_junk_weight = max(min_junk_floor, old_junk_weight - total_rescued_weight)
+        new_junk_weight = max(_MIN_JUNK_WEIGHT, old_junk_weight - total_rescued_weight)
 
         # Build new pi: original haplotypes scaled to fill (1 - total_rescued - new_junk).
         pi_new = np.zeros(k_eff_new)
@@ -2424,43 +2731,29 @@ class LongitudinalIntegrator:
         junk_idx = n_haps
 
         gamma = np.zeros((n_reads, k_eff))
-        cache = _LOG_PROB_CACHE
 
-        # Junk model constants. Spread the divergence probability over the
-        # ``n_alleles - 1`` non-matching states so the model is consistent with
-        # the active alphabet (4 for SNVs only, 6 with indels).
+        # Scored through the same two helpers the EM uses. A rescued haplotype takes the
+        # DONOR's footprint (see the new_consensus build above), so this E-step is exactly
+        # where a footprint-asymmetric likelihood would do the most damage - the rescued
+        # component is guaranteed to have a different site set from the resident ones.
+        snv_set = set(window.snv_pos)
         p_div = self.config.junk_divergence_rate
-        n_alleles = cache.n_alleles
-        log_junk_match = np.log(1.0 - p_div + 1e-12)
-        log_junk_miss = np.log(p_div / float(n_alleles - 1) + 1e-12)
+        default_q = self.config.default_base_quality
 
         for i, read in enumerate(reads):
             logp_k = np.full(k_eff, -np.inf)
+            support = _read_support(read, snv_set)
 
-            # Haplotype likelihoods
             for k in range(n_haps):
-                log_prob = 0.0
-                overlap = 0
-                for pos, read_base in read.alleles.items():
-                    if pos in haplotypes[k].consensus:
-                        q = read.quals.get(pos, self.config.default_base_quality)
-                        log_prob += cache.log_prob_base(haplotypes[k].consensus[pos], read_base, q)
-                        overlap += 1
-                if overlap > 0:
+                log_prob = _log_prob_read_hap(
+                    read, haplotypes[k].consensus, support, default_q
+                )
+                if log_prob is not None:
                     logp_k[k] = np.log(pi[k] + 1e-12) + log_prob
 
-            # Junk likelihood
-            log_junk = 0.0
-            for pos, read_base in read.alleles.items():
-                if pos in window.snv_pos:
-                    ref_base = window.ref_alleles.get(pos)
-                    if ref_base:
-                        if read_base == ref_base:
-                            log_junk += log_junk_match
-                        else:
-                            log_junk += log_junk_miss
-
-            logp_k[junk_idx] = np.log(pi[junk_idx] + 1e-12) + log_junk
+            logp_k[junk_idx] = np.log(pi[junk_idx] + 1e-12) + _log_prob_read_junk(
+                read, support, window.ref_alleles, p_div, default_q
+            )
 
             log_sum = logsumexp(logp_k)
             if np.isneginf(log_sum):
@@ -2794,7 +3087,9 @@ BREAK_PREFIX = "BRK"
 
 
 def _merge_split_reads(
-    reads: list[Read], config: HaplotyperConfig = DEFAULT_CONFIG
+    reads: list[Read],
+    config: HaplotyperConfig = DEFAULT_CONFIG,
+    snv_set: set[int] | None = None,
 ) -> tuple[list[Read], set[int]]:
     """Re-assemble split alignments into one Read each, and report the breakpoints.
 
@@ -2817,14 +3112,23 @@ def _merge_split_reads(
        identity.
 
     The breakpoint is anchored at the LAST aligned reference position of the preceding
-    segment. Returns the merged reads and the set of breakpoint positions.
+    segment, or at the nearest earlier position inside that segment that is not already a
+    called variant site. Shifting matters: the anchor is written unconditionally, so on a
+    position the VCF also calls, the BRK token replaced the read's real allele there and
+    ``site_type`` still said ``"snv"`` - the same clobbering the SV sidecar merge refuses
+    outright (caveat 7). Pass *snv_set* to enable the check; without it there is nothing
+    to check against and the anchor is taken as-is.
+
+    Returns the merged reads and the set of breakpoint positions.
     """
     by_molecule: dict[str, list[Read]] = defaultdict(list)
     for r in reads:
         by_molecule[r.id].append(r)
 
+    called = snv_set if snv_set is not None else frozenset()
     merged: list[Read] = []
     breaks: set[int] = set()
+    n_anchors_dropped = 0
     qual = config.default_base_quality
 
     for segs in by_molecule.values():
@@ -2832,6 +3136,8 @@ def _merge_split_reads(
             merged.append(segs[0])
             continue
         segs.sort(key=lambda r: (r.ref_start, r.ref_end))
+        # Captured before `whole` (which IS segs[0]) has its own span widened below.
+        spans = [(s.ref_start, s.ref_end) for s in segs]
         whole = segs[0]
         for seg in segs[1:]:
             whole.alleles.update(seg.alleles)
@@ -2841,24 +3147,48 @@ def _merge_split_reads(
         for prev, nxt in zip(segs, segs[1:]):  # noqa: B905
             if nxt.ref_start <= prev.ref_end:
                 continue  # overlapping segments: no gap, nothing to mark
+            # Walk back inside the preceding segment until the anchor is a position no
+            # variant was called at. Anywhere in that segment carries the same meaning -
+            # every read continuous across the gap is aligned there too - so shifting
+            # keeps the marker instead of choosing between it and a real allele.
             anchor = prev.ref_end - 1
+            while anchor in called and anchor > prev.ref_start:
+                anchor -= 1
+            if anchor in called:
+                n_anchors_dropped += 1
+                continue
             whole.alleles[anchor] = f"{BREAK_PREFIX}{nxt.ref_start}"
             whole.quals[anchor] = qual
             breaks.add(anchor)
-        whole.ref_start = min(s.ref_start for s in segs)
-        whole.ref_end = max(s.ref_end for s in segs)
+        whole.ref_start = min(s for s, _ in spans)
+        whole.ref_end = max(e for _, e in spans)
+        # The per-segment spans, which the outer span no longer describes.
+        whole.segments = spans
         merged.append(whole)
 
     # A read that spans a breakpoint with an unbroken alignment is evidence AGAINST the
     # event, not absence of evidence. Without this the marker cannot discriminate: only
     # the broken strain would carry a call and compare_consensus scores solely positions
     # where both sides have one.
+    #
+    # Read.covers, not the outer span: a molecule merged from segments [1000,5000) and
+    # [8000,15000) spans 1000-15000, so an outer-span test wrote "no break here" at 5001,
+    # inside that read's OWN unaligned gap. Two molecules carrying the same event with
+    # breakpoints ragged by a couple of bases then disagreed at the fabricated site and
+    # build_overlap_graph dropped the edge between them - the U1 fragmentation this
+    # function exists to prevent.
     for pos in breaks:
         for r in merged:
-            if pos in r.alleles or not (r.ref_start <= pos < r.ref_end):
+            if pos in r.alleles or not r.covers(pos):
                 continue
             r.alleles[pos] = CONTINUOUS
             r.quals[pos] = qual
+
+    if n_anchors_dropped:
+        logging.debug(
+            f"    _merge_split_reads: {n_anchors_dropped} breakpoint anchors dropped "
+            f"(no free position in the preceding segment)"
+        )
 
     return merged, breaks
 
@@ -3094,6 +3424,16 @@ def link_windows(
     # Deferred: strainphase.coherence imports HaplotyperConfig from this module, so a
     # top-level import here would be circular. The cost is one lookup per call.
     from strainphase.coherence import abundance_coherent
+
+    # This pass re-derives every mismatch it is about to record, so it owns the list
+    # rather than appending to whatever was there. The longitudinal driver calls this a
+    # second time after cross-timepoint rescue, and rescue hands back the ORIGINAL object
+    # on every early-return path - so an append-only list gave an unrescued window its
+    # first-pass rows plus a byte-identical second copy, inflating both
+    # mismatches_within_sample.tsv and the QC count logged from it.
+    for wr in results:
+        wr.link_mismatches.clear()
+
     if len(results) < 2:
         # Single window: each haplotype is its own track.
         track_counter = 0
@@ -3389,8 +3729,18 @@ def process_contig(
     # collide with a real variant are dropped to avoid clobbering (caveat 7).
     sv_support = None
     if sv_sidecar_path:
-        from strainphase.sv_encoding import load_sv_sidecar_for_contig
+        from strainphase.sv_encoding import _RECONCILE_MAX_SPAN, load_sv_sidecar_for_contig
 
+        # reconcile may move an event's anchor by up to _RECONCILE_MAX_SPAN, and a read
+        # is only credited with the event if its span brackets the anchor to within
+        # _SV_ANCHOR_PAD. If the former ever exceeds the latter, reconciling a sidecar
+        # silently costs present-calls on reads that genuinely carry the event. The
+        # coupling was stated in prose at both ends and enforced at neither.
+        assert _RECONCILE_MAX_SPAN <= _SV_ANCHOR_PAD, (
+            f"sv_encoding._RECONCILE_MAX_SPAN ({_RECONCILE_MAX_SPAN}) exceeds "
+            f"core._SV_ANCHOR_PAD ({_SV_ANCHOR_PAD}); reconciled anchors can fall "
+            "outside the span that credits a read with the event"
+        )
         sv_pos, sv_ref, sv_stype, sv_support = load_sv_sidecar_for_contig(
             sv_sidecar_path, contig_id
         )
@@ -3617,14 +3967,19 @@ def results_to_dataframe(results: dict[str, list[WindowResult]]) -> list[dict]:
                 for pos, base in hap.consensus.items():
                     position_votes[pos][base] += hap.weight
 
-                # Per-window abundance (conditioned on non-junk).
+                # Per-window abundance (conditioned on non-junk), or NO MEASUREMENT.
+                # A window with no pi vector, a short one, or one that came out entirely
+                # junk did not measure this track at zero — it did not measure it. Same
+                # rule as longitudinal._window_conditional_abundance, and for the same
+                # reason: counting those windows as 0.0 dropped a track from 0.87 to 0.50
+                # on the strength of a window that made no measurement at all.
                 pi_vec = _wr.pi
-                wa = 0.0
-                if len(pi_vec) > _k:
-                    pi_junk = float(pi_vec[-1])
-                    denom = 1.0 - pi_junk
-                    if denom > 0:
-                        wa = max(0.0, min(1.0, float(pi_vec[_k]) / denom))
+                if pi_vec is None or len(pi_vec) <= _k:
+                    continue
+                denom = 1.0 - float(pi_vec[-1])
+                if denom <= 0:
+                    continue
+                wa = max(0.0, min(1.0, float(pi_vec[_k]) / denom))
                 junk_col = _wr.gamma.shape[1] - 1
                 n_junk = int((_wr.gamma[:, junk_col] >= 0.5).sum())
                 n_nonjunk = max(
@@ -3650,6 +4005,24 @@ def results_to_dataframe(results: dict[str, list[WindowResult]]) -> list[dict]:
             # Get sample from first window (all should be same)
             sample = members[0][0].window.sample
 
+            # Pooled over reads, not averaged over windows. A mean of per-window ratios
+            # weights a 5-read window like a 40-read one — the estimator this codebase
+            # documents at length as the wrong one (longitudinal._pooled_abundance,
+            # lineages.PooledAbundance: it is what produced the sawtooth). NaN, not 0.0,
+            # when no window measured the track: absent evidence is not evidence of
+            # absence, and a consumer can drop a NaN but cannot recover a fabricated zero.
+            total_window_reads = sum(window_read_weights)
+            if total_window_reads > 0:
+                mean_weight = (
+                    sum(a * w for a, w in zip(window_abundances, window_read_weights))
+                    / total_window_reads
+                )
+            elif window_abundances:
+                # Measured, but no window has any non-junk read to weight by.
+                mean_weight = sum(window_abundances) / len(window_abundances)
+            else:
+                mean_weight = float("nan")
+
             records.append(
                 {
                     "contig": contig_id,
@@ -3660,8 +4033,7 @@ def results_to_dataframe(results: dict[str, list[WindowResult]]) -> list[dict]:
                     "span_bp": span_end - span_start,
                     "n_windows": n_windows,
                     "n_snvs": len(merged_consensus),
-                    "mean_weight": (sum(window_abundances) / len(window_abundances)
-                                    if window_abundances else 0.0),
+                    "mean_weight": mean_weight,
                     "total_supporting_reads": total_reads,
                     "mean_confidence": np.mean(confidences) if confidences else 0.0,
                     "consensus": "|".join(
