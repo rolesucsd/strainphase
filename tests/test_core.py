@@ -23,12 +23,9 @@ from strainphase.core import (
     link_windows,
     process_window,
     results_to_dataframe,
-    _weighted_median,
 )
 from strainphase.simulation.synthetic_data import (
-    SyntheticDataGenerator,
-    SimulationScenario,
-    create_test_scenarios
+    SyntheticDataGenerator
 )
 
 
@@ -479,9 +476,15 @@ class TestWindowLinking(unittest.TestCase):
     
     def setUp(self):
         """Set up test fixtures."""
+        # Synthetic 500 bp windows with 3 markers each: far below the production
+        # defaults (20 kb windows, 1 kb minimum overlap), so the physical-span gates
+        # are relaxed here. This class tests the LINKING decision, not depth policy.
         self.config = HaplotyperConfig(
             max_link_distance=0.1,
-            min_shared_snvs_for_link=2
+            min_shared_snvs_for_link=2,
+            min_shared_calls_for_link=2,
+            min_entity_overlap_bp=0,
+            min_cosupported_span_frac=0.0,
         )
     
     def test_link_overlapping_windows(self):
@@ -626,41 +629,13 @@ class TestSyntheticDataGenerator(unittest.TestCase):
                 self.assertGreater(len(window.reads), 0)
 
 
-class TestWeightedMedian(unittest.TestCase):
-    """Test the _weighted_median utility."""
-
-    def test_single_value(self):
-        """Single value returns itself."""
-        self.assertAlmostEqual(_weighted_median([0.3], [1.0]), 0.3)
-
-    def test_equal_weights(self):
-        """Equal weights: median is middle value."""
-        result = _weighted_median([0.1, 0.5, 0.9], [1.0, 1.0, 1.0])
-        self.assertAlmostEqual(result, 0.5)
-
-    def test_skewed_weights(self):
-        """Heavy weight on one value pulls median there."""
-        result = _weighted_median([0.1, 0.9], [0.9, 0.1])
-        self.assertAlmostEqual(result, 0.1)
-
-    def test_empty_returns_zero(self):
-        self.assertEqual(_weighted_median([], []), 0.0)
-
-    def test_zero_weights_returns_zero(self):
-        self.assertEqual(_weighted_median([0.5, 0.8], [0.0, 0.0]), 0.0)
-
-    def test_clamps_to_unit_interval(self):
-        """Result is always clamped to [0, 1]."""
-        result = _weighted_median([0.5], [1.0])
-        self.assertGreaterEqual(result, 0.0)
-        self.assertLessEqual(result, 1.0)
-
-
 class TestAssignReads(unittest.TestCase):
     """Test PostProcessor.assign_reads directly."""
 
     def setUp(self):
-        self.config = HaplotyperConfig()
+        # assign_reads is a debugging aid and is off by default (keep_read_assignments);
+        # these tests exercise the function itself, so they opt in explicitly.
+        self.config = HaplotyperConfig(keep_read_assignments=True)
         self.post = PostProcessor(self.config)
         self.reads = [
             Read(id=f"r{i}", contig="test", mapq=60, alleles={}, quals={})
@@ -864,6 +839,176 @@ class TestResultsToDataframe(unittest.TestCase):
         self.assertGreaterEqual(rec["span_end"], 500)
 
 
+class TestMeanWeightIsPooledOverReads(unittest.TestCase):
+    """REGRESSION (N3): `mean_weight` is the only abundance `strainphase run` emits.
+
+    It was an UNWEIGHTED mean of the per-window conditional abundances, which weights a
+    5-read window like a 40-read one - the estimator this codebase documents at length
+    as the wrong one (it is what produced the sawtooth). And a window whose EM collapsed
+    to junk contributed a 0.0, so a window that made NO measurement dragged the track
+    down by a third; `longitudinal._window_conditional_abundance` returns None on that
+    exact pi vector by design.
+    """
+
+    def _wr(self, pi, n_reads, n_junk, track_id="T1"):
+        window = Window(contig="ctg1", start=100, end=1100,
+                        snv_pos=[200, 300], ref_alleles={200: 'A', 300: 'C'})
+        hap = Haplotype(consensus={200: 'A', 300: 'C'}, weight=pi[0], track_id=track_id)
+        gamma = np.zeros((n_reads, len(pi)))
+        gamma[:n_reads - n_junk, 0] = 1.0
+        gamma[n_reads - n_junk:, len(pi) - 1] = 1.0
+        wr = WindowResult(window=window, haplotypes=[hap], gamma=gamma,
+                          pi=np.array(pi), log_likelihood=-5.0, assignments=[],
+                          converged=True, iterations=3)
+        wr.n_reads_examined = n_reads
+        return wr
+
+    def test_windows_are_weighted_by_the_reads_that_measured_them(self):
+        deep = self._wr([0.9, 0.1, 0.0], n_reads=40, n_junk=0)      # 0.90 on 40 reads
+        shallow = self._wr([0.6, 0.4, 0.0], n_reads=5, n_junk=0)    # 0.60 on 5 reads
+        rec = results_to_dataframe({"ctg1": [deep, shallow]})[0]
+
+        self.assertAlmostEqual(rec["mean_weight"], (0.9 * 40 + 0.6 * 5) / 45, places=9)
+        self.assertNotAlmostEqual(rec["mean_weight"], (0.9 + 0.6) / 2, places=3)
+
+    def test_a_window_that_measured_nothing_does_not_pull_the_track_down(self):
+        deep = self._wr([0.9, 0.1, 0.0], n_reads=40, n_junk=0)
+        shallow = self._wr([0.6, 0.4, 0.0], n_reads=5, n_junk=0)
+        collapsed = self._wr([0.0, 0.0, 1.0], n_reads=12, n_junk=12)  # entirely junk
+        rec = results_to_dataframe({"ctg1": [deep, shallow, collapsed]})[0]
+
+        self.assertAlmostEqual(rec["mean_weight"], (0.9 * 40 + 0.6 * 5) / 45, places=9)
+
+    def test_a_track_no_window_measured_is_nan_not_zero(self):
+        """Absent evidence is not evidence of absence: a consumer can drop a NaN but
+        cannot recover a fabricated zero."""
+        collapsed = self._wr([0.0, 0.0, 1.0], n_reads=12, n_junk=12)
+        rec = results_to_dataframe({"ctg1": [collapsed]})[0]
+        self.assertTrue(np.isnan(rec["mean_weight"]))
+
+
+class TestSplitReadBreakMarkers(unittest.TestCase):
+    """REGRESSION (R1-14 + R1-15): the CONT back-fill and the BRK anchor.
+
+    Both fabricate data when they get it wrong, and both are silent. A CONT written at a
+    position inside a read's OWN unaligned gap is a call the read does not support; a BRK
+    written over a called variant destroys the read's real allele there while
+    ``site_type`` still says "snv".
+    """
+
+    def _seg(self, name, rs, re_, alleles):
+        r = Read(id=name, contig="c1", mapq=60, ref_start=rs, ref_end=re_)
+        r.alleles = dict(alleles)
+        r.quals = dict.fromkeys(alleles, 30)
+        return r
+
+    def test_cont_is_not_written_inside_a_reads_own_unaligned_gap(self):
+        from strainphase.core import CONTINUOUS, _merge_split_reads
+
+        # X is itself split, over a WIDER gap than Y. An outer-span test writes "no
+        # break here" at Y's breakpoint, which sits inside X's own missing stretch - so
+        # two molecules carrying the same event with ragged breakpoints disagree at a
+        # fabricated site and the read graph drops the edge between them.
+        merged, breaks = _merge_split_reads([
+            self._seg("X", 1000, 5000, {1100: "A"}),
+            self._seg("X", 8000, 15000, {9000: "G"}),
+            self._seg("Y", 1000, 5002, {1100: "A"}),
+            self._seg("Y", 6000, 15000, {9000: "G"}),
+        ])
+        by_id = {r.id: r for r in merged}
+        y_break = 5001
+        self.assertIn(y_break, breaks)
+        self.assertNotIn(
+            y_break, by_id["X"].alleles,
+            "CONT written at a position X does not cover",
+        )
+        self.assertEqual(by_id["Y"].alleles[y_break][:3], "BRK")
+
+        # ...and a read that genuinely spans the position still votes CONT.
+        merged2, breaks2 = _merge_split_reads([
+            self._seg("s", 1000, 2000, {1100: "A"}),
+            self._seg("s", 3000, 4000, {3100: "G"}),
+            self._seg("w", 1000, 4000, {1100: "A", 3100: "G"}),
+        ])
+        whole = {r.id: r for r in merged2}["w"]
+        self.assertEqual(whole.alleles[breaks2.copy().pop()], CONTINUOUS)
+
+    def test_a_break_anchor_never_overwrites_a_called_variant(self):
+        from strainphase.core import BREAK_PREFIX, _merge_split_reads
+
+        # The last aligned base of the left segment is a called SNV the read votes G at.
+        segs = [
+            self._seg("mol", 500000, 500124, {500123: "G"}),
+            self._seg("mol", 509000, 509500, {509100: "T"}),
+        ]
+        merged, breaks = _merge_split_reads(segs, snv_set={500123})
+        read = merged[0]
+
+        self.assertEqual(read.alleles[500123], "G", "a real allele was clobbered by BRK")
+        self.assertTrue(breaks, "the marker must be kept, at a free position")
+        anchor = breaks.copy().pop()
+        self.assertNotEqual(anchor, 500123)
+        self.assertEqual(read.alleles[anchor], f"{BREAK_PREFIX}509000")
+
+
+class TestGammaRowsAlwaysSumToOne(unittest.TestCase):
+    """REGRESSION (R1-23): a prune that coincides with the convergence break.
+
+    Pruning a component rewrites gamma's columns; when the prune happens on the same
+    iteration the loop terminates, the surviving rows were never renormalised and any
+    read whose whole mass sat on the pruned component came out ALL ZERO. Every
+    downstream consumer reads gamma as a posterior - junk counts, read assignment, the
+    abundance denominator - and `validate()` raises on it.
+    """
+
+    def test_no_gamma_row_is_all_zero_after_a_terminating_prune(self):
+        # Two well-supported haplotypes on the LEFT block, and a third holding two reads
+        # on a RIGHT block the other two do not cover at all. The two reads share no
+        # position with the survivors, so their likelihood there is -inf, and they match
+        # their own component so much better than the divergent-reference junk model
+        # that their junk responsibility underflows to exactly 0. Pruning the third
+        # component then leaves those rows with nothing.
+        left = list(range(100, 160))
+        right = list(range(1000, 1400))
+
+        def read(name, positions, base):
+            return Read(id=name, contig="test", mapq=60,
+                        alleles={p: base for p in positions},
+                        quals={p: 35 for p in positions})
+
+        reads = (
+            [read(f"a{i}", left, 'A') for i in range(15)]
+            + [read(f"b{i}", left, 'G') for i in range(15)]
+            + [read(f"c{i}", right, 'C') for i in range(2)]
+        )
+        window = Window(contig="test", start=1, end=2000, snv_pos=left + right,
+                        ref_alleles={p: 'A' for p in left + right}, reads=reads)
+        initial = [
+            Haplotype(consensus={p: 'A' for p in left}),
+            Haplotype(consensus={p: 'G' for p in left}),
+            Haplotype(consensus={p: 'C' for p in right}),
+        ]
+        # em_max_iter=1 puts the prune and the loop exit on the same iteration; the
+        # general condition is any prune that coincides with the convergence break, so
+        # the next E-step never gets to overwrite the row.
+        config = HaplotyperConfig(em_max_iter=1, min_hap_eff_weight=3.0)
+        em = EMHaplotyper(window, initial, config=config)
+        haps, gamma, pi, log_like, _, _ = em.run()
+
+        self.assertEqual(gamma.shape, (len(reads), len(haps) + 1))
+        row_sums = gamma.sum(axis=1)
+        self.assertEqual(int((row_sums == 0).sum()), 0, f"all-zero gamma rows: {row_sums}")
+        np.testing.assert_allclose(row_sums, 1.0, atol=1e-9)
+
+        # "No haplotype explains this read" IS junk, and the read must be counted as
+        # such: an all-zero row scores it as neither resolved nor junk.
+        result = WindowResult(window=window, haplotypes=haps, gamma=gamma, pi=pi,
+                              log_likelihood=log_like, assignments=[], converged=True,
+                              iterations=1)
+        result.validate()
+        self.assertEqual(result.junk_read_counts(), (len(reads), 2))
+
+
 class TestIntegration(unittest.TestCase):
     """Integration tests for full pipeline."""
     
@@ -956,7 +1101,6 @@ def run_tests(verbosity: int = 2) -> unittest.TestResult:
     suite.addTests(loader.loadTestsFromTestCase(TestEMHaplotyper))
     suite.addTests(loader.loadTestsFromTestCase(TestPostProcessor))
     suite.addTests(loader.loadTestsFromTestCase(TestWindowLinking))
-    suite.addTests(loader.loadTestsFromTestCase(TestWeightedMedian))
     suite.addTests(loader.loadTestsFromTestCase(TestAssignReads))
     suite.addTests(loader.loadTestsFromTestCase(TestEMPiNormalization))
     suite.addTests(loader.loadTestsFromTestCase(TestProcessWindow))

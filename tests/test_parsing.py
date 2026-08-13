@@ -16,7 +16,6 @@ from strainphase.core import (
     DEFAULT_CONFIG,
     HaplotyperConfig,
     LogProbCache,
-    _select_log_prob_cache,
     load_snvs,
     make_windows_lazy,
 )
@@ -39,10 +38,13 @@ def base_config():
     return HaplotyperConfig(
         min_depth_site=1,
         af_range=None,
-        require_biallelic=True,
-        include_indels=True,
         min_snvs_per_window=1,
         min_reads_per_window=1,
+        # These tests exercise VCF/CIGAR parsing with tiny synthetic reads, so the
+        # physical-overlap gates (1 kb by default) would drop every read before the
+        # parser is reached. Depth policy is covered by its own tests.
+        min_read_window_overlap_bp=0,
+        min_read_read_overlap_bp=0,
     )
 
 
@@ -56,7 +58,7 @@ def _record(pos, ref, alt, dp=20, **kw):
 def test_loader_snv(tmp_path, base_config):
     """A single SNV produces 'snv' type, no del_span, no ins_len."""
     vcf = write_vcf(tmp_path, CONTIG, [_record(100, "A", "G")])
-    pos, refs, depth, af, st, ds, il = load_snvs(vcf, CONTIG, config=base_config)
+    pos, refs, depth, af, st, sk, ds, il = load_snvs(vcf, CONTIG, config=base_config)
 
     assert pos == [100]
     assert refs[100] == "A"
@@ -71,12 +73,14 @@ def test_loader_simple_deletion_footprint(tmp_path, base_config):
     This is the regression test for the deletion-anchor-vs-footprint bug.
     """
     vcf = write_vcf(tmp_path, CONTIG, [_record(100, "AGCT", "A")])
-    pos, refs, _, _, st, ds, il = load_snvs(vcf, CONTIG, config=base_config)
+    pos, refs, _, _, st, sk, ds, il = load_snvs(vcf, CONTIG, config=base_config)
 
     assert st[100] == "del"
-    assert ds[100] == (101, 103)
+    assert ds[100] == {(101, 103)}
     assert 100 not in il
-    assert refs[100] == "AGCT"
+    # ref_alleles holds the 1bp anchor base, not the record REF: reads carry
+    # either a base or DEL<len>, so a multi-base REF could never match one.
+    assert refs[100] == "A"
 
 
 def test_loader_multibase_alt_deletion(tmp_path, base_config):
@@ -85,43 +89,78 @@ def test_loader_multibase_alt_deletion(tmp_path, base_config):
     Catches an implementation that assumes ALT is always a single base.
     """
     vcf = write_vcf(tmp_path, CONTIG, [_record(100, "AGCT", "AG")])
-    _, _, _, _, st, ds, _ = load_snvs(vcf, CONTIG, config=base_config)
+    _, _, _, _, st, sk, ds, _ = load_snvs(vcf, CONTIG, config=base_config)
 
     assert st[100] == "del"
-    assert ds[100] == (102, 103)
+    assert ds[100] == {(102, 103)}
 
 
 def test_loader_simple_insertion(tmp_path, base_config):
     """REF=A, ALT=ACGT at pos 100 -> ins_len[100] = 3."""
     vcf = write_vcf(tmp_path, CONTIG, [_record(100, "A", "ACGT")])
-    _, _, _, _, st, ds, il = load_snvs(vcf, CONTIG, config=base_config)
+    _, _, _, _, st, sk, ds, il = load_snvs(vcf, CONTIG, config=base_config)
 
     assert st[100] == "ins"
-    assert il[100] == 3
+    assert il[100] == {3}
     assert 100 not in ds
 
 
-def test_loader_mnp_skipped(tmp_path, base_config):
-    """Same-length multi-base records (MNPs) are skipped."""
+def test_loader_mnp_atomized(tmp_path, base_config):
+    """Same-length multi-base records (MNPs) are atomized into per-base SNVs.
+
+    ``AT>GC`` at 100 differs at both offsets -> SNVs at 100 and 101.
+    """
     vcf = write_vcf(
         tmp_path,
         CONTIG,
         [
-            _record(100, "AT", "GC"),  # MNP -> skip
+            _record(100, "AT", "GC"),  # MNP -> SNVs at 100 and 101
             _record(200, "A", "G"),  # SNV -> keep
         ],
     )
-    pos, _, _, _, st, _, _ = load_snvs(vcf, CONTIG, config=base_config)
+    pos, refs, _, _, st, sk, _, _ = load_snvs(vcf, CONTIG, config=base_config)
 
-    assert pos == [200]
+    assert sorted(pos) == [100, 101, 200]
+    assert refs[100] == "A" and st[100] == "snv"
+    assert refs[101] == "T" and st[101] == "snv"
     assert st[200] == "snv"
 
 
-def test_loader_multiallelic_dropped_when_biallelic_required(tmp_path, base_config):
-    """A record with two ALT alleles is skipped when require_biallelic=True."""
+def test_loader_mnp_only_differing_positions(tmp_path, base_config):
+    """Identical bases inside an MNP block are not emitted as variants.
+
+    ``TACG>CACC`` differs only at offsets 0 (T/C) and 3 (G/C).
+    """
+    vcf = write_vcf(tmp_path, CONTIG, [_record(100, "TACG", "CACC")])
+    pos, refs, _, _, st, sk, _, _ = load_snvs(vcf, CONTIG, config=base_config)
+    assert sorted(pos) == [100, 103]
+    assert refs[100] == "T" and refs[103] == "G"
+
+
+def test_loader_multiallelic_snv_kept(tmp_path, base_config):
+    """A record with two SNV ALT alleles is kept (position, not dropped)."""
     vcf = write_vcf(tmp_path, CONTIG, [_record(100, "A", ["G", "C"])])
-    pos, _, _, _, _, _, _ = load_snvs(vcf, CONTIG, config=base_config)
-    assert pos == []
+    pos, refs, _, _, st, sk, _, _ = load_snvs(vcf, CONTIG, config=base_config)
+    assert pos == [100]
+    assert refs[100] == "A"
+    assert st[100] == "snv"
+
+
+def test_loader_multiallelic_snv_plus_indel(tmp_path, base_config):
+    """Mixed multi-allelic (SNV + indel) keeps BOTH alleles at the one position.
+
+    This is the dominant case in real data: the great majority of collisions are
+    an SNV sharing an anchor with an indel, not two indels. Previously the
+    second allele was discarded as a position_conflict.
+    """
+    # A>G (snv) and A>ACGT (ins) at the same anchor: both must register.
+    vcf = write_vcf(tmp_path, CONTIG, [_record(100, "A", ["G", "ACGT"])])
+    pos, refs, _, _, st, sk, _, il = load_snvs(vcf, CONTIG, config=base_config)
+    assert pos == [100]
+    assert sk[100] == frozenset({"snv", "ins"})
+    assert il[100] == {3}  # the insertion is no longer lost to the SNV
+    assert st[100] == "snv"  # str kept for the `site_type[p] == "sv"` test
+    assert refs[100] == "A"
 
 
 def test_loader_af_range_none_keeps_fixed_sites(tmp_path):
@@ -130,7 +169,7 @@ def test_loader_af_range_none_keeps_fixed_sites(tmp_path):
     vcf = write_vcf(
         tmp_path, CONTIG, [_record(100, "A", "G", info={"DP": 20, "AF": 1.0})]
     )
-    pos, _, _, _, _, _, _ = load_snvs(vcf, CONTIG, config=cfg)
+    pos, _, _, _, _, sk, _, _ = load_snvs(vcf, CONTIG, config=cfg)
     assert pos == [100]
 
 
@@ -145,27 +184,27 @@ def test_loader_af_range_strict_drops_fixed_sites(tmp_path):
             _record(200, "A", "G", info={"DP": 20, "AF": 0.5}),  # kept
         ],
     )
-    pos, _, _, _, _, _, _ = load_snvs(vcf, CONTIG, config=cfg)
+    pos, _, _, _, _, sk, _, _ = load_snvs(vcf, CONTIG, config=cfg)
     assert pos == [200]
 
 
-def test_loader_include_indels_false(tmp_path):
-    """When include_indels=False, only SNVs come through."""
-    cfg = HaplotyperConfig(min_depth_site=1, af_range=None, include_indels=False)
+def test_loader_indels_always_kept(tmp_path):
+    """Indels are ALWAYS loaded — there is no flag to drop them (invariant)."""
+    cfg = HaplotyperConfig(min_depth_site=1, af_range=None)
     vcf = write_vcf(
         tmp_path,
         CONTIG,
         [
-            _record(100, "A", "G"),  # SNV -> keep
-            _record(200, "AGCT", "A"),  # DEL -> skip
-            _record(300, "A", "ACGT"),  # INS -> skip
+            _record(100, "A", "G"),  # SNV
+            _record(200, "AGCT", "A"),  # DEL
+            _record(300, "A", "ACGT"),  # INS
         ],
     )
-    pos, _, _, _, st, ds, il = load_snvs(vcf, CONTIG, config=cfg)
-    assert pos == [100]
+    pos, _, _, _, st, sk, ds, il = load_snvs(vcf, CONTIG, config=cfg)
+    assert sorted(pos) == [100, 200, 300]
     assert st[100] == "snv"
-    assert ds == {}
-    assert il == {}
+    assert st[200] == "del" and ds[200] == {(201, 203)}
+    assert st[300] == "ins" and il[300] == {3}
 
 
 def test_loader_non_pass_filter_skipped(tmp_path, base_config):
@@ -178,7 +217,7 @@ def test_loader_non_pass_filter_skipped(tmp_path, base_config):
             _record(200, "A", "G", filter="PASS"),
         ],
     )
-    pos, _, _, _, _, _, _ = load_snvs(vcf, CONTIG, config=base_config)
+    pos, _, _, _, _, sk, _, _ = load_snvs(vcf, CONTIG, config=base_config)
     assert pos == [200]
 
 
@@ -193,7 +232,7 @@ def test_loader_min_depth_filter(tmp_path):
             _record(200, "A", "G", dp=20),  # kept
         ],
     )
-    pos, _, _, _, _, _, _ = load_snvs(vcf, CONTIG, config=cfg)
+    pos, _, _, _, _, sk, _, _ = load_snvs(vcf, CONTIG, config=cfg)
     assert pos == [200]
 
 
@@ -223,7 +262,7 @@ def test_loader_multisample_without_sample_name_raises(tmp_path, base_config):
 def test_loader_empty_vcf(tmp_path, base_config):
     """A VCF with no records returns empty containers."""
     vcf = write_vcf(tmp_path, CONTIG, [])
-    pos, refs, depth, af, st, ds, il = load_snvs(vcf, CONTIG, config=base_config)
+    pos, refs, depth, af, st, sk, ds, il = load_snvs(vcf, CONTIG, config=base_config)
     assert pos == []
     assert refs == {}
     assert depth == {}
@@ -248,8 +287,11 @@ def cigar_config():
         min_mapq=0,
         min_base_quality=0,
         af_range=None,
-        include_indels=True,
         max_reads_per_window=1000,
+        # 200 bp windows and 150 bp synthetic reads are both far below the 1 kb
+        # physical-overlap defaults; these tests exercise the CIGAR walk, not depth policy.
+        min_read_window_overlap_bp=0,
+        min_read_read_overlap_bp=0,
     )
 
 
@@ -261,7 +303,7 @@ def _run_window(tmp_path, cigar_config, vcf_records, reads, ref_seq=None):
     vcf = write_vcf(tmp_path, CONTIG, vcf_records, contig_length=CONTIG_LEN)
     bam = write_bam(tmp_path, CONTIG, CONTIG_LEN, reads)
 
-    snv_pos, refs, _, _, st, ds, il = load_snvs(vcf, CONTIG, config=cigar_config)
+    snv_pos, refs, _, _, st, sk, ds, il = load_snvs(vcf, CONTIG, config=cigar_config)
     return make_windows_lazy(
         bam,
         CONTIG,
@@ -270,6 +312,7 @@ def _run_window(tmp_path, cigar_config, vcf_records, reads, ref_seq=None):
         refs,
         cigar_config,
         site_type=st,
+        site_kinds=sk,
         del_span=ds,
         ins_len=il,
     )
@@ -302,7 +345,7 @@ def test_cigar_del_exact_match(tmp_path, cigar_config):
     windows = _run_window(tmp_path, cigar_config, vcf_recs, reads)
     alleles = _read_alleles(windows, "del_carrier")
     assert alleles is not None
-    assert alleles[100] == "DEL"
+    assert alleles[100] == "DEL3"
 
 
 def test_cigar_del_wrong_size_no_call(tmp_path, cigar_config):
@@ -323,8 +366,11 @@ def test_cigar_del_wrong_size_no_call(tmp_path, cigar_config):
     windows = _run_window(tmp_path, cigar_config, vcf_recs, reads)
     alleles = _read_alleles(windows, "wrong_size")
     assert alleles is not None
-    # Anchor base recorded as the ref-like vote; not "DEL".
-    assert alleles[100] != "DEL"
+    # Anchor base recorded as the ref-like vote. Asserting `!= "DEL"` is vacuous: the
+    # alphabet is DEL<len>, so the bare token is never emitted and even "DEL5" - the
+    # regression value - would satisfy it.
+    assert alleles[100] == "A"
+    assert not alleles[100].startswith("DEL")
 
 
 def test_cigar_del_off_by_one_no_call(tmp_path, cigar_config):
@@ -341,7 +387,10 @@ def test_cigar_del_off_by_one_no_call(tmp_path, cigar_config):
     windows = _run_window(tmp_path, cigar_config, vcf_recs, reads)
     alleles = _read_alleles(windows, "off_by_one")
     assert alleles is not None
-    assert alleles[100] != "DEL"
+    # The anchor base, not a deletion call of any length (see the sibling above on why
+    # `!= "DEL"` cannot fail).
+    assert alleles[100] == "A"
+    assert not alleles[100].startswith("DEL")
 
 
 def test_cigar_no_deletion_records_matched_base(tmp_path, cigar_config):
@@ -384,7 +433,23 @@ def test_cigar_ins_exact_match(tmp_path, cigar_config):
     windows = _run_window(tmp_path, cigar_config, vcf_recs, reads)
     alleles = _read_alleles(windows, "ins_carrier")
     assert alleles is not None
-    assert alleles[100] == "INS"
+    assert alleles[100] == "INS3"
+
+
+def test_cigar_ins_length_specific(tmp_path, cigar_config):
+    """A 3-bp insertion is its own allele (INS3); a read with a DIFFERENT-size
+    insertion at the same anchor does NOT match it (no collapse to generic INS)."""
+    vcf_recs = [_record(100, "A", "ACGT")]  # a 3-bp insertion at anchor 100
+    reads = [
+        {"name": "ins3", "start": 0, "cigar": "100M3I50M", "seq": "A" * 153},
+        {"name": "ins5", "start": 0, "cigar": "100M5I50M", "seq": "A" * 155},
+    ]
+    windows = _run_window(tmp_path, cigar_config, vcf_recs, reads)
+    a3 = _read_alleles(windows, "ins3")
+    a5 = _read_alleles(windows, "ins5")
+    assert a3[100] == "INS3"          # matches the VCF's 3-bp insertion
+    assert a5[100] != "INS3"          # a 5-bp insertion is not the same edit
+    assert a5[100] != a3[100]         # distinct alleles, not both "INS"
 
 
 def test_cigar_ins_off_by_one_no_call(tmp_path, cigar_config):
@@ -401,7 +466,10 @@ def test_cigar_ins_off_by_one_no_call(tmp_path, cigar_config):
     windows = _run_window(tmp_path, cigar_config, vcf_recs, reads)
     alleles = _read_alleles(windows, "ins_off")
     assert alleles is not None
-    assert alleles[100] != "INS"
+    # The anchor base, not an insertion call of any length: the alphabet is INS<len>, so
+    # `!= "INS"` is true for every value the parser can produce, "INS3" included.
+    assert alleles[100] == "A"
+    assert not alleles[100].startswith("INS")
 
 
 def test_cigar_no_insertion_records_matched_base(tmp_path, cigar_config):
@@ -453,8 +521,8 @@ def test_cigar_read_carries_both_del_and_ins(tmp_path, cigar_config):
     windows = _run_window(tmp_path, cigar_config, vcf_recs, reads)
     alleles = _read_alleles(windows, "both")
     assert alleles is not None
-    assert alleles[100] == "DEL"
-    assert alleles[200] == "INS"
+    assert alleles[100] == "DEL3"
+    assert alleles[200] == "INS2"
 
 
 def test_cigar_snv_alongside_indel(tmp_path, cigar_config):
@@ -478,7 +546,7 @@ def test_cigar_snv_alongside_indel(tmp_path, cigar_config):
     alleles = _read_alleles(windows, "mixed")
     assert alleles is not None
     assert alleles[50] == "G"
-    assert alleles[100] == "DEL"
+    assert alleles[100] == "DEL3"
 
 
 def test_cigar_soft_clip_then_deletion(tmp_path, cigar_config):
@@ -498,7 +566,7 @@ def test_cigar_soft_clip_then_deletion(tmp_path, cigar_config):
     windows = _run_window(tmp_path, cigar_config, vcf_recs, reads)
     alleles = _read_alleles(windows, "softclip")
     assert alleles is not None
-    assert alleles[100] == "DEL"
+    assert alleles[100] == "DEL3"
 
 
 def test_cigar_hard_clip_does_not_break_cursor(tmp_path, cigar_config):
@@ -515,7 +583,7 @@ def test_cigar_hard_clip_does_not_break_cursor(tmp_path, cigar_config):
     windows = _run_window(tmp_path, cigar_config, vcf_recs, reads)
     alleles = _read_alleles(windows, "hardclip")
     assert alleles is not None
-    assert alleles[100] == "DEL"
+    assert alleles[100] == "DEL3"
 
 
 def test_cigar_read_does_not_cover_site(tmp_path, cigar_config):
@@ -547,7 +615,6 @@ def test_cigar_low_quality_anchor_skipped(tmp_path):
         min_mapq=0,
         min_base_quality=20,  # threshold above the read's qual
         af_range=None,
-        include_indels=True,
     )
     vcf_recs = [_record(100, "A", "ACGT")]  # INS site
     reads = [
@@ -562,7 +629,7 @@ def test_cigar_low_quality_anchor_skipped(tmp_path):
     write_fasta(tmp_path, {CONTIG: "A" * CONTIG_LEN})
     vcf = write_vcf(tmp_path, CONTIG, vcf_recs, contig_length=CONTIG_LEN)
     bam = write_bam(tmp_path, CONTIG, CONTIG_LEN, reads)
-    snv_pos, refs, _, _, st, ds, il = load_snvs(vcf, CONTIG, config=cfg)
+    snv_pos, refs, _, _, st, sk, ds, il = load_snvs(vcf, CONTIG, config=cfg)
     windows = make_windows_lazy(
         bam, CONTIG, CONTIG_LEN, snv_pos, refs, cfg,
         site_type=st, del_span=ds, ins_len=il,
@@ -590,7 +657,7 @@ def test_cigar_indel_at_window_boundary(tmp_path, cigar_config):
     windows = _run_window(tmp_path, cigar_config, vcf_recs, reads)
     alleles = _read_alleles(windows, "boundary")
     assert alleles is not None
-    assert alleles[199] == "DEL"
+    assert alleles[199] == "DEL2"
 
 
 # ============================================================================
@@ -633,13 +700,11 @@ class TestLogProbCacheAlphabet:
         with pytest.raises(ValueError):
             LogProbCache(n_alleles=1)
 
-    def test_select_log_prob_cache_picks_4_when_indels_disabled(self):
-        cfg = HaplotyperConfig(include_indels=False)
-        assert _select_log_prob_cache(cfg).n_alleles == 4
+    def test_global_cache_is_six_allele(self):
+        """The one global cache is always 6-allele {A,C,G,T,DEL,INS}."""
+        from strainphase.core import _LOG_PROB_CACHE
 
-    def test_select_log_prob_cache_picks_6_when_indels_enabled(self):
-        cfg = HaplotyperConfig(include_indels=True)
-        assert _select_log_prob_cache(cfg).n_alleles == 6
+        assert _LOG_PROB_CACHE.n_alleles == 6
 
 
 # ============================================================================
@@ -657,7 +722,7 @@ def test_empty_vcf_yields_no_windows(tmp_path, cigar_config, caplog):
         CONTIG_LEN,
         [{"name": "r", "start": 0, "cigar": "150M", "seq": "A" * 150}],
     )
-    snv_pos, refs, _, _, st, ds, il = load_snvs(vcf, CONTIG, config=cigar_config)
+    snv_pos, refs, _, _, st, sk, ds, il = load_snvs(vcf, CONTIG, config=cigar_config)
     assert snv_pos == []
 
     with caplog.at_level(logging.WARNING):
@@ -668,17 +733,37 @@ def test_empty_vcf_yields_no_windows(tmp_path, cigar_config, caplog):
     assert windows == []
 
 
-def test_default_config_is_indel_aware():
-    """The default config enables indels and uses no AF filter."""
-    assert DEFAULT_CONFIG.include_indels is True
+def test_default_config_has_no_af_filter():
+    """The default config uses no AF filter (indels/multiallelic are always on
+    and have no flag to assert)."""
     assert DEFAULT_CONFIG.af_range is None
+    assert not hasattr(DEFAULT_CONFIG, "include_indels")
+    assert not hasattr(DEFAULT_CONFIG, "require_biallelic")
 
 
 # ============================================================================
 # Simulator: indel injection round-trip
+#
+# These exercise the private ``validation/`` simulator, which is not part of the
+# distributed repository. They skip on a fresh clone rather than failing it. The
+# equivalent public coverage lives in ``benchmark/tests/test_simulate.py``,
+# which checks the same properties against the shipped simulator.
 # ============================================================================
 
+try:
+    import validation.simulate_reads  # noqa: F401
 
+    _HAS_PRIVATE_SIMULATOR = True
+except ImportError:
+    _HAS_PRIVATE_SIMULATOR = False
+
+requires_private_simulator = pytest.mark.skipif(
+    not _HAS_PRIVATE_SIMULATOR,
+    reason="private validation/ simulator not present in this checkout",
+)
+
+
+@requires_private_simulator
 def test_simulator_emits_indel_cigar():
     """``simulate_read`` emits D and I CIGAR ops when the strain carries indels."""
     import numpy as np
@@ -701,6 +786,7 @@ def test_simulator_emits_indel_cigar():
     assert len(quals) == 200
 
 
+@requires_private_simulator
 def test_simulator_writes_canonical_indel_vcf(tmp_path):
     """``write_vcf`` emits indels in canonical left-anchored form."""
     from validation.simulate_reads import Strain, write_vcf
@@ -716,11 +802,11 @@ def test_simulator_writes_canonical_indel_vcf(tmp_path):
     out = tmp_path / "truth.vcf"
     write_vcf({"c": []}, [ref, s1], ref, str(out))
 
-    body = [l for l in out.read_text().splitlines() if not l.startswith("#")]
+    body = [ln for ln in out.read_text().splitlines() if not ln.startswith("#")]
     # Two records: one DEL and one INS
     assert len(body) == 2
 
-    rows = [l.split("\t") for l in body]
+    rows = [ln.split("\t") for ln in body]
     by_pos = {int(r[1]): r for r in rows}
 
     # DEL: anchor 0-based 100 -> VCF POS 101; REF len = 1+3 = 4; ALT len = 1
@@ -732,3 +818,70 @@ def test_simulator_writes_canonical_indel_vcf(tmp_path):
     ins_row = by_pos[151]
     assert len(ins_row[3]) == 1
     assert len(ins_row[4]) == 4
+
+
+# ============================================================================
+# Multi-variant sites: two edits sharing one anchor are two alleles
+#
+# Regression fixtures for the collapse that used to happen in _register, where
+# a position held exactly one variant and any second one at that position was
+# discarded as a `position_conflict`. Modelled on contig_1:16252 of the Figure-3
+# B. fragilis run: a G-homopolymer with a 1bp and a 2bp deletion on one anchor.
+# ============================================================================
+
+
+def test_loader_two_deletion_lengths_one_anchor(tmp_path, base_config):
+    """REF=TG/ALT=T and REF=TGG/ALT=T at pos 100 -> BOTH footprints registered.
+
+    Before, the 2bp deletion was dropped as a position_conflict and reads
+    carrying it were scored as reference-like.
+    """
+    vcf = write_vcf(
+        tmp_path, CONTIG, [_record(100, "TG", "T"), _record(100, "TGG", "T")]
+    )
+    pos, refs, _, _, st, sk, ds, il = load_snvs(vcf, CONTIG, config=base_config)
+
+    assert pos == [100]
+    assert ds[100] == {(101, 101), (101, 102)}  # 1bp and 2bp, both kept
+    assert sk[100] == frozenset({"del"})
+    assert refs[100] == "T"  # anchor base, so a read holding "T" is reference-like
+
+
+def test_loader_snv_and_indel_share_a_position(tmp_path, base_config):
+    """An SNV and a deletion at one position both register; site_kinds holds both."""
+    vcf = write_vcf(
+        tmp_path, CONTIG, [_record(100, "T", "C"), _record(100, "TGG", "T")]
+    )
+    pos, refs, _, _, st, sk, ds, il = load_snvs(vcf, CONTIG, config=base_config)
+
+    assert pos == [100]
+    assert sk[100] == frozenset({"snv", "del"})
+    assert ds[100] == {(101, 102)}
+    assert st[100] == "snv"  # first kind registered; kept a str for the "sv" test
+    assert refs[100] == "T"
+
+
+def test_cigar_two_deletion_lengths_give_distinct_alleles(tmp_path, cigar_config):
+    """Three reads at one anchor -> three distinct alleles: DEL1, DEL2, ref base.
+
+    This is the whole point of the change: a 1bp and a 2bp deletion sharing an
+    anchor must separate haplotypes instead of one being folded into the other.
+    """
+    ref_seq = "A" * 100 + "TGG" + "A" * (CONTIG_LEN - 103)
+    vcf_recs = [_record(100, "TG", "T"), _record(100, "TGG", "T")]
+    reads = [
+        # anchor at 1-based 100 == 0-based 99, so 100M covers ref 1..100
+        {"name": "del1", "start": 0, "cigar": "100M1D50M", "seq": "A" * 150},
+        {"name": "del2", "start": 0, "cigar": "100M2D50M", "seq": "A" * 150},
+        {"name": "noindel", "start": 0, "cigar": "150M", "seq": "A" * 99 + "T" + "A" * 50},
+    ]
+    windows = _run_window(tmp_path, cigar_config, vcf_recs, reads, ref_seq=ref_seq)
+
+    a1 = _read_alleles(windows, "del1")
+    a2 = _read_alleles(windows, "del2")
+    a3 = _read_alleles(windows, "noindel")
+    assert a1 is not None and a2 is not None and a3 is not None
+    assert a1[100] == "DEL1"
+    assert a2[100] == "DEL2"
+    assert a3[100] == "T"
+    assert len({a1[100], a2[100], a3[100]}) == 3  # three haplotypes, not two

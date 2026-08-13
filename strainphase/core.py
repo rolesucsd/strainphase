@@ -26,8 +26,10 @@ Date: 2025
 from __future__ import annotations
 
 import logging
+import os
 import warnings
 from collections import defaultdict
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from multiprocessing import Pool
 
@@ -84,17 +86,51 @@ class HaplotyperConfig:
     # =========== WINDOW PARAMETERS ===========
     window_size: int = 20000
     min_snvs_per_window: int = 1
-    min_reads_per_window: int = 3
+    # Depth policy (FIGURE4 diagnosis §6 #3). Two DIFFERENT floors:
+    #   min_reads_per_window  - reads needed to PHASE a window de novo. Separating two
+    #                           haplotypes at 50/50 needs ~10-20 reads; 3 cannot resolve
+    #                           anything and manufactures the abundance==1.0 artifact.
+    #   min_reads_for_rescue  - reads needed for a window to be BUILT AT ALL, so it can
+    #                           still receive a rescued haplotype from the anchor panel.
+    #                           Rescue matches an established anchor rather than doing de
+    #                           novo separation, so it legitimately needs less evidence.
+    # A window with min_reads_for_rescue <= n < min_reads_per_window is created but not phased.
+    min_reads_per_window: int = 10
+    min_reads_for_rescue: int = 5
 
     # =========== READ FILTERING ===========
     min_mapq: int = 20
     min_base_quality: int = 20
     default_base_quality: int = 20
-    max_reads_per_window: int = 10000
+    # Cap per window; reads above this are uniformly subsampled with the config seed.
+    max_reads_per_window: int = 500
+    # A read must physically cover at least this many bp of a window to be counted in it.
+    # Without this a read overlapping by 1 bp entered n_reads_examined, the junk
+    # classification and the abundance denominator identically to one spanning 20 kb.
+    # (FIGURE4 diagnosis §6 #6b; costs ~8% of reads on 000089747_1.)
+    min_read_window_overlap_bp: int = 1000
+    # Two reads must physically overlap by at least this much to be compared at all
+    # (FIGURE4 diagnosis §6 #8, LEVEL 1).
+    min_read_read_overlap_bp: int = 1000
+
+    # =========== MEMORY ===========
+    # Per-read hard assignments (WindowResult.assignments) are a debugging aid: one dict
+    # per read per window, never written to any output file and never read by any other
+    # function in the package. On a 146-sample MAG that is tens of millions of dicts
+    # retained for nothing, so they are off by default. Turn on to inspect them.
+    keep_read_assignments: bool = False
+    # Spill per-sample WindowResults to <output_dir>/tmp during the first pass instead of
+    # holding every sample's reads in RAM until the rescue pass. Cross-sample rescue only
+    # ever reads `.haplotypes` off OTHER samples (build_anchor_panel_for_key /
+    # count_timepoints_for_haplotype), so the heavy fields can live on disk and be
+    # reloaded one sample at a time. See longitudinal.process_mag_longitudinal.
+    spill_results_to_disk: bool = True
+    # Windows are handed to the worker pool in batches of n_workers * this, so the input
+    # list for a contig is never fully materialised at once.
+    window_batch_factor: int = 4
 
     # =========== VARIANT FILTERING ===========
     min_depth_site: int = 3
-    require_biallelic: bool = True
     # Optional AF range filter. ``None`` (default) keeps all variants regardless
     # of allele frequency, which is what you want for longitudinal phasing
     # because a position fixed at AF=0 or AF=1 in one timepoint can still be
@@ -102,18 +138,42 @@ class HaplotyperConfig:
     # to within-sample polymorphic sites.
     af_range: tuple[float, float] | None = None
 
-    # =========== INDEL HANDLING ===========
-    # When True, indel sites in the VCF are loaded alongside SNVs. A read is
-    # labeled "DEL" if its CIGAR has a D op exactly matching the VCF deletion
-    # footprint, "INS" if it has an I op anchored at the VCF insertion anchor,
-    # otherwise the matched reference base (or no call). All deletions/
-    # insertions at a position collapse to a single state regardless of size.
-    include_indels: bool = True
+    # =========== MUTATION HANDLING — INVARIANT ===========
+    # There is deliberately NO ``include_indels`` and NO ``require_biallelic``
+    # flag. strainphase ALWAYS loads every mutation type (SNV, MNP->SNVs,
+    # insertion, deletion) and ALWAYS keeps multi-allelic (>2 allele) sites.
+    # This is a hard invariant — see ``docs/MUTATION_HANDLING.md``. Do not add a
+    # switch that lets a caller drop indels or collapse alleles.
 
     # =========== GRAPH CONSTRUCTION ===========
-    min_shared_snvs_for_edge: int = 1
+    min_shared_snvs_for_edge: int = 3
     max_mismatch_frac: float = 0.01
     min_reads_per_cluster: int = 3
+
+    # =========== IDENTITY GATES (shared by all three linking levels) ===========
+    # The rate gate is applied as int(max_mismatch_frac * n_shared) - a FLOOR - so it
+    # already forces 0 mismatches below n_shared=100 and 1 below n_shared=200. The
+    # absolute cap therefore does nothing at low n_shared and becomes the binding gate
+    # at high n_shared, where a rate alone would tolerate 11 mismatches at n=1172.
+    # The two guard opposite ends of the range; both are required.
+    # (FIGURE4 diagnosis §6 #8.)
+    max_num_diff: int = 1
+    # Minimum physical overlap between two entities, below which the verdict is an
+    # explicit NON-MERGE rather than "unknown" (Strainy's I = 1000).
+    min_entity_overlap_bp: int = 1000
+    # AUTHOR'S DECISION: structural variants are NEVER excluded from identity. Capturing
+    # the trajectory of a flip is a goal of the analysis, not noise to be filtered, so an
+    # inversion is a first-class marker like any other.
+    #
+    # The consequence is deliberate and worth stating: when an invertible element flips,
+    # the two orientations become genotypically distinct and are reported as two entities
+    # whose frequencies trade off over time. That IS the flip trajectory - it is recorded
+    # as a pair of anti-correlated entities rather than as one entity changing state.
+    #
+    # Left as a knob only so the effect can be measured; do not flip the default. The
+    # earlier True default was set in code while FIGURE4 diagnosis §6 #16 was still an
+    # open author decision.
+    exclude_sv_from_identity: bool = False
 
     # =========== EM PARAMETERS ===========
     em_max_iter: int = 30
@@ -129,7 +189,7 @@ class HaplotyperConfig:
     # =========== POST-PROCESSING ===========
     merge_distance_threshold: float = 0.01
     min_shared_for_merge: int = 2  # Min shared SNVs with actual calls to consider merging
-    assign_confidence_threshold: float = 0.80
+    assign_confidence_threshold: float = 0.90
 
     # =========== 1-SNP VALIDATION ===========
     validate_1snp_differences: bool = True
@@ -145,10 +205,39 @@ class HaplotyperConfig:
     min_shared_for_rescue: int = 2  # Min shared SNVs with actual calls for rescue matching
     rescued_min_weight: float = 0.02
 
-    # =========== LINEAGE CLUSTERING PARAMETERS ===========
-    # Controls how tracks are clustered into lineages across samples
-    lineage_merge_distance: float = 0.01  # Max distance to merge tracks into same lineage
-    min_shared_for_lineage: int = 2  # Min shared SNVs to consider merging into lineage
+    # =========== CROSS-SAMPLE WINDOW GROUPING ===========
+    # Groups haplotypes at ONE FIXED WINDOW across samples (the "vertical" axis).
+    # Windows are fixed coordinate tiles, so every comparison here has an identical
+    # footprint - no span gating, nothing to expand, no imputation gap.
+    lineage_merge_distance: float = 0.01  # Max mismatch rate to group
+    min_shared_for_lineage: int = 3  # Min shared markers (raised 2 -> 3 to match linking)
+    # Identity shape. This decision is still OPEN (FIGURE4 diagnosis §6 #9); both are
+    # implemented so they can be compared on identical inputs.
+    #   "clique"     - complete linkage: a group is a clique, every member passes the
+    #                  gates against every other member. No time axis, so immune to
+    #                  irregular timepoint spacing and to sample-ordering mistakes.
+    #   "reciprocal" - unique-best-on-both-sides + mutual between consecutive samples,
+    #                  with a per-haplotype dropout skip. Requires a correct
+    #                  chronological sample order to mean anything.
+    # SPLIT MOLECULES (troubleshooting U1). A molecule the aligner had to split across a
+    # divergent segment is re-assembled into one Read, and the breakpoint is registered as
+    # a site carrying BRK<resume_pos> / CONT. Off only to measure the difference.
+    merge_split_reads: bool = True
+
+    # Step 3 runs inside the pipeline. Off only to skip it on a run that is producing the
+    # window tables for something else.
+    build_lineages: bool = True
+
+    cross_sample_method: str = "clique"
+
+    # =========== ABUNDANCE COHERENCE ===========
+    # A genome cannot hold two frequencies at one locus at one time. Tested on RAW
+    # counts (never the derived, already-quantised `abundance`) with Fisher's exact
+    # test, so the rule self-tightens as depth grows instead of using a fixed cutoff.
+    # SINGLE TIMEPOINT ONLY - this is a window-merging check, never a cross-timepoint
+    # comparison. (FIGURE4 diagnosis §6 #14.)
+    abundance_coherence_alpha: float = 0.01
+    min_reads_for_coherence: int = 10
 
     # =========== LINKING DIAGNOSTICS ===========
     linking_debug: bool = False  # Record detailed linking diagnostics
@@ -159,12 +248,30 @@ class HaplotyperConfig:
     # Haplotypes in adjacent overlapping windows are linked if their
     # consensus agrees on shared SNVs (Hamming distance <= max_link_distance)
     max_link_distance: float = 0.01  # Max mismatch fraction to link
-    min_shared_snvs_for_link: int = (
-        3  # Min shared SNVs with ACTUAL CALLS to link (not just window overlap)
-    )
+    # Window-level shared SNV POSITIONS (does the window pair even have common sites).
+    min_shared_snvs_for_link: int = 3
+    # Haplotype-level shared ACTUAL CALLS. Previously the same knob as the line above,
+    # which meant the two could not be set independently (FIGURE4 diagnosis §6 #8, LEVEL 2).
+    min_shared_calls_for_link: int = 3
+    # The two haplotypes' CO-SUPPORTED SPAN inside the shared region, as a fraction of
+    # that region. Window geometry itself is not a useful gate (tiles overlap by exactly
+    # 50% or exactly 0%, nothing between). Measured on 000089747_1: 25% rejects 16.0% of
+    # adjacent-window pairs, 50% rejects 30.0% - too aggressive given under-merging is the
+    # standing risk. 25% of a 10 kb overlap is 2500 bp, comfortably above
+    # min_entity_overlap_bp so the two gates agree rather than one masking the other.
+    min_cosupported_span_frac: float = 0.25
 
     # =========== RUNTIME PARAMETERS ===========
-    random_seed: int | None = None
+    # Seeded by DEFAULT, not None. Two things consume randomness and both change which
+    # haplotypes get called:
+    #   - make_windows_lazy subsamples to max_reads_per_window with config.get_rng(), so
+    #     an unseeded run draws a DIFFERENT set of reads in every window above the cap;
+    #   - Louvain read clustering (GraphInitializer) is handed this seed as random_state.
+    # Leaving this None made reruns disagree - identical inputs gave abundances that
+    # differed in the 8th decimal, and different subsampled reads above the cap. Set an
+    # explicit integer to vary it deliberately (e.g. to check a result is not an artefact
+    # of one draw); None restores the old unseeded behaviour.
+    random_seed: int | None = 42
     validate_results: bool = False  # Set False for production runs
     n_workers: int = 1  # Number of parallel workers for window processing (1=sequential)
 
@@ -206,6 +313,35 @@ class HaplotyperConfig:
         if self.window_size < 100:
             raise ValueError(f"window_size too small: {self.window_size}")
 
+        # Depth policy: a window must be buildable before it can be phased, so the
+        # rescue floor has to sit at or below the phasing floor. Clamp rather than raise -
+        # a caller lowering min_reads_per_window (tests, low-coverage runs) means "be more
+        # permissive", and erroring on that would be hostile. Above the phasing floor the
+        # rescue band would simply be empty, which is silent and confusing.
+        if self.min_reads_for_rescue > self.min_reads_per_window:
+            object.__setattr__(self, "min_reads_for_rescue", self.min_reads_per_window)
+
+        if self.max_num_diff < 0:
+            raise ValueError(f"max_num_diff must be >= 0, got {self.max_num_diff}")
+
+        if not (0 <= self.min_cosupported_span_frac <= 1):
+            raise ValueError(
+                f"min_cosupported_span_frac must be in [0, 1], got "
+                f"{self.min_cosupported_span_frac}"
+            )
+
+        if self.cross_sample_method not in ("clique", "reciprocal"):
+            raise ValueError(
+                f"cross_sample_method must be 'clique' or 'reciprocal', got "
+                f"{self.cross_sample_method!r}"
+            )
+
+        if not (0 < self.abundance_coherence_alpha < 1):
+            raise ValueError(
+                f"abundance_coherence_alpha must be in (0, 1), got "
+                f"{self.abundance_coherence_alpha}"
+            )
+
         # EM iterations
         if self.em_max_iter < 1:
             raise ValueError(f"em_max_iter must be >= 1, got {self.em_max_iter}")
@@ -233,6 +369,31 @@ class Read:
     alleles: dict[int, str] = field(default_factory=dict)
     quals: dict[int, int] = field(default_factory=dict)
     sample: str | None = None
+    # Reference alignment span, 1-based inclusive-exclusive (from aln.reference_start /
+    # aln.reference_end). Needed for the physical-overlap gates; without these the only
+    # available proxy is the span between shared VARIANT sites, which under-counts badly
+    # in variant-sparse regions. Default (0, 0) means "unknown" - overlap gates are then
+    # skipped rather than silently rejecting everything.
+    ref_start: int = 0
+    ref_end: int = 0
+    # Aligned reference intervals, 1-based [start, end), one per alignment segment. Empty
+    # for a read from a single alignment, whose outer span IS its coverage. A molecule
+    # re-assembled from split alignments carries one entry per segment, because there
+    # ref_start/ref_end bracket the unaligned gap between the segments as well - asking
+    # the outer span whether the read covers a position answers yes inside its own gap.
+    segments: list[tuple[int, int]] = field(default_factory=list)
+
+    def covers(self, pos: int) -> bool:
+        """Is *pos* inside an ALIGNED part of this read? Unknown span (0, 0) is False."""
+        if self.segments:
+            return any(s <= pos < e for s, e in self.segments)
+        return self.ref_start <= pos < self.ref_end
+
+    def overlap_bp(self, other: Read) -> int:
+        """Physical reference overlap with *other*, in bp. -1 when either span is unknown."""
+        if self.ref_end <= self.ref_start or other.ref_end <= other.ref_start:
+            return -1
+        return max(0, min(self.ref_end, other.ref_end) - max(self.ref_start, other.ref_start))
 
 
 @dataclass
@@ -251,7 +412,19 @@ class Window:
     end: int  # 1-based, exclusive
     snv_pos: list[int] = field(default_factory=list)  # SNV positions (from VCF)
     ref_alleles: dict[int, str] = field(default_factory=dict)  # REF base per SNV (from VCF)
-    reads: list[Read] = field(default_factory=list)  # Reads overlapping this window (from BAM)
+    # Reads overlapping this window (from BAM), in gamma-row order. AFTER a
+    # WindowResult offloads its heavy fields these are id-only stand-ins
+    # (longitudinal._ReadRef) rather than Reads: the payload is released but the row
+    # order and the read ids survive, so a consumer can still say which read each gamma
+    # row belongs to. Anything needing alleles must run before the offload - which
+    # everything in this module does.
+    reads: list[Read] = field(default_factory=list)
+    # Per-position site type ("snv" / "del" / "ins" / "sv") for the positions in this
+    # window. Carried on the Window because the identity code downstream needs to know
+    # which positions are structural variants in order to exclude them from the distance
+    # (an invertible promoter flips independently of strain background). Without this the
+    # SV exclusion cannot fire at all.
+    site_type: dict[int, str] = field(default_factory=dict)
     sample: str | None = None  # Optional timepoint/sample label (redundant with Read.sample)
     window_idx: int = 0  # Position in contig's window sequence
 
@@ -349,8 +522,60 @@ class WindowResult:
     converged: bool
     iterations: int
     linking_debug: list[dict] = field(default_factory=list)
+    # Step-1 comparisons that failed on a GENUINE ALLELE DISAGREEMENT, recorded so the
+    # verdict survives to the output. Only `failed_mismatch` is kept: it is a real
+    # genotypic wall (a candidate recombination breakpoint) and is the one negative the
+    # merge rules treat as absolute. `failed_no_evidence` is a measurement hole and is
+    # deliberately NOT recorded - reporting absence of coverage would bury the signal.
+    link_mismatches: list[dict] = field(default_factory=list)
     n_reads_examined: int = 0
     reads_within_mismatch_per_hap: list[int] = field(default_factory=list)
+    # Scalar summaries of `gamma`, recorded before the heavy fields are offloaded so the
+    # output tables can still be built while reads/gamma live on disk. -1 = not recorded.
+    n_reads_total: int = -1
+    n_junk_reads: int = -1
+    heavy_offloaded: bool = False
+
+    # ---------------- Heavy-field offload ----------------
+    # `window.reads` is ~99% of a WindowResult's footprint: a Read holds two
+    # position-keyed dicts, and on a contig with a variant every ~25 bp a single 15 kb
+    # HiFi read costs ~90 KB. Reads are needed only while the window's OWN sample is
+    # being phased or rescued - cross-sample rescue reads nothing but `.haplotypes` off
+    # other samples. `gamma` is ~1000x smaller and IS still read when the output tables
+    # are built, so it stays resident.
+    #
+    # The WindowResult object itself stays resident too, and that is deliberate: the
+    # rescue panel holds references to these very Haplotype objects and mutates their
+    # weights in place, so replacing the objects would change results.
+
+    def offload_heavy(self) -> list:
+        """Detach and return this window's reads, recording the read-count summaries."""
+        if self.heavy_offloaded:
+            return []
+        self.n_reads_total, self.n_junk_reads = self.junk_read_counts()
+        reads = self.window.reads
+        self.window.reads = []
+        self.window._pos_sets = None
+        self.assignments = []
+        self.heavy_offloaded = True
+        return reads
+
+    def restore_heavy(self, reads: list) -> None:
+        """Re-attach reads detached by :meth:`offload_heavy`."""
+        self.window.reads = reads
+        self.window._pos_sets = None
+        self.heavy_offloaded = False
+
+    def junk_read_counts(self) -> tuple[int, int]:
+        """``(n_reads_total, n_junk_reads)`` whether or not gamma is resident."""
+        if self.gamma is not None and self.gamma.size:
+            return (
+                int(self.gamma.shape[0]),
+                int((self.gamma[:, self.gamma.shape[1] - 1] >= 0.5).sum()),
+            )
+        if self.n_reads_total >= 0:
+            return self.n_reads_total, self.n_junk_reads
+        return 0, 0
 
     def validate(self) -> bool:
         """Validate internal consistency."""
@@ -463,9 +688,9 @@ class LogProbCache:
     Avoids redundant 10**(-Q/10) calculations. The mismatch probability is
     spread uniformly over the ``n_alleles - 1`` non-matching states.
 
-    For SNV-only phasing the alphabet is {A, C, G, T} → ``n_alleles=4``. With
-    indels enabled (``HaplotyperConfig.include_indels=True``) the alphabet
-    expands to {A, C, G, T, DEL, INS} → ``n_alleles=6``.
+    The alphabet is always {A, C, G, T, DEL, INS} → ``n_alleles=6``, because
+    indels are always processed (invariant — see ``docs/MUTATION_HANDLING.md``).
+    SV pseudo-alleles reuse the same 6-state error model.
     """
 
     def __init__(self, max_q: int = 60, n_alleles: int = 4):
@@ -475,6 +700,8 @@ class LogProbCache:
         self._log_match = np.zeros(max_q + 1)
         self._log_mismatch = np.zeros(max_q + 1)
         self.n_alleles = n_alleles
+        # Junk tables depend on junk_divergence_rate, which is config, not alphabet.
+        self._junk_tables: dict[float, tuple[np.ndarray, np.ndarray]] = {}
 
         denom = float(n_alleles - 1)
         for q in range(max_q + 1):
@@ -489,24 +716,299 @@ class LogProbCache:
             return self._log_match[q]
         return self._log_mismatch[q]
 
+    def log_mismatch(self, q: int) -> float:
+        """``log P(obs | the true allele is something else)`` at quality *q*."""
+        return float(self._log_mismatch[min(q, len(self._log_mismatch) - 1)])
 
-# Global cache instances. The 4-allele cache is the default for SNV-only
-# phasing; the 6-allele cache is selected at use-time when indels are enabled.
-_LOG_PROB_CACHE = LogProbCache(n_alleles=4)
-_LOG_PROB_CACHE_INDEL = LogProbCache(n_alleles=6)
+    def log_odds(self, q: int) -> float:
+        """``log P(obs | agree) - log P(obs | disagree)`` at quality *q*.
+
+        The evidence one base of quality *q* carries for the allele it calls. This is the
+        weight a consensus vote must use: it spans 6.20 nats at Q20 to 15.42 at Q60, so a
+        confident base genuinely outvotes several unreliable ones.
+        """
+        q = min(q, len(self._log_match) - 1)
+        return float(self._log_match[q] - self._log_mismatch[q])
+
+    def junk_tables(self, p_div: float) -> tuple[np.ndarray, np.ndarray]:
+        """Per-quality (log P(obs == REF), log P(obs == a given non-REF)) under the junk
+        model, cached per divergence rate.
+
+        The junk component describes a read off a genome diverged from the reference at
+        ``p_div``; what is OBSERVED is that genome seen through the same per-base error
+        channel the haplotype components use, so the two effects compose here rather than
+        junk being scored at a flat rate while every haplotype was quality-scaled. That
+        asymmetry was the defect: the softmax was comparing a model that believes in
+        sequencing error against one that does not.
+
+        It does NOT make the junk/haplotype boundary independent of base quality, and
+        should not: a likelihood ratio treats a Q60 mismatch as far stronger evidence than
+        a Q20 one, so the crossover sits at 4.25% divergence at Q20 and 1.0% at Q60 on a
+        400-site window. ``junk_divergence_rate`` is the prior on divergence, not a
+        decision threshold.
+        """
+        cached = self._junk_tables.get(p_div)
+        if cached is None:
+            n = float(self.n_alleles)
+            d = float(p_div)
+            q = np.arange(len(self._log_match))
+            e = 10.0 ** (-q / 10.0)
+            p_ref = (1.0 - d) * (1.0 - e) + d * e / (n - 1.0)
+            p_alt = (
+                (1.0 - d) * e / (n - 1.0)
+                + (d / (n - 1.0)) * (1.0 - e)
+                + (n - 2.0) * (d / (n - 1.0)) * (e / (n - 1.0))
+            )
+            cached = (np.log(p_ref + 1e-12), np.log(p_alt + 1e-12))
+            self._junk_tables[p_div] = cached
+        return cached
 
 
-def _select_log_prob_cache(config: "HaplotyperConfig") -> "LogProbCache":
-    """Pick the appropriate cache for the active config."""
-    return _LOG_PROB_CACHE_INDEL if config.include_indels else _LOG_PROB_CACHE
+# Single global cache. The alphabet is always {A,C,G,T,DEL,INS} (indels are
+# always processed — invariant), so the 6-state error model is used everywhere.
+_LOG_PROB_CACHE = LogProbCache(n_alleles=6)
+
+# log P(read allele | a component that has no allele at this position). Marginalising the
+# unknown allele over the alphabet gives exactly 1/n_alleles whatever the read carries.
+#
+# Every mixture component must be scored over the SAME set of sites or the softmax that
+# turns those scores into gamma is not a posterior. It used to score each haplotype only
+# where its own consensus reached and junk over every window site, so a narrower footprint
+# collected free likelihood: two haplotypes with identical alleles but footprints of 400
+# and 150 sites split a read 0.075 / 0.925, and at Q20 a 150-site haplotype that
+# MISMATCHED a read beat a 400-site one that matched it perfectly.
+_LOG_MISSING_SITE = float(np.log(1.0 / _LOG_PROB_CACHE.n_alleles))
+
+# The reference base an SV pseudo-site carries (strainphase.sv_encoding writes it): a
+# structural variant has no single reference allele, so the anchor gets a placeholder.
+# No read can ever equal it, which is why the junk model has to step over these sites -
+# see _log_prob_read_junk.
+_SV_PLACEHOLDER_REF = "N"
+
+
+def _read_support(read: Read, snv_set: set[int]) -> list[int]:
+    """The sites this read is scored at: its own calls that are window variant sites.
+
+    One list per read, shared by every mixture component, which is what makes the E-step
+    a comparison of like with like.
+    """
+    return [p for p in read.alleles if p in snv_set]
+
+
+def _log_prob_read_hap(
+    read: Read, consensus: dict[int, str], support: list[int], default_q: int
+) -> float | None:
+    """``log P(read | haplotype)`` over *support*.
+
+    A support position the consensus does not reach is explicit missing data, not an
+    absent term: it costs ``_LOG_MISSING_SITE``, the same constant every other component
+    pays there. ``None`` means the haplotype says nothing about this read at all (no
+    shared called site), which is the one case where it must not compete for it.
+    """
+    log_prob = 0.0
+    overlap = 0
+    for pos in support:
+        hap_base = consensus.get(pos)
+        if hap_base is None:
+            log_prob += _LOG_MISSING_SITE
+            continue
+        q = read.quals.get(pos, default_q)
+        log_prob += _LOG_PROB_CACHE.log_prob_base(hap_base, read.alleles[pos], q)
+        overlap += 1
+    return log_prob if overlap > 0 else None
+
+
+def _log_prob_read_junk(
+    read: Read,
+    support: list[int],
+    ref_alleles: dict[int, str],
+    p_div: float,
+    default_q: int,
+) -> float:
+    """``log P(read | junk)`` over the same *support* the haplotype components use.
+
+    Junk is "a genome diverged from the reference at ``p_div``", so a site with no usable
+    reference allele carries no junk evidence and takes the missing-data term instead.
+    Two kinds of site qualify: one the loader never assigned an anchor base, and an SV
+    pseudo-site, whose anchor is the ``"N"`` placeholder. Charging the placeholder as a
+    mismatch made junk pay ~3.9 nats at EVERY SV anchor whether or not the read carried
+    the event, and adding a 40-anchor sidecar to an unchanged BAM collapsed pi_junk from
+    0.178 to 0.0 - ten genuinely divergent reads absorbed by pseudo-sites no read carried.
+    Split-read breakpoints are the other SV mechanism and are NOT excluded: their anchor
+    holds CONTINUOUS, which a read crossing the position with an unbroken alignment
+    genuinely matches (see iter_windows_lazy).
+    """
+    log_ref, log_alt = _LOG_PROB_CACHE.junk_tables(p_div)
+    max_q = len(log_ref) - 1
+    log_prob = 0.0
+    for pos in support:
+        ref_base = ref_alleles.get(pos)
+        if ref_base is None or ref_base == _SV_PLACEHOLDER_REF:
+            log_prob += _LOG_MISSING_SITE
+            continue
+        q = min(read.quals.get(pos, default_q), max_q)
+        log_prob += log_ref[q] if read.alleles[pos] == ref_base else log_alt[q]
+    return float(log_prob)
+
+# Padding (bp) around an SV breakpoint anchor when deciding whether a read's
+# reference span brackets it. Absorbs Sniffles breakpoint imprecision
+# (CIPOS/CIEND) and soft-clip edges. See strainphase.sv_encoding.
+_SV_ANCHOR_PAD = 50
 
 
 # =============================================================================
 # I/O FUNCTIONS - LAZY LOADING
 # =============================================================================
 
+# Canonical single-base alleles. Anything else at a substitution offset (N,
+# IUPAC codes, symbolic) is counted and logged rather than silently taken.
+_ACGT = frozenset("ACGT")
+
+
+def _atomize_allele(pos: int, ref: str, alt: str) -> list[tuple[int, str, str, str]]:
+    """Decompose one REF/ALT pair into atomic variants ``(pos, ref, alt, type)``.
+
+    This is the SINGLE, uniform decomposition applied to every allele, so all
+    mutation types are handled the same clean way:
+
+    * 1bp REF / 1bp ALT              -> one ``snv``
+    * equal-length multi-base (MNP)  -> one ``snv`` per differing offset
+    * REF longer  (net deletion)     -> one ``del`` (positions trusted as-is)
+    * ALT longer  (net insertion)    -> one ``ins`` (positions trusted as-is)
+
+    INVARIANT: indels and multi-nucleotide substitutions are ALWAYS decomposed
+    and kept — there is no option to disable either (see
+    ``docs/MUTATION_HANDLING.md``). Non-ACGT bases at a substitution offset are
+    ambiguity codes, not phaseable alleles, so they yield no primitive; the
+    empty result is counted by the caller, never dropped silently.
+    """
+    ref = ref.upper()
+    alt = alt.upper()
+    if ref == alt:
+        return []
+    lr, la = len(ref), len(alt)
+    if lr == la:
+        # SNV (lr == 1) or MNP (lr > 1): one SNV per differing, canonical offset.
+        return [
+            (pos + i, ref[i], alt[i], "snv")
+            for i in range(lr)
+            if ref[i] != alt[i] and ref[i] in _ACGT and alt[i] in _ACGT
+        ]
+    # Length-changing: a single indel primitive (del if REF longer, else ins).
+    return [(pos, ref, alt, "del" if lr > la else "ins")]
+
+
+def _log_load_summary(vcf_path: str, contig_id: str | None, stats: dict[str, int]) -> None:
+    """Log a full per-load accounting so no variant is ever dropped silently.
+
+    Emits one INFO line with sites loaded per type and every skip reason with a
+    non-zero count. If any records were skipped, also emits a one-line WARNING
+    naming the reasons, so a reviewer scanning logs sees the loss immediately.
+    """
+    loaded = {
+        k[len("loaded_") :]: v for k, v in stats.items() if k.startswith("loaded_")
+    }
+    n_sites = sum(loaded.values())
+    skips = {
+        k: v for k, v in stats.items() if k.startswith("skip_") or k in (
+            "position_conflict",
+            "duplicate_site",
+            # A position may now hold several edits, so these are the only two
+            # ways an allele can still be lost or an input can be inconsistent.
+            # They MUST be listed here or the loss goes unreported.
+            "allele_collapsed_same_key",
+            "anchor_base_conflict",
+        )
+    }
+    where = f" [{contig_id}]" if contig_id else ""
+    loaded_str = " ".join(f"{k}={v}" for k, v in sorted(loaded.items())) or "none"
+    logging.info(
+        # "edits" not "sites": one position may hold several (an SNV and a
+        # deletion, or two deletion lengths), so the per-kind counts sum to more
+        # than the number of positions. Both numbers are reported.
+        "load_snvs%s %s: %d records seen -> %d edits at %d positions (%s); "
+        "mnp_atomized=%d multiallelic_records=%d",
+        where,
+        os.path.basename(vcf_path),
+        stats.get("records_seen", 0),
+        n_sites,
+        stats.get("n_positions", 0),
+        loaded_str,
+        stats.get("mnp_atomized", 0),
+        stats.get("multiallelic_records", 0),
+    )
+    dropped = {k: v for k, v in skips.items() if v}
+    if dropped:
+        logging.warning(
+            "load_snvs%s %s: %d record/allele rejections (NOT silent) -> %s",
+            where,
+            os.path.basename(vcf_path),
+            sum(dropped.values()),
+            " ".join(f"{k}={v}" for k, v in sorted(dropped.items())),
+        )
+
+
+# One parsed VCF per (path, contig, sample, gate settings). A longitudinal run calls
+# process_contig once PER SAMPLE, and under a cohort union VCF every one of those calls
+# parses the identical file: on 000066952_0 that was the same 76,988 records re-read 146
+# times. Keyed on the settings that change what is kept, so a config change still
+# re-parses. Bounded because a run touches one contig at a time.
+_SNV_CACHE: dict[tuple, tuple] = {}
+_SNV_CACHE_MAX = 8
+
+
+def _copy_snv_tables(tables: tuple) -> tuple:
+    """Shallow-copy every container in a parsed-VCF tuple.
+
+    One copy per container is enough: the callers that mutate (``process_contig``'s SV
+    merge, ``iter_windows_lazy``'s breakpoint registration) append to the position list
+    and assign into the top-level dicts. Nothing reaches into ``del_span`` / ``ins_len``'s
+    inner sets, which stay shared. Written by type rather than by position so a caller
+    stubbing out the loader with a shorter tuple still gets copies.
+    """
+    out = []
+    for t in tables:
+        if isinstance(t, list):
+            out.append(list(t))
+        elif isinstance(t, dict):
+            out.append(dict(t))
+        elif isinstance(t, set):
+            out.append(set(t))
+        else:
+            out.append(t)
+    return tuple(out)
+
 
 def load_snvs(
+    vcf_path: str,
+    contig_id: str | None = None,
+    sample_name: str | None = None,
+    config: HaplotyperConfig = DEFAULT_CONFIG,
+):
+    """Cached wrapper - see _SNV_CACHE. Returns a FRESH SHALLOW COPY of the parsed tables
+    on every call, hit or miss, so a caller is free to mutate what it gets back.
+
+    It has to. ``process_contig`` appends SV pseudo-sites to ``snv_pos`` and writes their
+    anchor bases and site types, and ``iter_windows_lazy`` registers split-read
+    breakpoints the same way. Handing back the cached objects meant sample 1's SV anchors
+    were already present when sample 2 ran under the same union VCF, so sample 2 saw them
+    as collisions with a called variant and dropped its own SV sites - one timepoint kept
+    the event and every other timepoint lost it.
+    """
+    key = (vcf_path, contig_id, sample_name, config.min_depth_site, config.af_range,
+           config.process_indels if hasattr(config, "process_indels") else None)
+    hit = _SNV_CACHE.get(key)
+    if hit is not None:
+        return _copy_snv_tables(hit)
+    out = _load_snvs_uncached(vcf_path, contig_id, sample_name, config)
+    if len(_SNV_CACHE) >= _SNV_CACHE_MAX:
+        _SNV_CACHE.pop(next(iter(_SNV_CACHE)))
+    _SNV_CACHE[key] = out
+    return _copy_snv_tables(out)
+
+
+
+def _load_snvs_uncached(
     vcf_path: str,
     contig_id: str | None = None,
     sample_name: str | None = None,
@@ -517,13 +1019,16 @@ def load_snvs(
     dict[int, int],
     dict[int, float | None],
     dict[int, str],
-    dict[int, tuple[int, int]],
-    dict[int, int],
+    dict[int, frozenset[str]],
+    dict[int, set[tuple[int, int]]],
+    dict[int, set[int]],
 ]:
     """Load variants from a VCF.
 
-    Returns SNVs and (when ``config.include_indels`` is True) indels. The site
-    type per position is one of ``"snv"``, ``"del"``, or ``"ins"``.
+    Returns every mutation as atomic sites: SNVs (incl. MNP blocks split into
+    per-position SNVs) and indels. The site type per position is one of
+    ``"snv"``, ``"del"``, or ``"ins"``. Indels and multi-allelic sites are
+    always kept (invariant — see ``docs/MUTATION_HANDLING.md``).
 
     The caller is trusted: this loader does not realign, fuzz-match, or attempt
     to reconcile alignment differences. Each VCF record's position and alleles
@@ -535,34 +1040,157 @@ def load_snvs(
     snv_pos
         Sorted list of variant positions (1-based VCF anchor position).
     ref_alleles
-        Per-position REF allele string from the VCF (for SNVs one base; for
-        indels the full anchor+changed sequence).
+        Per-position single-base REFERENCE base at the anchor. NOT the record's
+        full REF string: reads only ever carry one base or an indel token, so a
+        multi-base REF could never equal a read's allele and made every read a
+        mismatch at every deletion site.
     depth, af
         Per-position site depth and alt-allele frequency (AF may be ``None``).
+        AF is ``Number=A``, so a multi-allelic position holds the frequency of
+        the FIRST allele registered there — the value is a per-ALLELE quantity
+        and a position is not one. Nothing downstream reads it; the per-ALT
+        values are used where they belong, in the ``af_range`` gate.
     site_type
-        Per-position type: ``"snv"`` / ``"del"`` / ``"ins"``.
+        Per-position type of the FIRST variant registered there: ``"snv"`` /
+        ``"del"`` / ``"ins"`` (``"sv"`` is added later by the SV sidecar merge,
+        which drops anchors colliding with a called variant, so an ``"sv"``
+        position never holds another kind). Kept a plain ``str`` so
+        ``site_type[p] == "sv"`` tests stay correct; use ``site_kinds`` to ask
+        what a position holds.
+    site_kinds
+        Per-position set of ALL variant kinds registered there. A position may
+        be e.g. ``{"snv", "del"}``.
     del_span
-        For ``"del"`` sites only: the inclusive 1-based deleted-base footprint
-        on the reference, ``(start, end)``.
+        For deletion sites: the SET of inclusive 1-based deleted-base footprints
+        ``(start, end)`` anchored here. More than one length may share an anchor;
+        each becomes its own ``DEL<len>`` allele.
     ins_len
-        For ``"ins"`` sites only: the number of inserted bases.
+        For insertion sites: the SET of inserted lengths anchored here. Each
+        becomes its own ``INS<len>`` allele.
 
     Notes
     -----
-    Multi-allelic records are skipped when ``config.require_biallelic`` is True.
-    MNP records (same-length multi-base substitutions) are always skipped; rely
-    on ``bcftools norm -a`` to split them into SNVs upstream if needed.
+    **Nothing is dropped silently.** Every input record is decomposed into atomic
+    variants so no mutation is lost, and a full accounting (loaded per type +
+    every skip reason) is logged at INFO before returning:
+
+    * SNVs (1bp REF / 1bp ALT) are loaded as-is.
+    * **MNPs** (equal-length multi-base substitutions, e.g. ``TACG>CACC``) are
+      **atomized** into one SNV per offset where the bases differ.
+    * **Multi-allelic** records are decomposed allele-by-allele; each ALT is
+      classified independently. ALWAYS kept — there is no biallelic filter.
+    * **Indels** (length-changing REF/ALT) are ALWAYS loaded as-is. Positions
+      are trusted exactly — run ``bcftools norm -f REF`` upstream so placement
+      is canonical.
+
+    All four are handled by the one ``_atomize_allele`` helper; there is no flag
+    to disable indels or collapse alleles (invariant — see the module doc and
+    ``docs/MUTATION_HANDLING.md``).
+
+    Quality gates (FILTER!=PASS, missing/low DP, optional AF band) still apply,
+    but each rejection is COUNTED and logged, never silent. FILTER and DP are
+    record-level and reject the whole record; the AF band is per-ALLELE and
+    rejects only the allele that falls outside it, so it cannot take a
+    multi-allelic record's other alleles down with it.
+
+    **A position may hold more than one variant.** Two deletions of different
+    length anchored on the same base, or an SNV and an indel at one position,
+    are all registered; each distinct edit becomes its own allele downstream
+    (``DEL<len>`` / ``INS<len>`` / a base), so they separate haplotypes instead
+    of one silently displacing the others.
+
+    One collapse remains and is counted as ``allele_collapsed_same_key``: two
+    insertions of the SAME length at the same anchor differing only in inserted
+    SEQUENCE. The allele token is ``INS<len>`` and the read-match key is
+    ``(anchor, length)``, so sequence-level insertion identity is not
+    representable. Making it representable means putting the sequence in the
+    token, which is a separate decision.
     """
     if not HAS_PYSAM:
         raise ImportError("pysam required for VCF parsing")
 
-    snv_pos = []
-    ref_alleles = {}
-    depth = {}
-    af = {}
+    snv_pos: list[int] = []
+    seen_pos: set[int] = set()
+    ref_alleles: dict[int, str] = {}
+    depth: dict[int, int] = {}
+    af: dict[int, float | None] = {}
     site_type: dict[int, str] = {}
-    del_span: dict[int, tuple[int, int]] = {}
-    ins_len: dict[int, int] = {}
+    site_kinds: dict[int, set[str]] = {}
+    del_span: dict[int, set[tuple[int, int]]] = {}
+    ins_len: dict[int, set[int]] = {}
+
+    # Full accounting so no variant is ever dropped silently.
+    stats: dict[str, int] = defaultdict(int)
+
+    def _register(apos: int, aref: str, aalt: str, stype: str, dp, site_af) -> bool:
+        """Record one atomic variant.
+
+        A position may hold MORE THAN ONE variant. Each distinct edit at a
+        position becomes its own allele downstream (``DEL<len>`` / ``INS<len>``
+        / a base), so a 1bp and a 2bp deletion sharing an anchor are two
+        alleles rather than one surviving the other. Returns True if this
+        variant added a new allele-defining edit.
+
+        ``ref_alleles[apos]`` holds the single-base REFERENCE base at the
+        anchor, NOT the record's full REF string. Reads carry either an indel
+        token or one base, so a multi-base REF ("TG") could never equal
+        anything a read holds and every read scored as a mismatch at every
+        deletion site. The anchor base is what makes reference-likeness
+        answerable at a position that is both an SNV and an indel.
+        """
+        if apos <= 0:
+            stats["skip_out_of_bounds"] += 1
+            return False
+
+        anchor = aref[0]
+        if apos not in seen_pos:
+            seen_pos.add(apos)
+            snv_pos.append(apos)
+            ref_alleles[apos] = anchor
+            depth[apos] = dp
+            af[apos] = site_af
+            site_type[apos] = stype  # FIRST kind wins; see site_kinds for all of them
+            site_kinds[apos] = set()
+        elif ref_alleles[apos] != anchor:
+            # The reference base at a position is a property of the reference,
+            # so records disagreeing about it means inconsistent input.
+            stats["anchor_base_conflict"] += 1
+
+        # After ``bcftools norm``, indels are left-anchored: REF starts with the
+        # anchor base(s) matching ALT, then deletes (REF longer) / inserts (ALT
+        # longer) the trailing bases. Positions are trusted exactly.
+        added = False
+        if stype == "del":
+            del_start = apos + len(aalt)
+            del_end = apos + len(aref) - 1
+            if del_end >= del_start:
+                spans = del_span.setdefault(apos, set())
+                added = (del_start, del_end) not in spans
+                spans.add((del_start, del_end))
+            else:
+                stats["skip_degenerate_del"] += 1
+        elif stype == "ins":
+            lens = ins_len.setdefault(apos, set())
+            ilen = len(aalt) - len(aref)
+            added = ilen not in lens
+            if not added:
+                # Same anchor AND same inserted length, different sequence. The
+                # allele token is INS<len> and the match key is (anchor, length),
+                # so these genuinely cannot be told apart. Counted, not silent.
+                stats["allele_collapsed_same_key"] += 1
+            lens.add(ilen)
+        else:  # snv — multiple ALTs at one position need no extra bookkeeping,
+            # the read supplies whichever base it carries.
+            added = "snv" not in site_kinds[apos]
+            if not added:
+                stats["duplicate_site"] += 1
+
+        if stype == "del" and not added:
+            stats["duplicate_site"] += 1
+        site_kinds[apos].add(stype)
+        if added:
+            stats[f"loaded_{stype}"] += 1
+        return added
 
     vcf = pysam.VariantFile(vcf_path)
 
@@ -574,37 +1202,35 @@ def load_snvs(
             f"Available: {list(vcf.header.samples)}"
         )
 
-    for record in vcf.fetch(contig=contig_id) if contig_id else vcf.fetch():
-        # Filter check
+    # A contig the VCF never declares carries no variants, which is a fact about the
+    # data, not an error: callers routinely emit ##contig lines only for the contigs they
+    # called something on, and a MAG assembly is mostly such contigs. pysam raises
+    # "invalid contig" on fetch instead, which aborted the whole run on the first
+    # variant-free contig. Ask, and take the empty answer.
+    if contig_id and contig_id not in vcf.header.contigs:
+        records = ()
+        stats["contig_not_in_vcf"] = 1
+    elif contig_id:
+        records = vcf.fetch(contig=contig_id)
+    else:
+        records = vcf.fetch()
+
+    for record in records:
+        stats["records_seen"] += 1
+
+        # Filter check (counted, not silent).
         if record.filter.keys() and "PASS" not in record.filter.keys():
+            stats["skip_filter_not_pass"] += 1
             continue
 
         alts = record.alts
         if alts is None or len(alts) == 0:
-            continue
-
-        # Biallelic check
-        if config.require_biallelic and len(alts) > 1:
+            stats["skip_no_alt"] += 1
             continue
 
         ref = record.ref
-        alt = alts[0]
 
-        # Classify variant. We collapse all indels at a position to a single
-        # state (DEL/INS); size differences are intentionally ignored.
-        if len(ref) == 1 and len(alt) == 1:
-            stype = "snv"
-        elif not config.include_indels:
-            continue
-        elif len(ref) > len(alt):
-            stype = "del"
-        elif len(alt) > len(ref):
-            stype = "ins"
-        else:
-            # MNP (same length, multi-base) — skip; not handled.
-            continue
-
-        # Get sample
+        # Get sample (for DP/AD fallbacks on caller VCFs that carry them there).
         if sample_name is not None:
             sample = record.samples[sample_name]
         elif n_samples > 0:
@@ -619,47 +1245,71 @@ def load_snvs(
         elif sample is not None and "DP" in sample:
             site_depth = sample["DP"]
 
-        if site_depth is None or site_depth < config.min_depth_site:
+        if site_depth is None:
+            stats["skip_no_depth"] += 1
+            continue
+        if site_depth < config.min_depth_site:
+            stats["skip_low_depth"] += 1
             continue
 
-        # Extract AF
-        site_af = None
+        # Extract AF. INFO/AF is Number=A — one frequency PER ALT — so it is kept as a
+        # per-ALT sequence rather than collapsed to element [0]. AD is Number=R (REF
+        # first), so ALT i's frequency is ad[i + 1] over the total.
+        alt_afs: tuple[float, ...] | None = None
         if "AF" in record.info:
-            site_af = record.info["AF"]
-            if isinstance(site_af, tuple):
-                site_af = site_af[0]
+            raw_af = record.info["AF"]
+            alt_afs = tuple(raw_af) if isinstance(raw_af, tuple) else (raw_af,)
         elif sample is not None and "AD" in sample:
             ad = sample["AD"]
             if ad and len(ad) >= 2 and sum(ad) > 0:
-                site_af = ad[1] / sum(ad)
+                ad_total = sum(ad)
+                alt_afs = tuple(a / ad_total for a in ad[1:])
 
-        # Optional AF range filter (None = no filter; the default).
-        if config.af_range is not None and site_af is not None:
-            if not (config.af_range[0] <= site_af <= config.af_range[1]):
+        if len(alts) > 1:
+            stats["multiallelic_records"] += 1
+
+        # Decompose EVERY allele into atomic primitives via the one shared
+        # helper. All mutation types — SNV, MNP, insertion, deletion — and all
+        # (>2) alleles are ALWAYS kept; nothing here can turn that off.
+        for alt_idx, alt in enumerate(alts):
+            # The AF band is a PER-ALLELE gate, applied here rather than once per record.
+            # Evaluating it on ALT-0's frequency and `continue`ing the record threw away
+            # every other allele on the record: AF=0.01,0.45 under af_range=(0.05, 0.95)
+            # lost the 45% allele on the strength of the 1% one, which contradicts the
+            # invariant two paragraphs down in this function's docstring.
+            alt_af = (
+                alt_afs[alt_idx]
+                if alt_afs is not None and alt_idx < len(alt_afs)
+                else None
+            )
+            if config.af_range is not None and alt_af is not None:
+                if not (config.af_range[0] <= alt_af <= config.af_range[1]):
+                    stats["skip_af_band"] += 1
+                    continue
+            if alt is None or alt == "*" or alt.startswith("<"):
+                # Spanning-deletion star / symbolic (gVCF <*>, <DEL> …): no
+                # concrete allele to phase against.
+                stats["skip_symbolic_allele"] += 1
                 continue
-
-        pos = record.pos
-        snv_pos.append(pos)
-        ref_alleles[pos] = ref
-        depth[pos] = site_depth
-        af[pos] = site_af
-        site_type[pos] = stype
-
-        # Pre-compute exact CIGAR-event keys per indel site so the per-read
-        # decision is a dict/set lookup. After ``bcftools norm``, biallelic
-        # indels are left-anchored: REF starts with the anchor base(s)
-        # matching ALT, then either deletes (REF longer) or inserts (ALT
-        # longer) the trailing bases.
-        if stype == "del":
-            del_start = pos + len(alt)
-            del_end = pos + len(ref) - 1
-            if del_end >= del_start:
-                del_span[pos] = (del_start, del_end)
-        elif stype == "ins":
-            ins_len[pos] = len(alt) - len(ref)
+            prims = _atomize_allele(record.pos, ref, alt)
+            if not prims:
+                # Identical (no-op) or non-ACGT ambiguity code — counted here.
+                stats["skip_noncanonical"] += 1
+                continue
+            if len(ref) == len(alt) and len(ref) > 1:
+                stats["mnp_atomized"] += 1
+            for apos, aref, aalt, stype in prims:
+                _register(apos, aref, aalt, stype, site_depth, alt_af)
 
     vcf.close()
-    return snv_pos, ref_alleles, depth, af, site_type, del_span, ins_len
+
+    stats["n_positions"] = len(seen_pos)
+    _log_load_summary(vcf_path, contig_id, stats)
+    return (
+        snv_pos, ref_alleles, depth, af, site_type,
+        {p: frozenset(k) for p, k in site_kinds.items()},
+        del_span, ins_len,
+    )
 
 
 def make_windows_lazy(
@@ -671,26 +1321,69 @@ def make_windows_lazy(
     config: HaplotyperConfig = DEFAULT_CONFIG,
     sample_id: str | None = None,
     site_type: dict[int, str] | None = None,
-    del_span: dict[int, tuple[int, int]] | None = None,
-    ins_len: dict[int, int] | None = None,
+    site_kinds: dict[int, frozenset[str]] | None = None,
+    del_span: dict[int, set[tuple[int, int]]] | None = None,
+    ins_len: dict[int, set[int]] | None = None,
+    sv_support: dict[int, dict[str, set[str]]] | None = None,
 ) -> list[Window]:
+    """Eager wrapper around :func:`iter_windows_lazy`, kept for callers that want the
+    whole contig's windows at once (tests, ad-hoc scripts).
+
+    Prefer the iterator in production: materialising every window for a contig means
+    holding every window's reads simultaneously, which on a variant-dense contig is the
+    single largest allocation in the run.
     """
-    Create overlapping windows with lazy per-window read loading.
+    return list(
+        iter_windows_lazy(
+            bam_path,
+            contig_id,
+            contig_length,
+            snv_positions,
+            ref_alleles,
+            config,
+            sample_id,
+            site_type=site_type,
+            site_kinds=site_kinds,
+            del_span=del_span,
+            ins_len=ins_len,
+            sv_support=sv_support,
+        )
+    )
+
+
+def iter_windows_lazy(
+    bam_path: str,
+    contig_id: str,
+    contig_length: int,
+    snv_positions: list[int],
+    ref_alleles: dict[int, str],
+    config: HaplotyperConfig = DEFAULT_CONFIG,
+    sample_id: str | None = None,
+    site_type: dict[int, str] | None = None,
+    site_kinds: dict[int, frozenset[str]] | None = None,
+    del_span: dict[int, set[tuple[int, int]]] | None = None,
+    ins_len: dict[int, set[int]] | None = None,
+    sv_support: dict[int, dict[str, set[str]]] | None = None,
+) -> Iterator[Window]:
+    """
+    Yield overlapping windows with lazy per-window read loading.
 
     Windows overlap by 50% (step = window_size / 2) to enable linking
     of haplotypes across window boundaries via shared SNVs.
 
     This is O(W * reads_per_window) instead of O(W * total_reads),
     and uses O(window) memory instead of O(contig).
+
+    Yielding rather than returning a list means the caller can process (and release) each
+    window before the next one's reads are pulled from the BAM.
     """
     if not HAS_PYSAM:
         raise ImportError("pysam required for BAM parsing")
 
     snv_pos_sorted = sorted([p for p in snv_positions if 0 < p <= contig_length])
     if not snv_pos_sorted:
-        return []
+        return
 
-    windows = []
     rng = config.get_rng()
 
     bam = pysam.AlignmentFile(bam_path, "rb")
@@ -719,34 +1412,80 @@ def make_windows_lazy(
         # Partition window sites by type for fast lookup during extraction.
         # Sites without a recorded type default to "snv" (back-compat).
         st = site_type or {}
+        # Fall back to one kind per position rather than an empty map: a caller
+        # that passes site_type but not site_kinds must get the old single-kind
+        # behaviour, NOT silently lose all indel parsing.
+        sk = site_kinds or {p: frozenset({t}) for p, t in st.items()}
         ds = del_span or {}
         il = ins_len or {}
+        sv_sup = sv_support or {}
         # Per-window indel index. Decisions are dict/set lookups (O(1)) at
         # use time:
         #   del_key_to_pos: (D-op start_1b, D-op length) -> indel site pos
-        #   ins_anchor_to_pos: I-op anchor_1b -> indel site pos
-        indel_site_set = {p for p in window_snvs if st.get(p, "snv") != "snv"}
+        #   ins_key_to_pos: (I-op anchor_1b, inserted length) -> indel site pos
+        # Both keys are SIZE-specific, so a <len>-bp indel is its own allele
+        # (DEL<len> / INS<len>) rather than collapsing every indel here to a
+        # generic "DEL"/"INS" — mirrors the per-event SV encoding.
+        # Membership is decided by site_kinds, not site_type: a position may be
+        # both an SNV and an indel, and it must reach the CIGAR walk to have its
+        # indel alleles read. Reads without the indel fall through to the anchor
+        # base, which is how the co-located SNV allele is still captured.
+        indel_site_set = {
+            p for p in window_snvs
+            if sk.get(p, frozenset()) & {"del", "ins"}
+        }
+        # SV pseudo-sites: the "present" allele is the UNIQUE event ID (from
+        # Sniffles' supporting-read set; see strainphase.sv_encoding), NOT a
+        # generic INS/DEL token — distinct events stay distinct alleles so reads
+        # cluster only when they carry the identical event. Kept separate from
+        # indel_site_set so the D/I exact-match logic never touches them.
+        sv_site_set = {p for p in window_snvs if st.get(p, "snv") == "sv"}  # SV anchors never co-occur with a called variant (see process_contig)
+        # Sites parsed outside the base-by-base SNV loop (indels + SVs).
+        special_site_set = indel_site_set | sv_site_set
         del_key_to_pos: dict[tuple[int, int], int] = {}
-        ins_anchor_to_pos: dict[int, int] = {}
+        ins_key_to_pos: dict[tuple[int, int], int] = {}
         for p in indel_site_set:
-            stype_p = st[p]
-            if stype_p == "del" and p in ds:
-                d_start, d_end = ds[p]
-                d_len = d_end - d_start + 1
-                del_key_to_pos[(d_start, d_len)] = p
-            elif stype_p == "ins" and p in il:
-                ins_anchor_to_pos[p] = p
+            # ds[p] / il[p] are SETS: one anchor may carry several edits, and
+            # each gets its own key so it becomes its own DEL<len>/INS<len>
+            # allele. A position can appear in both loops.
+            for d_start, d_end in ds.get(p, ()):
+                del_key_to_pos[(d_start, d_end - d_start + 1)] = p
+            for ilen in il.get(p, ()):
+                # (anchor, inserted length): a read only matches an insertion of
+                # the SAME size, so different-size insertions stay distinct.
+                ins_key_to_pos[(p, ilen)] = p
 
         # pysam fetch uses 0-based coordinates
         for aln in bam.fetch(contig_id, start - 1, end - 1):
-            if aln.is_secondary or aln.is_supplementary or aln.is_unmapped:
+            # SECONDARY stays out: an alternative placement of sequence already counted.
+            # SUPPLEMENTARY is kept - it is a different PART of the same molecule, and
+            # the segments are merged back into ONE Read below. See _merge_split_reads.
+            if aln.is_secondary or aln.is_unmapped:
                 continue
             if aln.mapping_quality < config.min_mapq:
                 continue
 
+            # Physical read-to-window overlap. pysam reference_start/_end are 0-based
+            # half-open; the window is [start-1, end-1) in the same frame.
+            a_start = aln.reference_start
+            a_end = aln.reference_end
+            if a_end is None:
+                continue
+            win_overlap = min(a_end, end - 1) - max(a_start, start - 1)
+            if win_overlap < config.min_read_window_overlap_bp:
+                # A read barely clipping the window edge carries almost no information
+                # about it, yet would otherwise count identically to one spanning the
+                # whole window in n_reads_examined and the abundance denominator.
+                continue
+
             # Parse alleles at SNV sites
             r = Read(
-                id=aln.query_name, contig=contig_id, mapq=aln.mapping_quality, sample=sample_id
+                id=aln.query_name,
+                contig=contig_id,
+                mapq=aln.mapping_quality,
+                sample=sample_id,
+                ref_start=a_start + 1,  # store 1-based to match allele positions
+                ref_end=a_end + 1,
             )
 
             query_seq = aln.query_sequence
@@ -771,8 +1510,8 @@ def make_windows_lazy(
                 ref_pos_1based = ref_pos + 1
                 if ref_pos_1based not in snv_set:
                     continue
-                # Indel sites are handled below via the CIGAR scan.
-                if ref_pos_1based in indel_site_set:
+                # Indel and SV sites are handled below (CIGAR scan / support set).
+                if ref_pos_1based in special_site_set:
                     continue
 
                 base = query_seq[query_pos]
@@ -789,31 +1528,41 @@ def make_windows_lazy(
             # norm upstream). For each VCF indel site, the read carries the
             # variant iff its CIGAR contains the matching indel op:
             #
-            #   DEL: a D op of exactly the deleted length, starting at the
-            #        deleted footprint's first base
-            #   INS: an I op anchored exactly at the VCF anchor position
-            #
+            #   DEL: a D op of exactly the deleted length, at the footprint's
+            #        first base -> allele "DEL<len>"
+            #   INS: an I op of exactly the inserted length, at the VCF anchor
+            #        -> allele "INS<len>"
+            # The size is part of the allele, so a <len>-bp indel clusters only
+            # with reads carrying the same-size edit (not every indel here).
             # Otherwise, if a matched base (M/=/X) covers the anchor, record
             # it as the read's "vote against" the indel. Otherwise, no call.
-            if indel_site_set and aln.cigartuples:
+            if special_site_set and aln.cigartuples:
+                # Quality attached to a DEL<len> / INS<len> / event-id token. These are
+                # not base calls, so there is no per-base Phred score for them; MAPQ used
+                # to be stored here and was then read back as one by the EM, pricing a
+                # MAPQ-60 indel disagreement at 15.42 nats against 8.52 for a Q30 SNV -
+                # one indel outweighing 1.8 SNVs, on the least reliable marker class.
+                # MAPQ is a property of the alignment and is kept where it belongs, on
+                # Read.mapq; min_mapq has already gated on it above.
+                token_qual = config.default_base_quality
                 # Single CIGAR walk: collect indel events and the matched-base
-                # ref->query mapping for indel-anchor positions only.
+                # ref->query mapping for indel/SV-anchor positions only.
                 ref_cursor = aln.reference_start  # 0-based
                 query_cursor = 0
                 # Calls produced by this read at indel anchors. We assemble
                 # them, then resolve REF-base fallback at the end.
                 indel_calls: dict[int, tuple[str, int]] = {}
-                # ref_pos_1b -> query_idx for indel anchors covered by M/=/X.
+                # ref_pos_1b -> query_idx for indel/SV anchors covered by M/=/X.
                 anchor_qpos: dict[int, int] = {}
 
                 for op, length in aln.cigartuples:
                     if op in (0, 7, 8):  # M / = / X — consumes both
-                        # For each indel anchor inside this M op, remember
+                        # For each indel/SV anchor inside this M op, remember
                         # the query index so we can record the matched base
-                        # if no DEL/INS call is made.
+                        # if no DEL/INS/SV call is made.
                         op_start_1b = ref_cursor + 1
                         op_end_1b_excl = ref_cursor + length + 1
-                        for pos in indel_site_set:
+                        for pos in special_site_set:
                             if op_start_1b <= pos < op_end_1b_excl:
                                 anchor_qpos[pos] = query_cursor + (pos - op_start_1b)
                         ref_cursor += length
@@ -822,15 +1571,17 @@ def make_windows_lazy(
                         key = (ref_cursor + 1, length)
                         pos = del_key_to_pos.get(key)
                         if pos is not None:
-                            indel_calls[pos] = ("DEL", aln.mapping_quality)
+                            # per-edit token: a <len>-bp deletion is its own allele.
+                            indel_calls[pos] = (f"DEL{length}", token_qual)
                         ref_cursor += length
                     elif op == 1:  # I
-                        # Anchor is the 1-based position immediately before
-                        # the inserted bases (== ref_cursor in 1-based terms).
-                        anchor = ref_cursor
-                        pos = ins_anchor_to_pos.get(anchor)
+                        # Anchor is the 1-based position immediately before the
+                        # inserted bases (== ref_cursor in 1-based terms). Match on
+                        # (anchor, inserted length) so a <len>-bp insertion is its
+                        # own allele rather than collapsing to a generic "INS".
+                        pos = ins_key_to_pos.get((ref_cursor, length))
                         if pos is not None:
-                            indel_calls[pos] = ("INS", aln.mapping_quality)
+                            indel_calls[pos] = (f"INS{length}", token_qual)
                         query_cursor += length
                     elif op == 3:  # N: consumes ref only
                         ref_cursor += length
@@ -844,10 +1595,33 @@ def make_windows_lazy(
                     r.quals[pos] = mq
                     has_overlap = True
 
-                # For indel sites with no DEL/INS call but a matched anchor
-                # base, record the base as the read's "ref-like" vote.
+                # Apply SV pseudo-site "present" calls. A read carries a specific
+                # event iff its name is in THAT event's supporting-read set AND
+                # this alignment's reference span brackets the breakpoint anchor
+                # (small pad for imprecision / soft-clip). The allele is the
+                # event ID, so two distinct events at one anchor are a genuinely
+                # multi-allelic site. The span check prevents a read whose *other*
+                # split segment supports the SV elsewhere from being called here.
+                if sv_site_set and aln.reference_end is not None:
+                    aln_start_1b = aln.reference_start + 1
+                    aln_end_1b = aln.reference_end  # 1-based inclusive (None-guarded above)
+                    for pos in sv_site_set:
+                        events = sv_sup.get(pos)
+                        if not events:
+                            continue
+                        if not (aln_start_1b - _SV_ANCHOR_PAD <= pos <= aln_end_1b + _SV_ANCHOR_PAD):
+                            continue
+                        for event_id, ev_reads in events.items():
+                            if aln.query_name in ev_reads:
+                                r.alleles[pos] = event_id
+                                r.quals[pos] = token_qual
+                                has_overlap = True
+                                break
+
+                # For indel/SV sites with no event call but a matched anchor
+                # base, record the base as the read's "ref-like" (absent) vote.
                 for pos, qpos in anchor_qpos.items():
-                    if pos in indel_calls:
+                    if pos in r.alleles:  # already called (indel or SV present)
                         continue
                     base = query_seq[qpos]
                     qual = (
@@ -861,23 +1635,46 @@ def make_windows_lazy(
             if has_overlap:
                 reads.append(r)
 
+        # Re-assemble split molecules into single reads, and register the breakpoints
+        # they reveal as sites. Done before subsampling so the cap counts molecules.
+        if config.merge_split_reads:
+            reads, break_sites = _merge_split_reads(reads, config, snv_set)
+            for bp in break_sites:
+                if bp not in snv_set and start <= bp < end:
+                    window_snvs.append(bp)
+                    snv_set.add(bp)
+                    ref_alleles[bp] = CONTINUOUS
+                    st[bp] = "sv"
+            if break_sites:
+                window_snvs.sort()
+
         # Subsample if needed (reproducible)
         if config.max_reads_per_window and len(reads) > config.max_reads_per_window:
             indices = rng.permutation(len(reads))[: config.max_reads_per_window]
             reads = [reads[i] for i in indices]
 
-        if len(reads) < config.min_reads_per_window:
+        # Window CREATION uses the lower rescue floor, so windows in the
+        # [min_reads_for_rescue, min_reads_per_window) band still exist and can receive a
+        # rescued haplotype from the anchor panel. De-novo PHASING is gated separately in
+        # process_window() at the higher min_reads_per_window. If creation used the
+        # phasing floor instead, the rescue floor would be unreachable.
+        if len(reads) < config.min_reads_for_rescue:
             continue
 
         w = Window(contig=contig_id, start=start, end=end, sample=sample_id, window_idx=window_idx)
         w.snv_pos = window_snvs
-        w.ref_alleles = {p: ref_alleles[p] for p in window_snvs}
+        # Guarded: every registered position gets an anchor base, and SV
+        # pseudo-sites get one at merge time, but a caller supplying positions
+        # without one must not take the whole contig down here.
+        w.ref_alleles = {p: ref_alleles[p] for p in window_snvs if p in ref_alleles}
         w.reads = reads
-        windows.append(w)
+        # Carry the site types through. The identity code needs them to exclude SV
+        # positions from the distance; if they stop here the exclusion silently no-ops.
+        w.site_type = {p: st[p] for p in window_snvs if p in st}
+        yield w
         window_idx += 1
 
     bam.close()
-    return windows
 
 
 # =============================================================================
@@ -926,13 +1723,25 @@ class GraphInitializer:
                 if n_shared < self.config.min_shared_snvs_for_edge:
                     continue
 
-                # Count mismatches with early exit.
-                # We stop once mismatches exceed the allowed fraction.
-                max_allowed = int(self.config.max_mismatch_frac * n_shared)
+                r_i, r_j = reads[i], reads[j]
+
+                # Physical read-read overlap. -1 means the alignment spans are unknown
+                # (e.g. synthetic reads in tests), in which case the gate is skipped
+                # rather than rejecting everything.
+                ov = r_i.overlap_bp(r_j)
+                if 0 <= ov < self.config.min_read_read_overlap_bp:
+                    continue
+
+                # Count mismatches with early exit. Two independent gates: the RATE
+                # (floor(max_mismatch_frac * n_shared), which forces 0 mismatches below
+                # n_shared=100) and the ABSOLUTE cap, which is what actually binds once
+                # n_shared is large enough for the rate to go permissive.
+                max_allowed = min(
+                    int(self.config.max_mismatch_frac * n_shared), self.config.max_num_diff
+                )
                 mismatches = 0
                 exceeded = False
 
-                r_i, r_j = reads[i], reads[j]
                 for p in shared:
                     if r_i.alleles[p] != r_j.alleles[p]:
                         mismatches += 1
@@ -982,8 +1791,12 @@ class GraphInitializer:
             return [], []
 
         # Partition reads into clusters.
-        # Louvain community detection for read clustering.
-        partition = community_louvain.best_partition(graph, weight="weight")
+        # Louvain community detection for read clustering. random_state is passed
+        # explicitly: without it python-louvain draws from the unseeded global `random`,
+        # which made two runs of an identical config disagree on abundance at ~1e-7.
+        partition = community_louvain.best_partition(
+            graph, weight="weight", random_state=self.config.random_seed
+        )
 
         # Group by cluster
         clusters = defaultdict(list)
@@ -1032,43 +1845,35 @@ class EMHaplotyper:
         self.reads = window.reads
         self.config = config
 
-        # Use the cache appropriate for the active alphabet size (4 for SNVs
-        # only, 6 when indels are enabled).
-        self._cache = _select_log_prob_cache(config)
+        # Single 6-state alphabet {A,C,G,T,DEL,INS} — indels are always on.
+        self._cache = _LOG_PROB_CACHE
+
+        # The site set every component is scored over, fixed for the whole run. Fixed is
+        # the point: it is what makes gamma a posterior (components compared on the same
+        # observations) and what makes the log-likelihood a function of the parameters
+        # alone, so a decreasing objective is now a real signal rather than the
+        # bookkeeping artefact of a consensus footprint that grew between iterations.
+        self._snv_set = set(window.snv_pos)
+        self._support = [_read_support(r, self._snv_set) for r in self.reads]
 
     def _compute_log_prob_read_hap(self, read: Read, haplotype: Haplotype) -> float | None:
-        """Compute log P(read | haplotype) using cached base probs."""
-        log_prob = 0.0
-        overlap = 0
-
-        for pos, read_base in read.alleles.items():
-            if pos in haplotype.consensus:
-                q = read.quals.get(pos, self.config.default_base_quality)
-                log_prob += self._cache.log_prob_base(haplotype.consensus[pos], read_base, q)
-                overlap += 1
-
-        return log_prob if overlap > 0 else None
+        """Compute log P(read | haplotype) over this read's fixed support."""
+        return _log_prob_read_hap(
+            read,
+            haplotype.consensus,
+            _read_support(read, self._snv_set),
+            self.config.default_base_quality,
+        )
 
     def _compute_log_prob_read_junk(self, read: Read) -> float:
-        """Compute log P(read | junk) using divergent reference model."""
-        p_div = self.config.junk_divergence_rate
-        n_alleles = self._cache.n_alleles
-        log_match = np.log(1.0 - p_div + 1e-12)
-        log_miss = np.log(p_div / float(n_alleles - 1) + 1e-12)
-
-        log_prob = 0.0
-        for pos, read_base in read.alleles.items():
-            if pos not in self.window.snv_pos:
-                continue
-            ref_base = self.window.ref_alleles.get(pos)
-            if ref_base is None:
-                continue
-            if read_base == ref_base:
-                log_prob += log_match
-            else:
-                log_prob += log_miss
-
-        return log_prob
+        """Compute log P(read | junk) using the divergent reference model."""
+        return _log_prob_read_junk(
+            read,
+            _read_support(read, self._snv_set),
+            self.window.ref_alleles,
+            self.config.junk_divergence_rate,
+            self.config.default_base_quality,
+        )
 
     def run(self) -> tuple[list[Haplotype], np.ndarray, np.ndarray, float, bool, int]:
         """Run EM with cached log-probability computations."""
@@ -1105,12 +1910,22 @@ class EMHaplotyper:
             logl_hap = np.full((n_reads, n_haps), -np.inf)
             logl_junk = np.zeros(n_reads)
 
+            default_q = self.config.default_base_quality
             for i, read in enumerate(reads):
+                support = self._support[i]
                 for k in range(n_haps):
-                    lp = self._compute_log_prob_read_hap(read, haplotypes[k])
+                    lp = _log_prob_read_hap(
+                        read, haplotypes[k].consensus, support, default_q
+                    )
                     if lp is not None:
                         logl_hap[i, k] = lp
-                logl_junk[i] = self._compute_log_prob_read_junk(read)
+                logl_junk[i] = _log_prob_read_junk(
+                    read,
+                    support,
+                    self.window.ref_alleles,
+                    self.config.junk_divergence_rate,
+                    default_q,
+                )
 
             # E-STEP: compute responsibilities gamma[i, k] = P(haplotype k | read i).
             for i in range(n_reads):
@@ -1154,26 +1969,49 @@ class EMHaplotyper:
                     continue
 
                 allele_votes = defaultdict(lambda: defaultdict(float))
+                # Per position: the gamma mass reaching it, and the score every candidate
+                # allele starts from (every covering read charged as a mismatch). The two
+                # together are what let a vote be compared against calling nothing.
+                cover_weight: dict[int, float] = defaultdict(float)
+                mismatch_floor: dict[int, float] = defaultdict(float)
 
                 for i, read in enumerate(reads):
                     w = gamma[i, k]
                     if w < self.config.min_gamma_for_vote:
                         continue
 
-                    for pos, base in read.alleles.items():
-                        if pos not in self.window.snv_pos:
-                            continue
+                    for pos in self._support[i]:
                         q = read.quals.get(pos, self.config.default_base_quality)
-                        q_weight = 1.0 - 10 ** (-q / 10.0)
-                        allele_votes[pos][base] += w * q_weight
+                        # The consensus that maximises the expected complete
+                        # log-likelihood weights each vote by gamma * (log P(base | agree)
+                        # - log P(base | disagree)), not by the probability the base is
+                        # correct. The latter spans only [0.99, 1.0] over the admissible
+                        # quality range, which made this a plain majority vote: six Q20
+                        # reads calling G outvoted five Q93 reads calling C, emitting a
+                        # call 39.9 nats worse under this package's own error model.
+                        allele_votes[pos][read.alleles[pos]] += w * self._cache.log_odds(q)
+                        cover_weight[pos] += w
+                        mismatch_floor[pos] += w * self._cache.log_mismatch(q)
 
                 if not allele_votes:
                     continue
 
                 new_consensus = {}
                 for pos in self.window.snv_pos:
-                    if pos in allele_votes:
-                        new_consensus[pos] = max(allele_votes[pos], key=allele_votes[pos].get)
+                    votes = allele_votes.get(pos)
+                    if not votes:
+                        continue
+                    best = max(votes, key=votes.get)
+                    # Calling NOTHING at a position is a real option and sometimes the
+                    # better one: where only a couple of reads reach, no allele need beat
+                    # marginalising over the alphabet for everyone else. Taking the
+                    # majority regardless extended footprints into positions that cost the
+                    # objective more than they earned, which is why the log-likelihood
+                    # could fall between iterations with the haplotype count unchanged.
+                    if (mismatch_floor[pos] + votes[best]
+                            <= cover_weight[pos] * _LOG_MISSING_SITE):
+                        continue
+                    new_consensus[pos] = best
 
                 if new_consensus:
                     new_haps.append(Haplotype(consensus=new_consensus))
@@ -1204,7 +2042,18 @@ class EMHaplotyper:
             gamma = gamma_new
 
             row_sums = gamma.sum(axis=1, keepdims=True)
-            row_sums[row_sums == 0] = 1.0
+            # A read whose whole responsibility sat on haplotypes this iteration pruned
+            # has nothing left. Rescaling by 1.0 left the row all zeros, which is not a
+            # distribution: validate() rejects it, and junk_read_counts scores the read as
+            # neither resolved nor junk. Junk is exactly what "no haplotype explains this
+            # read" means, so that is where the mass goes. Usually the next E-step
+            # overwrites the row anyway - unless the prune lands on the iteration that
+            # also breaks for convergence, which is when this used to escape.
+            dead_rows = (row_sums[:, 0] == 0.0)
+            if dead_rows.any():
+                gamma[dead_rows, :] = 0.0
+                gamma[dead_rows, junk_idx] = 1.0
+                row_sums[dead_rows] = 1.0
             gamma /= row_sums
 
             # Convergence check using relative change in log-likelihood.
@@ -1289,16 +2138,29 @@ class PostProcessor:
 
                 minor_count = 0
                 total_at_pos = 0
+                p_error_sum = 0.0
                 for read in window.reads:
                     if diff_pos in read.alleles:
                         total_at_pos += 1
+                        q = read.quals.get(diff_pos, self.config.default_base_quality)
+                        # /3: the null is that the minor calls are sequencing errors that
+                        # happened to produce THIS base, one of the three alternatives.
+                        p_error_sum += 10 ** (-q / 10.0) / 3.0
                         if read.alleles[diff_pos] == minor_base:
                             minor_count += 1
 
                 if total_at_pos == 0:
                     return True
 
-                p_error = 10 ** (-30 / 10.0) / 3.0
+                # The reads' own base qualities, not a fixed Q30. The bases at this
+                # position are in read.quals and min_base_quality — the gate that decided
+                # which of them got here at all — defaults to 20, so assuming Q30 asserted
+                # an accuracy the data does not have to carry. It errs towards SPLIT: at
+                # 3 minor reads of 40 in a 250-site window, Q30 gives p=3.6e-07 (split)
+                # where the reads' real Q20 gives 3.3e-04 (merge), i.e. a phantom strain
+                # above the 10% abundance floor. The binomial wants one rate, so the mean
+                # over the reads at the position stands in for the Poisson-binomial.
+                p_error = p_error_sum / total_at_pos
                 alpha_corrected = self.config.binomial_alpha / len(window.snv_pos)
                 p_value = 1 - binom.cdf(minor_count - 1, total_at_pos, p_error)
 
@@ -1407,7 +2269,15 @@ class PostProcessor:
         return new_haplotypes, new_gamma, new_pi
 
     def assign_reads(self, reads: list[Read], gamma: np.ndarray, pi: np.ndarray) -> list[dict]:
-        """Hard assignment of reads."""
+        """Hard assignment of reads.
+
+        Skipped entirely unless ``config.keep_read_assignments`` is set - see that flag.
+        Returns ``[]`` in that case, which is what every downstream consumer already
+        tolerates (nothing reads this field).
+        """
+        if not self.config.keep_read_assignments:
+            return []
+
         assignments = []
         n_reads, k_eff = gamma.shape
         junk_idx = k_eff - 1
@@ -1445,6 +2315,11 @@ class PostProcessor:
 # =============================================================================
 # OPTIMIZED LONGITUDINAL INTEGRATOR
 # =============================================================================
+
+# Weight the junk component keeps no matter what a rescue takes from it, for numerical
+# stability. A rescue is funded ENTIRELY out of junk, so this floor is also the gate on
+# whether a rescue can happen at all: below it there is nothing to fund one with.
+_MIN_JUNK_WEIGHT = 0.01
 
 
 class LongitudinalIntegrator:
@@ -1582,6 +2457,34 @@ class LongitudinalIntegrator:
             )
             return window_result
 
+        # A rescue is funded entirely out of junk's weight, down to _MIN_JUNK_WEIGHT.
+        # Below that floor there is nothing to fund one with, and proceeding anyway is
+        # strictly harmful: every rescued weight is scaled to 0.0, junk is INFLATED up to
+        # the floor, and every original haplotype in the window is scaled down to make
+        # room for a haplotype contributing nothing - while the statistic recorded
+        # was_rescued=True. The posterior read count (n_junk_reads) does not imply the
+        # weight is there: a handful of reads can sit above gamma 0.5 on a pi_junk of
+        # 0.002.
+        if junk_weight - _MIN_JUNK_WEIGHT <= 0.0:
+            self.rescue_statistics.append(
+                RescueStatistic(
+                    sample=current_sample,
+                    rescued_timepoint=current_sample,
+                    contig=window.contig,
+                    window_start=window.start,
+                    track_id="window",
+                    was_rescued=False,
+                    original_weight=junk_weight,
+                    rescued_weight=junk_weight,
+                    donor_timepoint="",
+                    anchor_distance=-1.0,
+                    n_shared_with_anchor=0,
+                    n_mismatched_with_anchor=0,
+                    reason="junk_below_floor",
+                )
+            )
+            return window_result
+
         # Avoid duplicating an already-present haplotype in this window.
         existing_consensuses = [h.consensus for h in haplotypes]
 
@@ -1633,6 +2536,11 @@ class LongitudinalIntegrator:
         # and have at least one uniquely assigned read.
         rescued_any = False
         new_haplotypes = []
+        # Where each rescued haplotype's statistic landed, so the weight recorded there
+        # can be corrected to the one the window actually ends up carrying. The scaling
+        # below can only shrink it, and a statistic reporting the pre-scaling figure
+        # overstates every rescue that had to compete for a limited junk budget.
+        new_hap_stat_idx: list[int] = []
 
         for anchor_idx, anchor in enumerate(anchor_haps):
             anchor_already_present = False
@@ -1679,6 +2587,7 @@ class LongitudinalIntegrator:
                     new_haplotypes.append(new_hap)
 
                     donor_timepoint = anchor_samples[anchor_idx]
+                    new_hap_stat_idx.append(len(self.rescue_statistics))
                     self.rescue_statistics.append(
                         RescueStatistic(
                             sample=current_sample,
@@ -1750,8 +2659,7 @@ class LongitudinalIntegrator:
         # This avoids zeroing out original haplotypes when rescued_min_weight or
         # (previously) double-counted reads made total_rescued_weight > old_junk_weight.
         old_junk_weight = pi[junk_idx]
-        min_junk_floor = 0.01  # Keep a small junk component for numerical stability
-        available_from_junk = max(0.0, old_junk_weight - min_junk_floor)
+        available_from_junk = max(0.0, old_junk_weight - _MIN_JUNK_WEIGHT)
 
         total_rescued_weight = sum(h.weight for h in new_haplotypes)
         if total_rescued_weight > available_from_junk and total_rescued_weight > 0:
@@ -1760,8 +2668,11 @@ class LongitudinalIntegrator:
             for h in new_haplotypes:
                 h.weight *= scale_rescued
             total_rescued_weight = available_from_junk
+            # Report what the haplotype ends up with, not what it asked for.
+            for h, stat_idx in zip(new_haplotypes, new_hap_stat_idx):
+                self.rescue_statistics[stat_idx].rescued_weight = h.weight
 
-        new_junk_weight = max(min_junk_floor, old_junk_weight - total_rescued_weight)
+        new_junk_weight = max(_MIN_JUNK_WEIGHT, old_junk_weight - total_rescued_weight)
 
         # Build new pi: original haplotypes scaled to fill (1 - total_rescued - new_junk).
         pi_new = np.zeros(k_eff_new)
@@ -1820,43 +2731,29 @@ class LongitudinalIntegrator:
         junk_idx = n_haps
 
         gamma = np.zeros((n_reads, k_eff))
-        cache = _select_log_prob_cache(self.config)
 
-        # Junk model constants. Spread the divergence probability over the
-        # ``n_alleles - 1`` non-matching states so the model is consistent with
-        # the active alphabet (4 for SNVs only, 6 with indels).
+        # Scored through the same two helpers the EM uses. A rescued haplotype takes the
+        # DONOR's footprint (see the new_consensus build above), so this E-step is exactly
+        # where a footprint-asymmetric likelihood would do the most damage - the rescued
+        # component is guaranteed to have a different site set from the resident ones.
+        snv_set = set(window.snv_pos)
         p_div = self.config.junk_divergence_rate
-        n_alleles = cache.n_alleles
-        log_junk_match = np.log(1.0 - p_div + 1e-12)
-        log_junk_miss = np.log(p_div / float(n_alleles - 1) + 1e-12)
+        default_q = self.config.default_base_quality
 
         for i, read in enumerate(reads):
             logp_k = np.full(k_eff, -np.inf)
+            support = _read_support(read, snv_set)
 
-            # Haplotype likelihoods
             for k in range(n_haps):
-                log_prob = 0.0
-                overlap = 0
-                for pos, read_base in read.alleles.items():
-                    if pos in haplotypes[k].consensus:
-                        q = read.quals.get(pos, self.config.default_base_quality)
-                        log_prob += cache.log_prob_base(haplotypes[k].consensus[pos], read_base, q)
-                        overlap += 1
-                if overlap > 0:
+                log_prob = _log_prob_read_hap(
+                    read, haplotypes[k].consensus, support, default_q
+                )
+                if log_prob is not None:
                     logp_k[k] = np.log(pi[k] + 1e-12) + log_prob
 
-            # Junk likelihood
-            log_junk = 0.0
-            for pos, read_base in read.alleles.items():
-                if pos in window.snv_pos:
-                    ref_base = window.ref_alleles.get(pos)
-                    if ref_base:
-                        if read_base == ref_base:
-                            log_junk += log_junk_match
-                        else:
-                            log_junk += log_junk_miss
-
-            logp_k[junk_idx] = np.log(pi[junk_idx] + 1e-12) + log_junk
+            logp_k[junk_idx] = np.log(pi[junk_idx] + 1e-12) + _log_prob_read_junk(
+                read, support, window.ref_alleles, p_div, default_q
+            )
 
             log_sum = logsumexp(logp_k)
             if np.isneginf(log_sum):
@@ -1867,9 +2764,20 @@ class LongitudinalIntegrator:
         return gamma
 
     def rescue_low_abundance(
-        self, results_by_timepoint: dict[str, list[WindowResult]]
+        self,
+        results_by_timepoint: dict[str, list[WindowResult]],
+        only_sample: str | None = None,
     ) -> dict[str, list[WindowResult]]:
-        """Rescue low-abundance haplotypes across timepoints."""
+        """Rescue low-abundance haplotypes across timepoints.
+
+        ``only_sample`` restricts the rescue to that one sample, returning just its
+        rescued windows. Every other sample still contributes to the anchor panel, which
+        needs nothing but their ``.haplotypes`` - so their reads and gamma may be
+        offloaded (see WindowResult.offload_heavy). Calling this once per sample in the
+        same iteration order is equivalent to the all-samples call: the panel is indexed
+        from the same WindowResult objects and rescue mutates haplotype weights in place
+        either way.
+        """
         if len(results_by_timepoint) < 2:
             return results_by_timepoint
 
@@ -1891,9 +2799,9 @@ class LongitudinalIntegrator:
             if len(sample_results) >= 2:
                 n_windows_with_multiple_timepoints += 1
             for _sample_id, wr in sample_results.items():
-                n_reads = wr.gamma.shape[0]
-                junk_idx = wr.gamma.shape[1] - 1
-                junk_reads = (wr.gamma[:, junk_idx] > 0.5).sum()
+                # Works whether or not gamma is resident (offloaded samples carry the
+                # scalar summary instead).
+                n_reads, junk_reads = wr.junk_read_counts()
                 total_reads += n_reads
                 total_junk_reads += junk_reads
                 n_anchors += sum(1 for h in wr.haplotypes if h.weight >= self.config.min_weight_for_anchor)
@@ -1910,6 +2818,8 @@ class LongitudinalIntegrator:
 
         for _window_key, sample_results in windows_by_position.items():
             for sample_id, wr in sample_results.items():
+                if only_sample is not None and sample_id != only_sample:
+                    continue
                 # Build anchor panel excluding the current sample to avoid self-rescue.
                 anchor_haps, anchor_samples = self.build_anchor_panel_for_key(
                     sample_results, exclude_sample=sample_id
@@ -2036,6 +2946,31 @@ def process_window(
     """Process a single window through the full pipeline."""
     post = PostProcessor(config)
 
+    # 0) Resolving-depth floor. Windows are CREATED at min_reads_for_rescue so the
+    #    anchor panel can still populate them, but de-novo phasing needs enough reads to
+    #    actually separate haplotypes. Below the floor we emit a junk-only result: no
+    #    haplotype is invented, so the trajectory carries a gap instead of a
+    #    manufactured abundance of 1.0.
+    if len(window.reads) < config.min_reads_per_window:
+        n_reads = len(window.reads)
+        gamma = np.ones((n_reads, 1))
+        pi = np.array([1.0])
+        n_reads_examined, reads_within_mismatch_per_hap = _compute_read_mismatch_counts(
+            window, [], config.max_mismatch_frac
+        )
+        return WindowResult(
+            window=window,
+            haplotypes=[],
+            gamma=gamma,
+            pi=pi,
+            log_likelihood=-np.inf,
+            assignments=post.assign_reads(window.reads, gamma, pi),
+            converged=True,
+            iterations=0,
+            n_reads_examined=n_reads_examined,
+            reads_within_mismatch_per_hap=reads_within_mismatch_per_hap,
+        )
+
     # 1) Initialize haplotypes via read clustering on the overlap graph.
     initializer = GraphInitializer(config)
     initial_haps, cluster_sizes = initializer.get_initial_haplotypes(window)
@@ -2092,21 +3027,25 @@ def process_window(
         haplotypes, gamma, pi, window, n_timepoints_seen
     )
 
-    # 3b) Prune invariant positions: keep only SNV sites where at least two
-    #      haplotypes disagree.  Monomorphic sites (e.g. AF≈1 fixed ALTs)
-    #      add no discriminative signal and inflate shared-SNV counts during linking.
-    if len(merged_haps) >= 2:
-        all_positions = set()
-        for h in merged_haps:
-            all_positions.update(h.consensus.keys())
-        variable_positions = set()
-        for pos in all_positions:
-            calls = {h.consensus[pos] for h in merged_haps if pos in h.consensus}
-            if len(calls) > 1:
-                variable_positions.add(pos)
-        for h in merged_haps:
-            h.consensus = {pos: base for pos, base in h.consensus.items()
-                           if pos in variable_positions}
+    # 3b) NO invariant-site pruning here.
+    #
+    #     This step used to delete positions where the haplotypes in THIS window agreed,
+    #     gated on `if len(merged_haps) >= 2`. It was wrong in both directions:
+    #
+    #       * skipped entirely for single-haplotype windows (85% of windows on
+    #         000089747_1), so those kept every position they covered - a median of 743
+    #         positions of which 42.6% are invariant across the entire MAG - while
+    #         2-haplotype windows kept a median of 3. Distances were therefore computed
+    #         on wildly asymmetric marker sets.
+    #       * window-LOCAL, so a genuinely polymorphic position that happened to be
+    #         monomorphic among this window's haplotypes was destroyed for good.
+    #
+    #     Pruning is now a comparison-time concern, not a construction-time one:
+    #     `variable_marker_positions()` computes the marker set at the widest scope
+    #     available (all haplotypes in the sample for window linking; all haplotypes in
+    #     all samples for cross-sample grouping) and the linking code filters against it.
+    #     Construction keeps everything; nothing is destroyed before the scope is known.
+    #     (FIGURE4 diagnosis §2.6a.)
 
     assignments = post.assign_reads(window.reads, final_gamma, final_pi)
 
@@ -2134,6 +3073,336 @@ def process_window(
     return result
 
 
+
+# =============================================================================
+# SPLIT MOLECULES: re-assembly and the BREAK marker
+# =============================================================================
+
+# Allele values at a breakpoint site. A read that crosses the position with a continuous
+# alignment carries CONTINUOUS; one whose alignment is split there carries
+# BREAK_PREFIX + the coordinate it resumes at, so two different events at the same left
+# coordinate stay distinct alleles. Same shape as the INS<len> / DEL<len> encoding.
+CONTINUOUS = "CONT"
+BREAK_PREFIX = "BRK"
+
+
+def _merge_split_reads(
+    reads: list[Read],
+    config: HaplotyperConfig = DEFAULT_CONFIG,
+    snv_set: set[int] | None = None,
+) -> tuple[list[Read], set[int]]:
+    """Re-assemble split alignments into one Read each, and report the breakpoints.
+
+    When a strain carries a segment the aligner cannot place - a divergent cassette, an
+    insertion, a rearrangement - the molecule is emitted as a primary alignment plus one
+    or more supplementary ones, with the unplaceable part clipped. Those segments are ONE
+    molecule and therefore one strain, so they are merged back into a single Read.
+
+    Two things follow, and both matter:
+
+    1. The merged read carries alleles from BOTH sides of the break, so it links them in
+       the read graph and the EM assigns the whole molecule to one haplotype. The
+       fragments never form. Previously the segments were discarded outright and one
+       strain was emitted as several haplotypes, each handed a share of the window's
+       mixture weight (troubleshooting U1).
+    2. The break itself becomes a POSITIVE identity marker. A strain carrying the cassette
+       reads ``BRK<resume_pos>``; a strain without it reads ``CONT``. That is a
+       discriminating allele like any other, so the structural variant is tracked rather
+       than being a hole in the data - which is the point of not excluding SVs from
+       identity.
+
+    The breakpoint is anchored at the LAST aligned reference position of the preceding
+    segment, or at the nearest earlier position inside that segment that is not already a
+    called variant site. Shifting matters: the anchor is written unconditionally, so on a
+    position the VCF also calls, the BRK token replaced the read's real allele there and
+    ``site_type`` still said ``"snv"`` - the same clobbering the SV sidecar merge refuses
+    outright (caveat 7). Pass *snv_set* to enable the check; without it there is nothing
+    to check against and the anchor is taken as-is.
+
+    Returns the merged reads and the set of breakpoint positions.
+    """
+    by_molecule: dict[str, list[Read]] = defaultdict(list)
+    for r in reads:
+        by_molecule[r.id].append(r)
+
+    called = snv_set if snv_set is not None else frozenset()
+    merged: list[Read] = []
+    breaks: set[int] = set()
+    n_anchors_dropped = 0
+    qual = config.default_base_quality
+
+    for segs in by_molecule.values():
+        if len(segs) == 1:
+            merged.append(segs[0])
+            continue
+        segs.sort(key=lambda r: (r.ref_start, r.ref_end))
+        # Captured before `whole` (which IS segs[0]) has its own span widened below.
+        spans = [(s.ref_start, s.ref_end) for s in segs]
+        whole = segs[0]
+        for seg in segs[1:]:
+            whole.alleles.update(seg.alleles)
+            whole.quals.update(seg.quals)
+        # Set the break markers AFTER the union so they cannot be overwritten by a
+        # later segment that happens to have a call at the same position.
+        for prev, nxt in zip(segs, segs[1:]):  # noqa: B905
+            if nxt.ref_start <= prev.ref_end:
+                continue  # overlapping segments: no gap, nothing to mark
+            # Walk back inside the preceding segment until the anchor is a position no
+            # variant was called at. Anywhere in that segment carries the same meaning -
+            # every read continuous across the gap is aligned there too - so shifting
+            # keeps the marker instead of choosing between it and a real allele.
+            anchor = prev.ref_end - 1
+            while anchor in called and anchor > prev.ref_start:
+                anchor -= 1
+            if anchor in called:
+                n_anchors_dropped += 1
+                continue
+            whole.alleles[anchor] = f"{BREAK_PREFIX}{nxt.ref_start}"
+            whole.quals[anchor] = qual
+            breaks.add(anchor)
+        whole.ref_start = min(s for s, _ in spans)
+        whole.ref_end = max(e for _, e in spans)
+        # The per-segment spans, which the outer span no longer describes.
+        whole.segments = spans
+        merged.append(whole)
+
+    # A read that spans a breakpoint with an unbroken alignment is evidence AGAINST the
+    # event, not absence of evidence. Without this the marker cannot discriminate: only
+    # the broken strain would carry a call and compare_consensus scores solely positions
+    # where both sides have one.
+    #
+    # Read.covers, not the outer span: a molecule merged from segments [1000,5000) and
+    # [8000,15000) spans 1000-15000, so an outer-span test wrote "no break here" at 5001,
+    # inside that read's OWN unaligned gap. Two molecules carrying the same event with
+    # breakpoints ragged by a couple of bases then disagreed at the fabricated site and
+    # build_overlap_graph dropped the edge between them - the U1 fragmentation this
+    # function exists to prevent.
+    for pos in breaks:
+        for r in merged:
+            if pos in r.alleles or not r.covers(pos):
+                continue
+            r.alleles[pos] = CONTINUOUS
+            r.quals[pos] = qual
+
+    if n_anchors_dropped:
+        logging.debug(
+            f"    _merge_split_reads: {n_anchors_dropped} breakpoint anchors dropped "
+            f"(no free position in the preceding segment)"
+        )
+
+    return merged, breaks
+
+
+# =============================================================================
+# IDENTITY: marker set + the shared gate stack
+# =============================================================================
+
+
+def variable_marker_positions(
+    consensuses: Iterable[dict[int, str]],
+    site_type: dict[int, str] | None = None,
+    config: HaplotyperConfig = DEFAULT_CONFIG,
+) -> set[int]:
+    """Positions usable as identity markers, computed over *consensuses*.
+
+    A position is a marker only if at least two distinct alleles are observed across the
+    whole collection. A position where every haplotype agrees carries zero identity
+    information, yet still inflates ``n_shared`` and dilutes the mismatch rate - on
+    ``000089747_1`` 42.6% of emitted positions were invariant MAG-wide, accounting for
+    38.5% of all consensus entries.
+
+    Call this at the WIDEST scope available for the comparison being made:
+      * window linking within a sample -> every haplotype in that sample/contig
+      * grouping across samples        -> every haplotype in every sample, that contig
+
+    Structural variants ARE identity markers (``exclude_sv_from_identity`` defaults to
+    False, author's decision): capturing the trajectory of a flip is a goal of the
+    analysis. When an invertible element flips, the two orientations are reported as two
+    entities trading frequency over time, which is the trajectory. The flag exists only
+    so that effect can be measured.
+    """
+    seen: dict[int, set[str]] = defaultdict(set)
+    for consensus in consensuses:
+        for pos, base in consensus.items():
+            seen[pos].add(base)
+
+    markers = {pos for pos, alleles in seen.items() if len(alleles) > 1}
+    if config.exclude_sv_from_identity and site_type:
+        markers -= {pos for pos in markers if site_type.get(pos) == "sv"}
+    return markers
+
+
+def consensus_footprint(
+    consensus: dict[int, str], region: tuple[int, int] | None = None
+) -> tuple[int, int]:
+    """First and last position a consensus covers, optionally clipped to *region*.
+
+    Returned as (lo, hi) with hi < lo when nothing falls inside the region, so callers can
+    test emptiness without a second pass. Deliberately avoids materialising a set: this is
+    called once per haplotype per comparison batch, not once per pair.
+    """
+    if region is None:
+        return (min(consensus), max(consensus)) if consensus else (1, 0)
+    lo_r, hi_r = region
+    lo = hi = None
+    for p in consensus:
+        if lo_r <= p <= hi_r:
+            if lo is None or p < lo:
+                lo = p
+            if hi is None or p > hi:
+                hi = p
+    return (lo, hi) if lo is not None else (1, 0)
+
+
+@dataclass
+class GateResult:
+    """Outcome of one identity comparison.
+
+    ``reason`` distinguishes the two ways a comparison can fail, which is the
+    information the (paused) lineage layer needs in order to tell a measurement hole
+    from a real genotypic wall:
+
+      ``"linked"``              passed every gate
+      ``"failed_no_evidence"``  too few shared markers, or too little physical overlap -
+                                a DROPOUT. Nothing was shown to differ.
+      ``"failed_mismatch"``     enough shared markers, but the alleles genuinely disagree
+                                beyond the gates - a candidate recombination breakpoint.
+    """
+
+    passed: bool
+    reason: str
+    rate: float
+    n_shared: int
+    n_diff: int
+    # True when no discriminating markers were available and the comparison fell back to
+    # all co-covered positions. See compare_consensus for why that fallback exists.
+    used_fallback: bool = False
+
+
+def compare_consensus(
+    a: dict[int, str],
+    b: dict[int, str],
+    markers: set[int],
+    config: HaplotyperConfig = DEFAULT_CONFIG,
+    min_shared: int | None = None,
+    region: tuple[int, int] | None = None,
+    min_cospan_frac: float | None = None,
+    max_rate: float | None = None,
+    allow_fallback: bool = True,
+    a_span: tuple[int, int] | None = None,
+    b_span: tuple[int, int] | None = None,
+) -> GateResult:
+    """Apply the full identity gate stack to two consensus dicts.
+
+    Gates, in order: the two footprints must overlap by >= ``min_entity_overlap_bp``
+    (and >= ``min_cospan_frac`` of ``region``); shared markers >= ``min_shared``;
+    absolute mismatches <= ``max_num_diff``; mismatch rate <= ``lineage_merge_distance``.
+
+    The overlap gate asks only "how much sequence did both haplotypes cover", never
+    where the markers within it happen to fall.
+
+    ``a_span``/``b_span`` are precomputed ``consensus_footprint`` results. Pass them when
+    comparing many pairs - the footprint does not depend on the partner, and recomputing it
+    per pair dominates the cost.
+
+    ``allow_fallback=False`` forbids the clonal fallback, so the verdict rests only on
+    genuinely discriminating markers. Use it whenever a NEGATIVE verdict will be treated
+    as absolute: the fallback pads the comparison with positions that are invariant in
+    scope and therefore cannot disagree, which is harmless for a merge but would let a
+    mismatch be declared off evidence that was never discriminating.
+
+    The absolute cap and the rate guard opposite ends of the range: the rate is applied
+    as a floor, so it already forces zero mismatches below n_shared=100, while at
+    n_shared=1172 it would tolerate 11 - which is where the absolute cap binds.
+    """
+    if min_shared is None:
+        min_shared = config.min_shared_for_lineage
+    if min_cospan_frac is None:
+        min_cospan_frac = config.min_cosupported_span_frac
+    if max_rate is None:
+        max_rate = config.lineage_merge_distance
+
+    def _restrict(positions):
+        if region is None:
+            # already a set from the & below; copying it was pure overhead
+            return positions if isinstance(positions, set) else set(positions)
+        lo, hi = region
+        return {p for p in positions if lo <= p <= hi}
+
+    shared = _restrict(a.keys() & b.keys() & markers)
+    used_fallback = False
+
+    if len(shared) < min_shared and allow_fallback:
+        # No DISCRIMINATING markers between these two. Absence of discriminating
+        # evidence is not evidence of difference: a clonal locus legitimately has no
+        # variable positions at all, and a clonal SAMPLE can have almost none - 85% of
+        # windows on 000089747_1 hold a single haplotype. Restricting to markers would
+        # then make every comparison impossible and split a real lineage into singletons.
+        # Fall back to all co-covered positions, and record that we did so.
+        fallback = _restrict(a.keys() & b.keys())
+        if len(fallback) >= min_shared:
+            shared, used_fallback = fallback, True
+
+    n_shared = len(shared)
+
+    # HOW MUCH SEQUENCE DID WE ACTUALLY COMPARE? The stretch over which BOTH haplotypes
+    # have calls - their footprints' intersection. This is deliberately independent of
+    # WHERE the markers sit.
+    #
+    # It used to be `max(shared) - min(shared)`, the span of the marker subset, which
+    # measures how spread out the informative positions happen to be rather than how
+    # much sequence was jointly observed. That penalises exactly the loci where variation
+    # clusters (recombination tracts, hypervariable and phase-variable regions) and is
+    # backwards on evidence: 50 markers packed into 300 bp failed, while 2 markers
+    # 1,100 bp apart passed. Measured on 000066952_0: at window 1,880,001 every one of
+    # the 703 pairs overlapped by 6,126 bp yet had its 2 markers only 190 bp apart, so
+    # all 703 were rejected and a 2-genotype locus was emitted as 38 singleton groups.
+    # A footprint is a property of ONE haplotype, so it must not be recomputed per pair.
+    # Building the two position sets here cost 77% of this function's runtime and scaled
+    # as O(n^2 * positions) per window; `consensus_footprint` is O(positions) and callers
+    # that compare many pairs should hoist it out of the loop entirely (see a_span/b_span).
+    lo_a, hi_a = a_span if a_span is not None else consensus_footprint(a, region)
+    lo_b, hi_b = b_span if b_span is not None else consensus_footprint(b, region)
+    overlap = (min(hi_a, hi_b) - max(lo_a, lo_b)) if (hi_a >= lo_a and hi_b >= lo_b) else 0
+    if overlap < config.min_entity_overlap_bp:
+        return GateResult(False, "failed_no_evidence", 1.0, n_shared, 0, used_fallback)
+    if region is not None:
+        lo, hi = region
+        if hi > lo and overlap < min_cospan_frac * (hi - lo):
+            return GateResult(False, "failed_no_evidence", 1.0, n_shared, 0, used_fallback)
+
+    # ...AND WAS ANY OF IT INFORMATIVE? Separate question, separate gate. These two were
+    # previously tangled into one number, which is also why min_shared ended up doubling
+    # as the trigger for the clonal fallback above.
+    if n_shared < min_shared:
+        return GateResult(False, "failed_no_evidence", 1.0, n_shared, 0, used_fallback)
+
+    n_diff = sum(1 for p in shared if a[p] != b[p])
+    rate = n_diff / n_shared
+    if n_diff > config.max_num_diff or rate > max_rate:
+        return GateResult(False, "failed_mismatch", rate, n_shared, n_diff, used_fallback)
+    return GateResult(True, "linked", rate, n_shared, n_diff, used_fallback)
+
+
+def unique_best_matches(
+    matches: dict[int, list[tuple[float, int]]],
+) -> dict[int, int]:
+    """Keep only unambiguous best matches; a tie contributes NOTHING.
+
+    Shared by window linking and cross-sample grouping. Uniqueness on both sides means
+    every node has at most one partner in each direction, so a connected component is a
+    PATH rather than a hub - which is what bounds an entity's size by construction
+    instead of by tuning.
+    """
+    unique: dict[int, int] = {}
+    for idx, options in matches.items():
+        options.sort(key=lambda x: x[0])
+        best_dist = options[0][0]
+        if len([o for o in options if o[0] == best_dist]) == 1:
+            unique[idx] = options[0][1]
+    return unique
+
+
 def link_windows(
     results: list[WindowResult], config: HaplotyperConfig = DEFAULT_CONFIG
 ) -> list[WindowResult]:
@@ -2141,11 +3410,30 @@ def link_windows(
     Link haplotypes across overlapping windows based on consensus similarity.
 
     Since windows overlap by 50%, adjacent windows share SNV positions.
-    Haplotypes are linked (assigned the same track_id) if their consensus
-    agrees on the shared SNVs.
+    Haplotypes are linked (assigned the same track_id) if their consensus agrees on the
+    shared SNVs AND their within-window shares are compatible.
+
+    The abundance check is an ELIMINATOR, never an indicator: two adjacent windows in one
+    sample are the same timepoint, so a genome cannot sit at two frequencies across them,
+    and a genuine disagreement means they are not one entity. Agreement earns no credit
+    and cannot rescue a failed identity gate. Tested on RAW COUNTS - the derived abundance
+    is already quantised onto unit fractions by a median denominator of 9 non-junk reads.
 
     This modifies haplotypes in-place by setting their track_id field.
     """
+    # Deferred: strainphase.coherence imports HaplotyperConfig from this module, so a
+    # top-level import here would be circular. The cost is one lookup per call.
+    from strainphase.coherence import abundance_coherent
+
+    # This pass re-derives every mismatch it is about to record, so it owns the list
+    # rather than appending to whatever was there. The longitudinal driver calls this a
+    # second time after cross-timepoint rescue, and rescue hands back the ORIGINAL object
+    # on every early-return path - so an append-only list gave an unrescued window its
+    # first-pass rows plus a byte-identical second copy, inflating both
+    # mismatches_within_sample.tsv and the QC count logged from it.
+    for wr in results:
+        wr.link_mismatches.clear()
+
     if len(results) < 2:
         # Single window: each haplotype is its own track.
         track_counter = 0
@@ -2157,6 +3445,19 @@ def link_windows(
 
     # Sort by genomic coordinate so adjacent windows are compared in order.
     sorted_results = sorted(results, key=lambda wr: wr.window.start)
+
+    # Marker set at the widest scope available here: every haplotype in this sample and
+    # contig. Positions where every haplotype agrees carry no identity information and
+    # are excluded, as are SV sites. Construction no longer prunes, so this is where the
+    # non-informative positions are removed.
+    site_type_all: dict[int, str] = {}
+    for wr in sorted_results:
+        site_type_all.update(wr.window.site_type)
+    markers = variable_marker_positions(
+        (hap.consensus for wr in sorted_results for hap in wr.haplotypes),
+        site_type_all,
+        config,
+    )
 
     # Build graph: nodes = (window_idx, hap_idx); edges = linkable haplotype pairs.
     graph = nx.Graph()  # Undirected for connected components
@@ -2198,16 +3499,86 @@ def link_windows(
             if len(shared_snvs) < config.min_shared_snvs_for_link:
                 continue
 
+            # The region shared by the two windows; the co-supported span gate is
+            # measured as a fraction of it.
+            region = (
+                max(curr_wr.window.start, next_wr.window.start),
+                min(curr_wr.window.end, next_wr.window.end) - 1,
+            )
+
             # Evaluate candidate pairings before linking (avoid cross-links).
+            # Full gate stack: shared markers >= min_shared_calls_for_link, co-supported
+            # span >= 25% of the shared region, num_diff <= 1, rate <= max_link_distance.
             candidates: list[tuple[int, int, float, int]] = []
+
+            # Non-junk read count per window - the denominator the abundance eliminator
+            # tests against. Same definition build_window_tables uses for `total_reads`.
+            def _nonjunk(wr) -> int:
+                if wr.gamma is None or wr.gamma.size == 0:
+                    return 0
+                junk = wr.gamma.shape[1] - 1
+                return int(wr.gamma.shape[0] - (wr.gamma[:, junk] >= 0.5).sum())
+
+            n_curr, n_next = _nonjunk(curr_wr), _nonjunk(next_wr)
+
+            # per-haplotype footprints, clipped to the shared region, hoisted out of the
+            # pairwise loop (see consensus_footprint)
+            span_i = [consensus_footprint(h.consensus, region) for h in curr_wr.haplotypes]
+            span_j = [consensus_footprint(h.consensus, region) for h in next_wr.haplotypes]
             for hi, hap_i in enumerate(curr_wr.haplotypes):
                 for hj, hap_j in enumerate(next_wr.haplotypes):
-                    dist, _, n_shared = hap_i.distance_to(hap_j, shared_snvs)
-                    # Only consider pairs with real shared calls
-                    if n_shared < config.min_shared_snvs_for_link:
-                        continue
-                    if dist <= config.max_link_distance:
-                        candidates.append((hi, hj, dist, n_shared))
+                    gate = compare_consensus(
+                        hap_i.consensus,
+                        hap_j.consensus,
+                        markers,
+                        config,
+                        min_shared=config.min_shared_calls_for_link,
+                        region=region,
+                        max_rate=config.max_link_distance,
+                        a_span=span_i[hi],
+                        b_span=span_j[hj],
+                    )
+                    if gate.passed:
+                        # ABUNDANCE AS AN ELIMINATOR (author's rule, 2026-07-28).
+                        #
+                        # This is a SINGLE-TIMEPOINT comparison - one sample, two adjacent
+                        # windows - so it is exactly the case the coherence test is for: a
+                        # genome cannot sit at two different frequencies at one moment.
+                        # Two window-haplotypes whose shares genuinely disagree are not the
+                        # same entity, however well their alleles match.
+                        #
+                        # ELIMINATOR ONLY. Agreement never scores and never rescues a
+                        # failed identity gate; it can only refuse. And the test is run on
+                        # RAW COUNTS, never the derived abundance, which is already
+                        # quantised onto unit fractions by a median denominator of 9.
+                        if not abundance_coherent(
+                            [(hap_i.supporting_reads, n_curr),
+                             (hap_j.supporting_reads, n_next)], config
+                        ).coherent:
+                            record_debug(curr_wr, {
+                                "contig": curr_wr.window.contig,
+                                "window_start": curr_wr.window.start,
+                                "next_window_start": next_wr.window.start,
+                                "hap_i": hi, "hap_j": hj,
+                                "decision": "refused",
+                                "reason": "incompatible_abundance",
+                            })
+                            continue
+                        candidates.append((hi, hj, gate.rate, gate.n_shared))
+                    elif gate.reason == "failed_mismatch":
+                        curr_wr.link_mismatches.append(
+                            {
+                                "contig": curr_wr.window.contig,
+                                "window_a": curr_wr.window.start,
+                                "hap_a_idx": hi,
+                                "window_b": next_wr.window.start,
+                                "hap_b_idx": hj,
+                                "rate": round(gate.rate, 6),
+                                "n_shared": gate.n_shared,
+                                "n_diff": gate.n_diff,
+                                "used_fallback": gate.used_fallback,
+                            }
+                        )
 
             if not candidates:
                 if config.linking_debug:
@@ -2335,24 +3706,69 @@ def process_contig(
     sample_id: str | None = None,
     vcf_sample_name: str | None = None,
     pool: Pool | None = None,
+    sv_sidecar_path: str | None = None,
 ) -> list[WindowResult]:
     """
     Process all windows in a contig and link haplotypes across windows.
 
     Windows overlap by 50% to enable linking haplotypes based on
     consensus similarity in shared SNV positions.
+
+    If ``sv_sidecar_path`` is given (see :mod:`strainphase.sv_encoding`),
+    structural variants are merged in as pseudo-sites and co-phased with SNVs.
+    The "present" allele is the unique event ID, so a locus carrying two distinct
+    events is a multi-allelic site. Backward compatible: ``None`` reproduces
+    SNV/indel-only behavior.
     """
     # 1) Load SNVs (and indels, if enabled) for this contig from the VCF.
-    snv_pos, ref_alleles, depth, af, site_type, del_span, ins_len = load_snvs(
-        vcf_path, contig_id, vcf_sample_name, config
-    )
+    (
+        snv_pos, ref_alleles, depth, af, site_type, site_kinds, del_span, ins_len
+    ) = load_snvs(vcf_path, contig_id, vcf_sample_name, config)
+
+    # 1b) Merge SV pseudo-sites from the sidecar (if provided). Anchors that
+    # collide with a real variant are dropped to avoid clobbering (caveat 7).
+    sv_support = None
+    if sv_sidecar_path:
+        from strainphase.sv_encoding import _RECONCILE_MAX_SPAN, load_sv_sidecar_for_contig
+
+        # reconcile may move an event's anchor by up to _RECONCILE_MAX_SPAN, and a read
+        # is only credited with the event if its span brackets the anchor to within
+        # _SV_ANCHOR_PAD. If the former ever exceeds the latter, reconciling a sidecar
+        # silently costs present-calls on reads that genuinely carry the event. The
+        # coupling was stated in prose at both ends and enforced at neither.
+        assert _RECONCILE_MAX_SPAN <= _SV_ANCHOR_PAD, (
+            f"sv_encoding._RECONCILE_MAX_SPAN ({_RECONCILE_MAX_SPAN}) exceeds "
+            f"core._SV_ANCHOR_PAD ({_SV_ANCHOR_PAD}); reconciled anchors can fall "
+            "outside the span that credits a read with the event"
+        )
+        sv_pos, sv_ref, sv_stype, sv_support = load_sv_sidecar_for_contig(
+            sv_sidecar_path, contig_id
+        )
+        n_added = n_collision = 0
+        for p in sv_pos:
+            if p in ref_alleles:
+                n_collision += 1
+                sv_support.pop(p, None)
+                continue
+            snv_pos.append(p)
+            ref_alleles[p] = sv_ref[p]  # "N" placeholder; SV sites are scored by event id
+            site_type[p] = sv_stype[p]
+            site_kinds[p] = frozenset({sv_stype[p]})
+            n_added += 1
+        if n_added or n_collision:
+            logging.info(
+                f"Contig {contig_id}: merged {n_added} SV pseudo-sites "
+                f"({n_collision} dropped for colliding with a called variant)"
+            )
 
     if not snv_pos:
         logging.warning(f"No variants found for contig {contig_id}")
         return []
 
     # 2) Create overlapping windows with lazy read loading.
-    windows = make_windows_lazy(
+    #    This is an ITERATOR: windows are pulled from the BAM a batch at a time so the
+    #    whole contig's reads are never resident at once (see iter_windows_lazy).
+    window_iter = iter_windows_lazy(
         bam_path,
         contig_id,
         contig_length,
@@ -2361,44 +3777,79 @@ def process_contig(
         config,
         sample_id,
         site_type=site_type,
+        site_kinds=site_kinds,
         del_span=del_span,
         ins_len=ins_len,
+        sv_support=sv_support,
     )
 
-    if not windows:
+    # 3) Process windows (parallel if a pool is supplied or n_workers > 1).
+    #    Batching serves memory, not scheduling: pool.map over the full window list
+    #    pickles every window out and every result back with both copies alive in the
+    #    parent. Feeding batches caps that transient at batch_size windows.
+    n_workers = config.n_workers
+    own_pool = None
+    if pool is not None:
+        active_pool, n_pool_workers = pool, getattr(pool, "_processes", 1)
+    elif n_workers > 1:
+        own_pool = active_pool = make_worker_pool(n_workers, config)
+        n_pool_workers = n_workers
+    else:
+        active_pool, n_pool_workers = None, 1
+
+    batch_size = max(1, n_pool_workers * max(1, config.window_batch_factor))
+    results: list[WindowResult] = []
+    n_windows = 0
+    try:
+        for batch in _batched(window_iter, batch_size):
+            if n_windows == 0:
+                # Logged on dispatch, not on completion: a variant-dense contig can take
+                # many minutes and this is the line that shows the run is alive. The
+                # total is not known up front - windows arrive from an iterator.
+                logging.info(
+                    f"Processing windows on {contig_id} with {n_pool_workers} shared "
+                    f"workers in batches of {batch_size}"
+                )
+            n_windows += len(batch)
+            if active_pool is not None and (len(batch) > 1 or n_windows > 1):
+                chunksize = max(1, len(batch) // n_pool_workers)
+                results.extend(
+                    active_pool.map(_process_window_wrapper, batch, chunksize=chunksize)
+                )
+            else:
+                results.extend(process_window(w, config) for w in batch)
+            # Drop this batch's Window references before the next one is pulled. The
+            # results still hold their own window (rescue needs the reads), but the
+            # input list must not pin a second copy.
+            batch.clear()
+    finally:
+        if own_pool is not None:
+            own_pool.close()
+            own_pool.join()
+
+    if not results:
         logging.warning(f"No valid windows for contig {contig_id}")
         return []
 
-    # 3) Process windows (parallel if a pool is supplied or n_workers > 1).
-    n_workers = config.n_workers
-    if pool is not None and len(windows) > 1:
-        # Reuse a caller-owned pool. Workers must already have been initialized
-        # with this config via _init_worker (see make_worker_pool).
-        n_pool_workers = getattr(pool, "_processes", 1)
-        chunksize = max(1, len(windows) // (n_pool_workers * 4))
-        logging.info(
-            f"Processing {len(windows)} windows on {contig_id} with {n_pool_workers} shared workers"
-        )
-        results = pool.map(_process_window_wrapper, windows, chunksize=chunksize)
-    elif n_workers > 1 and len(windows) > 1:
-        # No pool supplied: spin up a one-shot pool. Initializer ships config
-        # to workers exactly once instead of re-pickling it with every task.
-        n_workers = min(n_workers, len(windows))
-        logging.info(f"Processing {len(windows)} windows with {n_workers} workers")
-        chunksize = max(1, len(windows) // (n_workers * 4))
-        with make_worker_pool(n_workers, config) as p:
-            results = p.map(_process_window_wrapper, windows, chunksize=chunksize)
-    else:
-        # Sequential processing
-        results = []
-        for window in windows:
-            result = process_window(window, config)
-            results.append(result)
+    logging.info(f"Processed {n_windows} windows on {contig_id}")
 
     # 4) Link haplotypes across overlapping windows into tracks.
     results = link_windows(results, config)
 
     return results
+
+
+def _batched(iterable: Iterable, n: int) -> Iterator[list]:
+    """Yield successive lists of up to *n* items. Local stand-in for
+    itertools.batched (3.12+) so this runs on the cluster's interpreter."""
+    batch: list = []
+    for item in iterable:
+        batch.append(item)
+        if len(batch) >= n:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
 
 
 _WORKER_CONFIG: HaplotyperConfig | None = None
@@ -2473,23 +3924,6 @@ def process_mag_longitudinal(*args, **kwargs):
 # =============================================================================
 
 
-def _weighted_median(values: list[float], weights: list[float]) -> float:
-    """Weighted median of *values* with corresponding *weights*."""
-    if not values:
-        return 0.0
-    total = sum(weights)
-    if total <= 0:
-        return 0.0
-    paired = sorted(zip(values, weights))  # noqa: B905
-    cumulative = 0.0
-    half = total / 2.0
-    for val, w in paired:
-        cumulative += w
-        if cumulative >= half:
-            return max(0.0, min(1.0, val))
-    return max(0.0, min(1.0, paired[-1][0]))
-
-
 def results_to_dataframe(results: dict[str, list[WindowResult]]) -> list[dict]:
     """
     Convert results to track-based records for DataFrame.
@@ -2533,14 +3967,19 @@ def results_to_dataframe(results: dict[str, list[WindowResult]]) -> list[dict]:
                 for pos, base in hap.consensus.items():
                     position_votes[pos][base] += hap.weight
 
-                # Per-window abundance (conditioned on non-junk).
+                # Per-window abundance (conditioned on non-junk), or NO MEASUREMENT.
+                # A window with no pi vector, a short one, or one that came out entirely
+                # junk did not measure this track at zero — it did not measure it. Same
+                # rule as longitudinal._window_conditional_abundance, and for the same
+                # reason: counting those windows as 0.0 dropped a track from 0.87 to 0.50
+                # on the strength of a window that made no measurement at all.
                 pi_vec = _wr.pi
-                wa = 0.0
-                if len(pi_vec) > _k:
-                    pi_junk = float(pi_vec[-1])
-                    denom = 1.0 - pi_junk
-                    if denom > 0:
-                        wa = max(0.0, min(1.0, float(pi_vec[_k]) / denom))
+                if pi_vec is None or len(pi_vec) <= _k:
+                    continue
+                denom = 1.0 - float(pi_vec[-1])
+                if denom <= 0:
+                    continue
+                wa = max(0.0, min(1.0, float(pi_vec[_k]) / denom))
                 junk_col = _wr.gamma.shape[1] - 1
                 n_junk = int((_wr.gamma[:, junk_col] >= 0.5).sum())
                 n_nonjunk = max(
@@ -2566,6 +4005,24 @@ def results_to_dataframe(results: dict[str, list[WindowResult]]) -> list[dict]:
             # Get sample from first window (all should be same)
             sample = members[0][0].window.sample
 
+            # Pooled over reads, not averaged over windows. A mean of per-window ratios
+            # weights a 5-read window like a 40-read one — the estimator this codebase
+            # documents at length as the wrong one (longitudinal._pooled_abundance,
+            # lineages.PooledAbundance: it is what produced the sawtooth). NaN, not 0.0,
+            # when no window measured the track: absent evidence is not evidence of
+            # absence, and a consumer can drop a NaN but cannot recover a fabricated zero.
+            total_window_reads = sum(window_read_weights)
+            if total_window_reads > 0:
+                mean_weight = (
+                    sum(a * w for a, w in zip(window_abundances, window_read_weights))
+                    / total_window_reads
+                )
+            elif window_abundances:
+                # Measured, but no window has any non-junk read to weight by.
+                mean_weight = sum(window_abundances) / len(window_abundances)
+            else:
+                mean_weight = float("nan")
+
             records.append(
                 {
                     "contig": contig_id,
@@ -2576,7 +4033,7 @@ def results_to_dataframe(results: dict[str, list[WindowResult]]) -> list[dict]:
                     "span_bp": span_end - span_start,
                     "n_windows": n_windows,
                     "n_snvs": len(merged_consensus),
-                    "mean_weight": _weighted_median(window_abundances, window_read_weights),
+                    "mean_weight": mean_weight,
                     "total_supporting_reads": total_reads,
                     "mean_confidence": np.mean(confidences) if confidences else 0.0,
                     "consensus": "|".join(
@@ -2608,7 +4065,10 @@ if __name__ == "__main__":
     parser.add_argument("--sample", help="Sample ID")
     parser.add_argument("--vcf-sample", help="Sample name in VCF")
     parser.add_argument("--output", default="haplotypes.tsv")
-    parser.add_argument("--seed", type=int, help="Random seed for reproducibility")
+    parser.add_argument(
+        "--seed", type=int, default=42,
+        help="Random seed for reproducibility. Seeded by default - see HaplotyperConfig.random_seed.",
+    )
     parser.add_argument("--window-size", type=int, default=20000)
     parser.add_argument("--max-reads", type=int, default=10000)
     parser.add_argument("--no-validate", action="store_true", help="Disable result validation")
