@@ -366,8 +366,11 @@ def test_cigar_del_wrong_size_no_call(tmp_path, cigar_config):
     windows = _run_window(tmp_path, cigar_config, vcf_recs, reads)
     alleles = _read_alleles(windows, "wrong_size")
     assert alleles is not None
-    # Anchor base recorded as the ref-like vote; not "DEL".
-    assert alleles[100] != "DEL"
+    # Anchor base recorded as the ref-like vote. Asserting `!= "DEL"` is vacuous: the
+    # alphabet is DEL<len>, so the bare token is never emitted and even "DEL5" - the
+    # regression value - would satisfy it.
+    assert alleles[100] == "A"
+    assert not alleles[100].startswith("DEL")
 
 
 def test_cigar_del_off_by_one_no_call(tmp_path, cigar_config):
@@ -384,7 +387,10 @@ def test_cigar_del_off_by_one_no_call(tmp_path, cigar_config):
     windows = _run_window(tmp_path, cigar_config, vcf_recs, reads)
     alleles = _read_alleles(windows, "off_by_one")
     assert alleles is not None
-    assert alleles[100] != "DEL"
+    # The anchor base, not a deletion call of any length (see the sibling above on why
+    # `!= "DEL"` cannot fail).
+    assert alleles[100] == "A"
+    assert not alleles[100].startswith("DEL")
 
 
 def test_cigar_no_deletion_records_matched_base(tmp_path, cigar_config):
@@ -460,7 +466,10 @@ def test_cigar_ins_off_by_one_no_call(tmp_path, cigar_config):
     windows = _run_window(tmp_path, cigar_config, vcf_recs, reads)
     alleles = _read_alleles(windows, "ins_off")
     assert alleles is not None
-    assert alleles[100] != "INS"
+    # The anchor base, not an insertion call of any length: the alphabet is INS<len>, so
+    # `!= "INS"` is true for every value the parser can produce, "INS3" included.
+    assert alleles[100] == "A"
+    assert not alleles[100].startswith("INS")
 
 
 def test_cigar_no_insertion_records_matched_base(tmp_path, cigar_config):

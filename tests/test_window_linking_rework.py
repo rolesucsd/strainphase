@@ -395,7 +395,24 @@ def test_window_carries_site_type():
 
 
 def _grp(gid, wstart, members):
+    """Build a WindowGroup, giving its members the ids the pipeline would emit.
+
+    The window coordinates and the haplotype id belong to the GROUP, so they are stamped
+    here rather than guessed by `_mem`. Before that, `_mem` spelled every id
+    `sample|h` with no window component, so two groups' members collided: a veto set of
+    `frozenset(("t0|h", "t0|h"))` is the degenerate ONE-element frozenset, which is a
+    state the pipeline cannot produce and which made the step-1 veto test pass on the
+    collision instead of on the veto.
+    """
+    from strainphase.longitudinal import _window_haplotype_id
     from strainphase.window_groups import WindowGroup
+
+    per_sample: Counter = Counter()
+    for m in members:
+        m.window_start = wstart
+        m.window_end = wstart + 20000
+        m.haplotype_id = _window_haplotype_id(m.sample, "c1", wstart, per_sample[m.sample])
+        per_sample[m.sample] += 1
     return WindowGroup(group_id=gid, contig="c1", window_start=wstart,
                        members=members, window_end=wstart + 20000)
 
@@ -403,11 +420,20 @@ def _grp(gid, wstart, members):
 def _mem(sample, consensus, reads=30, total=60, wsid="T1"):
     """`wsid` is the step-1 chain this haplotype belongs to. Two groups holding members of
     the SAME chain in one sample is a VOTE that they continue into each other - which is
-    now the only thing that scores a join."""
+    now the only thing that scores a join.
+
+    The id and window coordinates are placeholders; `_grp` overwrites them with the
+    group's own, so a member always carries an id unique to its (sample, window, index).
+    """
     return WindowHaplotype(sample=sample, contig="c1", window_start=0, window_end=20000,
-                           haplotype_id=f"{sample}|h", consensus=consensus,
+                           haplotype_id="", consensus=consensus,
                            reads=reads, total_reads=total, abundance=reads / total,
                            within_sample_id=wsid)
+
+
+def _hid_of(group, sample, idx=0):
+    """The id `_grp` gave this sample's ``idx``-th member of ``group``."""
+    return [m for m in group.members if m.sample == sample][idx].haplotype_id
 
 
 def _lcfg(**kw):
@@ -453,15 +479,54 @@ def test_absence_of_evidence_does_not_block_a_voted_join():
 
 def test_a_single_step1_mismatch_vetoes_the_join():
     """One sample whose OWN reads disagree across the boundary refuses the join, however
-    many other samples vote for it. Only failed_mismatch is absolute."""
+    many other samples vote for it. Only failed_mismatch is absolute.
+
+    The veto set is built from the MEMBERS' OWN ids, which is the only way this can be
+    a test of the veto. Spelled in any other format the lookup never matches and the
+    join goes through - which is what production did for the whole life of the
+    safeguard, and what this fixture hid by giving both groups' t0 members one id.
+    """
     from strainphase.lineages import build_lineages
     shared = {12000: "A", 15000: "C", 18000: "G"}
     a = _grp("A", 1, [_mem(f"t{i}", dict(shared)) for i in range(4)])
     b = _grp("B", 10001, [_mem(f"t{i}", dict(shared)) for i in range(4)])
-    veto = {frozenset(("t0|h", "t0|h"))}
+
+    # t0's own reads chained across the boundary and disagreed there.
+    left, right = _hid_of(a, "t0"), _hid_of(b, "t0")
+    assert left != right, "two window groups can never share a member id"
+    veto = {frozenset((left, right))}
+
     lins, edges = build_lineages([a, b], _lcfg(), step1_mismatches=veto)
     assert len(lins) == 2
     assert any(e.reason == "failed_mismatch" for e in edges)
+
+    # ...and the same fixture with nothing vetoed is one lineage, so the split above is
+    # the veto firing rather than the groups failing to be joinable at all.
+    joined, _ = build_lineages([a, b], _lcfg())
+    assert len(joined) == 1
+
+
+def test_a_veto_in_a_format_no_member_carries_does_not_silently_pass():
+    """The veto set and the member ids must be ONE spelling (R1-2).
+
+    Two loops of build_window_tables build the two sides, and while they spelled the id
+    differently the veto set could not match a single member: an anti-chimera safeguard
+    that never once fired, failing silently and open. Nothing about a non-matching veto
+    looks wrong from outside, so it is asserted from the inside here.
+    """
+    from strainphase.lineages import build_lineages
+    shared = {12000: "A", 15000: "C", 18000: "G"}
+    a = _grp("A", 1, [_mem(f"t{i}", dict(shared)) for i in range(4)])
+    b = _grp("B", 10001, [_mem(f"t{i}", dict(shared)) for i in range(4)])
+
+    stale = {frozenset(("t0|T0001|1", "t0|T0001|10001"))}  # the old pipe-separated form
+    lins, _ = build_lineages([a, b], _lcfg(), step1_mismatches=stale)
+    assert len(lins) == 1, "this fixture is only meaningful while the stale form misses"
+
+    members = {m.haplotype_id for g in (a, b) for m in g.members}
+    assert not any(x in members for f in stale for x in f), (
+        "the veto set must be written in the members' own id format"
+    )
 
 
 def test_abundance_eliminates_a_join_that_votes_would_accept():
@@ -491,21 +556,33 @@ def test_a_lineage_never_holds_two_groups_at_one_window():
     """Reciprocity makes each component a PATH and every edge advances one window, so this
     is structural. It is also what satisfies step 2's cannot-link constraints for free: a
     strain has ONE haplotype at a locus, so two groups of one lineage at one window would
-    be a contradiction between the steps."""
+    be a contradiction between the steps.
+
+    Two groups SHARE each window here, both plausible continuations of the chain. Built
+    at five distinct windows instead, the Counter assertion holds for any partition
+    whatsoever - including one that dumps every group into a single lineage - so it
+    asserted nothing.
+    """
     from strainphase.lineages import build_lineages
-    shared_pat = {"a": "A", "b": "C", "c": "G"}
     gs = []
     for i in range(5):
         w = 1 + i * 10000
-        cons = {w + 12000: shared_pat["a"], w + 15000: shared_pat["b"],
-                w + 18000: shared_pat["c"], w + 2000: shared_pat["a"],
-                w + 5000: shared_pat["b"], w + 8000: shared_pat["c"]}
-        gs.append(_grp(f"G{i}", w, [_mem(f"t{j}", cons) for j in range(4)]))
+        # Two co-located genotypes differing at one position in the forward overlap, so
+        # a chain could plausibly step onto either.
+        for branch, base in (("X", "A"), ("Y", "T")):
+            cons = {w + 12000: base, w + 15000: "C", w + 18000: "G",
+                    w + 2000: base, w + 5000: "C", w + 8000: "G"}
+            gs.append(_grp(f"G{i}{branch}", w,
+                           [_mem(f"t{j}", dict(cons), wsid=f"T{branch}") for j in range(4)]))
+
     lins, _ = build_lineages(gs, _lcfg())
-    assert max(x.n_windows for x in lins) <= 5
+    assert sum(len(x.groups) for x in lins) == len(gs), "no group may be lost"
+    assert any(x.n_windows > 1 for x in lins), "nothing chained - the invariant is vacuous"
     for lin in lins:
         per_window = Counter(g.window_start for g in lin.groups)
-        assert not per_window or max(per_window.values()) == 1
+        assert max(per_window.values()) == 1, (
+            f"lineage {lin.lineage_id} holds two groups at one window: {per_window}"
+        )
 
 
 def test_marker_span_reports_what_was_actually_resolved():
@@ -695,6 +772,149 @@ def test_lineage_abundance_pools_counts_rather_than_averaging_ratios():
     assert abs(naive - p.abundance) > 0.4, "averaging the ratios gives a very different answer"
 
 
+# --------------------------------------------------------------------------- #
+# TWO MEMBERS OF ONE SAMPLE IN ONE GROUP
+# --------------------------------------------------------------------------- #
+# Every other fixture in this file puts one member per (sample, window), and that is
+# the ONE shape in which summing a shared denominator, collapsing a sample's members,
+# and handing them to Fisher as separate windows are all indistinguishable from
+# correct. The pipeline produces the two-member shape routinely:
+# merge_similar_haplotypes deliberately declines some 1-SNP pairs and both halves then
+# clear the step-2 gate - which is a real strain split, i.e. exactly the event the
+# analysis exists to find. coherence.py:157 flags three per cell, not two.
+
+
+def _split_grp(gid, wstart, samples, reads_each, total, wsid="T1"):
+    """A group where every sample contributes TWO near-identical members.
+
+    ``reads_each`` is a per-member pair; the two halves of a split are rarely equal, and
+    equal halves are the one case that hides feeding them to Fisher as separate windows.
+    The denominator is one window's non-junk total, carried identically on every member
+    of that (sample, window) cell - it is a property of the window, not of the member.
+    """
+    members = []
+    for s in samples:
+        for k, reads in enumerate(reads_each):
+            members.append(_mem(s, {12000: "A", 15000: "C", 18000: "G"},
+                                reads=reads, total=total, wsid=f"{wsid}{k}"))
+    return _grp(gid, wstart, members)
+
+
+def test_a_samples_two_members_are_summed_over_one_denominator():
+    """REGRESSION (R1-5 + R1-6): the numerator is per member, the denominator per window.
+
+    Summing the denominator too halves a lineage's abundance precisely where a strain
+    split into two near-identical haplotypes - an error correlated with the signal, in
+    five columns of lineages.tsv. Collapsing the two members instead loses the reads of
+    all but one, and which one survives depends on member order.
+    """
+    from strainphase.lineages import _group_counts, build_lineages
+
+    g = _split_grp("A", 1, ["S1"], reads_each=(12, 4), total=50)
+    assert _group_counts(g) == {"S1": (16, 50)}, "reads sum; the window's total does not"
+
+    h = _split_grp("B", 10001, ["S1"], reads_each=(12, 4), total=50)
+    lins, _ = build_lineages([g, h], _lcfg())
+    assert len(lins) == 1
+    p = lins[0].abundance_by_sample()["S1"]
+    assert (p.reads, p.total_reads, p.n_windows) == (32, 100, 2)
+    assert p.abundance == pytest.approx(32 / 100)
+
+
+def test_a_split_strain_is_not_shredded_by_the_coherence_test():
+    """REGRESSION (R1-12): Fisher gets one observation per WINDOW, not per member.
+
+    Two members of one sample inside one group are one strain that split, not two
+    windows disagreeing. Fed to `abundance_coherent` as separate windows the 45/160 and
+    the 5/160 halves read as a flat contradiction at every timepoint, so the chain is
+    cut at every link and a real lineage recurses down to singletons - and it is logged
+    as a coherence split, which is a claim about the biology.
+    """
+    from strainphase.lineages import build_lineages
+
+    grps = [
+        _split_grp(chr(65 + i), 1 + i * 10000, ["S1", "S2"], reads_each=(45, 5), total=160)
+        for i in range(5)
+    ]
+    lins, edges = build_lineages(grps, _lcfg(), transitive_abundance_check=True)
+    assert not any(e.reason == "failed_abundance" for e in edges), (
+        "a strain that split is not a chain that drifts"
+    )
+    assert len(lins) == 1 and lins[0].n_windows == 5
+
+
+def test_a_genuinely_drifting_chain_of_split_groups_is_still_cut():
+    """Guards the guard: the coherence test must still WORK on two-member groups."""
+    from strainphase.lineages import build_lineages
+
+    ks = [70, 63, 56, 49, 42, 35]  # each member; the cell is twice this out of 200
+    grps = [
+        _split_grp(chr(65 + w), 1 + w * 10000, ["S1", "S2", "S3", "S4"],
+                   reads_each=(k, k), total=200)
+        for w, k in enumerate(ks)
+    ]
+    split, _ = build_lineages(grps, _lcfg(), transitive_abundance_check=True)
+    assert max(len(x.groups) for x in split) < len(grps), "real drift must still cut"
+
+
+def test_lineage_output_is_the_same_whatever_order_the_samples_were_given():
+    """REGRESSION (R1-17): `--samples A,B,D` and `B,A,D` must give the same lineages.
+
+    The group consensus is a majority vote and `Counter.most_common` breaks a tie on
+    first-increment order, which here is member order, which follows the order the BAMs
+    were listed on the command line. Once one tied position fell in a forward overlap
+    the two orders produced different consensus bases and different lineages, from
+    byte-identical inputs, in a published pipeline.
+    """
+    from strainphase.lineages import build_lineages
+
+    def build(order):
+        # Position 12000 is a genuine 2-2 TIE in the first group and falls inside the
+        # forward overlap; 15000/18000 agree, so the pair clears min_shared either way.
+        # The second group calls 12000 "A" outright, so whichever base the tie resolves
+        # to decides between `linked` and `failed_mismatch`.
+        tied = {"A": "A", "B": "A", "C": "T", "D": "T"}
+        first = _grp("G0", 1, [
+            _mem(s, {12000: tied[s], 15000: "C", 18000: "G"}) for s in order
+        ])
+        second = _grp("G1", 10001, [
+            _mem(s, {12000: "A", 15000: "C", 18000: "G"}) for s in order
+        ])
+        lins, edges = build_lineages([first, second], _lcfg())
+        return (sorted(tuple(sorted(g.group_id for g in x.groups)) for x in lins),
+                sorted((e.group_a, e.group_b, e.reason) for e in edges))
+
+    forward = build(["A", "B", "C", "D"])
+    swapped = build(["C", "D", "A", "B"])
+    assert forward == swapped, f"sample order changed the lineages: {forward} vs {swapped}"
+
+
+def test_step2_clusters_at_the_threshold_the_gate_used():
+    """REGRESSION (R1-13): --lineage-merge-distance must reach the clustering.
+
+    The gate ran at `config.lineage_merge_distance` while `fcluster` was pinned to a
+    hard-coded 0.01, so raising the knob admitted pairs the gate called `linked` and
+    then split them anyway - steps 2 and 3 running at two different identities, and a
+    parameter sweep over the knob measuring nothing.
+    """
+    base = {p: "A" for p in range(100, 200)}
+    haps = [
+        _hap("t0", "h0", dict(base)),
+        _hap("t1", "h1", {**base, 150: "T", 160: "T"}),  # 2 diffs in 100 -> rate 0.02
+    ]
+    markers = set(base)
+
+    def group(distance):
+        return group_window_across_samples(
+            haps, markers,
+            cfg(cross_sample_method="clique", lineage_merge_distance=distance,
+                max_num_diff=2),
+        )[0]
+
+    assert len(group(0.015)) == 2, "0.02 is above a 0.015 threshold - the gate refuses"
+    assert len(group(0.05)) == 1, "the gate admitted this pair; the clustering must agree"
+
+
 def test_both_denominators_are_reported():
     """Dividing by PHASED reads renormalises away how much of a window resolved; dividing
     by all reads does not. A window where 8 of 100 reads phased and this haplotype holds 5
@@ -725,9 +945,12 @@ def test_load_snvs_is_cached_across_samples():
     calls = {"n": 0}
     real = core._load_snvs_uncached
 
+    # The real loader returns EIGHT tables; a shorter stub was accepted here for a while
+    # and nothing noticed, which is how the aliasing contract below stayed untested.
     def counting(*a, **k):
         calls["n"] += 1
-        return ([1], {1: "A"}, {1: 9}, {1: 0.5}, {1: "snv"}, {}, {})
+        return ([1], {1: "A"}, {1: 9}, {1: 0.5}, {1: "snv"}, {1: frozenset({"alt"})},
+                {1: {(1, 2)}}, {1: {3}})
 
     core._SNV_CACHE.clear()
     core._load_snvs_uncached = counting
@@ -741,6 +964,44 @@ def test_load_snvs_is_cached_across_samples():
 
         core.load_snvs("dummy.vcf.gz", "c2", None, cfg())
         assert calls["n"] == 3, "a different contig must re-parse"
+    finally:
+        core._load_snvs_uncached = real
+        core._SNV_CACHE.clear()
+
+
+def test_a_cached_load_snvs_caller_cannot_reach_the_next_callers_tables():
+    """REGRESSION (R1-4): each call gets its OWN containers, hit or miss.
+
+    process_contig APPENDS SV pseudo-sites to snv_pos and writes their anchor bases and
+    site types; iter_windows_lazy registers split-read breakpoints the same way. Handing
+    back the cached objects meant sample 1's SV anchors were already present when sample
+    2 ran under the same union VCF, so sample 2 saw them as collisions with a called
+    variant and dropped its own SV sites - one timepoint kept the event, every other
+    timepoint lost it, and the loss was logged as a legitimate collision.
+
+    Asserting the call count alone cannot see this: the cache was already working.
+    """
+    from strainphase import core
+
+    real = core._load_snvs_uncached
+
+    def stub(*a, **k):
+        return ([100], {100: "A"}, {100: 30}, {100: 0.5}, {100: "snv"},
+                {100: frozenset({"T"})}, {}, {})
+
+    core._SNV_CACHE.clear()
+    core._load_snvs_uncached = stub
+    try:
+        first = core.load_snvs("union.vcf.gz", "c1", None, cfg())
+        # Sample 1 does what process_contig does: append an SV anchor and claim the site.
+        first[0].append(500)
+        first[1][500] = "N"
+        first[4][500] = "sv"
+
+        second = core.load_snvs("union.vcf.gz", "c1", None, cfg())
+        assert second[0] == [100], "sample 2 sees sample 1's appended SV anchor"
+        assert 500 not in second[1] and 500 not in second[4]
+        assert all(a is not b for a, b in zip(first, second) if isinstance(a, (list, dict)))
     finally:
         core._load_snvs_uncached = real
         core._SNV_CACHE.clear()
@@ -849,9 +1110,9 @@ def test_transitive_abundance_check_splits_a_drifting_chain():
     assert not any(e.reason == "failed_abundance" for e in edges), \
         "the pairwise veto must pass every adjacent pair, or this tests nothing"
     split, _ = build_lineages(grps, _lcfg(), transitive_abundance_check=True)
-    assert sum(len(l.groups) for l in joined) == sum(len(l.groups) for l in split), \
+    assert sum(len(x.groups) for x in joined) == sum(len(x.groups) for x in split), \
         "splitting must preserve every window group, never discard one"
-    assert max(len(l.groups) for l in split) < max(len(l.groups) for l in joined), \
+    assert max(len(x.groups) for x in split) < max(len(x.groups) for x in joined), \
         "the drifting chain should be cut into shorter pieces"
 
 

@@ -209,16 +209,69 @@ def test_spill_directory_is_cleaned_up(dataset):
 
 def test_reads_are_released_after_the_run(dataset):
     """The point of the exercise: once a MAG is done, no WindowResult should still be
-    pinning its reads."""
+    pinning a read's PAYLOAD - the two position-keyed dicts that make a read expensive.
+
+    Released is not the same as gone. This asserted `len(window.reads) == 0` for a while,
+    which is a stricter thing than the offload exists to do and is wrong: a caller
+    scoring reads rather than haplotypes needs to know which read each gamma row is, and
+    with the list emptied every returned window read as "phased nothing". What must
+    survive is the id and the row order; what must not is `.alleles`.
+    """
+    from strainphase.longitudinal import _ReadRef
+
     tmp, bams, vcfs = dataset
     _out, results, _tables = _run(tmp, bams, vcfs, _cfg(spill_results_to_disk=True), "released")
+    windows = [wr for contigs in results.values() for wrs in contigs.values() for wr in wrs]
+    assert windows, "the fixture produced no windows - the assertions below are vacuous"
+
     resident = sum(
-        len(wr.window.reads)
-        for contigs in results.values()
-        for wrs in contigs.values()
-        for wr in wrs
+        1
+        for wr in windows
+        for read in wr.window.reads
+        if getattr(read, "alleles", None)
     )
-    assert resident == 0, f"{resident} reads still resident after the run"
+    assert resident == 0, f"{resident} reads still carrying their payload after the run"
+    assert all(
+        isinstance(read, _ReadRef) for wr in windows for read in wr.window.reads
+    ), "a released read must be an id-only stand-in, not a stripped Read"
+    # The stand-ins ARE the read partition, so they must still line up with gamma.
+    for wr in windows:
+        assert len(wr.window.reads) == wr.gamma.shape[0], (
+            "gamma row count and read count disagree - the partition cannot be recovered"
+        )
+        assert all(read.id for read in wr.window.reads)
+
+
+def test_a_read_partition_can_still_be_built_from_the_returned_windows(dataset):
+    """REGRESSION (N1): the returned WindowResults ARE the read partition.
+
+    The post-rescue cleanup used to call offload_heavy() on the very objects it handed
+    back, so every returned window held zero reads against a gamma of 50-odd rows. A
+    caller scoring reads rather than haplotypes - which is what the benchmark's
+    longitudinal partition is - then saw nothing assigned and read as "phased nothing".
+    The failure looked like a bad score rather than like missing plumbing, because
+    single-sample mode never offloads and so never showed it.
+
+    This walks the return value the way such a caller does: gamma row i belongs to
+    window.reads[i], and its cluster is the winning column.
+    """
+    tmp, bams, vcfs = dataset
+    _out, results, _tables = _run(tmp, bams, vcfs, _cfg(spill_results_to_disk=True), "partition")
+
+    assignment = {}
+    for sample, per_contig in results.items():
+        for contig, wrs in per_contig.items():
+            for wr in wrs:
+                junk_col = wr.gamma.shape[1] - 1
+                for row, read in zip(wr.gamma, wr.window.reads):  # noqa: B905
+                    k = int(row.argmax())
+                    if k == junk_col:
+                        continue
+                    assignment[(sample, read.id)] = f"{contig}:{wr.window.start}:{k}"
+
+    assert assignment, "no read could be assigned - the partition is empty"
+    assert len({s for s, _ in assignment}) == len(SAMPLES), "every sample must contribute"
+    assert len({c for c in assignment.values()}) > 1, "one cluster is not a partition"
 
 
 # ---------------------------------------------------------------------------
@@ -317,6 +370,49 @@ def test_spilling_is_on_by_default_and_no_spill_turns_it_off(tmp_path, monkeypat
 # disk is realistic, so both directions must fail loudly or recover, never degrade.
 
 
+class _FakeRead:
+    """The narrowest thing _SpillStore's collaborator has to be: an id and a payload."""
+
+    def __init__(self, read_id, payload=None):
+        self.id = read_id
+        self.alleles = payload if payload is not None else {}
+
+    def __eq__(self, other):
+        return isinstance(other, _FakeRead) and (self.id, self.alleles) == (
+            other.id,
+            other.alleles,
+        )
+
+    def __repr__(self):  # pragma: no cover - diagnostics only
+        return f"_FakeRead({self.id!r})"
+
+
+class _FakeWR:
+    """A stand-in for WindowResult with the shape _SpillStore actually reaches into.
+
+    The store goes through ``_detach_reads``, which reads ``wr.window.reads`` to build
+    the id-only stand-ins before calling ``offload_heavy``. A stub with a bare ``reads``
+    attribute and no ``window`` stopped modelling the collaborator the moment those
+    stand-ins existed, and would have gone on passing while the real store crashed.
+    """
+
+    def __init__(self, reads):
+        self.window = type("W", (), {"reads": list(reads), "_pos_sets": None})()
+        self.restored = False
+
+    @property
+    def reads(self):
+        return self.window.reads
+
+    def offload_heavy(self):
+        out, self.window.reads = self.window.reads, []
+        return out
+
+    def restore_heavy(self, reads):
+        self.window.reads = reads
+        self.restored = True
+
+
 def test_a_failed_spill_write_keeps_the_reads_in_memory(dataset, monkeypatch, tmp_path):
     """Disk full mid-run must cost memory, not correctness."""
     from strainphase.longitudinal import _SpillStore
@@ -332,24 +428,12 @@ def test_a_failed_spill_write_keeps_the_reads_in_memory(dataset, monkeypatch, tm
     monkeypatch.setattr("builtins.open", exploding_open)
     store = _SpillStore(str(tmp_path / "spill"))
 
-    class FakeWR:
-        def __init__(self):
-            self.reads = ["r1", "r2"]
-            self.restored = False
-
-        def offload_heavy(self):
-            out, self.reads = self.reads, []
-            return out
-
-        def restore_heavy(self, reads):
-            self.reads = reads
-            self.restored = True
-
-    wrs = [FakeWR(), FakeWR()]
+    originals = [_FakeRead("r1", {1: "A"}), _FakeRead("r2", {1: "C"})]
+    wrs = [_FakeWR(originals), _FakeWR(originals)]
     store.offload("s1", {"c1": wrs})
 
     assert all(w.restored for w in wrs), "reads were dropped instead of kept in memory"
-    assert all(w.reads == ["r1", "r2"] for w in wrs), "reads came back wrong"
+    assert all(w.reads == originals for w in wrs), "reads came back wrong"
     assert ("s1", "c1") not in store._paths, (
         "a failed write must not register a path - restore() would then expect a file "
         "that does not exist"
@@ -362,18 +446,7 @@ def test_an_unreadable_spill_file_raises_rather_than_silently_dropping_reads(tmp
 
     store = _SpillStore(str(tmp_path / "spill"))
 
-    class FakeWR:
-        def __init__(self):
-            self.reads = ["r1"]
-
-        def offload_heavy(self):
-            out, self.reads = self.reads, []
-            return out
-
-        def restore_heavy(self, reads):
-            self.reads = reads
-
-    wrs = [FakeWR()]
+    wrs = [_FakeWR([_FakeRead("r1", {1: "A"})])]
     store.offload("s1", {"c1": wrs})
     path = store._paths[("s1", "c1")]
     with open(path, "wb") as fh:          # corrupt it
@@ -383,28 +456,33 @@ def test_an_unreadable_spill_file_raises_rather_than_silently_dropping_reads(tmp
         store.restore("s1", "c1", wrs)
 
 
-def test_spill_round_trips_reads_unchanged(tmp_path):
-    from strainphase.longitudinal import _SpillStore
+def test_spill_leaves_id_only_stand_ins_and_round_trips_the_reads(tmp_path):
+    """Spilling releases the PAYLOAD and keeps the row correspondence.
+
+    This asserted `w.reads == []` after the offload, which is the behaviour that made
+    the returned partition empty. What the store owes the caller is the ids, in gamma
+    order, until the real reads come back over the top of them.
+    """
+    from strainphase.longitudinal import _ReadRef, _SpillStore
 
     store = _SpillStore(str(tmp_path / "spill"))
 
-    class FakeWR:
-        def __init__(self, r):
-            self.reads = r
-
-        def offload_heavy(self):
-            out, self.reads = self.reads, []
-            return out
-
-        def restore_heavy(self, reads):
-            self.reads = reads
-
-    wrs = [FakeWR([{"id": "a"}]), FakeWR([{"id": "b"}, {"id": "c"}])]
+    a = [_FakeRead("a", {1: "A"})]
+    bc = [_FakeRead("b", {1: "C"}), _FakeRead("c", {1: "G"})]
+    wrs = [_FakeWR(a), _FakeWR(bc)]
     store.offload("s1", {"c1": wrs})
-    assert all(w.reads == [] for w in wrs), "offload did not detach"
+
+    assert [[r.id for r in w.reads] for w in wrs] == [["a"], ["b", "c"]], (
+        "the ids and their order must survive the offload"
+    )
+    assert all(isinstance(r, _ReadRef) for w in wrs for r in w.reads), (
+        "the payload must be detached, not merely reachable"
+    )
+    assert not any(hasattr(r, "alleles") for w in wrs for r in w.reads)
+
     store.restore("s1", "c1", wrs)
-    assert wrs[0].reads == [{"id": "a"}]
-    assert wrs[1].reads == [{"id": "b"}, {"id": "c"}]
+    assert wrs[0].reads == a
+    assert wrs[1].reads == bc
 
 
 def test_the_real_cli_actually_writes_spill_files(dataset, monkeypatch):
