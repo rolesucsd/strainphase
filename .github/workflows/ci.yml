@@ -69,5 +69,3 @@ jobs:
         strainphase --help
         strainphase run --help
         strainphase longitudinal --help
-
-    # Parameter sweep is a developer/validation tool; keep it out of CI by default

@@ -74,7 +74,6 @@ results = process_contig(
 | `strainphase run` | Process a single contig |
 | `strainphase longitudinal` | Multi-sample longitudinal analysis |
 | `strainphase test` | Run unit test suite |
-| `strainphase sweep` | Parameter sensitivity analysis (developer tool) |
 | `strainphase version` | Show version |
 
 ### `strainphase run`
@@ -146,7 +145,7 @@ Options:
 | `span_start` | Track start position |
 | `span_end` | Track end position |
 | `n_snvs` | Number of SNVs in consensus |
-| `mean_weight` | Mean abundance (π) |
+| `mean_weight` | Read-weighted abundance pooled over the track's windows; `NaN` where no window could measure one |
 | `consensus` | SNV profile (pos:base pairs) |
 
 ## Algorithm Overview
@@ -166,72 +165,6 @@ Options:
 │ 6. RESCUE: Cross-timepoint anchor matching (longitudinal)  │
 └─────────────────────────────────────────────────────────────┘
 ```
-
-## Benchmarking
-
-Benchmarking is **not distributed with the repository right now.** Both suites
-are gitignored and live only in the working tree and in git history. Nothing
-below is runnable from a fresh clone yet; this section records what exists and
-what has to be true before it ships.
-
-### `benchmark/` — the public tool comparison
-
-A Snakemake workflow that compares strainphase against Floria and Strainy on
-longitudinal mixtures built from **real strain assemblies**, with `spbench` as
-the scoring library. Every tool is scored on its **read partition**, and the
-harness derives consensus haplotypes from that partition with one code path for
-all tools, so no tool is scored through another tool's output format.
-`strainphase-single` (cross-timepoint rescue off) sits beside the external
-tools; the longitudinal claim is the gap between it and
-`strainphase-longitudinal`, which is the same code one flag apart.
-
-```
-benchmark/
-├── config/config.yaml     strain groups, seeds, tools
-├── workflow/              Snakefile + rules: simulate, pipeline, tools, evaluate
-│   ├── envs/              one conda env per tool
-│   └── scripts/           snoopy_to_vcf.py
-└── spbench/               scoring library (metrics, truth, report)
-```
-
-Run it with `snakemake --use-conda --cores 16`, or `--profile <slurm-profile>`
-on a cluster; Snakemake handles job submission, so there are no hand-written
-sbatch scripts by design.
-
-**Known blockers, in the order they have to be fixed:**
-
-1. **`call_variants` cannot run.** The rule invokes `snoopy` under
-   `workflow/envs/snoopy.yaml`, which does not exist and never has. The
-   `spbench` env pins `clair3` instead, so the workflow and its environment
-   disagree about the variant caller. Everything downstream of this rule is
-   blocked.
-2. **No way to obtain the input data.** `config/config.yaml` points `groups` at
-   `assemblies/group3` and friends, and the README tells you to supply your own
-   directories. There is no accession list and no fetch script, so a reader who
-   clones this cannot reproduce a single number — which is the whole point of
-   shipping it.
-3. **The suite has never run end to end.** Badread, minimap2 and SNooPy are
-   conda-only and the simulate → align → call → compare chain has only been
-   dry-run. Treat every number as provisional until that changes.
-4. **`naive-greedy` is cited but cannot be produced.** `spbench/report.py`
-   explains that the row exists to expose the over-splitting failure mode, but
-   no rule or adapter generates it. Either restore the baseline or drop the
-   paragraph.
-
-Comparators worth adding before submission: **devider** (same author as Floria,
-the obvious "why not the current method?" question), a **naive greedy baseline**
-so a reviewer can tell a real result from an easy dataset, and **whatshap** at
-k=2 to answer "why not a standard diploid phaser?" with a measurement.
-
-### `benchmarks/` + `validation/` — internal parameter sweeps
-
-The older tooling: a SLURM-array parameter sweep (`parameter_sweep.py`), a
-file-based read simulator with indel injection (`validation/simulate_reads.py`),
-and Floria/Strainy comparison scripts. Still used —
-`strainphase sweep` shells out to `benchmarks/parameter_sweep.py`, and
-`tests/test_parsing.py` imports `validation.simulate_reads`, so a fresh clone
-currently fails those tests. This is not superseded by `benchmark/`; the two
-answer different questions.
 
 ## License
 
