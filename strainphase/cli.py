@@ -6,7 +6,6 @@ Usage:
     strainphase run          # Process single contig
     strainphase longitudinal # Process MAG across timepoints
     strainphase test         # Run test suite
-    strainphase sweep        # Run parameter sensitivity analysis
     strainphase version      # Show version
 """
 
@@ -100,12 +99,29 @@ def cmd_longitudinal(args: argparse.Namespace) -> int:
     samples = [s.strip() for s in args.samples.split(",")]
     logging.info(f"Processing {len(samples)} samples: {samples}")
 
+    if len(set(samples)) != len(samples):
+        logging.error(f"--samples contains duplicates: {args.samples}")
+        return 1
+
     # Build path mappings
     bam_paths = {s: args.bams.format(sample=s) for s in samples}
     vcf_paths = {s: args.vcfs.format(sample=s) for s in samples}
     sv_sidecar_paths = None
     if getattr(args, "sv_sidecars", None):
         sv_sidecar_paths = {s: args.sv_sidecars.format(sample=s) for s in samples}
+
+    # A --bams template without {sample} in it resolves to ONE alignment file for
+    # every timepoint, and the existence check below then passes for all of them.
+    # Nothing downstream can notice: every timepoint is phased from one sample's
+    # reads and the run looks entirely normal. A shared --vcfs (a cohort/union VCF)
+    # or a shared --sv-sidecars is legitimate by contrast — those are variant
+    # catalogues, and the BAM is what makes a sample a sample.
+    if len(set(bam_paths.values())) != len(samples):
+        logging.error(
+            f"--bams does not resolve to a distinct BAM per sample: {args.bams!r} -> "
+            f"{sorted(set(bam_paths.values()))}. The template must contain {{sample}}."
+        )
+        return 1
 
     # Verify files exist
     for sample in samples:
@@ -194,9 +210,9 @@ def cmd_longitudinal(args: argparse.Namespace) -> int:
             all_integrators.append(integrator)
 
     # ---- Window-level tables (the deliverables) ----
-    # The final lineage table is PAUSED by default: composing the within-sample and
-    # across-sample linking axes into a lineage is an open decision, and these tables are
-    # the substrate that decision will be evaluated on.
+    # lineages.tsv comes back from here too, under config.build_lineages (default on):
+    # composing the within-sample and across-sample linking axes was the open decision
+    # these tables were built as the substrate for, and step 3 now makes it.
     (hap_rows, within_rows, across_rows, edge_rows, mismatch_rows,
      edge_counts, lineage_rows) = build_window_tables(
         args.output_dir, all_results, config, sample_order=samples
@@ -241,32 +257,6 @@ def cmd_test(args: argparse.Namespace) -> int:
         return 1
 
 
-def cmd_sweep(args: argparse.Namespace) -> int:
-    """Run parameter sensitivity analysis."""
-    setup_logging("INFO")
-
-    print(f"\n{'=' * 60}")
-    print(f"STRAINPHASE v{__version__} - PARAMETER SWEEP")
-    print(f"{'=' * 60}\n")
-
-    try:
-        import subprocess
-
-        output_dir = args.output_dir or "strainphase_sweep_results"
-        cmd = ["python", "benchmarks/parameter_sweep.py"]
-        if args.max_configs:
-            # Pass via environment or modify script to accept args
-            pass
-        print("Running parameter sweep from benchmarks/parameter_sweep.py...")
-        print(f"Results will be saved to: {output_dir}\n")
-        result = subprocess.run(cmd, capture_output=False)
-        return result.returncode
-    except Exception as e:
-        logging.error(f"Could not run sweep: {e}")
-        logging.info("Try running: python benchmarks/parameter_sweep.py")
-        return 1
-
-
 def cmd_version(args: argparse.Namespace) -> int:
     """Show version information."""
     print(f"strainphase {__version__}")
@@ -291,9 +281,6 @@ Examples:
 
     # Run tests
     strainphase test
-
-    # Parameter sweep
-    strainphase sweep --quick
         """,
     )
     parser.add_argument(
@@ -439,7 +426,9 @@ Examples:
     )
     long_parser.add_argument(
         "--lineage-merge-distance", type=float, default=0.01,
-        help="Max mismatch RATE to group haplotypes.",
+        help="Max mismatch RATE to group haplotypes. --max-num-diff caps its reach: a "
+             "pair still needs that many differences or fewer, so raising this above "
+             "max_num_diff/min_shared stops changing anything.",
     )
     long_parser.add_argument(
         "--min-shared-for-lineage", type=int, default=3,
@@ -488,18 +477,6 @@ Examples:
     )
     test_parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
     test_parser.set_defaults(func=cmd_test)
-
-    # =========== SWEEP subcommand ===========
-    sweep_parser = subparsers.add_parser(
-        "sweep",
-        help="Run parameter sensitivity analysis",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    sweep_parser.add_argument("--quick", action="store_true", help="Use reduced parameter grid")
-    sweep_parser.add_argument("--output-dir", "-o", help="Output directory")
-    sweep_parser.add_argument("--max-configs", type=int, help="Limit number of configurations")
-    sweep_parser.add_argument("-q", "--quiet", action="store_true", help="Suppress progress output")
-    sweep_parser.set_defaults(func=cmd_sweep)
 
     # =========== VERSION subcommand ===========
     version_parser = subparsers.add_parser("version", help="Show version")
