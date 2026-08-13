@@ -79,6 +79,20 @@ def _window_conditional_abundance(pi_vec, hap_idx: int) -> float | None:
     return max(0.0, min(1.0, float(pi_vec[hap_idx]) / denom))
 
 
+def _window_haplotype_id(sample_id: str, contig_id: str, window_start: int, h_idx: int) -> str:
+    """The step-0 haplotype id, ``sample_contig_windowstart_H<idx>``.
+
+    ONE definition, because a second spelling of it is a silent no-op rather than a
+    mismatch anyone notices. The step-1 mismatch rows and the WindowHaplotype objects
+    step 3 vetoes against are built in different loops of build_window_tables, and while
+    those loops spelled the id differently - one pipe-separated and track-prefixed, the
+    other underscore-separated and window-keyed - the veto set could not match a single
+    member id, so the "a sample whose own reads disagree vetoes the join outright"
+    safeguard in build_lineages never once fired.
+    """
+    return f"{sample_id}_{contig_id}_{window_start}_H{h_idx}"
+
+
 def load_allowed_contigs(path: str) -> set[str]:
     """
     Load an optional contig filter file.
@@ -166,11 +180,55 @@ def parse_reference_contigs(
 # -----------------------------------------------------------------------------#
 
 
+class _ReadRef:
+    """A read's identity, kept after its alleles have been released.
+
+    ``window.reads`` is emptied as soon as a window's own sample is finished with it (see
+    WindowResult.offload_heavy), but the WindowResults handed back to the caller still
+    have to say WHICH read each gamma row belongs to. That correspondence IS the read
+    partition, and it is the entire output for a caller scoring reads rather than
+    haplotypes. Dropping it returned every window with zero reads against a gamma of
+    50-odd rows, so a partition built from the return value came out empty and the
+    pipeline looked like it had phased nothing.
+
+    Holding the whole Read instead is not an option - two position-keyed dicts, ~90 KB on
+    a variant-dense contig, times every sample resident at once - which is exactly what
+    the offload exists to prevent. The id alone is ~1500x cheaper (48 bytes against the
+    ~70 KB of a 600-marker read) and preserves the row correspondence exactly. Nothing
+    else survives, on purpose: code that reaches for
+    ``.alleles`` here is reading a released read, and an AttributeError naming this class
+    is far better than silently seeing no alleles.
+    """
+
+    __slots__ = ("id",)
+
+    def __init__(self, read_id: str) -> None:
+        self.id = read_id
+
+    def __repr__(self) -> str:  # pragma: no cover - diagnostics only
+        return f"_ReadRef({self.id!r})"
+
+
+def _detach_reads(wr: WindowResult) -> list:
+    """Offload a window's reads, leaving id-only stand-ins in gamma-row order.
+
+    Returns the detached Read objects so the caller can spill them; ``restore_heavy``
+    lays the real ones back over the stand-ins. Idempotent, and order-independent across
+    the several WindowResults that can share one Window after rescue.
+    """
+    refs = [r if isinstance(r, _ReadRef) else _ReadRef(r.id) for r in wr.window.reads]
+    reads = wr.offload_heavy()
+    wr.window.reads = refs
+    return reads
+
+
 class _SpillStore:
     """Parks per-sample read lists on disk between the phasing pass and the rescue pass.
 
     Only ``window.reads`` moves - see WindowResult.offload_heavy for why that is the
     field worth moving and why the WindowResult objects themselves must stay resident.
+    An id-only stand-in is left in each read's place (``_detach_reads``) so the window
+    still knows which read each gamma row is.
 
     Reads are spilled rather than re-read from the BAM because re-deriving them would
     have to reproduce the per-window subsample exactly (make_windows_lazy draws
@@ -215,7 +273,7 @@ class _SpillStore:
         more memory (the old behaviour) but stays correct.
         """
         for contig_id, window_results in contig_map.items():
-            payload = [wr.offload_heavy() for wr in window_results]
+            payload = [_detach_reads(wr) for wr in window_results]
             if not any(payload):
                 continue
             tmp_path = os.path.join(self.root, f"{self._n + 1:06d}.reads.pkl")
@@ -313,17 +371,23 @@ def process_mag_longitudinal(
 
     Haplotypes are linked across windows after processing and after rescue.
 
-    Reads and gamma are offloaded to ``<output_dir>/tmp/spill`` as each sample finishes
+    Reads are offloaded to ``<output_dir>/tmp/spill`` as each sample finishes
     (config.spill_results_to_disk) and reloaded one sample at a time during rescue.
     Without that, every sample's reads stay resident until the whole MAG is done, which
-    on a 146-sample variant-dense MAG is what runs the job out of memory. The
-    WindowResult objects themselves stay in RAM - the rescue panel holds references to
-    their Haplotype objects and mutates weights in place, so they must not be replaced.
+    on a 146-sample variant-dense MAG is what runs the job out of memory. Gamma is ~1000x
+    smaller and stays resident throughout. The WindowResult objects themselves stay in RAM
+    too - the rescue panel holds references to their Haplotype objects and mutates weights
+    in place, so they must not be replaced.
 
     Returns:
         Tuple of:
         - {sample_id: {contig_id: [WindowResult, ...]}}
         - LongitudinalIntegrator instance (or None if single timepoint)
+
+    The returned windows carry ``_ReadRef`` stand-ins rather than Read objects wherever
+    the alleles have been released: ``window.reads[i].id`` still names the read gamma row
+    ``i`` describes, which is what a caller scoring the read partition needs, but the
+    alleles are gone and must not be read.
     """
     mag_label = mag_name or "<unknown>"
     logging.info(
@@ -427,15 +491,27 @@ def process_mag_longitudinal(
                     )
                     window_results = rescued.get(sample_id)
                     if window_results is not None:
-                        # Re-link windows (rescue may add new haplotypes).
+                        # Re-link windows, because rescue may have added haplotypes. This
+                        # is the second link_windows call on these objects; it resets
+                        # link_mismatches itself, so the rows are re-derived rather than
+                        # duplicated.
                         all_results[sample_id][contig_id] = link_windows(window_results, config)
                     # `results_by_timepoint` deliberately keeps pointing at the PRE-rescue
                     # objects, so later samples see the same panel the all-at-once call
                     # gave them: weights mutated in place, newly rescued haplotypes not
-                    # yet included. Their reads are finished with - the panel needs only
-                    # haplotypes - so drop them for good rather than re-spilling.
+                    # yet included. Their read ALLELES are finished with - the panel needs
+                    # only haplotypes - so release them for good rather than re-spilling.
+                    # The ids stay: a rescued WindowResult wraps the SAME Window object,
+                    # so emptying it outright handed the caller a window with zero reads
+                    # against a full gamma, i.e. an empty read partition.
                     for wr in originals:
-                        wr.offload_heavy()
+                        _detach_reads(wr)
+                    # Those rescued results share that Window, so they already hold the
+                    # stand-ins and only their own flag has to agree. Deliberately NOT
+                    # offload_heavy(), which would also clear `assignments` - the one
+                    # place --keep-read-assignments' output survives the rescue pass.
+                    for wr in all_results[sample_id].get(contig_id, ()):
+                        wr.heavy_offloaded = True
                     spill.discard(sample_id, contig_id)
 
         # Log rescue statistics
@@ -569,10 +645,13 @@ def build_window_tables(
     all_results: dict[str, dict[str, dict[str, list[WindowResult]]]],
     config: HaplotyperConfig,
     sample_order: list[str] | None = None,
-) -> tuple[list[dict], list[dict], list[dict], list[dict]]:
-    """Build the three window-level tables plus the recorded cross-sample comparisons.
+) -> tuple[
+    list[dict], list[dict], list[dict], list[dict], list[dict], dict[str, int], list[dict]
+]:
+    """Build the window-level tables plus the recorded cross-sample comparisons.
 
-    Returns ``(haplotypes, windows_within_sample, windows_across_samples, edges)``:
+    Returns ``(haplotypes, windows_within_sample, windows_across_samples, edges,
+    within_mismatches, edge_counts, lineages)``:
 
     ``haplotypes``
         One row per haplotype per window per sample. The raw unit; no merging applied.
@@ -591,9 +670,19 @@ def build_window_tables(
         genotypic difference, i.e. a candidate recombination breakpoint) must stay
         distinguishable; a discarded comparison cannot be told apart from one never made.
 
-    The final lineage table is deliberately NOT produced here - composing these two axes
-    into a lineage is an open decision (see FIGURE4 diagnosis §6 #9). These tables are the
-    substrate that decision will be evaluated on.
+    ``within_mismatches``
+        The step-1 rows where one sample's own reads disagreed across a window boundary.
+        They are also step 3's veto set, which is why they carry the same haplotype ids
+        as the rows above.
+
+    ``edge_counts``
+        Attempted continuations tallied by reason, for the run log.
+
+    ``lineages``
+        One row per (lineage, sample), produced here whenever ``config.build_lineages``
+        is set - which it is by default. It is built in this function rather than by a
+        separate driver because everything step 3 needs is already in memory: the groups,
+        the contig-wide marker set, and step 1's mismatch verdicts.
     """
     haplotype_rows: list[dict] = []
     within_rows: list[dict] = []
@@ -609,9 +698,11 @@ def build_window_tables(
                 # Group by the within-sample entity id assigned by link_windows.
                 entities: dict[str, list[tuple[WindowResult, Haplotype, int]]] = defaultdict(list)
 
-                # Step-1 mismatches, resolved to the same haplotype ids used above so
-                # they join back to haplotypes.tsv. Only genuine allele disagreements are
-                # here; dropouts are not recorded (see WindowResult.link_mismatches).
+                # Step-1 mismatches, resolved through the SAME id helper the haplotype
+                # rows and the WindowHaplotype objects use below, so they join back to
+                # haplotypes.tsv and so step 3's veto set speaks the members' language.
+                # Only genuine allele disagreements are here; dropouts are not recorded
+                # (see WindowResult.link_mismatches).
                 by_start = {wr.window.start: wr for wr in window_results}
 
                 def _hid(win_start: int, h_idx: int, _bs=by_start,
@@ -619,8 +710,7 @@ def build_window_tables(
                     wr_ = _bs.get(win_start)
                     if wr_ is None or h_idx >= len(wr_.haplotypes):
                         return ""
-                    eid_ = wr_.haplotypes[h_idx].track_id or f"unlinked_W{win_start}"
-                    return f"{_s}|{_c}|{eid_}_W{win_start}_H{h_idx}"
+                    return _window_haplotype_id(_s, _c, win_start, h_idx)
 
                 for wr in window_results:
                     for m in getattr(wr, "link_mismatches", []):
@@ -648,8 +738,17 @@ def build_window_tables(
                     nonjunk = n_reads_w - n_junk_w
 
                     for h_idx, hap in enumerate(wr.haplotypes):
-                        if hap.supporting_reads == 0:
-                            continue
+                        # Haplotypes with no CONFIDENT read are emitted too, with reads=0.
+                        # supporting_reads counts gamma[:, k] >= assign_confidence_threshold
+                        # (0.90); nothing prunes a haplotype on read support, so a real
+                        # mixture component can hold pi weight and still have every one of
+                        # its reads sitting at gamma 0.6-0.89 - two strains agreeing on all
+                        # but a couple of markers at ~10x depth do exactly that. Skipping
+                        # them kept them out of EVERY table, and since `abundance` below is
+                        # pi_k / (1 - pi_junk), which sums to 1 over all k by construction,
+                        # the published abundances then summed to less than 1 with no
+                        # residual column and no log line - a reader could not tell mass
+                        # was missing. Emitting the row is what makes the window audit.
                         raw_eid = hap.track_id or f"unlinked_{wr.window.start}"
                         eid = f"{sample_id}_{contig_id}_{raw_eid}"
                         entities[eid].append((wr, hap, h_idx))
@@ -667,7 +766,9 @@ def build_window_tables(
                         # link_windows assigns track_id per (sample, contig), so bare
                         # "T0001" recurred in every sample AND every contig, and joining
                         # on it inflated haplotypes.tsv x windows_within_sample.tsv 94x.
-                        hap_id = f"{sample_id}_{contig_id}_{wr.window.start}_H{h_idx}"
+                        hap_id = _window_haplotype_id(
+                            sample_id, contig_id, wr.window.start, h_idx
+                        )
                         consensus_str = "|".join(
                             f"{p}:{b}" for p, b in sorted(hap.consensus.items())
                         )
@@ -779,9 +880,10 @@ def build_window_tables(
                             "abundance_all_reads": (track_reads / track_all) if track_all else float("nan"),
                             # The SAME id as haplotypes.tsv, so the member list joins
                             # back directly. It previously used the track-prefixed form,
-                            # which matched nothing in that table.
+                            # which matched nothing in that table; it now comes from the
+                            # one helper, so it cannot drift again.
                             "haplotype_ids": ",".join(
-                                f"{sample_id}_{contig_id}_{wr.window.start}_H{i}"
+                                _window_haplotype_id(sample_id, contig_id, wr.window.start, i)
                                 for wr, _, i in members
                             ),
                         }
@@ -947,7 +1049,12 @@ def main():
     parser.add_argument(
         "--max-reads",
         type=int,
-        default=500,
+        # 300, matching `strainphase longitudinal` and README.md. This parser stood at
+        # 500, and max_reads_per_window selects WHICH reads enter a window, upstream of
+        # the graph, the EM and every abundance denominator - so any window holding
+        # 301-500 reads was phased from a different read set depending on which of the
+        # two documented entry points the operator happened to use.
+        default=300,
         help="Max reads per window; above this reads are uniformly subsampled with the "
         "config seed. Applied to RAW reads before junk classification, so the effective "
         "non-junk ceiling is lower.",
@@ -991,7 +1098,9 @@ def main():
         "--lineage-merge-distance",
         type=float,
         default=0.01,
-        help="Max mismatch RATE to group haplotypes (default: 0.01 = 1%%)",
+        help="Max mismatch RATE to group haplotypes (default: 0.01 = 1%%). "
+        "--max-num-diff caps its reach: a pair still needs that many differences or "
+        "fewer, so raising this above max_num_diff/min_shared stops changing anything.",
     )
     parser.add_argument(
         "--max-num-diff",
@@ -1189,9 +1298,10 @@ def main():
         if integrator:
             all_integrators.append(integrator)
 
-    # ---- Window-level tables (the three deliverables) ----
-    # The final lineage table is PAUSED: composing the within-sample and across-sample
-    # axes into a lineage is an open decision (FIGURE4 diagnosis §6 #9), and these tables
+    # ---- Window-level tables (the deliverables) ----
+    # lineages.tsv comes back from here too, under config.build_lineages (default on):
+    # composing the within-sample and across-sample axes was the open decision these
+    # tables were built as the substrate for, and step 3 now makes it.
     logging.info("Building window tables across processed MAGs")
     (hap_rows, within_rows, across_rows, edge_rows, mismatch_rows,
      edge_counts, lineage_rows) = build_window_tables(
