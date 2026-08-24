@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "strainphase"
-version = "0.1.0"
+version = "0.1.0rc1"
 description = "Hybrid graph-probabilistic haplotype reconstruction for PacBio HiFi metagenomic data"
 readme = "README.md"
 license = {text = "BSD-3-Clause"}
@@ -38,14 +38,18 @@ dependencies = [
     "numpy>=1.20",
     "scipy>=1.7",
     "networkx>=2.6",
-    "pandas>=1.3",
     "python-louvain>=0.16",
+    # Not optional: strainphase/__init__.py imports strainphase.longitudinal,
+    # which imports pysam at module level, so `import strainphase` fails without
+    # it. It was previously in the "full" extra, which made every plain
+    # `pip install strainphase` a broken install.
+    "pysam>=0.19",
 ]
 
 [project.optional-dependencies]
-full = [
-    "pysam>=0.19",
-]
+# Retained so an existing `pip install strainphase[full]` keeps resolving. pysam
+# moved into the core dependencies, so this now adds nothing.
+full = []
 dev = [
     "pytest>=7.0",
     "pytest-cov>=4.0",
@@ -64,7 +68,10 @@ strainphase = "strainphase.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-exclude = ["tests*", "benchmarks*", "validation*", "docs*"]
+# archive/ and benchmark/ are gitignored working directories, but a source tree
+# on disk still has them and archive/benchmarks/ contains an __init__.py, so
+# setuptools would otherwise pick it up and ship it inside the wheel.
+exclude = ["tests*", "docs*", "archive*", "benchmark*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

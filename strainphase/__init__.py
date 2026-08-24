@@ -16,7 +16,16 @@ CLI usage:
     $ strainphase test --quick
 """
 
-__version__ = "0.1.0"
+# Single source of truth is pyproject.toml. Hard-coding it here meant the two
+# could drift - and they had: pyproject said 0.1.0rc1 while this said 0.1.0, so
+# `strainphase version` would have misreported a release. The fallback covers a
+# source tree that was never installed.
+try:  # pragma: no cover - trivial, and the except path needs an uninstalled tree
+    from importlib.metadata import PackageNotFoundError, version as _version
+
+    __version__ = _version("strainphase")
+except PackageNotFoundError:  # pragma: no cover
+    __version__ = "0.0.0+unknown"
 __author__ = "Renee Oles"
 __email__ = "roles@ucsd.edu"
 
