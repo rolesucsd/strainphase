@@ -39,6 +39,21 @@ import numpy as np
 from scipy.special import logsumexp
 from scipy.stats import binom
 
+# `community` is the module python-louvain installs, and it is a generic enough
+# name that PyPI also carries an unrelated package called `community`. Install
+# that one - or conda-forge's unrelated igraph-based `louvain` - and the import
+# above succeeds, then clustering dies much later with an AttributeError that
+# reads like a bug in strainphase rather than a wrong package. Check identity
+# once, here, where the message can say what to do about it.
+if not hasattr(community_louvain, "best_partition"):
+    raise ImportError(
+        "The installed `community` module is not python-louvain: it has no "
+        "best_partition(). Some other package of that name is shadowing it. "
+        "Fix with:  pip uninstall -y community && pip install python-louvain  "
+        "(conda: the package is `python-louvain`, NOT `louvain`, which is an "
+        "unrelated igraph binding.)"
+    )
+
 try:
     import pysam
 
