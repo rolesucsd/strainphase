@@ -25,6 +25,7 @@ Date: 2025
 
 from __future__ import annotations
 
+import bisect
 import logging
 import os
 import warnings
@@ -226,6 +227,14 @@ class HaplotyperConfig:
     # footprint - no span gating, nothing to expand, no imputation gap.
     lineage_merge_distance: float = 0.01  # Max mismatch rate to group
     min_shared_for_lineage: int = 3  # Min shared markers (raised 2 -> 3 to match linking)
+    # Fraction of testable samples allowed to disagree on abundance before the
+    # abundance ELIMINATOR vetoes a cross-window continuation. 0.0 = zero
+    # tolerance (any one incompatible sample vetoes), which on real divergent
+    # data breaks clean (n_diff=0) same-strain links on noisy per-window
+    # abundance estimates. Exposed so it can be relaxed; the veto still only
+    # sees pairs that already PASSED the consensus gate, so relaxing it cannot
+    # merge consensus-divergent strains.
+    lineage_max_bad_frac: float = 0.0
     # Identity shape. This decision is still OPEN (FIGURE4 diagnosis §6 #9); both are
     # implemented so they can be compared on identical inputs.
     #   "clique"     - complete linkage: a group is a clique, every member passes the
@@ -1414,8 +1423,13 @@ def iter_windows_lazy(
         # trailing windows and contigs shorter than window_size) are kept
         # and filtered downstream by min_snvs_per_window / min_reads_per_window.
 
-        # Collect SNVs in this window
-        window_snvs = [p for p in snv_pos_sorted if start <= p < end]
+        # Collect SNVs in this window. snv_pos_sorted is sorted, so bisect the
+        # [start, end) slice instead of scanning all ~N variants per window - the
+        # linear scan was O(windows * total_variants) (~12M comparisons on a 5 Mb
+        # contig with 24k sites) and dominated this function's self-time.
+        lo = bisect.bisect_left(snv_pos_sorted, start)
+        hi = bisect.bisect_left(snv_pos_sorted, end)
+        window_snvs = snv_pos_sorted[lo:hi]
 
         if len(window_snvs) < config.min_snvs_per_window:
             continue
@@ -1516,26 +1530,57 @@ def iter_windows_lazy(
                     f"Some reads lack quality scores. Using default Q{config.default_base_quality}.",
                 )
 
-            # Extract alleles at SNV positions (matched bases only).
+            # Extract alleles at SNV positions (matched bases only) via a TARGETED
+            # CIGAR walk. get_aligned_pairs() materialises the whole read-length
+            # alignment (~15k tuples on a HiFi read) just to find the handful of SNV
+            # columns in this window; walking the CIGAR once and emitting only at
+            # this read's SNV positions is the IDENTICAL result at O(variants on
+            # read) instead of O(read length) - the dominant cost of iter_windows_lazy.
+            # Verified byte-identical against the get_aligned_pairs form on real data.
+            # Indel/SV sites are excluded here and handled by the CIGAR scan below.
             has_overlap = False
-            for query_pos, ref_pos in aln.get_aligned_pairs(with_seq=False):
-                if query_pos is None or ref_pos is None:
-                    continue
-
-                ref_pos_1based = ref_pos + 1
-                if ref_pos_1based not in snv_set:
-                    continue
-                # Indel and SV sites are handled below (CIGAR scan / support set).
-                if ref_pos_1based in special_site_set:
-                    continue
-
-                base = query_seq[query_pos]
-                qual = query_qual[query_pos] if query_qual else config.default_base_quality
-
-                if qual >= config.min_base_quality:
-                    r.alleles[ref_pos_1based] = base
-                    r.quals[ref_pos_1based] = qual
-                    has_overlap = True
+            # SNV-only targets in this window. window_snvs is sorted (a bisect slice
+            # of snv_pos_sorted; break sites are appended only after this loop), so
+            # the walk can advance through it monotonically.
+            snv_targets = (
+                window_snvs
+                if not special_site_set
+                else [p for p in window_snvs if p not in special_site_set]
+            )
+            n_targets = len(snv_targets)
+            if n_targets:
+                ti = 0
+                ref_cur = aln.reference_start  # 0-based
+                q_cur = 0
+                for op, length in (aln.cigartuples or ()):
+                    if ti >= n_targets:
+                        break
+                    if op in (0, 7, 8):  # M / = / X consume ref and query together
+                        seg_end = ref_cur + length  # 0-based, exclusive
+                        # Targets before this segment fell in a D/N gap (or before the
+                        # read): no query base, no call - exactly what get_aligned_pairs
+                        # yields as (None, ref) for a deleted reference position.
+                        while ti < n_targets and snv_targets[ti] - 1 < ref_cur:
+                            ti += 1
+                        while ti < n_targets and snv_targets[ti] - 1 < seg_end:
+                            pos = snv_targets[ti]
+                            qp = q_cur + (pos - 1 - ref_cur)
+                            qual = (
+                                query_qual[qp] if query_qual else config.default_base_quality
+                            )
+                            if qual >= config.min_base_quality:
+                                r.alleles[pos] = query_seq[qp]
+                                r.quals[pos] = qual
+                                has_overlap = True
+                            ti += 1
+                        ref_cur, q_cur = seg_end, q_cur + length
+                    elif op == 1:  # I consumes query only
+                        q_cur += length
+                    elif op in (2, 3):  # D / N consume ref only
+                        ref_cur += length
+                    elif op == 4:  # S (soft clip) consumes query only
+                        q_cur += length
+                    # H (5) / P (6) consume neither
 
             # Extract alleles at indel sites.
             #
