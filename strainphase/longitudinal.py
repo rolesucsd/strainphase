@@ -913,6 +913,7 @@ def build_window_tables(
                 (m.consensus for g in cgroups for m in g.members), site_type_all, config)
             lins, ledges = build_lineages(
                 cgroups, config, markers=markers, step1_mismatches=step1_mm,
+                max_bad_frac=config.lineage_max_bad_frac,
                 lineage_prefix=f"{contig_id_}_LIN")
             lineage_edges.extend(ledges)
             lineage_rows.extend(_lineage_rows(lins, mag_of_contig.get(contig_id_, "")))
