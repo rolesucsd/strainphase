@@ -970,6 +970,43 @@ def _em_logl_hap(haplotypes, site_idx, code, read_code, sup_mask, lm, lmm):
     return logl
 
 
+def _em_hap_consensus(gamma_k, read_code, sup_mask, lo, lmm, n_alleles,
+                      sites, dec, snv_pos, min_gamma):
+    """Vectorised weighted-vote consensus for one haplotype (M-step).
+
+    Identical to the per-read voting loop: each read with ``gamma >= min_gamma``
+    contributes, at each of its support sites, ``gamma * log_odds(q)`` toward the
+    allele it calls and ``gamma * log_mismatch(q)`` to the position's mismatch
+    floor; an allele is taken only where ``floor + its vote`` beats calling
+    nothing (``cover * _LOG_MISSING_SITE``). Reuses the read x site tensors built
+    once by :func:`_em_read_tensors`. Returns the consensus dict, or ``None`` if no
+    read voted (the "if not allele_votes: continue" case).
+    """
+    w = np.where(gamma_k >= min_gamma, gamma_k, 0.0)
+    ew = w[:, None] * sup_mask                # effective weight per (read, site)
+    if not ew.any():
+        return None
+    cover = ew.sum(axis=0)                    # (n_sites,)
+    floor = (ew * lmm).sum(axis=0)            # (n_sites,)
+    contrib = ew * lo                         # (n_reads, n_sites) vote weight
+    n_sites = read_code.shape[1]
+    votes = np.full((n_sites, n_alleles), -np.inf)
+    for a in range(n_alleles):
+        m = read_code == a
+        if not m.any():
+            continue
+        col = np.where(m, contrib, 0.0).sum(axis=0)
+        votes[(m & sup_mask).any(axis=0), a] = col[(m & sup_mask).any(axis=0)]
+    best = votes.argmax(axis=1)
+    best_val = votes[np.arange(n_sites), best]
+    keep = np.isfinite(best_val) & (floor + best_val > cover * _LOG_MISSING_SITE)
+    return {
+        sites[s]: dec[int(best[s])]
+        for s in np.nonzero(keep)[0]
+        if sites[s] in snv_pos
+    }
+
+
 # Padding (bp) around an SV breakpoint anchor when deciding whether a read's
 # reference span brackets it. Absorbs Sniffles breakpoint imprecision
 # (CIPOS/CIEND) and soft-clip edges. See strainphase.sv_encoding.
@@ -2077,6 +2114,18 @@ class EMHaplotyper:
             self.config.default_base_quality,
             _LOG_PROB_CACHE,
         )
+        # Derived, also constant across iterations, for the vectorised M-step vote:
+        # per-(read, site) log_odds = log_match - log_mismatch; a code->allele
+        # decoder and a site-index->position list; the read-allele alphabet size.
+        _em_lo = _em_lm - _em_lmm
+        _em_sites = sorted(_em_site_idx, key=_em_site_idx.get)
+        _em_dec = {c: a for a, c in _em_alleles.items()}
+        _em_n_alleles = (
+            int(_em_read_code.max()) + 1
+            if _em_read_code.size and _em_read_code.max() >= 0
+            else 0
+        )
+        _em_snv_pos = set(self.window.snv_pos)
 
         for iteration in range(self.config.em_max_iter):
             # E-STEP prep: log P(read | haplotype) for the current consensuses.
@@ -2086,33 +2135,22 @@ class EMHaplotyper:
                 _em_sup_mask, _em_lm, _em_lmm,
             )
 
-            # E-STEP: compute responsibilities gamma[i, k] = P(haplotype k | read i).
-            for i in range(n_reads):
-                logp_k = np.full(k_eff, -np.inf)
-
-                for k in range(n_haps):
-                    if logl_hap[i, k] > -np.inf:
-                        logp_k[k] = np.log(pi[k] + 1e-12) + logl_hap[i, k]
-
-                logp_k[junk_idx] = np.log(pi[junk_idx] + 1e-12) + logl_junk[i]
-
-                log_sum = logsumexp(logp_k)
-                if np.isneginf(log_sum):
-                    gamma[i, :] = 0.0
-                    gamma[i, junk_idx] = 1.0
-                else:
-                    gamma[i, :] = np.exp(logp_k - log_sum)
-
-            # Log-likelihood: sum over reads of log(sum_k pi_k * P(read | k)).
-            log_like = 0.0
-            for i in range(n_reads):
-                terms = []
-                for k in range(n_haps):
-                    if logl_hap[i, k] > -np.inf:
-                        terms.append(np.log(pi[k] + 1e-12) + logl_hap[i, k])
-                terms.append(np.log(pi[junk_idx] + 1e-12) + logl_junk[i])
-                if terms:
-                    log_like += logsumexp(np.array(terms))
+            # E-STEP: responsibilities gamma[i,k] and the data log-likelihood, both
+            # from ONE batched logsumexp over the (n_reads x k_eff) log-posterior.
+            # (Was two per-read Python loops each calling scipy logsumexp per read.)
+            log_pi = np.log(pi + 1e-12)
+            logp = np.full((n_reads, k_eff), -np.inf)
+            logp[:, :n_haps] = log_pi[:n_haps][None, :] + logl_hap  # -inf where logl_hap -inf
+            logp[:, junk_idx] = log_pi[junk_idx] + logl_junk
+            log_sum = logsumexp(logp, axis=1)          # (n_reads,)
+            gamma[:] = 0.0
+            good = ~np.isneginf(log_sum)
+            gamma[good] = np.exp(logp[good] - log_sum[good, None])
+            gamma[~good, junk_idx] = 1.0
+            # Junk is always finite, so log_sum is finite for every read; summing all
+            # of it reproduces the per-read logsumexp total (a -inf read would sum to
+            # -inf here too, matching the old loop).
+            log_like = float(log_sum.sum())
 
             # M-STEP: update mixture weights and haplotype consensuses.
             # nk = effective counts per component (with Dirichlet smoothing).
@@ -2127,51 +2165,18 @@ class EMHaplotyper:
                 if nk[k] < self.config.min_hap_eff_weight:
                     continue
 
-                allele_votes = defaultdict(lambda: defaultdict(float))
-                # Per position: the gamma mass reaching it, and the score every candidate
-                # allele starts from (every covering read charged as a mismatch). The two
-                # together are what let a vote be compared against calling nothing.
-                cover_weight: dict[int, float] = defaultdict(float)
-                mismatch_floor: dict[int, float] = defaultdict(float)
-
-                for i, read in enumerate(reads):
-                    w = gamma[i, k]
-                    if w < self.config.min_gamma_for_vote:
-                        continue
-
-                    for pos in self._support[i]:
-                        q = read.quals.get(pos, self.config.default_base_quality)
-                        # The consensus that maximises the expected complete
-                        # log-likelihood weights each vote by gamma * (log P(base | agree)
-                        # - log P(base | disagree)), not by the probability the base is
-                        # correct. The latter spans only [0.99, 1.0] over the admissible
-                        # quality range, which made this a plain majority vote: six Q20
-                        # reads calling G outvoted five Q93 reads calling C, emitting a
-                        # call 39.9 nats worse under this package's own error model.
-                        allele_votes[pos][read.alleles[pos]] += w * self._cache.log_odds(q)
-                        cover_weight[pos] += w
-                        mismatch_floor[pos] += w * self._cache.log_mismatch(q)
-
-                if not allele_votes:
-                    continue
-
-                new_consensus = {}
-                for pos in self.window.snv_pos:
-                    votes = allele_votes.get(pos)
-                    if not votes:
-                        continue
-                    best = max(votes, key=votes.get)
-                    # Calling NOTHING at a position is a real option and sometimes the
-                    # better one: where only a couple of reads reach, no allele need beat
-                    # marginalising over the alphabet for everyone else. Taking the
-                    # majority regardless extended footprints into positions that cost the
-                    # objective more than they earned, which is why the log-likelihood
-                    # could fall between iterations with the haplotype count unchanged.
-                    if (mismatch_floor[pos] + votes[best]
-                            <= cover_weight[pos] * _LOG_MISSING_SITE):
-                        continue
-                    new_consensus[pos] = best
-
+                # Rebuild this haplotype's consensus by gamma-weighted voting. The
+                # objective, quality weighting (gamma * log_odds vote, gamma *
+                # log_mismatch floor) and the call-nothing test are unchanged; the
+                # per-read Python triple loop is replaced by numpy over the read x
+                # site tensors (see _em_hap_consensus). "no vote" -> None, "all
+                # positions failed the floor" -> {} both fall through to `if
+                # new_consensus:` below, exactly as `continue` did.
+                new_consensus = _em_hap_consensus(
+                    gamma[:, k], _em_read_code, _em_sup_mask, _em_lo, _em_lmm,
+                    _em_n_alleles, _em_sites, _em_dec, _em_snv_pos,
+                    self.config.min_gamma_for_vote,
+                )
                 if new_consensus:
                     new_haps.append(Haplotype(consensus=new_consensus))
                     surviving_indices.append(k)
