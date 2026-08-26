@@ -874,6 +874,102 @@ def _log_prob_read_junk(
         log_prob += log_ref[q] if read.alleles[pos] == ref_base else log_alt[q]
     return float(log_prob)
 
+def _em_read_tensors(reads, support, ref_alleles, p_div, default_q, cache):
+    """Build the E-step tensors that are CONSTANT across EM iterations.
+
+    The reads, their support sites and their qualities do not change during EM -
+    only the haplotype consensuses do (M-step) - so encoding the reads to an
+    integer allele matrix, precomputing the per-(read, site) log_match/log_mismatch
+    at each read's quality, and computing the junk log-likelihood (which depends
+    only on the reads and the reference) are all done ONCE here. This is the
+    vectorised replacement for the per-(read, hap) Python loop over
+    ``_log_prob_read_hap`` / ``_log_prob_read_junk`` that dominated EM runtime;
+    it is numerically identical to summing those calls (float order aside).
+
+    Returns ``(site_idx, alleles, read_code, sup_mask, lm, lmm, logl_junk)`` where
+    ``alleles`` is the shared string->int encoder (a dict, extended in place when
+    haplotype consensuses are encoded per iteration) so read/hap/ref alleles all
+    compare as integers.
+    """
+    sites = sorted({p for sup in support for p in sup})
+    site_idx = {p: s for s, p in enumerate(sites)}
+    n_reads, n_sites = len(reads), len(sites)
+    max_q = len(cache._log_match) - 1
+
+    alleles: dict[str, int] = {}
+
+    def code(a: str) -> int:
+        c = alleles.get(a)
+        if c is None:
+            c = len(alleles)
+            alleles[a] = c
+        return c
+
+    read_code = np.full((n_reads, n_sites), -1, dtype=np.int32)
+    read_q = np.zeros((n_reads, n_sites), dtype=np.int32)
+    for i, r in enumerate(reads):
+        r_alleles, r_quals = r.alleles, r.quals
+        for p in support[i]:
+            s = site_idx[p]
+            read_code[i, s] = code(r_alleles[p])
+            read_q[i, s] = min(r_quals.get(p, default_q), max_q)
+
+    sup_mask = read_code >= 0
+    lm = cache._log_match[read_q]        # (n_reads, n_sites) log P(match) at each q
+    lmm = cache._log_mismatch[read_q]    # (n_reads, n_sites) log P(mismatch)
+
+    # Junk component: constant across iterations. A site with no reference allele,
+    # or an SV placeholder, takes the missing-data term (see _log_prob_read_junk).
+    log_ref, log_alt = cache.junk_tables(p_div)
+    ref_code = np.full(n_sites, -1, dtype=np.int32)
+    for p, base in ref_alleles.items():
+        s = site_idx.get(p)
+        if s is not None and base != _SV_PLACEHOLDER_REF:
+            ref_code[s] = code(base)
+    ref_present = ref_code >= 0
+    jr = log_ref[read_q]
+    ja = log_alt[read_q]
+    junk_contrib = np.where(
+        ref_present[None, :],
+        np.where(read_code == ref_code[None, :], jr, ja),
+        _LOG_MISSING_SITE,
+    )
+    logl_junk = np.where(sup_mask, junk_contrib, 0.0).sum(axis=1)
+
+    return site_idx, alleles, code, read_code, sup_mask, lm, lmm, logl_junk
+
+
+def _em_logl_hap(haplotypes, site_idx, code, read_code, sup_mask, lm, lmm):
+    """Vectorised ``log P(read | hap)`` matrix, one column per haplotype.
+
+    Identical to calling ``_log_prob_read_hap`` for every (read, hap): a support
+    site the consensus does not reach costs ``_LOG_MISSING_SITE``; a covered site
+    is log_match/log_mismatch at the read's quality; a read with zero shared
+    covered sites gets ``-inf`` (must not compete), matching the ``None`` return.
+    ``code`` extends the shared encoder with any hap-only alleles (no read carries
+    them, so they can only mismatch - the correct outcome).
+    """
+    n_reads, n_sites = read_code.shape
+    n_haps = len(haplotypes)
+    logl = np.full((n_reads, n_haps), -np.inf)
+    for k, hap in enumerate(haplotypes):
+        hc = np.full(n_sites, -1, dtype=np.int32)
+        for p, base in hap.consensus.items():
+            s = site_idx.get(p)
+            if s is not None:
+                hc[s] = code(base)
+        present = hc >= 0
+        contrib = np.where(
+            present[None, :],
+            np.where(read_code == hc[None, :], lm, lmm),
+            _LOG_MISSING_SITE,
+        )
+        total = np.where(sup_mask, contrib, 0.0).sum(axis=1)
+        overlap = (sup_mask & present[None, :]).sum(axis=1)
+        logl[:, k] = np.where(overlap > 0, total, -np.inf)
+    return logl
+
+
 # Padding (bp) around an SV breakpoint anchor when deciding whether a read's
 # reference span brackets it. Absorbs Sniffles breakpoint imprecision
 # (CIPOS/CIEND) and soft-clip edges. See strainphase.sv_encoding.
@@ -1964,28 +2060,31 @@ class EMHaplotyper:
         prev_log_like = -np.inf
         converged = False
 
-        for iteration in range(self.config.em_max_iter):
-            # E-STEP prep: cache log P(read | haplotype) and log P(read | junk)
-            # so we do not recompute them in multiple places.
-            logl_hap = np.full((n_reads, n_haps), -np.inf)
-            logl_junk = np.zeros(n_reads)
+        # E-STEP tensors that do not change across iterations: the integer read
+        # allele matrix, per-(read, site) match/mismatch log-probs, and the junk
+        # log-likelihood (which depends only on the reads and the reference). Built
+        # once; only logl_hap is recomputed per iteration as consensuses update.
+        # Vectorised replacement for the per-(read, hap) _log_prob_read_hap /
+        # _log_prob_read_junk loop that dominated EM runtime.
+        (
+            _em_site_idx, _em_alleles, _em_code, _em_read_code,
+            _em_sup_mask, _em_lm, _em_lmm, logl_junk,
+        ) = _em_read_tensors(
+            reads,
+            self._support,
+            self.window.ref_alleles,
+            self.config.junk_divergence_rate,
+            self.config.default_base_quality,
+            _LOG_PROB_CACHE,
+        )
 
-            default_q = self.config.default_base_quality
-            for i, read in enumerate(reads):
-                support = self._support[i]
-                for k in range(n_haps):
-                    lp = _log_prob_read_hap(
-                        read, haplotypes[k].consensus, support, default_q
-                    )
-                    if lp is not None:
-                        logl_hap[i, k] = lp
-                logl_junk[i] = _log_prob_read_junk(
-                    read,
-                    support,
-                    self.window.ref_alleles,
-                    self.config.junk_divergence_rate,
-                    default_q,
-                )
+        for iteration in range(self.config.em_max_iter):
+            # E-STEP prep: log P(read | haplotype) for the current consensuses.
+            # (logl_junk is constant across iterations, computed once above.)
+            logl_hap = _em_logl_hap(
+                haplotypes, _em_site_idx, _em_code, _em_read_code,
+                _em_sup_mask, _em_lm, _em_lmm,
+            )
 
             # E-STEP: compute responsibilities gamma[i, k] = P(haplotype k | read i).
             for i in range(n_reads):
