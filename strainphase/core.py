@@ -29,9 +29,8 @@ import bisect
 import logging
 import os
 import warnings
-from array import array
 from collections import defaultdict
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from multiprocessing import Pool
 
@@ -145,12 +144,6 @@ class HaplotyperConfig:
     # Windows are handed to the worker pool in batches of n_workers * this, so the input
     # list for a contig is never fully materialised at once.
     window_batch_factor: int = 4
-    # Store each read's alleles/quals as compact arrays instead of two Python dicts once
-    # the window is built (see Read.freeze). ~15-20x smaller per variant-dense read, the
-    # bulk of resident memory when many windows (or samples) are held at once. Behaviour
-    # is identical - the compact form reads through the same Mapping interface. Opt-in
-    # because it trades a little per-lookup speed (a bisect vs a hash) for the memory.
-    compact_reads: bool = False
 
     # =========== VARIANT FILTERING ===========
     min_depth_site: int = 3
@@ -425,136 +418,6 @@ class Read:
         if self.ref_end <= self.ref_start or other.ref_end <= other.ref_start:
             return -1
         return max(0, min(self.ref_end, other.ref_end) - max(self.ref_start, other.ref_start))
-
-    def freeze(self) -> None:
-        """Swap the alleles/quals dicts for array-backed views (see _CompactAlleles).
-
-        On a variant-dense read the two position-keyed dicts are ~97% of the read's
-        footprint; the compact form is ~15-20x smaller and reads identically through the
-        Mapping interface, so nothing downstream changes. Idempotent. Called only after
-        the last writer (split-read merge); everything past that only reads. A no-op if
-        alleles and quals ever disagree on their positions - the read stays a dict rather
-        than risk a silent mismatch.
-        """
-        a = self.alleles
-        if not isinstance(a, dict):
-            return  # already frozen
-        q = self.quals
-        if a.keys() != q.keys():
-            return
-        items = sorted(a.items())
-        pos = array("i", (p for p, _ in items))
-        extra: list[str] = []
-        codes = array("b", (_encode_allele(v, extra) for _, v in items))
-        quals = array("B", (min(q[p], 255) for p, _ in items))
-        self.alleles = _CompactAlleles(pos, codes, extra)
-        self.quals = _CompactQuals(pos, quals)
-
-
-# Allele codec for the compact read form. The overwhelming majority of calls are single
-# bases; those get a fixed code so no per-object table is needed. Anything else (indel
-# alleles, SV event ids, split-read CONT/BRK anchors) is rare and kept verbatim in a
-# small per-read `extra` list, addressed by NEGATIVE codes. Crucially the codes are
-# self-contained - a global string->int table would decode to the WRONG allele in a
-# worker process that built its table in a different order (reads are pickled to the
-# pool), which this avoids.
-_FIXED_DECODE = ("A", "C", "G", "T", "N")
-_FIXED_CODE = {b: i for i, b in enumerate(_FIXED_DECODE)}
-
-
-def _encode_allele(a: str, extra: list[str]) -> int:
-    c = _FIXED_CODE.get(a)
-    if c is not None:
-        return c
-    for j, x in enumerate(extra):
-        if x == a:
-            return -(j + 1)
-    extra.append(a)
-    return -len(extra)
-
-
-class _CompactAlleles(Mapping):
-    """A read's alleles as a sorted int32 position array + int8 codes (+ a per-read
-    `extra` list for the rare non-ACGTN tokens). Read-only Mapping: reads are frozen
-    only after their last writer, so the whole downstream only looks things up. Pickles
-    by value (arrays + list), so it is safe to send to worker processes and disk spill."""
-
-    __slots__ = ("_pos", "_codes", "_extra")
-
-    def __init__(self, pos, codes, extra):
-        self._pos = pos
-        self._codes = codes
-        self._extra = extra
-
-    def _val(self, c):
-        return _FIXED_DECODE[c] if c >= 0 else self._extra[-c - 1]
-
-    def __getitem__(self, k):
-        i = bisect.bisect_left(self._pos, k)
-        if i < len(self._pos) and self._pos[i] == k:
-            return self._val(self._codes[i])
-        raise KeyError(k)
-
-    def get(self, k, default=None):
-        i = bisect.bisect_left(self._pos, k)
-        if i < len(self._pos) and self._pos[i] == k:
-            return self._val(self._codes[i])
-        return default
-
-    def __contains__(self, k):
-        i = bisect.bisect_left(self._pos, k)
-        return i < len(self._pos) and self._pos[i] == k
-
-    def __iter__(self):
-        return iter(self._pos)
-
-    def __len__(self):
-        return len(self._pos)
-
-    def __getstate__(self):
-        return (self._pos, self._codes, self._extra)
-
-    def __setstate__(self, s):
-        self._pos, self._codes, self._extra = s
-
-
-class _CompactQuals(Mapping):
-    """A read's per-position qualities as a uint8 array over the SAME position axis as
-    its alleles (they always share positions). See _CompactAlleles."""
-
-    __slots__ = ("_pos", "_quals")
-
-    def __init__(self, pos, quals):
-        self._pos = pos
-        self._quals = quals
-
-    def __getitem__(self, k):
-        i = bisect.bisect_left(self._pos, k)
-        if i < len(self._pos) and self._pos[i] == k:
-            return self._quals[i]
-        raise KeyError(k)
-
-    def get(self, k, default=None):
-        i = bisect.bisect_left(self._pos, k)
-        if i < len(self._pos) and self._pos[i] == k:
-            return self._quals[i]
-        return default
-
-    def __contains__(self, k):
-        i = bisect.bisect_left(self._pos, k)
-        return i < len(self._pos) and self._pos[i] == k
-
-    def __iter__(self):
-        return iter(self._pos)
-
-    def __len__(self):
-        return len(self._pos)
-
-    def __getstate__(self):
-        return (self._pos, self._quals)
-
-    def __setstate__(self, s):
-        self._pos, self._quals = s
 
 
 @dataclass
@@ -2033,13 +1896,6 @@ def iter_windows_lazy(
         if len(reads) < config.min_reads_for_rescue:
             continue
 
-        # Compact the final reads. This is the last point a read is written - the split
-        # merge above is its last writer, subsampling just selects - so from here on
-        # (process_window, linking, scoring) reads are only looked up. See Read.freeze.
-        if config.compact_reads:
-            for r in reads:
-                r.freeze()
-
         w = Window(contig=contig_id, start=start, end=end, sample=sample_id, window_idx=window_idx)
         w.snv_pos = window_snvs
         # Guarded: every registered position gets an anchor base, and SV
@@ -2085,14 +1941,6 @@ class GraphInitializer:
         # (window.get_read_position_sets caches these).
         pos_sets = window.get_read_position_sets()
 
-        # Materialise each read's alleles into a plain dict ONCE. The pairwise loop below
-        # is O(reads^2 x shared) allele lookups; under compact_reads a lookup is a bisect,
-        # and re-bisecting the same read O(reads) times dominated. One dict per read makes
-        # every lookup a hash again. Transient and per-window (released when the window is),
-        # so the compact STORAGE that keeps the held result set small is untouched. A no-op
-        # copy when reads are already dicts.
-        allele_maps = [dict(r.alleles) for r in reads]
-
         # Compare read pairs to decide if they should be connected.
         # We only connect reads that share enough SNVs and agree closely.
         for i in range(n_reads):
@@ -2129,9 +1977,8 @@ class GraphInitializer:
                 mismatches = 0
                 exceeded = False
 
-                a_i, a_j = allele_maps[i], allele_maps[j]
                 for p in shared:
-                    if a_i[p] != a_j[p]:
+                    if r_i.alleles[p] != r_j.alleles[p]:
                         mismatches += 1
                         if mismatches > max_allowed:
                             exceeded = True
