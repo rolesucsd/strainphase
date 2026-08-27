@@ -217,7 +217,7 @@ def test_reads_are_released_after_the_run(dataset):
     with the list emptied every returned window read as "phased nothing". What must
     survive is the id and the row order; what must not is `.alleles`.
     """
-    from strainphase.longitudinal import _ReadRef
+    from strainphase.core import _ReadRef
 
     tmp, bams, vcfs = dataset
     _out, results, _tables = _run(tmp, bams, vcfs, _cfg(spill_results_to_disk=True), "released")
@@ -463,7 +463,8 @@ def test_spill_leaves_id_only_stand_ins_and_round_trips_the_reads(tmp_path):
     the returned partition empty. What the store owes the caller is the ids, in gamma
     order, until the real reads come back over the top of them.
     """
-    from strainphase.longitudinal import _ReadRef, _SpillStore
+    from strainphase.core import _ReadRef
+    from strainphase.longitudinal import _SpillStore
 
     store = _SpillStore(str(tmp_path / "spill"))
 

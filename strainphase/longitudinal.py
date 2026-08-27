@@ -47,6 +47,7 @@ from strainphase.core import (
     HaplotyperConfig,
     LongitudinalIntegrator,
     WindowResult,
+    _detach_reads,
     link_windows,
     make_worker_pool,
     process_contig,
@@ -178,48 +179,6 @@ def parse_reference_contigs(
 # -----------------------------------------------------------------------------#
 # Read spilling
 # -----------------------------------------------------------------------------#
-
-
-class _ReadRef:
-    """A read's identity, kept after its alleles have been released.
-
-    ``window.reads`` is emptied as soon as a window's own sample is finished with it (see
-    WindowResult.offload_heavy), but the WindowResults handed back to the caller still
-    have to say WHICH read each gamma row belongs to. That correspondence IS the read
-    partition, and it is the entire output for a caller scoring reads rather than
-    haplotypes. Dropping it returned every window with zero reads against a gamma of
-    50-odd rows, so a partition built from the return value came out empty and the
-    pipeline looked like it had phased nothing.
-
-    Holding the whole Read instead is not an option - two position-keyed dicts, ~90 KB on
-    a variant-dense contig, times every sample resident at once - which is exactly what
-    the offload exists to prevent. The id alone is ~1500x cheaper (48 bytes against the
-    ~70 KB of a 600-marker read) and preserves the row correspondence exactly. Nothing
-    else survives, on purpose: code that reaches for
-    ``.alleles`` here is reading a released read, and an AttributeError naming this class
-    is far better than silently seeing no alleles.
-    """
-
-    __slots__ = ("id",)
-
-    def __init__(self, read_id: str) -> None:
-        self.id = read_id
-
-    def __repr__(self) -> str:  # pragma: no cover - diagnostics only
-        return f"_ReadRef({self.id!r})"
-
-
-def _detach_reads(wr: WindowResult) -> list:
-    """Offload a window's reads, leaving id-only stand-ins in gamma-row order.
-
-    Returns the detached Read objects so the caller can spill them; ``restore_heavy``
-    lays the real ones back over the stand-ins. Idempotent, and order-independent across
-    the several WindowResults that can share one Window after rescue.
-    """
-    refs = [r if isinstance(r, _ReadRef) else _ReadRef(r.id) for r in wr.window.reads]
-    reads = wr.offload_heavy()
-    wr.window.reads = refs
-    return reads
 
 
 class _SpillStore:
