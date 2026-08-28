@@ -448,7 +448,10 @@ def build_lineages(
     transitive_abundance_check: bool = True,
     lineage_prefix: str = "LIN",
     markers: set[int] | None = None,
-    step1_mismatches: set[frozenset[str]] | None = None,
+    step1_mismatches: dict[frozenset[str], set[str]] | set[frozenset[str]] | None = None,
+    # A step-1 within-sample mismatch vetoes only when >= this many DISTINCT
+    # timepoints flag the group-to-group join. See config.step1_veto_min_timepoints.
+    min_mismatch_timepoints: int = 2,
 ) -> tuple[list[Lineage], list[LineageEdge]]:
     """Chain window groups into lineages by reciprocal best match on step-1 votes.
 
@@ -467,7 +470,15 @@ def build_lineages(
         step = config.window_size // 2
     if markers is None:
         markers = {p for g in groups for m in g.members for p in m.consensus}
-    mismatched = step1_mismatches or set()
+    # Normalise to {pair: {timepoints that flagged it}}. A legacy set (no timepoint
+    # info) treats each pair as its own timepoint, so an explicit dict is required to
+    # exercise the >=2-timepoint rule; a bare set of one pair no longer vetoes.
+    if isinstance(step1_mismatches, dict):
+        mismatched = step1_mismatches
+    elif step1_mismatches:
+        mismatched = {pair: {f"_tp{i}"} for i, pair in enumerate(step1_mismatches)}
+    else:
+        mismatched = {}
 
     by_key: dict[tuple[str, int], list[WindowGroup]] = defaultdict(list)
     for g in groups:
@@ -530,15 +541,22 @@ def build_lineages(
                 if gate.reason == "failed_mismatch":
                     edges.append(e)
                     continue
-                # A single sample whose OWN reads disagree across this boundary vetoes the
-                # join outright, however many other samples vote for it.
-                if mismatched and any(
-                    frozenset((a, b)) in mismatched
-                    for a in hap_ids[ga.group_id] for b in hap_ids[gb.group_id]
-                ):
-                    e.reason = "failed_mismatch"
-                    edges.append(e)
-                    continue
+                # A within-sample mismatch vetoes the join only when >= this many
+                # DISTINCT timepoints flag it. One timepoint's per-window EM miscall
+                # (~0.03%/site) trips the zero-tolerance link gate over a short overlap
+                # but is not corroborated; a genuine strain difference is flagged in
+                # every timepoint the strains co-occur. Corroboration separates them.
+                if mismatched:
+                    veto_tps: set[str] = set()
+                    for a in hap_ids[ga.group_id]:
+                        for b in hap_ids[gb.group_id]:
+                            flagged = mismatched.get(frozenset((a, b)))
+                            if flagged:
+                                veto_tps |= flagged
+                    if len(veto_tps) >= min_mismatch_timepoints:
+                        e.reason = "failed_mismatch"
+                        edges.append(e)
+                        continue
                 veto, tested, bad = _abundance_incompatible(
                     counts[ga.group_id], counts[gb.group_id], config,
                     max_bad_frac, min_samples_for_veto)

@@ -861,8 +861,13 @@ def build_window_tables(
     # meant the pipeline shipped a lineage table built by a different algorithm.
     lineage_rows: list[dict] = []
     if config.build_lineages:
-        step1_mm = {frozenset((r["haplotype_a"], r["haplotype_b"]))
-                    for r in within_mismatch_rows if r["haplotype_a"] and r["haplotype_b"]}
+        # Map each flagged pair to the set of timepoints (samples) that flagged it,
+        # so build_lineages can require corroboration before a within-sample mismatch
+        # vetoes a cross-window continuation (config.step1_veto_min_timepoints).
+        step1_mm: dict[frozenset[str], set[str]] = defaultdict(set)
+        for r in within_mismatch_rows:
+            if r["haplotype_a"] and r["haplotype_b"]:
+                step1_mm[frozenset((r["haplotype_a"], r["haplotype_b"]))].add(r["sample"])
         by_contig: dict[str, list] = defaultdict(list)
         for g in groups:
             by_contig[g.contig].append(g)
@@ -873,6 +878,7 @@ def build_window_tables(
             lins, ledges = build_lineages(
                 cgroups, config, markers=markers, step1_mismatches=step1_mm,
                 max_bad_frac=config.lineage_max_bad_frac,
+                min_mismatch_timepoints=config.step1_veto_min_timepoints,
                 lineage_prefix=f"{contig_id_}_LIN")
             lineage_edges.extend(ledges)
             lineage_rows.extend(_lineage_rows(lins, mag_of_contig.get(contig_id_, "")))

@@ -174,6 +174,15 @@ class HaplotyperConfig:
     # The two guard opposite ends of the range; both are required.
     # (FIGURE4 diagnosis §6 #8.)
     max_num_diff: int = 1
+    # A within-sample link mismatch vetoes a cross-window lineage continuation
+    # only when at least this many timepoints INDEPENDENTLY flag the same join.
+    # 1 = the old behaviour (a single timepoint's per-window EM miscall cuts the
+    # link). The per-window EM miscalls ~0.03% of sites, so over a short overlap a
+    # lone 1-SNV error trips the zero-tolerance link gate in exactly one timepoint
+    # and severed strains the POOLED consensus agrees on over ~90 markers. Requiring
+    # corroboration (2) drops those: a genuine strain difference shows in every
+    # timepoint the two strains co-occur, a random EM miscall in only one.
+    step1_veto_min_timepoints: int = 2
     # Minimum physical overlap between two entities, below which the verdict is an
     # explicit NON-MERGE rather than "unknown" (Strainy's I = 1000).
     min_entity_overlap_bp: int = 1000
@@ -270,8 +279,18 @@ class HaplotyperConfig:
 
     # =========== WINDOW LINKING PARAMETERS ===========
     # Haplotypes in adjacent overlapping windows are linked if their
-    # consensus agrees on shared SNVs (Hamming distance <= max_link_distance)
-    max_link_distance: float = 0.01  # Max mismatch fraction to link
+    # consensus agrees on shared SNVs (Hamming distance <= max_link_distance).
+    # 0.02 (2%): the per-window EM miscalls ~0.03%/site, so over a short window
+    # overlap (~50 markers) a lone 1-SNV error is ~2%. At the old 0.01 that lone
+    # error was a hard mismatch and severed same-strain tracks; the within-sample
+    # link check is a rate gate now (its absolute cap is off, see max_link_num_diff)
+    # so it tolerates a couple of expected miscalls without merging cross-strain
+    # pairs, which disagree at ~50% of markers.
+    max_link_distance: float = 0.02  # Max mismatch fraction to link
+    # The absolute mismatch cap for the WITHIN-SAMPLE link gate only. Effectively off
+    # (rate-gate only) so a single EM-miscall SNV over a short overlap is not a hard
+    # mismatch. The cross-strain lineage gate keeps its own cap (config.max_num_diff).
+    max_link_num_diff: int = 1_000_000
     # Window-level shared SNV POSITIONS (does the window pair even have common sites).
     min_shared_snvs_for_link: int = 3
     # Haplotype-level shared ACTUAL CALLS. Previously the same knob as the line above,
@@ -3494,6 +3513,7 @@ def compare_consensus(
     region: tuple[int, int] | None = None,
     min_cospan_frac: float | None = None,
     max_rate: float | None = None,
+    max_num_diff: int | None = None,
     allow_fallback: bool = True,
     a_span: tuple[int, int] | None = None,
     b_span: tuple[int, int] | None = None,
@@ -3527,6 +3547,8 @@ def compare_consensus(
         min_cospan_frac = config.min_cosupported_span_frac
     if max_rate is None:
         max_rate = config.lineage_merge_distance
+    if max_num_diff is None:
+        max_num_diff = config.max_num_diff
 
     def _restrict(positions):
         if region is None:
@@ -3585,7 +3607,7 @@ def compare_consensus(
 
     n_diff = sum(1 for p in shared if a[p] != b[p])
     rate = n_diff / n_shared
-    if n_diff > config.max_num_diff or rate > max_rate:
+    if n_diff > max_num_diff or rate > max_rate:
         return GateResult(False, "failed_mismatch", rate, n_shared, n_diff, used_fallback)
     return GateResult(True, "linked", rate, n_shared, n_diff, used_fallback)
 
@@ -3741,6 +3763,7 @@ def link_windows(
                         min_shared=config.min_shared_calls_for_link,
                         region=region,
                         max_rate=config.max_link_distance,
+                        max_num_diff=config.max_link_num_diff,
                         a_span=span_i[hi],
                         b_span=span_j[hj],
                     )
