@@ -25,6 +25,7 @@ Date: 2025
 
 from __future__ import annotations
 
+import bisect
 import logging
 import os
 import warnings
@@ -226,6 +227,14 @@ class HaplotyperConfig:
     # footprint - no span gating, nothing to expand, no imputation gap.
     lineage_merge_distance: float = 0.01  # Max mismatch rate to group
     min_shared_for_lineage: int = 3  # Min shared markers (raised 2 -> 3 to match linking)
+    # Fraction of testable samples allowed to disagree on abundance before the
+    # abundance ELIMINATOR vetoes a cross-window continuation. 0.0 = zero
+    # tolerance (any one incompatible sample vetoes), which on real divergent
+    # data breaks clean (n_diff=0) same-strain links on noisy per-window
+    # abundance estimates. Exposed so it can be relaxed; the veto still only
+    # sees pairs that already PASSED the consensus gate, so relaxing it cannot
+    # merge consensus-divergent strains.
+    lineage_max_bad_frac: float = 0.0
     # Identity shape. This decision is still OPEN (FIGURE4 diagnosis §6 #9); both are
     # implemented so they can be compared on identical inputs.
     #   "clique"     - complete linkage: a group is a clique, every member passes the
@@ -865,6 +874,139 @@ def _log_prob_read_junk(
         log_prob += log_ref[q] if read.alleles[pos] == ref_base else log_alt[q]
     return float(log_prob)
 
+def _em_read_tensors(reads, support, ref_alleles, p_div, default_q, cache):
+    """Build the E-step tensors that are CONSTANT across EM iterations.
+
+    The reads, their support sites and their qualities do not change during EM -
+    only the haplotype consensuses do (M-step) - so encoding the reads to an
+    integer allele matrix, precomputing the per-(read, site) log_match/log_mismatch
+    at each read's quality, and computing the junk log-likelihood (which depends
+    only on the reads and the reference) are all done ONCE here. This is the
+    vectorised replacement for the per-(read, hap) Python loop over
+    ``_log_prob_read_hap`` / ``_log_prob_read_junk`` that dominated EM runtime;
+    it is numerically identical to summing those calls (float order aside).
+
+    Returns ``(site_idx, alleles, read_code, sup_mask, lm, lmm, logl_junk)`` where
+    ``alleles`` is the shared string->int encoder (a dict, extended in place when
+    haplotype consensuses are encoded per iteration) so read/hap/ref alleles all
+    compare as integers.
+    """
+    sites = sorted({p for sup in support for p in sup})
+    site_idx = {p: s for s, p in enumerate(sites)}
+    n_reads, n_sites = len(reads), len(sites)
+    max_q = len(cache._log_match) - 1
+
+    alleles: dict[str, int] = {}
+
+    def code(a: str) -> int:
+        c = alleles.get(a)
+        if c is None:
+            c = len(alleles)
+            alleles[a] = c
+        return c
+
+    read_code = np.full((n_reads, n_sites), -1, dtype=np.int32)
+    read_q = np.zeros((n_reads, n_sites), dtype=np.int32)
+    for i, r in enumerate(reads):
+        r_alleles, r_quals = r.alleles, r.quals
+        for p in support[i]:
+            s = site_idx[p]
+            read_code[i, s] = code(r_alleles[p])
+            read_q[i, s] = min(r_quals.get(p, default_q), max_q)
+
+    sup_mask = read_code >= 0
+    lm = cache._log_match[read_q]        # (n_reads, n_sites) log P(match) at each q
+    lmm = cache._log_mismatch[read_q]    # (n_reads, n_sites) log P(mismatch)
+
+    # Junk component: constant across iterations. A site with no reference allele,
+    # or an SV placeholder, takes the missing-data term (see _log_prob_read_junk).
+    log_ref, log_alt = cache.junk_tables(p_div)
+    ref_code = np.full(n_sites, -1, dtype=np.int32)
+    for p, base in ref_alleles.items():
+        s = site_idx.get(p)
+        if s is not None and base != _SV_PLACEHOLDER_REF:
+            ref_code[s] = code(base)
+    ref_present = ref_code >= 0
+    jr = log_ref[read_q]
+    ja = log_alt[read_q]
+    junk_contrib = np.where(
+        ref_present[None, :],
+        np.where(read_code == ref_code[None, :], jr, ja),
+        _LOG_MISSING_SITE,
+    )
+    logl_junk = np.where(sup_mask, junk_contrib, 0.0).sum(axis=1)
+
+    return site_idx, alleles, code, read_code, sup_mask, lm, lmm, logl_junk
+
+
+def _em_logl_hap(haplotypes, site_idx, code, read_code, sup_mask, lm, lmm):
+    """Vectorised ``log P(read | hap)`` matrix, one column per haplotype.
+
+    Identical to calling ``_log_prob_read_hap`` for every (read, hap): a support
+    site the consensus does not reach costs ``_LOG_MISSING_SITE``; a covered site
+    is log_match/log_mismatch at the read's quality; a read with zero shared
+    covered sites gets ``-inf`` (must not compete), matching the ``None`` return.
+    ``code`` extends the shared encoder with any hap-only alleles (no read carries
+    them, so they can only mismatch - the correct outcome).
+    """
+    n_reads, n_sites = read_code.shape
+    n_haps = len(haplotypes)
+    logl = np.full((n_reads, n_haps), -np.inf)
+    for k, hap in enumerate(haplotypes):
+        hc = np.full(n_sites, -1, dtype=np.int32)
+        for p, base in hap.consensus.items():
+            s = site_idx.get(p)
+            if s is not None:
+                hc[s] = code(base)
+        present = hc >= 0
+        contrib = np.where(
+            present[None, :],
+            np.where(read_code == hc[None, :], lm, lmm),
+            _LOG_MISSING_SITE,
+        )
+        total = np.where(sup_mask, contrib, 0.0).sum(axis=1)
+        overlap = (sup_mask & present[None, :]).sum(axis=1)
+        logl[:, k] = np.where(overlap > 0, total, -np.inf)
+    return logl
+
+
+def _em_hap_consensus(gamma_k, read_code, sup_mask, lo, lmm, n_alleles,
+                      sites, dec, snv_pos, min_gamma):
+    """Vectorised weighted-vote consensus for one haplotype (M-step).
+
+    Identical to the per-read voting loop: each read with ``gamma >= min_gamma``
+    contributes, at each of its support sites, ``gamma * log_odds(q)`` toward the
+    allele it calls and ``gamma * log_mismatch(q)`` to the position's mismatch
+    floor; an allele is taken only where ``floor + its vote`` beats calling
+    nothing (``cover * _LOG_MISSING_SITE``). Reuses the read x site tensors built
+    once by :func:`_em_read_tensors`. Returns the consensus dict, or ``None`` if no
+    read voted (the "if not allele_votes: continue" case).
+    """
+    w = np.where(gamma_k >= min_gamma, gamma_k, 0.0)
+    ew = w[:, None] * sup_mask                # effective weight per (read, site)
+    if not ew.any():
+        return None
+    cover = ew.sum(axis=0)                    # (n_sites,)
+    floor = (ew * lmm).sum(axis=0)            # (n_sites,)
+    contrib = ew * lo                         # (n_reads, n_sites) vote weight
+    n_sites = read_code.shape[1]
+    votes = np.full((n_sites, n_alleles), -np.inf)
+    for a in range(n_alleles):
+        m = read_code == a
+        if not m.any():
+            continue
+        col = np.where(m, contrib, 0.0).sum(axis=0)
+        votes[(m & sup_mask).any(axis=0), a] = col[(m & sup_mask).any(axis=0)]
+    best = votes.argmax(axis=1)
+    best_val = votes[np.arange(n_sites), best]
+    keep = np.isfinite(best_val) & (floor + best_val > cover * _LOG_MISSING_SITE)
+    return {
+        sites[s]: dec[int(best[s])]
+        for s in np.nonzero(keep)[0]
+        if sites[s] in snv_pos
+    }
+
+
 # Padding (bp) around an SV breakpoint anchor when deciding whether a read's
 # reference span brackets it. Absorbs Sniffles breakpoint imprecision
 # (CIPOS/CIEND) and soft-clip edges. See strainphase.sv_encoding.
@@ -1414,8 +1556,13 @@ def iter_windows_lazy(
         # trailing windows and contigs shorter than window_size) are kept
         # and filtered downstream by min_snvs_per_window / min_reads_per_window.
 
-        # Collect SNVs in this window
-        window_snvs = [p for p in snv_pos_sorted if start <= p < end]
+        # Collect SNVs in this window. snv_pos_sorted is sorted, so bisect the
+        # [start, end) slice instead of scanning all ~N variants per window - the
+        # linear scan was O(windows * total_variants) (~12M comparisons on a 5 Mb
+        # contig with 24k sites) and dominated this function's self-time.
+        lo = bisect.bisect_left(snv_pos_sorted, start)
+        hi = bisect.bisect_left(snv_pos_sorted, end)
+        window_snvs = snv_pos_sorted[lo:hi]
 
         if len(window_snvs) < config.min_snvs_per_window:
             continue
@@ -1516,26 +1663,57 @@ def iter_windows_lazy(
                     f"Some reads lack quality scores. Using default Q{config.default_base_quality}.",
                 )
 
-            # Extract alleles at SNV positions (matched bases only).
+            # Extract alleles at SNV positions (matched bases only) via a TARGETED
+            # CIGAR walk. get_aligned_pairs() materialises the whole read-length
+            # alignment (~15k tuples on a HiFi read) just to find the handful of SNV
+            # columns in this window; walking the CIGAR once and emitting only at
+            # this read's SNV positions is the IDENTICAL result at O(variants on
+            # read) instead of O(read length) - the dominant cost of iter_windows_lazy.
+            # Verified byte-identical against the get_aligned_pairs form on real data.
+            # Indel/SV sites are excluded here and handled by the CIGAR scan below.
             has_overlap = False
-            for query_pos, ref_pos in aln.get_aligned_pairs(with_seq=False):
-                if query_pos is None or ref_pos is None:
-                    continue
-
-                ref_pos_1based = ref_pos + 1
-                if ref_pos_1based not in snv_set:
-                    continue
-                # Indel and SV sites are handled below (CIGAR scan / support set).
-                if ref_pos_1based in special_site_set:
-                    continue
-
-                base = query_seq[query_pos]
-                qual = query_qual[query_pos] if query_qual else config.default_base_quality
-
-                if qual >= config.min_base_quality:
-                    r.alleles[ref_pos_1based] = base
-                    r.quals[ref_pos_1based] = qual
-                    has_overlap = True
+            # SNV-only targets in this window. window_snvs is sorted (a bisect slice
+            # of snv_pos_sorted; break sites are appended only after this loop), so
+            # the walk can advance through it monotonically.
+            snv_targets = (
+                window_snvs
+                if not special_site_set
+                else [p for p in window_snvs if p not in special_site_set]
+            )
+            n_targets = len(snv_targets)
+            if n_targets:
+                ti = 0
+                ref_cur = aln.reference_start  # 0-based
+                q_cur = 0
+                for op, length in (aln.cigartuples or ()):
+                    if ti >= n_targets:
+                        break
+                    if op in (0, 7, 8):  # M / = / X consume ref and query together
+                        seg_end = ref_cur + length  # 0-based, exclusive
+                        # Targets before this segment fell in a D/N gap (or before the
+                        # read): no query base, no call - exactly what get_aligned_pairs
+                        # yields as (None, ref) for a deleted reference position.
+                        while ti < n_targets and snv_targets[ti] - 1 < ref_cur:
+                            ti += 1
+                        while ti < n_targets and snv_targets[ti] - 1 < seg_end:
+                            pos = snv_targets[ti]
+                            qp = q_cur + (pos - 1 - ref_cur)
+                            qual = (
+                                query_qual[qp] if query_qual else config.default_base_quality
+                            )
+                            if qual >= config.min_base_quality:
+                                r.alleles[pos] = query_seq[qp]
+                                r.quals[pos] = qual
+                                has_overlap = True
+                            ti += 1
+                        ref_cur, q_cur = seg_end, q_cur + length
+                    elif op == 1:  # I consumes query only
+                        q_cur += length
+                    elif op in (2, 3):  # D / N consume ref only
+                        ref_cur += length
+                    elif op == 4:  # S (soft clip) consumes query only
+                        q_cur += length
+                    # H (5) / P (6) consume neither
 
             # Extract alleles at indel sites.
             #
@@ -1919,56 +2097,60 @@ class EMHaplotyper:
         prev_log_like = -np.inf
         converged = False
 
+        # E-STEP tensors that do not change across iterations: the integer read
+        # allele matrix, per-(read, site) match/mismatch log-probs, and the junk
+        # log-likelihood (which depends only on the reads and the reference). Built
+        # once; only logl_hap is recomputed per iteration as consensuses update.
+        # Vectorised replacement for the per-(read, hap) _log_prob_read_hap /
+        # _log_prob_read_junk loop that dominated EM runtime.
+        (
+            _em_site_idx, _em_alleles, _em_code, _em_read_code,
+            _em_sup_mask, _em_lm, _em_lmm, logl_junk,
+        ) = _em_read_tensors(
+            reads,
+            self._support,
+            self.window.ref_alleles,
+            self.config.junk_divergence_rate,
+            self.config.default_base_quality,
+            _LOG_PROB_CACHE,
+        )
+        # Derived, also constant across iterations, for the vectorised M-step vote:
+        # per-(read, site) log_odds = log_match - log_mismatch; a code->allele
+        # decoder and a site-index->position list; the read-allele alphabet size.
+        _em_lo = _em_lm - _em_lmm
+        _em_sites = sorted(_em_site_idx, key=_em_site_idx.get)
+        _em_dec = {c: a for a, c in _em_alleles.items()}
+        _em_n_alleles = (
+            int(_em_read_code.max()) + 1
+            if _em_read_code.size and _em_read_code.max() >= 0
+            else 0
+        )
+        _em_snv_pos = set(self.window.snv_pos)
+
         for iteration in range(self.config.em_max_iter):
-            # E-STEP prep: cache log P(read | haplotype) and log P(read | junk)
-            # so we do not recompute them in multiple places.
-            logl_hap = np.full((n_reads, n_haps), -np.inf)
-            logl_junk = np.zeros(n_reads)
+            # E-STEP prep: log P(read | haplotype) for the current consensuses.
+            # (logl_junk is constant across iterations, computed once above.)
+            logl_hap = _em_logl_hap(
+                haplotypes, _em_site_idx, _em_code, _em_read_code,
+                _em_sup_mask, _em_lm, _em_lmm,
+            )
 
-            default_q = self.config.default_base_quality
-            for i, read in enumerate(reads):
-                support = self._support[i]
-                for k in range(n_haps):
-                    lp = _log_prob_read_hap(
-                        read, haplotypes[k].consensus, support, default_q
-                    )
-                    if lp is not None:
-                        logl_hap[i, k] = lp
-                logl_junk[i] = _log_prob_read_junk(
-                    read,
-                    support,
-                    self.window.ref_alleles,
-                    self.config.junk_divergence_rate,
-                    default_q,
-                )
-
-            # E-STEP: compute responsibilities gamma[i, k] = P(haplotype k | read i).
-            for i in range(n_reads):
-                logp_k = np.full(k_eff, -np.inf)
-
-                for k in range(n_haps):
-                    if logl_hap[i, k] > -np.inf:
-                        logp_k[k] = np.log(pi[k] + 1e-12) + logl_hap[i, k]
-
-                logp_k[junk_idx] = np.log(pi[junk_idx] + 1e-12) + logl_junk[i]
-
-                log_sum = logsumexp(logp_k)
-                if np.isneginf(log_sum):
-                    gamma[i, :] = 0.0
-                    gamma[i, junk_idx] = 1.0
-                else:
-                    gamma[i, :] = np.exp(logp_k - log_sum)
-
-            # Log-likelihood: sum over reads of log(sum_k pi_k * P(read | k)).
-            log_like = 0.0
-            for i in range(n_reads):
-                terms = []
-                for k in range(n_haps):
-                    if logl_hap[i, k] > -np.inf:
-                        terms.append(np.log(pi[k] + 1e-12) + logl_hap[i, k])
-                terms.append(np.log(pi[junk_idx] + 1e-12) + logl_junk[i])
-                if terms:
-                    log_like += logsumexp(np.array(terms))
+            # E-STEP: responsibilities gamma[i,k] and the data log-likelihood, both
+            # from ONE batched logsumexp over the (n_reads x k_eff) log-posterior.
+            # (Was two per-read Python loops each calling scipy logsumexp per read.)
+            log_pi = np.log(pi + 1e-12)
+            logp = np.full((n_reads, k_eff), -np.inf)
+            logp[:, :n_haps] = log_pi[:n_haps][None, :] + logl_hap  # -inf where logl_hap -inf
+            logp[:, junk_idx] = log_pi[junk_idx] + logl_junk
+            log_sum = logsumexp(logp, axis=1)          # (n_reads,)
+            gamma[:] = 0.0
+            good = ~np.isneginf(log_sum)
+            gamma[good] = np.exp(logp[good] - log_sum[good, None])
+            gamma[~good, junk_idx] = 1.0
+            # Junk is always finite, so log_sum is finite for every read; summing all
+            # of it reproduces the per-read logsumexp total (a -inf read would sum to
+            # -inf here too, matching the old loop).
+            log_like = float(log_sum.sum())
 
             # M-STEP: update mixture weights and haplotype consensuses.
             # nk = effective counts per component (with Dirichlet smoothing).
@@ -1983,51 +2165,18 @@ class EMHaplotyper:
                 if nk[k] < self.config.min_hap_eff_weight:
                     continue
 
-                allele_votes = defaultdict(lambda: defaultdict(float))
-                # Per position: the gamma mass reaching it, and the score every candidate
-                # allele starts from (every covering read charged as a mismatch). The two
-                # together are what let a vote be compared against calling nothing.
-                cover_weight: dict[int, float] = defaultdict(float)
-                mismatch_floor: dict[int, float] = defaultdict(float)
-
-                for i, read in enumerate(reads):
-                    w = gamma[i, k]
-                    if w < self.config.min_gamma_for_vote:
-                        continue
-
-                    for pos in self._support[i]:
-                        q = read.quals.get(pos, self.config.default_base_quality)
-                        # The consensus that maximises the expected complete
-                        # log-likelihood weights each vote by gamma * (log P(base | agree)
-                        # - log P(base | disagree)), not by the probability the base is
-                        # correct. The latter spans only [0.99, 1.0] over the admissible
-                        # quality range, which made this a plain majority vote: six Q20
-                        # reads calling G outvoted five Q93 reads calling C, emitting a
-                        # call 39.9 nats worse under this package's own error model.
-                        allele_votes[pos][read.alleles[pos]] += w * self._cache.log_odds(q)
-                        cover_weight[pos] += w
-                        mismatch_floor[pos] += w * self._cache.log_mismatch(q)
-
-                if not allele_votes:
-                    continue
-
-                new_consensus = {}
-                for pos in self.window.snv_pos:
-                    votes = allele_votes.get(pos)
-                    if not votes:
-                        continue
-                    best = max(votes, key=votes.get)
-                    # Calling NOTHING at a position is a real option and sometimes the
-                    # better one: where only a couple of reads reach, no allele need beat
-                    # marginalising over the alphabet for everyone else. Taking the
-                    # majority regardless extended footprints into positions that cost the
-                    # objective more than they earned, which is why the log-likelihood
-                    # could fall between iterations with the haplotype count unchanged.
-                    if (mismatch_floor[pos] + votes[best]
-                            <= cover_weight[pos] * _LOG_MISSING_SITE):
-                        continue
-                    new_consensus[pos] = best
-
+                # Rebuild this haplotype's consensus by gamma-weighted voting. The
+                # objective, quality weighting (gamma * log_odds vote, gamma *
+                # log_mismatch floor) and the call-nothing test are unchanged; the
+                # per-read Python triple loop is replaced by numpy over the read x
+                # site tensors (see _em_hap_consensus). "no vote" -> None, "all
+                # positions failed the floor" -> {} both fall through to `if
+                # new_consensus:` below, exactly as `continue` did.
+                new_consensus = _em_hap_consensus(
+                    gamma[:, k], _em_read_code, _em_sup_mask, _em_lo, _em_lmm,
+                    _em_n_alleles, _em_sites, _em_dec, _em_snv_pos,
+                    self.config.min_gamma_for_vote,
+                )
                 if new_consensus:
                     new_haps.append(Haplotype(consensus=new_consensus))
                     surviving_indices.append(k)
