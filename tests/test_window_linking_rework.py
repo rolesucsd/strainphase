@@ -477,33 +477,38 @@ def test_absence_of_evidence_does_not_block_a_voted_join():
     assert len(lins) == 1, "no shared markers is a measurement hole, not a difference"
 
 
-def test_a_single_step1_mismatch_vetoes_the_join():
-    """One sample whose OWN reads disagree across the boundary refuses the join, however
-    many other samples vote for it. Only failed_mismatch is absolute.
+def test_step1_mismatch_needs_two_timepoints_to_veto():
+    """A within-sample mismatch vetoes a continuation only when >= 2 timepoints
+    corroborate it (config.step1_veto_min_timepoints, default 2). A single
+    timepoint's per-window EM miscall trips the zero-tolerance link gate over a
+    short overlap, but must NOT sever a join the pooled consensus supports; a
+    genuine strain difference shows in every timepoint the strains co-occur.
 
-    The veto set is built from the MEMBERS' OWN ids, which is the only way this can be
-    a test of the veto. Spelled in any other format the lookup never matches and the
-    join goes through - which is what production did for the whole life of the
-    safeguard, and what this fixture hid by giving both groups' t0 members one id.
+    The veto dict is built from the MEMBERS' OWN ids, which is the only way this can
+    be a test of the veto. Spelled in any other format the lookup never matches.
     """
     from strainphase.lineages import build_lineages
     shared = {12000: "A", 15000: "C", 18000: "G"}
     a = _grp("A", 1, [_mem(f"t{i}", dict(shared)) for i in range(4)])
     b = _grp("B", 10001, [_mem(f"t{i}", dict(shared)) for i in range(4)])
 
-    # t0's own reads chained across the boundary and disagreed there.
-    left, right = _hid_of(a, "t0"), _hid_of(b, "t0")
-    assert left != right, "two window groups can never share a member id"
-    veto = {frozenset((left, right))}
+    # ONE timepoint (t0) disagreed across the boundary -> not corroborated -> no veto.
+    one = {frozenset((_hid_of(a, "t0"), _hid_of(b, "t0"))): {"t0"}}
+    joined, _ = build_lineages([a, b], _lcfg(), step1_mismatches=one)
+    assert len(joined) == 1, "a lone timepoint's mismatch must not veto"
 
-    lins, edges = build_lineages([a, b], _lcfg(), step1_mismatches=veto)
+    # TWO independent timepoints (t0, t1) disagreed -> corroborated -> veto fires.
+    two = {
+        frozenset((_hid_of(a, "t0"), _hid_of(b, "t0"))): {"t0"},
+        frozenset((_hid_of(a, "t1"), _hid_of(b, "t1"))): {"t1"},
+    }
+    lins, edges = build_lineages([a, b], _lcfg(), step1_mismatches=two)
     assert len(lins) == 2
     assert any(e.reason == "failed_mismatch" for e in edges)
 
-    # ...and the same fixture with nothing vetoed is one lineage, so the split above is
-    # the veto firing rather than the groups failing to be joinable at all.
-    joined, _ = build_lineages([a, b], _lcfg())
-    assert len(joined) == 1
+    # baseline: nothing vetoed is one lineage, so the split above is the veto firing.
+    base, _ = build_lineages([a, b], _lcfg())
+    assert len(base) == 1
 
 
 def test_a_veto_in_a_format_no_member_carries_does_not_silently_pass():

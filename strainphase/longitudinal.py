@@ -47,6 +47,7 @@ from strainphase.core import (
     HaplotyperConfig,
     LongitudinalIntegrator,
     WindowResult,
+    _detach_reads,
     link_windows,
     make_worker_pool,
     process_contig,
@@ -178,48 +179,6 @@ def parse_reference_contigs(
 # -----------------------------------------------------------------------------#
 # Read spilling
 # -----------------------------------------------------------------------------#
-
-
-class _ReadRef:
-    """A read's identity, kept after its alleles have been released.
-
-    ``window.reads`` is emptied as soon as a window's own sample is finished with it (see
-    WindowResult.offload_heavy), but the WindowResults handed back to the caller still
-    have to say WHICH read each gamma row belongs to. That correspondence IS the read
-    partition, and it is the entire output for a caller scoring reads rather than
-    haplotypes. Dropping it returned every window with zero reads against a gamma of
-    50-odd rows, so a partition built from the return value came out empty and the
-    pipeline looked like it had phased nothing.
-
-    Holding the whole Read instead is not an option - two position-keyed dicts, ~90 KB on
-    a variant-dense contig, times every sample resident at once - which is exactly what
-    the offload exists to prevent. The id alone is ~1500x cheaper (48 bytes against the
-    ~70 KB of a 600-marker read) and preserves the row correspondence exactly. Nothing
-    else survives, on purpose: code that reaches for
-    ``.alleles`` here is reading a released read, and an AttributeError naming this class
-    is far better than silently seeing no alleles.
-    """
-
-    __slots__ = ("id",)
-
-    def __init__(self, read_id: str) -> None:
-        self.id = read_id
-
-    def __repr__(self) -> str:  # pragma: no cover - diagnostics only
-        return f"_ReadRef({self.id!r})"
-
-
-def _detach_reads(wr: WindowResult) -> list:
-    """Offload a window's reads, leaving id-only stand-ins in gamma-row order.
-
-    Returns the detached Read objects so the caller can spill them; ``restore_heavy``
-    lays the real ones back over the stand-ins. Idempotent, and order-independent across
-    the several WindowResults that can share one Window after rescue.
-    """
-    refs = [r if isinstance(r, _ReadRef) else _ReadRef(r.id) for r in wr.window.reads]
-    reads = wr.offload_heavy()
-    wr.window.reads = refs
-    return reads
 
 
 class _SpillStore:
@@ -902,8 +861,13 @@ def build_window_tables(
     # meant the pipeline shipped a lineage table built by a different algorithm.
     lineage_rows: list[dict] = []
     if config.build_lineages:
-        step1_mm = {frozenset((r["haplotype_a"], r["haplotype_b"]))
-                    for r in within_mismatch_rows if r["haplotype_a"] and r["haplotype_b"]}
+        # Map each flagged pair to the set of timepoints (samples) that flagged it,
+        # so build_lineages can require corroboration before a within-sample mismatch
+        # vetoes a cross-window continuation (config.step1_veto_min_timepoints).
+        step1_mm: dict[frozenset[str], set[str]] = defaultdict(set)
+        for r in within_mismatch_rows:
+            if r["haplotype_a"] and r["haplotype_b"]:
+                step1_mm[frozenset((r["haplotype_a"], r["haplotype_b"]))].add(r["sample"])
         by_contig: dict[str, list] = defaultdict(list)
         for g in groups:
             by_contig[g.contig].append(g)
@@ -914,6 +878,7 @@ def build_window_tables(
             lins, ledges = build_lineages(
                 cgroups, config, markers=markers, step1_mismatches=step1_mm,
                 max_bad_frac=config.lineage_max_bad_frac,
+                min_mismatch_timepoints=config.step1_veto_min_timepoints,
                 lineage_prefix=f"{contig_id_}_LIN")
             lineage_edges.extend(ledges)
             lineage_rows.extend(_lineage_rows(lins, mag_of_contig.get(contig_id_, "")))

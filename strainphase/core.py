@@ -174,6 +174,15 @@ class HaplotyperConfig:
     # The two guard opposite ends of the range; both are required.
     # (FIGURE4 diagnosis §6 #8.)
     max_num_diff: int = 1
+    # A within-sample link mismatch vetoes a cross-window lineage continuation
+    # only when at least this many timepoints INDEPENDENTLY flag the same join.
+    # 1 = the old behaviour (a single timepoint's per-window EM miscall cuts the
+    # link). The per-window EM miscalls ~0.03% of sites, so over a short overlap a
+    # lone 1-SNV error trips the zero-tolerance link gate in exactly one timepoint
+    # and severed strains the POOLED consensus agrees on over ~90 markers. Requiring
+    # corroboration (2) drops those: a genuine strain difference shows in every
+    # timepoint the two strains co-occur, a random EM miscall in only one.
+    step1_veto_min_timepoints: int = 2
     # Minimum physical overlap between two entities, below which the verdict is an
     # explicit NON-MERGE rather than "unknown" (Strainy's I = 1000).
     min_entity_overlap_bp: int = 1000
@@ -270,8 +279,18 @@ class HaplotyperConfig:
 
     # =========== WINDOW LINKING PARAMETERS ===========
     # Haplotypes in adjacent overlapping windows are linked if their
-    # consensus agrees on shared SNVs (Hamming distance <= max_link_distance)
-    max_link_distance: float = 0.01  # Max mismatch fraction to link
+    # consensus agrees on shared SNVs (Hamming distance <= max_link_distance).
+    # 0.02 (2%): the per-window EM miscalls ~0.03%/site, so over a short window
+    # overlap (~50 markers) a lone 1-SNV error is ~2%. At the old 0.01 that lone
+    # error was a hard mismatch and severed same-strain tracks; the within-sample
+    # link check is a rate gate now (its absolute cap is off, see max_link_num_diff)
+    # so it tolerates a couple of expected miscalls without merging cross-strain
+    # pairs, which disagree at ~50% of markers.
+    max_link_distance: float = 0.02  # Max mismatch fraction to link
+    # The absolute mismatch cap for the WITHIN-SAMPLE link gate only. Effectively off
+    # (rate-gate only) so a single EM-miscall SNV over a short overlap is not a hard
+    # mismatch. The cross-strain lineage gate keeps its own cap (config.max_num_diff).
+    max_link_num_diff: int = 1_000_000
     # Window-level shared SNV POSITIONS (does the window pair even have common sites).
     min_shared_snvs_for_link: int = 3
     # Haplotype-level shared ACTUAL CALLS. Previously the same knob as the line above,
@@ -438,7 +457,7 @@ class Window:
     ref_alleles: dict[int, str] = field(default_factory=dict)  # REF base per SNV (from VCF)
     # Reads overlapping this window (from BAM), in gamma-row order. AFTER a
     # WindowResult offloads its heavy fields these are id-only stand-ins
-    # (longitudinal._ReadRef) rather than Reads: the payload is released but the row
+    # (_ReadRef) rather than Reads: the payload is released but the row
     # order and the read ids survive, so a consumer can still say which read each gamma
     # row belongs to. Anything needing alleles must run before the offload - which
     # everything in this module does.
@@ -631,6 +650,48 @@ class WindowResult:
             )
 
         return True
+
+
+class _ReadRef:
+    """A read's identity, kept after its alleles have been released.
+
+    ``window.reads`` is emptied as soon as a window's own sample is finished with it (see
+    WindowResult.offload_heavy), but the WindowResults handed back to the caller still
+    have to say WHICH read each gamma row belongs to. That correspondence IS the read
+    partition, and it is the entire output for a caller scoring reads rather than
+    haplotypes. Dropping it returned every window with zero reads against a gamma of
+    50-odd rows, so a partition built from the return value came out empty and the
+    pipeline looked like it had phased nothing.
+
+    Holding the whole Read instead is not an option - two position-keyed dicts, ~90 KB on
+    a variant-dense contig, times every sample resident at once - which is exactly what
+    the offload exists to prevent. The id alone is ~1500x cheaper (48 bytes against the
+    ~70 KB of a 600-marker read) and preserves the row correspondence exactly. Nothing
+    else survives, on purpose: code that reaches for
+    ``.alleles`` here is reading a released read, and an AttributeError naming this class
+    is far better than silently seeing no alleles.
+    """
+
+    __slots__ = ("id",)
+
+    def __init__(self, read_id: str) -> None:
+        self.id = read_id
+
+    def __repr__(self) -> str:  # pragma: no cover - diagnostics only
+        return f"_ReadRef({self.id!r})"
+
+
+def _detach_reads(wr: WindowResult) -> list:
+    """Offload a window's reads, leaving id-only stand-ins in gamma-row order.
+
+    Returns the detached Read objects so the caller can spill them; ``restore_heavy``
+    lays the real ones back over the stand-ins. Idempotent, and order-independent across
+    the several WindowResults that can share one Window after rescue.
+    """
+    refs = [r if isinstance(r, _ReadRef) else _ReadRef(r.id) for r in wr.window.reads]
+    reads = wr.offload_heavy()
+    wr.window.reads = refs
+    return reads
 
 
 def _compute_read_mismatch_counts(
@@ -3452,6 +3513,7 @@ def compare_consensus(
     region: tuple[int, int] | None = None,
     min_cospan_frac: float | None = None,
     max_rate: float | None = None,
+    max_num_diff: int | None = None,
     allow_fallback: bool = True,
     a_span: tuple[int, int] | None = None,
     b_span: tuple[int, int] | None = None,
@@ -3485,6 +3547,8 @@ def compare_consensus(
         min_cospan_frac = config.min_cosupported_span_frac
     if max_rate is None:
         max_rate = config.lineage_merge_distance
+    if max_num_diff is None:
+        max_num_diff = config.max_num_diff
 
     def _restrict(positions):
         if region is None:
@@ -3543,7 +3607,7 @@ def compare_consensus(
 
     n_diff = sum(1 for p in shared if a[p] != b[p])
     rate = n_diff / n_shared
-    if n_diff > config.max_num_diff or rate > max_rate:
+    if n_diff > max_num_diff or rate > max_rate:
         return GateResult(False, "failed_mismatch", rate, n_shared, n_diff, used_fallback)
     return GateResult(True, "linked", rate, n_shared, n_diff, used_fallback)
 
@@ -3699,6 +3763,7 @@ def link_windows(
                         min_shared=config.min_shared_calls_for_link,
                         region=region,
                         max_rate=config.max_link_distance,
+                        max_num_diff=config.max_link_num_diff,
                         a_span=span_i[hi],
                         b_span=span_j[hj],
                     )
@@ -3871,6 +3936,7 @@ def process_contig(
     vcf_sample_name: str | None = None,
     pool: Pool | None = None,
     sv_sidecar_path: str | None = None,
+    offload_reads: bool = False,
 ) -> list[WindowResult]:
     """
     Process all windows in a contig and link haplotypes across windows.
@@ -3977,11 +4043,22 @@ def process_contig(
             n_windows += len(batch)
             if active_pool is not None and (len(batch) > 1 or n_windows > 1):
                 chunksize = max(1, len(batch) // n_pool_workers)
-                results.extend(
-                    active_pool.map(_process_window_wrapper, batch, chunksize=chunksize)
+                batch_results = active_pool.map(
+                    _process_window_wrapper, batch, chunksize=chunksize
                 )
             else:
-                results.extend(process_window(w, config) for w in batch)
+                batch_results = [process_window(w, config) for w in batch]
+            # Release each window's read payload (the position-keyed allele/qual dicts,
+            # ~97% of a WindowResult's footprint) as soon as its EM is done, keeping
+            # id-only stand-ins in gamma-row order. Neither link_windows (haplotypes +
+            # gamma only) nor a read-partition consumer needs the alleles again on this
+            # path, so holding every window's reads to the end of the contig is dead
+            # weight. OFF by default: the longitudinal caller manages its own spill and
+            # rescue, which DO re-read alleles, so it must keep them. See _detach_reads.
+            if offload_reads:
+                for wr in batch_results:
+                    _detach_reads(wr)
+            results.extend(batch_results)
             # Drop this batch's Window references before the next one is pulled. The
             # results still hold their own window (rescue needs the reads), but the
             # input list must not pin a second copy.
