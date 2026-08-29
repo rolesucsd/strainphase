@@ -599,6 +599,29 @@ def _write_lineage_edges(edges, output_dir: str) -> None:
                  f"{dict(_C(e.reason for e in edges))}")
 
 
+def _write_read_assignments(rows: list[dict], output_dir: str) -> None:
+    """PROTOTYPE dump: per-window read->haplotype assignments -> tmp/window_read_assignments.tsv.
+
+    Written only when ``config.keep_read_assignments`` is set. One row per assigned read
+    per window: (sample, contig, window_start, window_end, read_id, hap_id, prob, is_junk,
+    is_ambiguous). ``hap_id`` is the same global window-haplotype id as haplotypes.tsv, so
+    a reader spanning two windows appears as two rows sharing ``read_id`` with different
+    ``hap_id`` - the raw material for a read-overlap stitcher.
+    """
+    import csv as _csv
+
+    if not rows:
+        return
+    tmp = os.path.join(output_dir, "tmp")
+    os.makedirs(tmp, exist_ok=True)
+    path = os.path.join(tmp, "window_read_assignments.tsv")
+    with open(path, "w", newline="") as f:
+        w = _csv.DictWriter(f, fieldnames=list(rows[0].keys()), delimiter="\t")
+        w.writeheader()
+        w.writerows(rows)
+    logging.info(f"  window read assignments (temp, prototype): {len(rows)} rows -> {path}")
+
+
 def build_window_tables(
     output_dir: str,
     all_results: dict[str, dict[str, dict[str, list[WindowResult]]]],
@@ -649,6 +672,12 @@ def build_window_tables(
     site_type_all: dict[int, str] = {}
     within_mismatch_rows: list[dict] = []
     mag_of_contig: dict[str, str] = {}
+    # PROTOTYPE (read-anchored threading experiment): per-window read->haplotype
+    # assignments, dumped only when config.keep_read_assignments is set. This is the
+    # one thing no existing table carries and it is what a read-overlap stitcher needs -
+    # which physical read landed in which within-window haplotype, so reads spanning a
+    # window boundary can tie two haplotypes together directly instead of via consensus.
+    read_assignment_rows: list[dict] = []
 
     for mag_name, mag_results in all_results.items():
         for sample_id, contig_results in mag_results.items():
@@ -695,6 +724,26 @@ def build_window_tables(
                     junk_col = wr.gamma.shape[1] - 1
                     n_junk_w = int((wr.gamma[:, junk_col] >= 0.5).sum())
                     nonjunk = n_reads_w - n_junk_w
+
+                    # PROTOTYPE dump: one row per assigned read in this window. hap_id is
+                    # the GLOBAL window-haplotype id (same scheme as haplotypes.tsv), blank
+                    # for junk/ambiguous reads. Only populated when keep_read_assignments.
+                    for a in getattr(wr, "assignments", None) or []:
+                        k = a.get("hap_id")
+                        read_assignment_rows.append({
+                            "sample": sample_id,
+                            "contig": contig_id,
+                            "window_start": wr.window.start,
+                            "window_end": wr.window.end,
+                            "read_id": a.get("read_id"),
+                            "hap_id": (
+                                _window_haplotype_id(sample_id, contig_id, wr.window.start, k)
+                                if k is not None else ""
+                            ),
+                            "prob": round(float(a.get("prob", 0.0)), 4),
+                            "is_junk": int(bool(a.get("is_junk"))),
+                            "is_ambiguous": int(bool(a.get("is_ambiguous"))),
+                        })
 
                     for h_idx, hap in enumerate(wr.haplotypes):
                         # Haplotypes with no CONFIDENT read are emitted too, with reads=0.
@@ -883,6 +932,11 @@ def build_window_tables(
             lineage_edges.extend(ledges)
             lineage_rows.extend(_lineage_rows(lins, mag_of_contig.get(contig_id_, "")))
         _write_lineage_edges(lineage_edges, output_dir)
+
+    # PROTOTYPE: dump per-window read->haplotype assignments for the read-anchored
+    # threading experiment (gated on keep_read_assignments so normal runs pay nothing).
+    if config.keep_read_assignments and read_assignment_rows:
+        _write_read_assignments(read_assignment_rows, output_dir)
 
     across_rows: list[dict] = []
     for g in groups:
