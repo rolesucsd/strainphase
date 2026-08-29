@@ -1,0 +1,24 @@
+# What goes into the source distribution.
+#
+# `[tool.setuptools.packages.find] exclude` controls which packages get INSTALLED
+# (the wheel). It does not control what the sdist contains, and the sdist is what
+# PyPI hosts and what bioconda downloads and rebuilds. Without the prunes below,
+# `python -m build` shipped archive/ and benchmark/ - private working directories
+# that are gitignored precisely because they are not for distribution.
+
+include LICENSE
+include README.md
+recursive-include tests *.py *.txt *.md
+
+# Gitignored working directories. Present in a source tree on disk, never in a
+# release.
+prune archive
+prune benchmark
+prune benchmarks
+prune validation
+prune docs
+
+# Build and tool droppings.
+prune .github
+global-exclude *.py[cod] __pycache__/* .DS_Store
+exclude .pre-commit-config.yaml
