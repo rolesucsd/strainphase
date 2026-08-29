@@ -570,11 +570,18 @@ def build_lineages(
                 # No votes means no read ever chained these two - not a join.
                 votes = link_votes.get((ga.group_id, gb.group_id), 0)
                 e.n_link_votes = votes
-                if votes == 0:
+                if votes == 0 and config.require_link_votes:
                     e.reason = "failed_no_votes"
                     edges.append(e)
                     continue
-                score = -float(votes)   # unique_best_matches takes lower-is-better
+                # Reciprocal-best-match ranking (unique_best_matches: lower is better).
+                # With the vote requirement on (default), score by votes alone. With it
+                # off, vote-less edges must still be rankable, so fall back to consensus
+                # agreement: fewest mismatches, then most shared markers.
+                if config.require_link_votes:
+                    score = -float(votes)
+                else:
+                    score = (-votes, e.n_diff, -e.n_shared)
                 forward.setdefault(ga.group_id, []).append((score, gb.group_id))
                 backward.setdefault(gb.group_id, []).append((score, ga.group_id))
                 pending[(ga.group_id, gb.group_id)] = e

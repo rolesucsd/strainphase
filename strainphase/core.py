@@ -244,6 +244,12 @@ class HaplotyperConfig:
     # sees pairs that already PASSED the consensus gate, so relaxing it cannot
     # merge consensus-divergent strains.
     lineage_max_bad_frac: float = 0.0
+    # Require a step-1 within-sample link vote to chain two window-groups into one
+    # lineage (default). When False, the "votes are the only score" rule is
+    # dropped: a vote-less join is allowed and ranked by consensus agreement
+    # instead (fewest mismatches, then most shared markers). Exposed to test
+    # whether the vote requirement is over-fragmenting consensus-identical joins.
+    require_link_votes: bool = True
     # Identity shape. This decision is still OPEN (FIGURE4 diagnosis §6 #9); both are
     # implemented so they can be compared on identical inputs.
     #   "clique"     - complete linkage: a group is a clique, every member passes the
