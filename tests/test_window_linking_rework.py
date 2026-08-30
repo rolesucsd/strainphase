@@ -9,6 +9,7 @@ coherence test, the QC gate, and the zero-leak fix.
 from __future__ import annotations
 
 from collections import Counter
+from dataclasses import replace
 
 import os
 
@@ -1334,3 +1335,43 @@ def test_link_by_read_overlap_forces_consistent_subsampling():
 
     assert HaplotyperConfig(link_by_read_overlap=True).consistent_read_subsampling is True
     assert HaplotyperConfig().consistent_read_subsampling is False
+
+
+def test_assign_reads_records_best_hap_below_confidence_threshold():
+    """Linking needs the argmax haplotype even when it is not confidently called.
+
+    hap_id is withheld below assign_confidence_threshold, which is correct for
+    CALLING a read's haplotype. Read-overlap threading only asks whether the same
+    molecule sits in both windows, and two strains differing at a couple of markers
+    leave most reads at gamma 0.6-0.89 - so gating on hap_id discarded exactly the
+    evidence that near-identical strains depend on.
+    """
+    import numpy as np
+
+    from strainphase.core import DEFAULT_CONFIG, PostProcessor
+
+    post = PostProcessor.__new__(PostProcessor)
+    post.config = replace(DEFAULT_CONFIG, keep_read_assignments=True,
+                          assign_confidence_threshold=0.90)
+
+    class _R:
+        def __init__(self, rid):
+            self.id = rid
+
+    # read0 confident on hap0, read1 ambiguous between hap0/hap1, read2 junk
+    gamma = np.array([
+        [0.97, 0.02, 0.01],
+        [0.70, 0.28, 0.02],
+        [0.05, 0.05, 0.90],
+    ])
+    out = post.assign_reads([_R("r0"), _R("r1"), _R("r2")], gamma, None)
+    by_id = {a["read_id"]: a for a in out}
+
+    assert by_id["r0"]["hap_id"] == 0 and by_id["r0"]["best_hap"] == 0
+    # the case that matters: no confident call, but the argmax is still recorded
+    assert by_id["r1"]["hap_id"] is None
+    assert by_id["r1"]["is_ambiguous"] is True
+    assert by_id["r1"]["best_hap"] == 0
+    # junk contributes no link
+    assert by_id["r2"]["is_junk"] is True
+    assert by_id["r2"]["best_hap"] is None

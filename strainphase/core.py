@@ -2611,6 +2611,17 @@ class PostProcessor:
                 {
                     "read_id": reads[i].id,
                     "hap_id": hap_id,
+                    # The argmax haplotype REGARDLESS of confidence (None only when
+                    # the read is junk). `hap_id` above is deliberately withheld
+                    # below assign_confidence_threshold, which is right for calling
+                    # a read's haplotype but wrong for LINKING: read-overlap
+                    # threading only needs to know that the same molecule sits in
+                    # both windows, and two strains that differ at a couple of
+                    # markers leave most of their reads at gamma 0.6-0.89 - exactly
+                    # the near-identical case where linking evidence matters most.
+                    # Using hap_id there discarded that evidence and reported it as
+                    # failed_no_read_overlap.
+                    "best_hap": None if is_junk else best_k,
                     "prob": best_prob,
                     "is_junk": is_junk,
                     "is_ambiguous": is_ambiguous,

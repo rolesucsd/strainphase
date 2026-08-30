@@ -731,7 +731,12 @@ def build_window_tables(
                     reads_by_hidx: dict[int, set] = {}
                     if config.link_by_read_overlap:
                         for a in getattr(wr, "assignments", None) or []:
-                            k = a.get("hap_id")
+                            # best_hap, not hap_id: the argmax haplotype even when the
+                            # posterior is below assign_confidence_threshold. Linking
+                            # asks whether the same molecule is in both windows, which
+                            # does not need the read's haplotype called confidently -
+                            # and near-identical strains leave most reads ambiguous.
+                            k = a.get("best_hap", a.get("hap_id"))
                             if k is None:
                                 continue
                             reads_by_hidx.setdefault(int(k), set()).add(a.get("read_id"))
@@ -750,6 +755,11 @@ def build_window_tables(
                             "hap_id": (
                                 _window_haplotype_id(sample_id, contig_id, wr.window.start, k)
                                 if k is not None else ""
+                            ),
+                            "best_hap": (
+                                _window_haplotype_id(sample_id, contig_id, wr.window.start,
+                                                     a["best_hap"])
+                                if a.get("best_hap") is not None else ""
                             ),
                             "prob": round(float(a.get("prob", 0.0)), 4),
                             "is_junk": int(bool(a.get("is_junk"))),
