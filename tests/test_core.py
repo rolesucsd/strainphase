@@ -422,8 +422,8 @@ class TestPostProcessor(unittest.TestCase):
     def setUp(self):
         """Set up test fixtures."""
         self.config = HaplotyperConfig(
-            merge_distance_threshold=0.1,
-            min_shared_for_merge=2
+            identity_distance=0.1,
+            min_shared_markers=2
         )
         self.post = PostProcessor(self.config)
     
@@ -480,9 +480,9 @@ class TestWindowLinking(unittest.TestCase):
         # defaults (20 kb windows, 1 kb minimum overlap), so the physical-span gates
         # are relaxed here. This class tests the LINKING decision, not depth policy.
         self.config = HaplotyperConfig(
-            max_link_distance=0.1,
+            identity_distance=0.1,
             min_shared_snvs_for_link=2,
-            min_shared_calls_for_link=2,
+            min_shared_markers=2,
             min_entity_overlap_bp=0,
             min_cosupported_span_frac=0.0,
         )
@@ -649,7 +649,6 @@ class TestAssignReads(unittest.TestCase):
             [0.02, 0.96, 0.02],
             [0.01, 0.01, 0.98],
         ])
-        pi = np.array([0.45, 0.45, 0.10])
         assignments = self.post.assign_reads(self.reads, gamma)
 
         self.assertEqual(assignments[0]["hap_id"], 0)
@@ -661,7 +660,6 @@ class TestAssignReads(unittest.TestCase):
     def test_junk_assignment(self):
         """Read whose best column is the last (junk) gets is_junk=True."""
         gamma = np.array([[0.05, 0.95]])  # 1 read, 1 hap + junk
-        pi = np.array([0.05, 0.95])
         reads = [Read(id="r0", contig="test", mapq=60, alleles={}, quals={})]
         assignments = self.post.assign_reads(reads, gamma)
 
@@ -675,7 +673,6 @@ class TestAssignReads(unittest.TestCase):
         gamma = np.array([[low_prob, 1.0 - low_prob]])  # best is hap 0, but below threshold
         # Make hap 0 best but below threshold, junk (col 1) lower
         gamma = np.array([[low_prob + 0.01, 1.0 - low_prob - 0.01]])
-        pi = np.array([0.5, 0.5])
         reads = [Read(id="r0", contig="test", mapq=60, alleles={}, quals={})]
         assignments = self.post.assign_reads(reads, gamma)
 

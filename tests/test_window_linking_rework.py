@@ -33,7 +33,7 @@ def cfg(**kw) -> HaplotyperConfig:
     base = {
         "min_entity_overlap_bp": 0,
         "min_cosupported_span_frac": 0.0,
-        "min_shared_for_lineage": 3,
+        "min_shared_markers": 3,
     }
     base.update(kw)
     return HaplotyperConfig(**base)
@@ -426,7 +426,7 @@ def _hid_of(group, sample, idx=0):
 
 
 def _lcfg(**kw):
-    base = {"window_size": 20000, "min_shared_for_lineage": 3,
+    base = {"window_size": 20000, "min_shared_markers": 3,
             "min_entity_overlap_bp": 0, "min_cosupported_span_frac": 0.0}
     base.update(kw)
     return HaplotyperConfig(**base)
@@ -864,7 +864,7 @@ def test_lineage_output_is_the_same_whatever_order_the_samples_were_given():
 def test_step2_clusters_at_the_threshold_the_gate_used():
     """REGRESSION (R1-13): --lineage-merge-distance must reach the clustering.
 
-    The gate ran at `config.lineage_merge_distance` while `fcluster` was pinned to a
+    The gate ran at `config.identity_distance` while `fcluster` was pinned to a
     hard-coded 0.01, so raising the knob admitted pairs the gate called `linked` and
     then split them anyway - steps 2 and 3 running at two different identities, and a
     parameter sweep over the knob measuring nothing.
@@ -879,7 +879,7 @@ def test_step2_clusters_at_the_threshold_the_gate_used():
     def group(distance):
         return group_window_across_samples(
             haps, markers,
-            cfg(cross_sample_method="clique", lineage_merge_distance=distance),
+            cfg(cross_sample_method="clique", identity_distance=distance),
         )[0]
 
     assert len(group(0.015)) == 2, "0.02 is above a 0.015 threshold - the gate refuses"
@@ -1436,7 +1436,7 @@ def test_evidence_gate_blocks_a_join_with_too_few_markers():
     from strainphase.core import HaplotyperConfig
     from strainphase.lineages import build_lineages
 
-    thin = {5000: "A"}          # one marker, below min_shared_for_lineage
+    thin = {5000: "A"}          # one marker, below min_shared_markers
     groups = [
         _ro_group("g_P", 0, [_ro_hap("S1", 0, "hP", {"r1", "r2", "r3"}, consensus=thin)]),
         _ro_group("g_Q", 5000, [_ro_hap("S1", 5000, "hQ", {"r1", "r2", "r3"}, consensus=thin)]),

@@ -1137,20 +1137,6 @@ def main():
 
     # Identity gates (shared across the three linking levels)
     parser.add_argument(
-        "--lineage-merge-distance",
-        type=float,
-        default=0.01,
-        help="Max mismatch RATE to group haplotypes (default: 0.01 = 1%%). "
-        "--max-num-diff caps its reach: a pair still needs that many differences or "
-        "fewer.",
-    )
-    parser.add_argument(
-        "--min-shared-for-lineage",
-        type=int,
-        default=3,
-        help="Min shared identity markers to compare two haplotypes across samples",
-    )
-    parser.add_argument(
         "--min-cosupported-span-frac",
         type=float,
         default=0.25,
@@ -1218,6 +1204,24 @@ def main():
         default=2,
         help="Timepoints that must flag a within-sample mismatch before it vetoes a "
         "cross-window continuation.",
+    )
+    parser.add_argument(
+        "--identity-distance",
+        type=float,
+        default=0.02,
+        help="Max mismatch RATE at which two consensuses are one entity. ONE knob for "
+             "every consensus-vs-consensus comparison: the post-EM merge inside a "
+             "window, step 1's link across adjacent windows, and steps 2/3 across "
+             "samples and along the genome. Read-level thresholds (--max-mismatch-frac, "
+             "--rescue-match-distance) are separate on purpose - a read carries "
+             "sequencing error a consensus has already averaged out.",
+    )
+    parser.add_argument(
+        "--min-shared-markers",
+        type=int,
+        default=3,
+        help="Shared markers required before that rate means anything. Same scope as "
+             "--identity-distance.",
     )
     parser.add_argument(
         "--cross-sample-method",
@@ -1298,8 +1302,6 @@ def main():
         min_reads_per_window=args.min_reads_per_window,
         min_reads_for_rescue=args.min_reads_for_rescue,
         # Identity gates
-        lineage_merge_distance=args.lineage_merge_distance,
-        min_shared_for_lineage=args.min_shared_for_lineage,
         min_cosupported_span_frac=args.min_cosupported_span_frac,
         min_entity_overlap_bp=args.min_entity_overlap_bp,
         min_read_window_overlap_bp=args.min_read_window_overlap_bp,

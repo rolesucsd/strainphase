@@ -171,10 +171,8 @@ def cmd_longitudinal(args: argparse.Namespace) -> int:
         min_entity_overlap_bp=args.min_entity_overlap_bp,
         min_cosupported_span_frac=args.min_cosupported_span_frac,
         min_shared_snvs_for_link=args.min_shared_snvs_for_link,
-        min_shared_calls_for_link=args.min_shared_calls_for_link,
-        max_link_distance=args.max_link_distance,
-        lineage_merge_distance=args.lineage_merge_distance,
-        min_shared_for_lineage=args.min_shared_for_lineage,
+        identity_distance=args.identity_distance,
+        min_shared_markers=args.min_shared_markers,
         cross_sample_method=args.cross_sample_method,
         random_seed=args.seed,
         min_shared_reads_for_link=args.min_shared_reads_for_link,
@@ -407,27 +405,9 @@ Examples:
              "haplotypes are even compared.",
     )
     long_parser.add_argument(
-        "--min-shared-calls-for-link", type=int, default=3,
-        help="Min shared ACTUAL CALLS between two haplotypes in overlapping windows. "
-             "Separate from --min-shared-snvs-for-link; this is the one that governs "
-             "whether a haplotype can chain across windows.",
-    )
-    long_parser.add_argument(
-        "--max-link-distance", type=float, default=0.01,
-        help="Max mismatch RATE to link two haplotypes across adjacent windows.",
-    )
-    long_parser.add_argument(
         "--min-cosupported-span-frac", type=float, default=0.25,
         help="Min co-supported span between two haplotypes as a fraction of their "
              "shared region. 0.25 rejects ~16%% of adjacent-window pairs; 0.50 rejects ~30%%.",
-    )
-    long_parser.add_argument(
-        "--lineage-merge-distance", type=float, default=0.01,
-        help="Max mismatch RATE to group haplotypes across samples.",
-    )
-    long_parser.add_argument(
-        "--min-shared-for-lineage", type=int, default=3,
-        help="Min shared identity markers to compare two haplotypes across samples.",
     )
     # --- step 3 (build_lineages) linking + vetoes -------------------------------
     long_parser.add_argument(
@@ -453,6 +433,20 @@ Examples:
         "--step1-veto-min-timepoints", type=int, default=2,
         help="Distinct timepoints that must flag a within-sample link mismatch before "
              "it vetoes a cross-window lineage continuation.",
+    )
+    long_parser.add_argument(
+        "--identity-distance", type=float, default=0.02,
+        help="Max mismatch RATE at which two consensuses are one entity. ONE knob for "
+             "every consensus-vs-consensus comparison: the post-EM merge inside a "
+             "window, step 1's link across adjacent windows, and steps 2/3 across "
+             "samples and along the genome. Read-level thresholds (--max-mismatch-frac, "
+             "--rescue-match-distance) are separate on purpose - a read carries "
+             "sequencing error a consensus has already averaged out.",
+    )
+    long_parser.add_argument(
+        "--min-shared-markers", type=int, default=3,
+        help="Shared markers required before that rate means anything. Same scope as "
+             "--identity-distance.",
     )
     long_parser.add_argument(
         "--cross-sample-method", choices=["clique", "reciprocal"], default="clique",

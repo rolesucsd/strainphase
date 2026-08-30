@@ -559,7 +559,7 @@ def build_lineages(
                 # overlap and gating on it discards those joins outright.
                 gate = compare_consensus(
                     cons[ga.group_id], cons[gb.group_id], markers,
-                    config, min_shared=config.min_shared_for_lineage, region=region,
+                    config, min_shared=config.min_shared_markers, region=region,
                     min_cospan_frac=0.0,       # the region IS the constraint here
                     allow_fallback=False,      # a veto may not rest on padded evidence
                     a_span=span[ga.group_id], b_span=span[gb.group_id],

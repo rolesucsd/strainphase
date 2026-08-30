@@ -215,12 +215,12 @@ def _labels_clique(
     linkage_matrix = linkage(condensed, method="complete")
     # fcluster is inclusive at t, so nudge below 1.0 to keep explicit non-merges apart.
     # The threshold must come from the CALLER's config, not from DEFAULT_CONFIG: the gate
-    # above already ran at `config.lineage_merge_distance`, and clustering at a different
+    # above already ran at `config.identity_distance`, and clustering at a different
     # value meant a raised --lineage-merge-distance admitted pairs the gate called linked
     # and then split them anyway - steps 2 and 3 running at two different identities.
     # A pair still
     # needs n_diff <= 1, so beyond 1/min_shared the absolute cap binds, not the rate.
-    threshold = min(config.lineage_merge_distance, 0.999)
+    threshold = min(config.identity_distance, 0.999)
     return [int(x) for x in fcluster(linkage_matrix, t=threshold, criterion="distance")]
 
 

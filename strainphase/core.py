@@ -195,9 +195,21 @@ class HaplotyperConfig:
     # =========== JUNK MODEL ===========
     junk_divergence_rate: float = 0.10
 
-    # =========== POST-PROCESSING ===========
-    merge_distance_threshold: float = 0.02
-    min_shared_for_merge: int = 3  # Min shared SNVs with actual calls to consider merging
+    # ---- HAPLOTYPE IDENTITY: one rate, one marker floor, every stage ----------------
+    # "Are these two consensuses the same entity?" is asked at three places - the post-EM
+    # merge inside a window, step 1's link across adjacent windows, and steps 2/3 across
+    # samples and along the genome - and each used to own a private copy of the same two
+    # thresholds (max_link_distance / lineage_merge_distance / merge_distance_threshold,
+    # and min_shared_calls_for_link / min_shared_for_lineage / min_shared_for_merge).
+    # They agreed only because someone set them equal; nothing enforced it, and steps 1
+    # and 3 drifted apart on exactly this kind of parallel knob. Collapsed 2026-08-30.
+    #
+    # NOT folded in, deliberately: max_mismatch_frac / min_shared_snvs_for_edge compare
+    # READ to READ, and rescue_match_distance / min_shared_for_rescue compare READ to
+    # haplotype. A read carries sequencing error that a consensus has already averaged
+    # out, so those are a different error model and keep their own thresholds.
+    identity_distance: float = 0.02
+    min_shared_markers: int = 3
     assign_confidence_threshold: float = 0.90
 
     # =========== 1-SNP VALIDATION ===========
@@ -214,12 +226,6 @@ class HaplotyperConfig:
     min_shared_for_rescue: int = 3  # Min shared SNVs with actual calls for rescue matching
     rescued_min_weight: float = 0.02
 
-    # =========== CROSS-SAMPLE WINDOW GROUPING ===========
-    # Groups haplotypes at ONE FIXED WINDOW across samples (the "vertical" axis).
-    # Windows are fixed coordinate tiles, so every comparison here has an identical
-    # footprint - no span gating, nothing to expand, no imputation gap.
-    lineage_merge_distance: float = 0.02  # Max mismatch rate to group
-    min_shared_for_lineage: int = 3  # Min shared markers (raised 2 -> 3 to match linking)
     # Fraction of testable samples allowed to disagree on abundance before the
     # abundance ELIMINATOR vetoes a cross-window continuation. 0.0 = zero
     # tolerance (any one incompatible sample vetoes), which on real divergent
@@ -280,21 +286,8 @@ class HaplotyperConfig:
     linking_debug: bool = False  # Record detailed linking diagnostics
     linking_debug_max_records: int = 5000  # Cap to avoid massive files
 
-    # =========== WINDOW LINKING PARAMETERS ===========
-    # Haplotypes in adjacent overlapping windows are linked if their
-    # consensus agrees on shared SNVs (Hamming distance <= max_link_distance).
-    # 0.02 (2%): the per-window EM miscalls ~0.03%/site, so over a short window
-    # overlap (~50 markers) a lone 1-SNV error is ~2%. At the old 0.01 that lone
-    # error was a hard mismatch and severed same-strain tracks; the within-sample
-    # link check is a rate gate (the absolute cap was removed 2026-08-30)
-    # so it tolerates a couple of expected miscalls without merging cross-strain
-    # pairs, which disagree at ~50% of markers.
-    max_link_distance: float = 0.02  # Max mismatch fraction to link
     # Window-level shared SNV POSITIONS (does the window pair even have common sites).
     min_shared_snvs_for_link: int = 3
-    # Haplotype-level shared ACTUAL CALLS. Previously the same knob as the line above,
-    # which meant the two could not be set independently (FIGURE4 diagnosis §6 #8, LEVEL 2).
-    min_shared_calls_for_link: int = 3
     # The two haplotypes' CO-SUPPORTED SPAN inside the shared region, as a fraction of
     # that region. Window geometry itself is not a useful gate (tiles overlap by exactly
     # 50% or exactly 0%, nothing between). Measured on 000089747_1: 25% rejects 16.0% of
@@ -327,9 +320,9 @@ class HaplotyperConfig:
             )
 
         # Merge distance threshold
-        if not (0 <= self.merge_distance_threshold <= 1):
+        if not (0 <= self.identity_distance <= 1):
             raise ValueError(
-                f"merge_distance_threshold must be in [0, 1], got {self.merge_distance_threshold}"
+                f"identity_distance must be in [0, 1], got {self.identity_distance}"
             )
 
         # AF range (optional)
@@ -2422,7 +2415,7 @@ class PostProcessor:
             return haplotypes, gamma, pi
 
         # Precompute max allowed mismatches for early exit when comparing haplotypes.
-        max_mismatches = int(self.config.merge_distance_threshold * len(window.snv_pos)) + 1
+        max_mismatches = int(self.config.identity_distance * len(window.snv_pos)) + 1
 
         used = set()
         new_haplotypes = []
@@ -2445,10 +2438,10 @@ class PostProcessor:
                 )
 
                 # Require minimum shared positions to consider merging
-                if n_shared < self.config.min_shared_for_merge:
+                if n_shared < self.config.min_shared_markers:
                     continue
 
-                if dist <= self.config.merge_distance_threshold:
+                if dist <= self.config.identity_distance:
                     if n_diff == 1:
                         should_merge = self.should_merge_1snp_pair(
                             haplotypes[i], haplotypes[j], i, j, window, gamma, n_timepoints_seen
@@ -3544,7 +3537,7 @@ def compare_consensus(
 
     Gates, in order: the two footprints must overlap by >= ``min_entity_overlap_bp``
     (and >= ``min_cospan_frac`` of ``region``); shared markers >= ``min_shared``;
-    mismatch rate <= ``lineage_merge_distance``.
+    mismatch rate <= ``identity_distance``.
 
     The overlap gate asks only "how much sequence did both haplotypes cover", never
     where the markers within it happen to fall.
@@ -3564,11 +3557,11 @@ def compare_consensus(
     n_shared=1172 it would tolerate 11 - which is where the absolute cap binds.
     """
     if min_shared is None:
-        min_shared = config.min_shared_for_lineage
+        min_shared = config.min_shared_markers
     if min_cospan_frac is None:
         min_cospan_frac = config.min_cosupported_span_frac
     if max_rate is None:
-        max_rate = config.lineage_merge_distance
+        max_rate = config.identity_distance
 
     def _restrict(positions):
         if region is None:
@@ -3755,8 +3748,9 @@ def link_windows(
             )
 
             # Evaluate candidate pairings before linking (avoid cross-links).
-            # Full gate stack: shared markers >= min_shared_calls_for_link, co-supported
-            # span >= 25% of the shared region, num_diff <= 1, rate <= max_link_distance.
+            # Full gate stack: shared markers >= min_shared_markers, co-supported span
+            # >= 25% of the shared region, rate <= identity_distance - the SAME stack
+            # step 3 applies, reading the same two thresholds.
             candidates: list[tuple[int, int, float, int]] = []
 
             # Non-junk read count per window - the denominator the abundance eliminator
@@ -3796,9 +3790,9 @@ def link_windows(
                         hap_j.consensus,
                         markers,
                         config,
-                        min_shared=config.min_shared_calls_for_link,
+                        min_shared=config.min_shared_markers,
                         region=region,
-                        max_rate=config.max_link_distance,
+                        max_rate=config.identity_distance,
                         a_span=span_i[hi],
                         b_span=span_j[hj],
                     )
