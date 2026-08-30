@@ -179,6 +179,7 @@ def cmd_longitudinal(args: argparse.Namespace) -> int:
         random_seed=args.seed,
         min_shared_reads_for_link=args.min_shared_reads_for_link,
         lineage_max_bad_frac=args.lineage_max_bad_frac,
+        transitive_abundance_check=not args.no_transitive_abundance_check,
         step1_veto_min_timepoints=args.step1_veto_min_timepoints,
         spill_results_to_disk=not args.no_spill,
         window_batch_factor=args.window_batch_factor,
@@ -434,6 +435,13 @@ Examples:
         help="Reads that must sit in BOTH groups before --link-by-read-overlap joins "
              "them. Observed overlap on real joins was ~33 reads, so the default 3 is "
              "a floor against coincidence rather than a real gate.",
+    )
+    long_parser.add_argument(
+        "--no-transitive-abundance-check", action="store_true",
+        help="Skip the END-TO-END abundance re-test that cuts a finished lineage where "
+             "it drifts. That test's power grows with chain length, so the longest "
+             "lineages are the most likely to be cut; turn it off to measure how much "
+             "contiguity it is costing.",
     )
     long_parser.add_argument(
         "--lineage-max-bad-frac", type=float, default=0.0,

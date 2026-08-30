@@ -949,6 +949,7 @@ def build_window_tables(
                 cgroups, config, markers=markers, step1_mismatches=step1_mm,
                 max_bad_frac=config.lineage_max_bad_frac,
                 min_mismatch_timepoints=config.step1_veto_min_timepoints,
+                transitive_abundance_check=config.transitive_abundance_check,
                 lineage_prefix=f"{contig_id_}_LIN")
             lineage_edges.extend(ledges)
             lineage_rows.extend(_lineage_rows(lins, mag_of_contig.get(contig_id_, "")))
@@ -1199,6 +1200,12 @@ def main():
         help="Reads that must sit in BOTH groups before --link-by-read-overlap joins them.",
     )
     parser.add_argument(
+        "--no-transitive-abundance-check",
+        action="store_true",
+        help="Skip the end-to-end abundance re-test that cuts a drifting lineage. Its "
+        "power grows with chain length, so it cuts the longest lineages first.",
+    )
+    parser.add_argument(
         "--lineage-max-bad-frac",
         type=float,
         default=0.0,
@@ -1301,6 +1308,7 @@ def main():
         n_workers=max(1, args.workers),
         min_shared_reads_for_link=args.min_shared_reads_for_link,
         lineage_max_bad_frac=args.lineage_max_bad_frac,
+        transitive_abundance_check=not args.no_transitive_abundance_check,
         step1_veto_min_timepoints=args.step1_veto_min_timepoints,
         spill_results_to_disk=not args.no_spill,
         window_batch_factor=args.window_batch_factor,

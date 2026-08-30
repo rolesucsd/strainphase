@@ -1366,3 +1366,33 @@ def test_strict_best_tie_links_nothing():
     lineages, edges = _ro_build_strict(groups)
     assert len(lineages) == 3
     assert {e.reason for e in edges} == {"failed_not_best"}
+
+
+def test_transitive_abundance_check_is_configurable():
+    """It must be switchable: its power grows with chain length, so it cuts the
+    longest lineages first, and that cost has to be measurable."""
+    from strainphase.core import HaplotyperConfig
+
+    assert HaplotyperConfig().transitive_abundance_check is True
+    assert HaplotyperConfig(transitive_abundance_check=False).transitive_abundance_check is False
+
+
+def test_disabling_transitive_check_keeps_a_drifting_chain_whole():
+    """The same chain the check splits stays in one piece when it is off."""
+    from strainphase.core import HaplotyperConfig
+    from strainphase.lineages import build_lineages
+
+    # one sample whose share swings hard from end to end of the chain
+    groups = [
+        _grp("A", 1, [_mem("T1", {12000: "A", 15000: "C"}, reads=58, total=60)]),
+        _grp("B", 10001, [_mem("T1", {22000: "A", 25000: "C"}, reads=30, total=60)]),
+        _grp("C", 20001, [_mem("T1", {32000: "A", 35000: "C"}, reads=2, total=60)]),
+    ]
+    config = HaplotyperConfig(window_size=20000, min_shared_reads_for_link=3)
+
+    split, _ = build_lineages(groups, config, step=10000, max_bad_frac=0.0,
+                              transitive_abundance_check=True)
+    whole, _ = build_lineages(groups, config, step=10000, max_bad_frac=0.0,
+                              transitive_abundance_check=False)
+    assert len(whole) <= len(split)
+    assert max(len(lin.groups) for lin in whole) >= max(len(lin.groups) for lin in split)

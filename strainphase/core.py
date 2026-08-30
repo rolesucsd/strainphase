@@ -231,6 +231,17 @@ class HaplotyperConfig:
     # sees pairs that already PASSED the consensus gate, so relaxing it cannot
     # merge consensus-divergent strains.
     lineage_max_bad_frac: float = 0.25
+    # Re-test each finished lineage END TO END and cut it where it drifts. The pairwise
+    # abundance veto only ever compares ADJACENT groups, so A-B and B-C can both pass
+    # while A and C are never compared; this pools every window of the chain into one
+    # per-sample Fisher test and recurses on the halves.
+    #
+    # CAVEAT (why it is exposed, 2026-08-30): the test's POWER GROWS WITH CHAIN LENGTH.
+    # A 761-window chain can reject "constant share" on fluctuations far smaller than
+    # the ones a short chain would survive, so the longest - i.e. best - lineages are
+    # the most likely to be cut. Measured on div0025_k2, linked components reaching
+    # 2.78 Mb came out of this step at ~1.85 Mb.
+    transitive_abundance_check: bool = True
     # Reads that must sit in BOTH groups before their join is made. A 15 kb read
     # spans ~3 windows at a 10 kb window / 5 kb step, and observed overlaps on real
     # joins were ~33 reads, so 3 is a floor against coincidence, not a real gate.
