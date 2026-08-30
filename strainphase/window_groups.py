@@ -94,6 +94,12 @@ class WindowHaplotype:
     # link_windows entity contains a haplotype from group A at window W and one from group
     # B at W+step, that sample is a vote for joining A and B.
     within_sample_id: str = ""
+    # Ids of the reads confidently assigned to this haplotype, populated only under
+    # config.link_by_read_overlap (which forces keep_read_assignments). Step 3 joins
+    # two window-groups when the same physical reads sit in both - direct evidence
+    # that they continue into each other, and unlike a consensus comparison it does
+    # not have to re-establish identity from a string at every window boundary.
+    read_ids: frozenset = frozenset()
 
 
 @dataclass

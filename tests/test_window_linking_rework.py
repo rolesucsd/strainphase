@@ -1163,3 +1163,126 @@ def test_untestable_abundance_does_not_block_a_join():
     assert all(e.n_samples_tested == 0 for e in edges), \
         "this fixture is only meaningful while the test genuinely cannot run"
     assert not any(e.reason == "failed_abundance" for e in edges)
+
+
+# ---------------------------------------------------------------------------
+# Read-overlap threading (config.link_by_read_overlap)
+#
+# Measured on div0050_k4: the reciprocal-best-match linker terminated 152 chains
+# and HALF of those had a byte-identical partner it refused as failed_not_mutual,
+# 67 of them because that partner preferred an equally identical rival. These
+# tests pin the three behaviours that matter: the over-split is rejoined, the
+# 2% consensus gate still vetoes first, and no read evidence means no join.
+# ---------------------------------------------------------------------------
+
+_OVERLAP_REGION = range(5000, 8000, 50)   # inside the [0,10000]/[5000,15000] overlap
+
+
+def _ro_hap(sample, window, hap_id, read_ids, consensus=None, reads=50):
+    from strainphase.window_groups import WindowHaplotype
+
+    return WindowHaplotype(
+        sample=sample, contig="c1", window_start=window, window_end=window + 10000,
+        haplotype_id=hap_id,
+        consensus=dict(consensus or {p: "A" for p in _OVERLAP_REGION}),
+        reads=reads, total_reads=100, junk_reads=0, abundance=reads / 100,
+        within_sample_id="", read_ids=frozenset(read_ids),
+    )
+
+
+def _ro_group(group_id, window, members):
+    from strainphase.window_groups import WindowGroup
+
+    return WindowGroup(group_id=group_id, contig="c1", window_start=window,
+                       window_end=window + 10000, members=members)
+
+
+def _ro_build(groups, link_by_read_overlap):
+    from strainphase.core import HaplotyperConfig
+    from strainphase.lineages import build_lineages
+
+    config = HaplotyperConfig(
+        window_size=10000, link_by_read_overlap=link_by_read_overlap,
+        require_link_votes=False, min_shared_reads_for_link=3,
+    )
+    lineages, edges = build_lineages(
+        groups, config, step=5000, max_bad_frac=1.0, transitive_abundance_check=False)
+    return lineages, edges
+
+
+def _ro_contested_groups():
+    """One strain over-split into two groups at w=0, both feeding one group at w=5000."""
+    shared = {f"r{i}" for i in range(1, 9)}
+    return [
+        _ro_group("g_A1", 0, [_ro_hap("S1", 0, "hA1", {"r1", "r2", "r3", "r4"})]),
+        _ro_group("g_A2", 0, [_ro_hap("S1", 0, "hA2", {"r5", "r6", "r7", "r8"})]),
+        _ro_group("g_B", 5000, [_ro_hap("S1", 5000, "hB", shared, reads=100)]),
+    ]
+
+
+def test_read_overlap_rejoins_contested_oversplit():
+    """Both halves of an over-split strain are kept; reciprocity orphans them."""
+    lineages, edges = _ro_build(_ro_contested_groups(), True)
+    assert len(lineages) == 1
+    assert len(lineages[0].groups) == 3
+    assert {e.reason for e in edges} == {"linked"}
+    assert all(e.n_shared_reads == 4 for e in edges)
+
+
+def test_reciprocity_orphans_contested_oversplit():
+    """The behaviour being replaced: a tie contributes no edge, so nothing joins."""
+    lineages, edges = _ro_build(_ro_contested_groups(), False)
+    assert len(lineages) == 3
+    assert {e.reason for e in edges} == {"failed_not_mutual"}
+
+
+def test_read_overlap_still_vetoed_by_consensus_mismatch():
+    """Shared reads never override the <=2% gate - the cross-strain wall holds."""
+    divergent = {p: ("A" if i % 2 else "T") for i, p in enumerate(_OVERLAP_REGION)}
+    groups = [
+        _ro_group("g_X", 0, [_ro_hap("S1", 0, "hX", {"r1", "r2", "r3", "r4"})]),
+        _ro_group("g_Y", 5000,
+                  [_ro_hap("S1", 5000, "hY", {"r1", "r2", "r3", "r4"}, consensus=divergent)]),
+    ]
+    lineages, edges = _ro_build(groups, True)
+    assert len(lineages) == 2
+    assert [e.reason for e in edges] == ["failed_mismatch"]
+
+
+def test_read_overlap_requires_read_evidence():
+    """Identical consensus is not enough: no shared reads, no join."""
+    groups = [
+        _ro_group("g_P", 0, [_ro_hap("S1", 0, "hP", {"r1", "r2"})]),
+        _ro_group("g_Q", 5000, [_ro_hap("S1", 5000, "hQ", {"r9", "r10"})]),
+    ]
+    lineages, edges = _ro_build(groups, True)
+    assert len(lineages) == 2
+    assert [e.reason for e in edges] == ["failed_no_read_overlap"]
+
+
+def test_link_by_read_overlap_forces_keep_read_assignments():
+    """The linker reads WindowResult.assignments, so it cannot be a silent no-op."""
+    from strainphase.core import HaplotyperConfig
+
+    assert HaplotyperConfig(link_by_read_overlap=True).keep_read_assignments is True
+    assert HaplotyperConfig().keep_read_assignments is False
+
+
+def test_offload_preserves_read_assignments():
+    """offload_heavy drops reads but must keep the assignments they produced."""
+    from strainphase.core import WindowResult
+
+    wr = WindowResult.__new__(WindowResult)
+    wr.assignments = [{"read_id": "r1", "hap_id": 0}]
+    wr.heavy_offloaded = False
+    wr.gamma = None
+    wr.n_reads_total = wr.n_junk_reads = -1
+
+    class _W:
+        reads = ["read-object"]
+        _pos_sets = None
+    wr.window = _W()
+
+    wr.offload_heavy()
+    assert wr.window.reads == []
+    assert wr.assignments == [{"read_id": "r1", "hap_id": 0}]

@@ -725,6 +725,17 @@ def build_window_tables(
                     n_junk_w = int((wr.gamma[:, junk_col] >= 0.5).sum())
                     nonjunk = n_reads_w - n_junk_w
 
+                    # Read ids per within-window haplotype index, for read-overlap
+                    # threading (step 3). Built once per window and only when that
+                    # linker is on, so a normal run neither builds nor retains it.
+                    reads_by_hidx: dict[int, set] = {}
+                    if config.link_by_read_overlap:
+                        for a in getattr(wr, "assignments", None) or []:
+                            k = a.get("hap_id")
+                            if k is None:
+                                continue
+                            reads_by_hidx.setdefault(int(k), set()).add(a.get("read_id"))
+
                     # PROTOTYPE dump: one row per assigned read in this window. hap_id is
                     # the GLOBAL window-haplotype id (same scheme as haplotypes.tsv), blank
                     # for junk/ambiguous reads. Only populated when keep_read_assignments.
@@ -837,6 +848,7 @@ def build_window_tables(
                                 # single window. It was written to the TSV above but
                                 # never onto the object step 3 actually reads.
                                 within_sample_id=eid,
+                                read_ids=frozenset(reads_by_hidx.get(h_idx, ())),
                             )
                         )
 

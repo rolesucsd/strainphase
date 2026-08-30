@@ -250,6 +250,30 @@ class HaplotyperConfig:
     # instead (fewest mismatches, then most shared markers). Exposed to test
     # whether the vote requirement is over-fragmenting consensus-identical joins.
     require_link_votes: bool = True
+    # --- READ-OVERLAP THREADING (step 3 linker) ---------------------------------
+    # Chain two window-groups when the SAME PHYSICAL READS sit in both, instead of
+    # ranking candidates by consensus identity under a 1-to-1 reciprocal-best-match.
+    #
+    # Measured on div0050_k4 (per-window read->haplotype dump, w10k): read overlap
+    # linked 920 adjacent-window pairs with 100% same-strain and ZERO cross-strain
+    # errors, threading the dominant strain into ONE component spanning the whole
+    # 4.87 Mb contig - where the reciprocal-best linker emitted 93 pieces. Half of
+    # its cut points (76/152 chain terminations) were BYTE-IDENTICAL continuations
+    # (n_diff=0) rejected as `failed_not_mutual`: 67 of them because the single
+    # identical target preferred a rival that matched it equally well ("target
+    # contested"), 8 because the source itself had two identical targets. A strain
+    # that momentarily over-splits into two groups therefore loses one of them
+    # permanently. Read overlap has no such constraint: two groups sharing reads
+    # with one target simply merge, which is the correct answer when the split was
+    # the artifact.
+    #
+    # OFF by default: it needs per-read assignments (forced on below), so the
+    # existing consensus linker stays the shipped behaviour until this is scored.
+    link_by_read_overlap: bool = False
+    # Reads that must sit in BOTH groups before their join is made. A 15 kb read
+    # spans ~3 windows at a 10 kb window / 5 kb step, and observed overlaps on real
+    # joins were ~33 reads, so 3 is a floor against coincidence, not a real gate.
+    min_shared_reads_for_link: int = 3
     # Identity shape. This decision is still OPEN (FIGURE4 diagnosis §6 #9); both are
     # implemented so they can be compared on identical inputs.
     #   "clique"     - complete linkage: a group is a clique, every member passes the
@@ -326,6 +350,14 @@ class HaplotyperConfig:
 
     def __post_init__(self):
         """Validate configuration parameters."""
+        # Read-overlap threading reads WindowResult.assignments, which assign_reads
+        # only populates under keep_read_assignments. Forcing it here means the
+        # linker cannot be switched on into a silent no-op (every join would see
+        # zero shared reads and fail), at the cost of retaining one small dict per
+        # read - ~0.2% of a Read's footprint, which holds two position-keyed dicts.
+        if self.link_by_read_overlap:
+            self.keep_read_assignments = True
+
         # Junk divergence rate
         if not (0 < self.junk_divergence_rate < 0.75):
             raise ValueError(
@@ -605,7 +637,14 @@ class WindowResult:
         reads = self.window.reads
         self.window.reads = []
         self.window._pos_sets = None
-        self.assignments = []
+        # `assignments` is deliberately NOT cleared. It is populated only under
+        # keep_read_assignments, so dropping it here discarded the very thing that
+        # flag exists to produce - the per-window read->haplotype table came back
+        # covering only the windows that happened to escape a spill (16 of 975
+        # windows in one sample, 888 in another). It is also cheap next to what is
+        # being offloaded: one small dict per read against a Read's two
+        # position-keyed dicts (~90 KB for a 15 kb HiFi read). Read-overlap
+        # threading reads it after every sample is phased, so it must survive.
         self.heavy_offloaded = True
         return reads
 

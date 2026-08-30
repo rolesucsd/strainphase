@@ -53,6 +53,17 @@ votes is not a join. Sample count, identity distance and abundance never score.
 **Reciprocal best match, never greedy.** A join is kept only when each side's best partner
 is the other and the best is a strict winner. A tie contributes NO edge.
 
+**ALTERNATIVE: read-overlap threading** (``config.link_by_read_overlap``, off by default).
+Joins two groups when the SAME PHYSICAL READS are assigned in both, replacing the score +
+reciprocity above; every veto still applies. Measured on div0050_k4 (w10k), the rule above
+terminated 152 chains and HALF of those (76) had a byte-identical (``n_diff=0``) partner it
+refused as ``failed_not_mutual`` - 67 because that partner preferred an equally identical
+rival ("target contested"), 8 because the source had two identical partners. Read overlap
+made 920 joins with 100% same-strain and ZERO cross-strain errors, threading the dominant
+strain into ONE component across the whole 4.87 Mb contig where reciprocity emitted 93
+pieces. It is not "more evidence" but DIFFERENT evidence: a shared read is the same
+molecule in both windows, so identity never has to be re-established from a string.
+
 Reciprocity is what bounds the result. Every node has at most one partner in each
 direction, so a component is a PATH; every edge advances exactly one window, so a lineage
 holds exactly ONE group per window and ``|lineage| <= n_windows`` by construction rather
@@ -233,6 +244,7 @@ class LineageEdge:
       ``failed_mismatch``     enough evidence, the alleles genuinely disagree
       ``failed_abundance``    identity passed, but the within-window shares are incompatible
       ``failed_not_mutual``   best match, but not reciprocated (or a tie on either side)
+      ``failed_no_read_overlap``  read-overlap linker only: too few reads sit in both
     """
 
     contig: str
@@ -249,6 +261,8 @@ class LineageEdge:
     # samples whose step-1 (within-sample) chain contains a haplotype from BOTH groups —
     # direct read-level evidence that these two continue into each other
     n_link_votes: int = 0
+    # Reads confidently assigned to a haplotype of BOTH groups (read-overlap linker).
+    n_shared_reads: int = 0
 
 
 def _group_consensus(group: WindowGroup) -> dict[int, str]:
@@ -505,6 +519,14 @@ def build_lineages(
     cons = {g.group_id: _group_consensus(g) for g in groups}
     counts = {g.group_id: _group_counts(g) for g in groups}
     hap_ids = {g.group_id: {m.haplotype_id for m in g.members} for g in groups}
+    # Reads backing each group, keyed by (sample, read_id) because a read id is only
+    # unique within its own sample. Empty unless the read-overlap linker is on.
+    group_reads: dict[str, set] = {}
+    if config.link_by_read_overlap:
+        group_reads = {
+            g.group_id: {(m.sample, r) for m in g.members for r in m.read_ids}
+            for g in groups
+        }
     edges: list[LineageEdge] = []
     graph = nx.Graph()
     graph.add_nodes_from(g.group_id for g in groups)
@@ -563,6 +585,23 @@ def build_lineages(
                 e.n_samples_tested, e.n_samples_incompatible = tested, bad
                 if veto:
                     e.reason = "failed_abundance"
+                    edges.append(e)
+                    continue
+                # READ-OVERLAP THREADING. The same physical reads sitting in both
+                # groups IS the continuation - no ranking, no reciprocity, so a strain
+                # that momentarily split into two groups keeps BOTH halves instead of
+                # orphaning one. Every veto above still applies, so the <=2% consensus
+                # gate remains the wall against merging genuinely different strains;
+                # measured, this linker made 920 joins with zero cross-strain errors.
+                if config.link_by_read_overlap:
+                    shared = len(group_reads.get(ga.group_id, ()) & group_reads.get(gb.group_id, set()))
+                    e.n_shared_reads = shared
+                    e.n_link_votes = link_votes.get((ga.group_id, gb.group_id), 0)
+                    if shared >= config.min_shared_reads_for_link:
+                        e.reason = "linked"
+                        graph.add_edge(ga.group_id, gb.group_id)
+                    else:
+                        e.reason = "failed_no_read_overlap"
                     edges.append(e)
                     continue
                 # SCORE: step-1 link votes and nothing else. Identity has already had its
@@ -632,13 +671,34 @@ def build_lineages(
     # step-2 cannot-link constraints for free (measured: 0 unions refused against 16,412
     # constraints on 000066952_0) - a strain has ONE haplotype at a locus, so two groups
     # of one lineage at one window would mean a contradiction between the two steps.
-    for lin in lineages:
-        per_window = Counter(g.window_start for g in lin.groups)
-        if per_window and max(per_window.values()) > 1:  # pragma: no cover - invariant
-            raise AssertionError(
-                f"{lin.lineage_id} holds {max(per_window.values())} groups at one window; "
-                "reciprocal best match should make this impossible"
+    #
+    # The read-overlap linker deliberately BREAKS this invariant, and that is the point
+    # of it: when one strain over-splits into two groups at a window, both share the
+    # reads of the neighbouring window and both are kept, where reciprocity orphaned one
+    # of them forever (measured: 67 of 152 chain terminations were exactly this). A
+    # lineage may then hold two groups at one window. The cost is that the step-2
+    # cannot-link constraints are no longer satisfied structurally, so the doubled
+    # windows are COUNTED and logged rather than assumed away.
+    if config.link_by_read_overlap:
+        doubled = sum(
+            1
+            for lin in lineages
+            for w, n in Counter(g.window_start for g in lin.groups).items()
+            if n > 1
+        )
+        if doubled:
+            logging.info(
+                f"  read-overlap linker: {doubled} (lineage, window) cells hold >1 group "
+                f"- merged over-splits, expected"
             )
+    else:
+        for lin in lineages:
+            per_window = Counter(g.window_start for g in lin.groups)
+            if per_window and max(per_window.values()) > 1:  # pragma: no cover - invariant
+                raise AssertionError(
+                    f"{lin.lineage_id} holds {max(per_window.values())} groups at one window; "
+                    "reciprocal best match should make this impossible"
+                )
 
     linked = [e for e in edges if e.reason == "linked"]
     reasons = Counter(e.reason for e in edges)
