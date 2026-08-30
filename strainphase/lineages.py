@@ -245,6 +245,8 @@ class LineageEdge:
       ``failed_abundance``    identity passed, but the within-window shares are incompatible
       ``failed_not_mutual``   best match, but not reciprocated (or a tie on either side)
       ``failed_no_read_overlap``  read-overlap linker only: too few reads sit in both
+      ``failed_not_best``     read-overlap + read_link_unique_best: shared enough reads,
+                              but another target of this group shared more (or tied)
     """
 
     contig: str
@@ -597,11 +599,22 @@ def build_lineages(
                     shared = len(group_reads.get(ga.group_id, ()) & group_reads.get(gb.group_id, set()))
                     e.n_shared_reads = shared
                     e.n_link_votes = link_votes.get((ga.group_id, gb.group_id), 0)
-                    if shared >= config.min_shared_reads_for_link:
-                        e.reason = "linked"
-                        graph.add_edge(ga.group_id, gb.group_id)
-                    else:
+                    if shared < config.min_shared_reads_for_link:
                         e.reason = "failed_no_read_overlap"
+                        edges.append(e)
+                        continue
+                    if config.read_link_unique_best:
+                        # Defer: rank this source's targets by shared reads and let
+                        # only a STRICT winner through, resolved after the loop. Only
+                        # `forward` is filled - `backward` stays empty on purpose, so
+                        # nothing here requires reciprocity and two sources may still
+                        # name one target.
+                        forward.setdefault(ga.group_id, []).append(
+                            (-float(shared), gb.group_id))
+                        pending[(ga.group_id, gb.group_id)] = e
+                        continue
+                    e.reason = "linked"
+                    graph.add_edge(ga.group_id, gb.group_id)
                     edges.append(e)
                     continue
                 # SCORE: step-1 link votes and nothing else. Identity has already had its
@@ -626,6 +639,21 @@ def build_lineages(
                 pending[(ga.group_id, gb.group_id)] = e
 
         best_f = unique_best_matches(forward)
+        if config.link_by_read_overlap and config.read_link_unique_best:
+            # FORWARD-strict only. A group continues into its single best target by
+            # shared reads; a tie continues nowhere. Two groups naming the SAME
+            # target both link, which is the over-split merge that motivated this
+            # linker - so this is not reciprocity, it only forbids fan-out.
+            for a, b in best_f.items():
+                e = pending[(a, b)]
+                e.reason = "linked"
+                graph.add_edge(a, b)
+                edges.append(e)
+            for (a, b), e in pending.items():
+                if best_f.get(a) != b:
+                    e.reason = "failed_not_best"
+                    edges.append(e)
+            continue
         best_b = unique_best_matches(backward)
         for a, b in best_f.items():
             e = pending[(a, b)]

@@ -1222,6 +1222,12 @@ def main():
         help="Reads that must sit in BOTH groups before --link-by-read-overlap joins them.",
     )
     parser.add_argument(
+        "--read-link-unique-best",
+        action="store_true",
+        help="With --link-by-read-overlap, keep only a group's STRICTLY best target "
+        "by shared reads (a tie links nothing). Many-to-one is preserved.",
+    )
+    parser.add_argument(
         "--lineage-max-bad-frac",
         type=float,
         default=0.0,
@@ -1332,6 +1338,7 @@ def main():
         keep_read_assignments=args.keep_read_assignments,
         link_by_read_overlap=args.link_by_read_overlap,
         min_shared_reads_for_link=args.min_shared_reads_for_link,
+        read_link_unique_best=args.read_link_unique_best,
         lineage_max_bad_frac=args.lineage_max_bad_frac,
         require_link_votes=not args.no_require_link_votes,
         step1_veto_min_timepoints=args.step1_veto_min_timepoints,

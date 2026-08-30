@@ -1375,3 +1375,60 @@ def test_assign_reads_records_best_hap_below_confidence_threshold():
     # junk contributes no link
     assert by_id["r2"]["is_junk"] is True
     assert by_id["r2"]["best_hap"] is None
+
+
+# --- read_link_unique_best: forward-strict best, many-to-one still allowed -----
+
+
+def _ro_build_strict(groups):
+    from strainphase.core import HaplotyperConfig
+    from strainphase.lineages import build_lineages
+
+    config = HaplotyperConfig(
+        window_size=10000, link_by_read_overlap=True, read_link_unique_best=True,
+        require_link_votes=False, min_shared_reads_for_link=3,
+    )
+    return build_lineages(groups, config, step=5000, max_bad_frac=1.0,
+                          transitive_abundance_check=False)
+
+
+def test_strict_best_still_merges_contested_oversplit():
+    """The over-split fix must survive: two groups may name the SAME target."""
+    lineages, edges = _ro_build_strict(_ro_contested_groups())
+    assert len(lineages) == 1
+    assert len(lineages[0].groups) == 3
+    assert {e.reason for e in edges} == {"linked"}
+
+
+def test_strict_best_blocks_fan_out():
+    """One group may not continue into two targets - that is how one bad join
+    contaminated a whole component (mis-merged reads 3.7% -> 6.3% on a 6-strain
+    0.25%-divergence set)."""
+    reads = {f"r{i}" for i in range(1, 11)}
+    groups = [
+        _ro_group("g_A", 0, [_ro_hap("S1", 0, "hA", reads)]),
+        _ro_group("g_B1", 5000,
+                  [_ro_hap("S1", 5000, "hB1", {"r1", "r2", "r3", "r4", "r5", "r6", "r7"})]),
+        _ro_group("g_B2", 5000, [_ro_hap("S1", 5000, "hB2", {"r8", "r9", "r10"})]),
+    ]
+    lineages, edges = _ro_build_strict(groups)
+    assert len(lineages) == 2                      # B2 is not fused in
+    by_reason = Counter(e.reason for e in edges)
+    assert by_reason["linked"] == 1
+    assert by_reason["failed_not_best"] == 1
+
+    # without the flag the two targets fuse into one lineage
+    fused, _ = _ro_build(groups, True)
+    assert len(fused) == 1
+
+
+def test_strict_best_tie_links_nothing():
+    """A tie continues nowhere, matching `a tie contributes NOTHING` elsewhere."""
+    groups = [
+        _ro_group("g_A", 0, [_ro_hap("S1", 0, "hA", {f"r{i}" for i in range(1, 11)})]),
+        _ro_group("g_B1", 5000, [_ro_hap("S1", 5000, "hB1", {"r1", "r2", "r3", "r4"})]),
+        _ro_group("g_B2", 5000, [_ro_hap("S1", 5000, "hB2", {"r5", "r6", "r7", "r8"})]),
+    ]
+    lineages, edges = _ro_build_strict(groups)
+    assert len(lineages) == 3
+    assert {e.reason for e in edges} == {"failed_not_best"}

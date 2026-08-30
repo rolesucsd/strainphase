@@ -282,6 +282,20 @@ class HaplotyperConfig:
     # spans ~3 windows at a 10 kb window / 5 kb step, and observed overlaps on real
     # joins were ~33 reads, so 3 is a floor against coincidence, not a real gate.
     min_shared_reads_for_link: int = 3
+    # Read-overlap linking, but a group may continue into only its STRICTLY best
+    # target by shared-read count (a tie links nothing). Many-to-one is preserved -
+    # two groups may still name the SAME target, which is the over-split merge this
+    # linker exists for - so this is not a return to reciprocity; it only stops one
+    # group fanning out into several targets at a boundary.
+    #
+    # Measured: on a 6-strain 0.25%-divergence set, plain read-overlap linking left
+    # assigned_fraction UP (0.941 -> 0.943) but nearly doubled the mis-merged share
+    # of discriminating reads (3.7% -> 6.3%). With several strains at 1-5% abundance
+    # the <=2% consensus gate has too few discriminating markers to refuse a bad
+    # pair, and with reciprocity gone nothing else did - one bad join then
+    # contaminates a whole component. Requiring a strict winner restores a second
+    # constraint without reinstating the orphaning.
+    read_link_unique_best: bool = False
     # Identity shape. This decision is still OPEN (FIGURE4 diagnosis §6 #9); both are
     # implemented so they can be compared on identical inputs.
     #   "clique"     - complete linkage: a group is a clique, every member passes the
