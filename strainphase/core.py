@@ -266,7 +266,6 @@ class HaplotyperConfig:
     # =========== LINKING DIAGNOSTICS ===========
     linking_debug: bool = False  # Record detailed linking diagnostics
     linking_debug_max_records: int = 5000  # Cap to avoid massive files
-    max_span_gap_for_lineage: int = 10000  # Max gap between track spans to consider same locus
 
     # =========== WINDOW LINKING PARAMETERS ===========
     # Haplotypes in adjacent overlapping windows are linked if their
@@ -2126,24 +2125,7 @@ class EMHaplotyper:
         self._snv_set = set(window.snv_pos)
         self._support = [_read_support(r, self._snv_set) for r in self.reads]
 
-    def _compute_log_prob_read_hap(self, read: Read, haplotype: Haplotype) -> float | None:
-        """Compute log P(read | haplotype) over this read's fixed support."""
-        return _log_prob_read_hap(
-            read,
-            haplotype.consensus,
-            _read_support(read, self._snv_set),
-            self.config.default_base_quality,
-        )
 
-    def _compute_log_prob_read_junk(self, read: Read) -> float:
-        """Compute log P(read | junk) using the divergent reference model."""
-        return _log_prob_read_junk(
-            read,
-            _read_support(read, self._snv_set),
-            self.window.ref_alleles,
-            self.config.junk_divergence_rate,
-            self.config.default_base_quality,
-        )
 
     def run(self) -> tuple[list[Haplotype], np.ndarray, np.ndarray, float, bool, int]:
         """Run EM with cached log-probability computations."""
