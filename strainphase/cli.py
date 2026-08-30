@@ -180,6 +180,7 @@ def cmd_longitudinal(args: argparse.Namespace) -> int:
         random_seed=args.seed,
         keep_read_assignments=args.keep_read_assignments,
         link_by_read_overlap=args.link_by_read_overlap,
+        consistent_read_subsampling=args.consistent_read_subsampling,
         min_shared_reads_for_link=args.min_shared_reads_for_link,
         read_link_unique_best=args.read_link_unique_best,
         lineage_max_bad_frac=args.lineage_max_bad_frac,
@@ -456,6 +457,14 @@ Examples:
         help="Reads that must sit in BOTH groups before --link-by-read-overlap joins "
              "them. Observed overlap on real joins was ~33 reads, so the default 3 is "
              "a floor against coincidence rather than a real gate.",
+    )
+    long_parser.add_argument(
+        "--consistent-read-subsampling", action="store_true",
+        help="When --max-reads caps a window, keep the reads whose ids hash smallest "
+             "instead of an independent random draw per window, so overlapping windows "
+             "select the SAME reads out of those they share. Required for read-overlap "
+             "linking (which forces it on) and worth setting explicitly on a comparison "
+             "arm that does NOT use that linker, so both arms phase the same reads.",
     )
     long_parser.add_argument(
         "--read-link-unique-best", action="store_true",

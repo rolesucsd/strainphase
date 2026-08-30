@@ -1222,6 +1222,13 @@ def main():
         help="Reads that must sit in BOTH groups before --link-by-read-overlap joins them.",
     )
     parser.add_argument(
+        "--consistent-read-subsampling",
+        action="store_true",
+        help="Cap windows by smallest read-id hash instead of an independent random "
+        "draw, so overlapping windows keep the same shared reads. Forced on by "
+        "--link-by-read-overlap; set it explicitly on a non-linker comparison arm.",
+    )
+    parser.add_argument(
         "--read-link-unique-best",
         action="store_true",
         help="With --link-by-read-overlap, keep only a group's STRICTLY best target "
@@ -1337,6 +1344,7 @@ def main():
         n_workers=max(1, args.workers),
         keep_read_assignments=args.keep_read_assignments,
         link_by_read_overlap=args.link_by_read_overlap,
+        consistent_read_subsampling=args.consistent_read_subsampling,
         min_shared_reads_for_link=args.min_shared_reads_for_link,
         read_link_unique_best=args.read_link_unique_best,
         lineage_max_bad_frac=args.lineage_max_bad_frac,
