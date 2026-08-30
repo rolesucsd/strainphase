@@ -29,6 +29,7 @@ import bisect
 import logging
 import os
 import warnings
+import zlib
 from collections import defaultdict
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
@@ -120,6 +121,13 @@ class HaplotyperConfig:
     default_base_quality: int = 20
     # Cap per window; reads above this are uniformly subsampled with the config seed.
     max_reads_per_window: int = 500
+    # How the cap above picks WHICH reads to keep. False = an independent random draw
+    # per window (historic). True = the reads whose ids hash smallest, so overlapping
+    # windows keep the SAME reads out of the molecules they share - required for
+    # read-overlap linking, which otherwise sees (cap/N)^2 of the shared reads and
+    # reports a sampling artefact as a linking failure. Forced on by
+    # link_by_read_overlap; harmless (and more reproducible) on its own.
+    consistent_read_subsampling: bool = False
     # A read must physically cover at least this many bp of a window to be counted in it.
     # Without this a read overlapping by 1 bp entered n_reads_examined, the junk
     # classification and the abundance denominator identically to one spanning 20 kb.
@@ -357,6 +365,8 @@ class HaplotyperConfig:
         # read - ~0.2% of a Read's footprint, which holds two position-keyed dicts.
         if self.link_by_read_overlap:
             self.keep_read_assignments = True
+            # Without this the linker measures the SUBSAMPLE's overlap, not the reads'.
+            self.consistent_read_subsampling = True
 
         # Junk divergence rate
         if not (0 < self.junk_divergence_rate < 0.75):
@@ -724,6 +734,17 @@ class _ReadRef:
 
     def __repr__(self) -> str:  # pragma: no cover - diagnostics only
         return f"_ReadRef({self.id!r})"
+
+
+def _read_sort_hash(read_id: str, seed: int | None) -> int:
+    """Stable per-read sort key for window-consistent subsampling.
+
+    ``hash()`` is salted per process for str, so it would pick a different subset on
+    every run and break reproducibility; CRC32 over the seeded id is stable across
+    processes, runs and machines. The seed is mixed in so a different ``random_seed``
+    still draws a different (but internally consistent) subset.
+    """
+    return zlib.crc32(f"{seed}:{read_id}".encode())
 
 
 def _detach_reads(wr: WindowResult) -> list:
@@ -1949,8 +1970,25 @@ def iter_windows_lazy(
 
         # Subsample if needed (reproducible)
         if config.max_reads_per_window and len(reads) > config.max_reads_per_window:
-            indices = rng.permutation(len(reads))[: config.max_reads_per_window]
-            reads = [reads[i] for i in indices]
+            if config.consistent_read_subsampling:
+                # CONSISTENT across windows: keep the reads whose id hashes smallest,
+                # so two overlapping windows pick THE SAME reads out of the molecules
+                # they share. An independent draw per window (the branch below) keeps
+                # a shared read in both only with probability (cap/N)^2 - at 20 kb
+                # windows and a 200-read cap over a few thousand reads that leaves
+                # ~2-3 shared reads where the biology has hundreds, which reads as a
+                # linking failure when it is really a sampling artefact. Selecting on
+                # a stable function of the read ID makes the loss LINEAR instead:
+                # a read kept in one window is kept in its neighbour too.
+                reads = [
+                    r for _, _, r in sorted(
+                        (_read_sort_hash(r.id, config.random_seed), i, r)
+                        for i, r in enumerate(reads)
+                    )[: config.max_reads_per_window]
+                ]
+            else:
+                indices = rng.permutation(len(reads))[: config.max_reads_per_window]
+                reads = [reads[i] for i in indices]
 
         # Window CREATION uses the lower rescue floor, so windows in the
         # [min_reads_for_rescue, min_reads_per_window) band still exist and can receive a

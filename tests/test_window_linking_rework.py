@@ -1286,3 +1286,51 @@ def test_offload_preserves_read_assignments():
     wr.offload_heavy()
     assert wr.window.reads == []
     assert wr.assignments == [{"read_id": "r1", "hap_id": 0}]
+
+
+def test_consistent_subsampling_preserves_overlap_between_windows():
+    """The read cap must not destroy the shared reads the linker joins on.
+
+    Adjacent windows overlap by 50%, so they share half their molecules. Drawing an
+    independent random subsample in each keeps a shared read in BOTH only with
+    probability (cap/N)^2, which at a 200-read cap over a few thousand reads leaves
+    ~1-3 shared reads where the biology has hundreds - read-overlap linking then
+    reports a sampling artefact as a linking failure. Selecting on a stable hash of
+    the read id keeps the loss linear.
+    """
+    import numpy as np
+
+    from strainphase.core import _read_sort_hash
+
+    cap, n, seed = 200, 6000, 42
+    rng = np.random.default_rng(0)
+    window_a = [f"read{i}" for i in range(n)]
+    window_b = [f"read{i}" for i in range(n // 2, n // 2 + n)]   # 50% overlap
+
+    independent = len(
+        set(np.array(window_a)[rng.permutation(n)[:cap]])
+        & set(np.array(window_b)[rng.permutation(n)[:cap]])
+    )
+    consistent = len(
+        set(sorted(window_a, key=lambda r: _read_sort_hash(r, seed))[:cap])
+        & set(sorted(window_b, key=lambda r: _read_sort_hash(r, seed))[:cap])
+    )
+    assert independent < 10           # the artefact being fixed
+    assert consistent > cap // 4      # enough shared reads to link on
+    assert consistent > independent * 5
+
+
+def test_read_sort_hash_is_stable_and_seed_dependent():
+    """Must not use hash(): str hashing is salted per process, so the subsample
+    would differ between runs and between workers of the same run."""
+    from strainphase.core import _read_sort_hash
+
+    assert _read_sort_hash("read1", 42) == _read_sort_hash("read1", 42)
+    assert _read_sort_hash("read1", 42) != _read_sort_hash("read1", 7)
+
+
+def test_link_by_read_overlap_forces_consistent_subsampling():
+    from strainphase.core import HaplotyperConfig
+
+    assert HaplotyperConfig(link_by_read_overlap=True).consistent_read_subsampling is True
+    assert HaplotyperConfig().consistent_read_subsampling is False
