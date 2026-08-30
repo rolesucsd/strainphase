@@ -126,6 +126,10 @@ from strainphase.window_groups import WindowGroup
 
 __all__ = ["Lineage", "LineageEdge", "PooledAbundance", "build_lineages"]
 
+# Default for a group with no recorded reads. A bare () would raise TypeError on the
+# set intersection below rather than reporting "no shared reads".
+_NO_READS: frozenset = frozenset()
+
 
 @dataclass
 class PooledAbundance:
@@ -596,7 +600,10 @@ def build_lineages(
                 # gate remains the wall against merging genuinely different strains;
                 # measured, this linker made 920 joins with zero cross-strain errors.
                 if config.link_by_read_overlap:
-                    shared = len(group_reads.get(ga.group_id, ()) & group_reads.get(gb.group_id, set()))
+                    shared = len(
+                        group_reads.get(ga.group_id, _NO_READS)
+                        & group_reads.get(gb.group_id, _NO_READS)
+                    )
                     e.n_shared_reads = shared
                     e.n_link_votes = link_votes.get((ga.group_id, gb.group_id), 0)
                     if shared < config.min_shared_reads_for_link:
