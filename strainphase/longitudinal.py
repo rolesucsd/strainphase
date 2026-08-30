@@ -1196,6 +1196,41 @@ def main():
         "Lower it to cut peak memory on variant-dense contigs; raise it to cut "
         "scheduling overhead.",
     )
+    # Kept in step with strainphase/cli.py's parser - two hand-maintained arg lists
+    # over one HaplotyperConfig.
+    parser.add_argument(
+        "--link-by-read-overlap",
+        action="store_true",
+        help="Chain two window-groups when the SAME PHYSICAL READS are assigned in "
+        "both, instead of a 1-to-1 reciprocal-best-match on consensus identity. "
+        "Every veto still runs first. Forces --keep-read-assignments.",
+    )
+    parser.add_argument(
+        "--min-shared-reads-for-link",
+        type=int,
+        default=3,
+        help="Reads that must sit in BOTH groups before --link-by-read-overlap joins them.",
+    )
+    parser.add_argument(
+        "--lineage-max-bad-frac",
+        type=float,
+        default=0.0,
+        help="Fraction of testable samples whose read shares may disagree before the "
+        "abundance veto refuses a continuation. 0.0 = zero tolerance, 1.0 = disabled.",
+    )
+    parser.add_argument(
+        "--no-require-link-votes",
+        action="store_true",
+        help="Drop the step-1 vote requirement for a join. Moot under "
+        "--link-by-read-overlap.",
+    )
+    parser.add_argument(
+        "--step1-veto-min-timepoints",
+        type=int,
+        default=2,
+        help="Timepoints that must flag a within-sample mismatch before it vetoes a "
+        "cross-window continuation.",
+    )
     parser.add_argument(
         "--cross-sample-method",
         choices=["clique", "reciprocal"],
@@ -1285,6 +1320,11 @@ def main():
         cross_sample_method=args.cross_sample_method,
         n_workers=max(1, args.workers),
         keep_read_assignments=args.keep_read_assignments,
+        link_by_read_overlap=args.link_by_read_overlap,
+        min_shared_reads_for_link=args.min_shared_reads_for_link,
+        lineage_max_bad_frac=args.lineage_max_bad_frac,
+        require_link_votes=not args.no_require_link_votes,
+        step1_veto_min_timepoints=args.step1_veto_min_timepoints,
         spill_results_to_disk=not args.no_spill,
         window_batch_factor=args.window_batch_factor,
     )

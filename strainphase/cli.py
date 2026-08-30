@@ -179,6 +179,11 @@ def cmd_longitudinal(args: argparse.Namespace) -> int:
         cross_sample_method=args.cross_sample_method,
         random_seed=args.seed,
         keep_read_assignments=args.keep_read_assignments,
+        link_by_read_overlap=args.link_by_read_overlap,
+        min_shared_reads_for_link=args.min_shared_reads_for_link,
+        lineage_max_bad_frac=args.lineage_max_bad_frac,
+        require_link_votes=not args.no_require_link_votes,
+        step1_veto_min_timepoints=args.step1_veto_min_timepoints,
         spill_results_to_disk=not args.no_spill,
         window_batch_factor=args.window_batch_factor,
     )
@@ -433,6 +438,40 @@ Examples:
     long_parser.add_argument(
         "--min-shared-for-lineage", type=int, default=3,
         help="Min shared identity markers to compare two haplotypes across samples.",
+    )
+    # --- step 3 (build_lineages) linking + vetoes -------------------------------
+    long_parser.add_argument(
+        "--link-by-read-overlap", action="store_true",
+        help="Chain two window-groups when the SAME PHYSICAL READS are assigned in "
+             "both, instead of ranking candidates by consensus identity under a "
+             "1-to-1 reciprocal-best-match. The reciprocal rule orphans a strain that "
+             "momentarily over-splits (measured: half of all chain terminations were "
+             "byte-identical partners it refused); read overlap keeps both halves. "
+             "Every veto still runs first, so the identity gate remains the wall "
+             "against merging different strains. Forces --keep-read-assignments.",
+    )
+    long_parser.add_argument(
+        "--min-shared-reads-for-link", type=int, default=3,
+        help="Reads that must sit in BOTH groups before --link-by-read-overlap joins "
+             "them. Observed overlap on real joins was ~33 reads, so the default 3 is "
+             "a floor against coincidence rather than a real gate.",
+    )
+    long_parser.add_argument(
+        "--lineage-max-bad-frac", type=float, default=0.0,
+        help="Fraction of testable samples whose per-sample read shares may disagree "
+             "before the abundance veto refuses a lineage continuation. 0.0 is zero "
+             "tolerance; 1.0 disables the veto.",
+    )
+    long_parser.add_argument(
+        "--no-require-link-votes", action="store_true",
+        help="Drop the rule that a step-1 within-sample chain must vote for a join. "
+             "Vote-less joins are then ranked by consensus agreement. Moot under "
+             "--link-by-read-overlap, which decides before the vote check.",
+    )
+    long_parser.add_argument(
+        "--step1-veto-min-timepoints", type=int, default=2,
+        help="Distinct timepoints that must flag a within-sample link mismatch before "
+             "it vetoes a cross-window lineage continuation.",
     )
     long_parser.add_argument(
         "--cross-sample-method", choices=["clique", "reciprocal"], default="clique",
