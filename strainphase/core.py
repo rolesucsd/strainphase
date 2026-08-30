@@ -242,10 +242,15 @@ class HaplotyperConfig:
     # the most likely to be cut. Measured on div0025_k2, linked components reaching
     # 2.78 Mb came out of this step at ~1.85 Mb.
     transitive_abundance_check: bool = True
-    # Reads that must sit in BOTH groups before their join is made. A 15 kb read
-    # spans ~3 windows at a 10 kb window / 5 kb step, and observed overlaps on real
-    # joins were ~33 reads, so 3 is a floor against coincidence, not a real gate.
-    min_shared_reads_for_link: int = 3
+    # Reads that must sit in BOTH groups (or both haplotypes, in step 1) before their
+    # join is made. Lowered 3 -> 1 on 2026-08-30: measured on 5 datasets with exact
+    # truth labels, the threshold dominates every other linking choice - recall by k
+    # was 1:0.96-1.00, 3:0.94-0.98, 5:0.78-0.92, 10:0.38-0.68 - and k=1 buys +1.4 to
+    # +3.0% recall. On the near-clonal sets k=1 is strictly better (0.957 vs 0.943
+    # recall at identical 0.087 cross-strain error). One shared read is weak evidence
+    # on its own, which is why it is not the gate: the identity and evidence gates
+    # above decide admissibility, and this only sets the floor for ranking.
+    min_shared_reads_for_link: int = 1
     # Identity shape. This decision is still OPEN (FIGURE4 diagnosis §6 #9); both are
     # implemented so they can be compared on identical inputs.
     #   "clique"     - complete linkage: a group is a clique, every member passes the
@@ -693,6 +698,9 @@ def _read_sort_hash(read_id: str, seed: int | None) -> int:
     still draws a different (but internally consistent) subset.
     """
     return zlib.crc32(f"{seed}:{read_id}".encode())
+
+
+_EMPTY_READS: frozenset = frozenset()
 
 
 def _detach_reads(wr: WindowResult) -> list:
@@ -3764,6 +3772,22 @@ def link_windows(
 
             n_curr, n_next = _nonjunk(curr_wr), _nonjunk(next_wr)
 
+            # Reads backing each haplotype, for the SHARED-READ ranking below. Same
+            # signal step 3 uses, so the two steps rank candidates identically.
+            # `best_hap` is the argmax regardless of confidence: linking only asks
+            # whether the same molecule is in both windows, and near-identical strains
+            # leave most reads below assign_confidence_threshold.
+            def _hap_reads(wr) -> dict[int, set]:
+                out: dict[int, set] = {}
+                for a in getattr(wr, "assignments", None) or []:
+                    k = a.get("best_hap", a.get("hap_id"))
+                    if k is None:
+                        continue
+                    out.setdefault(int(k), set()).add(a.get("read_id"))
+                return out
+
+            reads_i, reads_j = _hap_reads(curr_wr), _hap_reads(next_wr)
+
             # per-haplotype footprints, clipped to the shared region, hoisted out of the
             # pairwise loop (see consensus_footprint)
             span_i = [consensus_footprint(h.consensus, region) for h in curr_wr.haplotypes]
@@ -3807,7 +3831,16 @@ def link_windows(
                                 "reason": "incompatible_abundance",
                             })
                             continue
-                        candidates.append((hi, hj, gate.rate, gate.n_shared))
+                        # RANK BY SHARED READS (lower is better for unique_best):
+                        # the same score step 3 uses. Consensus has already had its
+                        # say as a veto; where two candidates are byte-identical it
+                        # cannot discriminate, and shared reads can. Falls back to
+                        # the consensus rate when no read assignments are available.
+                        shared_reads = len(
+                            reads_i.get(hi, _EMPTY_READS) & reads_j.get(hj, _EMPTY_READS)
+                        )
+                        score = -float(shared_reads) if (reads_i or reads_j) else gate.rate
+                        candidates.append((hi, hj, score, gate.n_shared))
                     elif gate.reason == "failed_mismatch":
                         curr_wr.link_mismatches.append(
                             {

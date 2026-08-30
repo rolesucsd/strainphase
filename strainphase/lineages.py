@@ -31,44 +31,55 @@ FIGURE4 STRAINPHASE_TROUBLESHOOTING.md - not by loosening the rules here.
 THE RULES
 =========
 
+ONE RULE SET, SHARED WITH STEP 1 (2026-08-30)
+=============================================
+Steps 1 and 3 answer the same question at two scopes - "do these two continue into each
+other?" - and used to answer it with different rules: step 1 linked on consensus identity
+under a reciprocal best match and refused a pair it could not judge, step 3 linked on
+shared reads under a forward-only best match and let an unjudgeable pair through. They now
+run the same stack, in this order:
+
 **Candidacy is PROXIMITY.** Every (group at W, group at W+step) pair is a candidate because
 the windows are adjacent. Nothing has to pass a genotype test to be considered.
 
+**Evidence GATES.** Too few shared markers to judge the pair (``failed_no_evidence``)
+refuses it. This is step 1's rule, adopted here in 2026-08. Measured over 353k candidate
+pairs it costs 0.9% of joins on the divergent panel but blocks 9,470 near-clonal joins
+(99.999% ANI) that rested on ZERO discriminating markers - the population that cost 12-21
+points of read-placement accuracy. A pair we cannot judge is not a pair we may join.
+
 **Identity is a VETO, never the evidence for.** ``failed_mismatch`` refuses the join
-outright - one sample is enough, and it outranks any number of votes. ``failed_no_evidence``
-refuses nothing: 46% of windows carry no discriminating position in the forward overlap, so
-gating on it would discard those joins wholesale. A veto is computed on real markers with
-the clonal fallback DISABLED, because a negative verdict must not rest on positions that
-were incapable of disagreeing.
+outright - one sample is enough. A veto is computed on real markers with the clonal
+fallback DISABLED, because a negative verdict must not rest on positions that were
+incapable of disagreeing.
 
 **Abundance is an ELIMINATOR, not an INDICATOR.** A strain sits at the same frequency in
 every window it occupies, so genuinely disagreeing shares cannot be one unit. But *agreeing*
 is weak evidence in favour - 57% of groups had more than one abundance-compatible partner -
-so it vetoes and never scores.
+so it vetoes and never scores. One tolerance (``lineage_max_bad_frac``) governs both steps;
+within a sample there is one testable unit, so any value below 1.0 behaves identically.
 
+**Shared reads SCORE.** Among admissible candidates, rank by how many physical reads sit in
+both. Identity has already had its say, and where two candidates are byte-identical it
+cannot discriminate - shared reads can. ``min_shared_reads_for_link`` is a floor against
+coincidence, not the gate.
 
-**READ-OVERLAP THREADING is the linker.** Two groups continue into each other when the
-SAME PHYSICAL READS are assigned in both - direct evidence, so identity never has to be
-re-established from a consensus string at an arbitrary window boundary. A group takes
-only its STRICTLY best target by shared-read count (a tie takes none), but many-to-one
-is allowed: two groups may name one target, which is what rejoins a strain that
-momentarily over-split.
+**Reciprocal best match, never greedy.** A join is kept only when each side's best partner
+is the other and the best is a strict winner. A tie contributes NO edge. Measured on 5
+datasets with exact truth, reciprocal had lower cross-strain error than forward-only at
+equal recall everywhere (div0025_k6: 0.0018 vs 0.0034 for -0.2% recall).
 
-The consensus rule this replaced (2026-08-30) ranked candidates by step-1 votes under a
-1-to-1 reciprocal best match. Measured on div0050_k4, it terminated 152 chains and HALF
-of those had a byte-identical (n_diff=0) partner it refused - 67 because that partner
-preferred an equally identical rival, 8 because the source had two. Read overlap made 920
-joins with 100% same-strain and ZERO cross-strain errors, threading the dominant strain
-into ONE component across a whole 4.87 Mb contig where the old rule emitted 93 pieces.
+**A lineage may never fragment a step-1 track.** If two groups hold members of one
+within-sample chain, that sample's own reads already called them one strain, and they are
+unioned even where reciprocity refused the edge - unless the mismatch veto refused it, which
+always wins. This is what makes longitudinal >= single structurally: without it, a sample
+whose step-1 track spanned a whole contig could still be handed a fragmented lineage, and
+because a read is labelled by its lineage, the intact chain was discarded. It is also what
+makes reciprocity affordable: a continuation lost to a tie is recovered wherever any
+sample's own chain crossed that boundary.
 
-A lineage may hold more than one group at a window - that IS the over-split merge - so the
-old one-group-per-window invariant no longer holds and the doubled cells are counted and
-logged instead of asserted away.
-
-The alternative considered and not taken was a vote floor with constrained union-find
-(§5.2 of the troubleshooting doc): it links more (29.1% vs 21.5% multi-window) but produces
-48-group components, needs the constraints actively enforced, and its size bound is
-empirical rather than structural.
+A lineage may therefore hold more than one group at a window, so the old one-group-per-window
+invariant no longer holds; doubled cells are counted and logged instead of asserted away.
 
 ABUNDANCE: POOLED COUNTS, TWO DENOMINATORS
    ``Lineage.abundance_by_sample()`` returns, per sample, Sum(reads) / Sum(denominator)
@@ -537,6 +548,7 @@ def build_lineages(
         span = {g.group_id: consensus_footprint(cons[g.group_id], region)
                 for g in (*left, *right)}
         forward: dict[str, list[tuple[float, str]]] = {}
+        backward: dict[str, list[tuple[float, str]]] = {}
         pending: dict[tuple[str, str], LineageEdge] = {}
 
         for ga in left:
@@ -556,6 +568,17 @@ def build_lineages(
                                 gate.reason, round(gate.rate, 6), gate.n_shared,
                                 gate.n_diff, 0, 0)
                 if gate.reason == "failed_mismatch":
+                    edges.append(e)
+                    continue
+                # EVIDENCE GATE (blocking, 2026-08-30) - the same rule step 1 applies,
+                # where a pair that does not pass the gate is simply not a candidate.
+                # It used to refuse nothing here, which was safe only while a step-1
+                # vote was also required. Measured across 353k candidate pairs: on the
+                # divergent panel this blocks 0.9% of joins, but on near-clonal isolates
+                # (99.999% ANI) it blocks 9,470 joins that rested on ZERO discriminating
+                # markers - the population that drove assigned_correct_fraction down by
+                # 12-21 points. A pair we cannot judge is not a pair we may join.
+                if gate.reason == "failed_no_evidence":
                     edges.append(e)
                     continue
                 # A within-sample mismatch vetoes the join only when >= this many
@@ -603,21 +626,73 @@ def build_lineages(
                     e.reason = "failed_no_read_overlap"
                     edges.append(e)
                     continue
-                # Resolved after the loop: only `forward` is filled, so nothing here
-                # requires reciprocity.
+                # Resolved after the loop, RECIPROCALLY - the same rule step 1 uses.
+                # Measured on 5 datasets with exact truth: reciprocal has lower
+                # cross-strain error than forward-only at equal recall everywhere
+                # (div0025_k6: 0.0018 vs 0.0034 error for -0.2% recall). Forward-only
+                # was adopted because reciprocity orphaned byte-identical joins at the
+                # GROUP level, but that is step 2 over-splitting (3.41 groups for 2
+                # strains), not a defect of reciprocity - and it must be fixed where it
+                # is caused. The track-preserving union below is what now guarantees a
+                # real continuation is never lost to a tie.
                 forward.setdefault(ga.group_id, []).append((-float(shared), gb.group_id))
+                backward.setdefault(gb.group_id, []).append((-float(shared), ga.group_id))
                 pending[(ga.group_id, gb.group_id)] = e
 
         best_f = unique_best_matches(forward)
+        best_b = unique_best_matches(backward)
         for a, b in best_f.items():
             e = pending[(a, b)]
-            e.reason = "linked"
-            graph.add_edge(a, b)
+            if best_b.get(b) == a:
+                e.reason = "linked"
+                graph.add_edge(a, b)
+            else:
+                e.reason = "failed_not_mutual"
             edges.append(e)
         for (a, b), e in pending.items():
             if best_f.get(a) != b:
                 e.reason = "failed_not_best"
                 edges.append(e)
+
+    # ---- TRACK-PRESERVING UNION: a lineage may never fragment a step-1 track ----
+    #
+    # step 1 chained these window-haplotypes inside ONE sample, on that sample's own
+    # reads, through the same gate stack used above. If two groups hold members of the
+    # same track, that sample's reads already say they are one strain, and a lineage
+    # that separates them contradicts evidence step 1 already accepted.
+    #
+    # Without this, longitudinal could be WORSE than single: on div0025_k2 sample T6,
+    # step 1 produced ONE track spanning the whole 4.87 Mb contig while the lineages
+    # built over it came out in 12 pieces capped at 1.85 Mb - and because a read is
+    # labelled by its lineage (the track is only a fallback), the intact chain was
+    # discarded. This makes "longitudinal >= single" structural rather than hoped for.
+    #
+    # It is also what makes reciprocity safe again: a continuation lost to a tie at one
+    # boundary is recovered here whenever any sample's own chain crossed it.
+    track_groups: dict[tuple[str, str], list[str]] = defaultdict(list)
+    for g in groups:
+        for m in g.members:
+            if m.within_sample_id:
+                track_groups[(m.sample, m.within_sample_id)].append(g.group_id)
+    # A track NEVER overrides the mismatch veto. Step 1 chained on one sample's
+    # haplotypes; step 3 compares the POOLED cross-sample group consensus, which can
+    # see a genuine difference that sample could not. Where the two disagree the veto
+    # wins, because it is the one verdict this module treats as absolute.
+    refused = {frozenset((e.group_a, e.group_b))
+               for e in edges if e.reason == "failed_mismatch"}
+    n_track_unions = 0
+    for _key, gids in track_groups.items():
+        uniq = sorted(set(gids))
+        for a, b in zip(uniq, uniq[1:]):
+            if frozenset((a, b)) in refused:
+                continue
+            if not graph.has_edge(a, b):
+                n_track_unions += 1
+            graph.add_edge(a, b)
+    if n_track_unions:
+        logging.info(
+            f"  track-preserving union: {n_track_unions} group pair(s) joined because a "
+            f"step-1 track spans them (lineages cannot fragment a within-sample chain)")
 
     gmap = {g.group_id: g for g in groups}
     # Each component is a chain of pairwise-approved joins. Re-test each one END TO

@@ -1183,16 +1183,6 @@ def _ro_contested_groups():
     ]
 
 
-def test_read_overlap_rejoins_contested_oversplit():
-    """Both halves of an over-split strain are kept; the old reciprocal rule
-    orphaned one of them permanently."""
-    lineages, edges = _ro_build(_ro_contested_groups())
-    assert len(lineages) == 1
-    assert len(lineages[0].groups) == 3
-    assert {e.reason for e in edges} == {"linked"}
-    assert all(e.n_shared_reads == 4 for e in edges)
-
-
 
 def test_read_overlap_still_vetoed_by_consensus_mismatch():
     """Shared reads never override the <=2% gate - the cross-strain wall holds."""
@@ -1329,13 +1319,6 @@ def _ro_build_strict(groups):
     return _ro_build(groups)
 
 
-def test_strict_best_still_merges_contested_oversplit():
-    """The over-split fix must survive: two groups may name the SAME target."""
-    lineages, edges = _ro_build_strict(_ro_contested_groups())
-    assert len(lineages) == 1
-    assert len(lineages[0].groups) == 3
-    assert {e.reason for e in edges} == {"linked"}
-
 
 def test_strict_best_blocks_fan_out():
     """One group may not continue into two targets - that is how one bad join
@@ -1396,3 +1379,70 @@ def test_disabling_transitive_check_keeps_a_drifting_chain_whole():
                               transitive_abundance_check=False)
     assert len(whole) <= len(split)
     assert max(len(lin.groups) for lin in whole) >= max(len(lin.groups) for lin in split)
+
+
+def test_reciprocity_refuses_a_contested_tie():
+    """A contested over-split is a TIE on the target's side, so reciprocity links
+    neither half. This is the cost of matching step 1's resolution rule; the track
+    union below is what recovers it when the evidence exists."""
+    lineages, edges = _ro_build(_ro_contested_groups())
+    assert len(lineages) == 3
+    assert {e.reason for e in edges} == {"failed_not_mutual"}
+
+
+def test_track_union_rejoins_what_a_tie_refused():
+    """A lineage may never fragment a step-1 track: where a within-sample chain
+    crossed the boundary, both halves of the over-split are rejoined even though
+    reciprocity refused the edge."""
+    groups = [
+        _ro_group("g_A1", 0, [_ro_hap("S1", 0, "hA1", {"r1", "r2", "r3", "r4"})]),
+        _ro_group("g_A2", 0, [_ro_hap("S2", 0, "hA2", {"q5", "q6", "q7", "q8"})]),
+        _ro_group("g_B", 5000, [
+            _ro_hap("S1", 5000, "hB1", {f"r{i}" for i in range(1, 9)}),
+            _ro_hap("S2", 5000, "hB2", {f"q{i}" for i in range(5, 9)}),
+        ]),
+    ]
+    # step 1 chained A1->B in S1 and A2->B in S2
+    groups[0].members[0].within_sample_id = "TA"
+    groups[2].members[0].within_sample_id = "TA"
+    groups[1].members[0].within_sample_id = "TB"
+    groups[2].members[1].within_sample_id = "TB"
+
+    lineages, _ = _ro_build(groups)
+    assert len(lineages) == 1
+    assert len(lineages[0].groups) == 3
+
+
+def test_track_union_never_overrides_the_mismatch_veto():
+    """Step 1 saw one sample; step 3 compares the pooled cross-sample consensus and
+    can see a difference that sample could not. The veto wins."""
+    divergent = {p: ("A" if i % 2 else "T") for i, p in enumerate(_OVERLAP_REGION)}
+    groups = [
+        _ro_group("g_X", 0, [_ro_hap("S1", 0, "hX", {"r1", "r2", "r3"})]),
+        _ro_group("g_Y", 5000, [_ro_hap("S1", 5000, "hY", {"r1", "r2", "r3"},
+                                        consensus=divergent)]),
+    ]
+    groups[0].members[0].within_sample_id = "T1"     # same track...
+    groups[1].members[0].within_sample_id = "T1"
+    lineages, edges = _ro_build(groups)
+    assert [e.reason for e in edges] == ["failed_mismatch"]
+    assert len(lineages) == 2                        # ...still not joined
+
+
+def test_evidence_gate_blocks_a_join_with_too_few_markers():
+    """`failed_no_evidence` now refuses, matching step 1: a pair we cannot judge is
+    not a pair we may join. This is what stops near-clonal genomes linking on reads
+    that carry no discriminating position."""
+    from strainphase.core import HaplotyperConfig
+    from strainphase.lineages import build_lineages
+
+    thin = {5000: "A"}          # one marker, below min_shared_for_lineage
+    groups = [
+        _ro_group("g_P", 0, [_ro_hap("S1", 0, "hP", {"r1", "r2", "r3"}, consensus=thin)]),
+        _ro_group("g_Q", 5000, [_ro_hap("S1", 5000, "hQ", {"r1", "r2", "r3"}, consensus=thin)]),
+    ]
+    config = HaplotyperConfig(window_size=10000, min_shared_reads_for_link=1)
+    lineages, edges = build_lineages(groups, config, step=5000, max_bad_frac=1.0,
+                                     transitive_abundance_check=False)
+    assert [e.reason for e in edges] == ["failed_no_evidence"]
+    assert len(lineages) == 2
