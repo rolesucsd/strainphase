@@ -81,9 +81,6 @@ class WarningThrottler:
             warnings.warn(message, stacklevel=2)
             cls._warned.add(key)
 
-    @classmethod
-    def reset(cls):
-        cls._warned.clear()
 
 
 # =============================================================================
@@ -2510,7 +2507,7 @@ class PostProcessor:
 
         return new_haplotypes, new_gamma, new_pi
 
-    def assign_reads(self, reads: list[Read], gamma: np.ndarray, pi: np.ndarray) -> list[dict]:
+    def assign_reads(self, reads: list[Read], gamma: np.ndarray) -> list[dict]:
         """Hard assignment of reads.
 
         Always computed: step-3 read-overlap linking joins window-groups on the reads
@@ -2947,7 +2944,7 @@ class LongitudinalIntegrator:
 
         # Recompute assignments
         post = PostProcessor(self.config)
-        assignments = post.assign_reads(reads, gamma_new, pi_new)
+        assignments = post.assign_reads(reads, gamma_new)
 
         for k, hap in enumerate(haplotypes):
             hap.supporting_reads = int(
@@ -3215,7 +3212,7 @@ def process_window(
             gamma=gamma,
             pi=pi,
             log_likelihood=-np.inf,
-            assignments=post.assign_reads(window.reads, gamma, pi),
+            assignments=post.assign_reads(window.reads, gamma),
             converged=True,
             iterations=0,
             n_reads_examined=n_reads_examined,
@@ -3232,7 +3229,7 @@ def process_window(
         n_reads = len(window.reads)
         gamma = np.ones((n_reads, 1))
         pi = np.array([1.0])
-        assignments = post.assign_reads(window.reads, gamma, pi)
+        assignments = post.assign_reads(window.reads, gamma)
 
         n_reads_examined, reads_within_mismatch_per_hap = _compute_read_mismatch_counts(
             window, [], config.max_mismatch_frac
@@ -3256,7 +3253,7 @@ def process_window(
 
     if not haplotypes:
         # EM pruned all haplotypes; keep the (junk) assignments.
-        assignments = post.assign_reads(window.reads, gamma, pi)
+        assignments = post.assign_reads(window.reads, gamma)
         n_reads_examined, reads_within_mismatch_per_hap = _compute_read_mismatch_counts(
             window, [], config.max_mismatch_frac
         )
@@ -3298,7 +3295,7 @@ def process_window(
     #     Construction keeps everything; nothing is destroyed before the scope is known.
     #     (FIGURE4 diagnosis §2.6a.)
 
-    assignments = post.assign_reads(window.reads, final_gamma, final_pi)
+    assignments = post.assign_reads(window.reads, final_gamma)
 
     n_reads_examined, reads_within_mismatch_per_hap = _compute_read_mismatch_counts(
         window, merged_haps, config.max_mismatch_frac

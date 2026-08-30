@@ -1298,7 +1298,7 @@ def test_assign_reads_records_best_hap_below_confidence_threshold():
         [0.70, 0.28, 0.02],
         [0.05, 0.05, 0.90],
     ])
-    out = post.assign_reads([_R("r0"), _R("r1"), _R("r2")], gamma, None)
+    out = post.assign_reads([_R("r0"), _R("r1"), _R("r2")], gamma)
     by_id = {a["read_id"]: a for a in out}
 
     assert by_id["r0"]["hap_id"] == 0 and by_id["r0"]["best_hap"] == 0

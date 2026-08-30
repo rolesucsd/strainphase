@@ -650,7 +650,7 @@ class TestAssignReads(unittest.TestCase):
             [0.01, 0.01, 0.98],
         ])
         pi = np.array([0.45, 0.45, 0.10])
-        assignments = self.post.assign_reads(self.reads, gamma, pi)
+        assignments = self.post.assign_reads(self.reads, gamma)
 
         self.assertEqual(assignments[0]["hap_id"], 0)
         self.assertFalse(assignments[0]["is_junk"])
@@ -663,7 +663,7 @@ class TestAssignReads(unittest.TestCase):
         gamma = np.array([[0.05, 0.95]])  # 1 read, 1 hap + junk
         pi = np.array([0.05, 0.95])
         reads = [Read(id="r0", contig="test", mapq=60, alleles={}, quals={})]
-        assignments = self.post.assign_reads(reads, gamma, pi)
+        assignments = self.post.assign_reads(reads, gamma)
 
         self.assertTrue(assignments[0]["is_junk"])
         self.assertIsNone(assignments[0]["hap_id"])
@@ -677,7 +677,7 @@ class TestAssignReads(unittest.TestCase):
         gamma = np.array([[low_prob + 0.01, 1.0 - low_prob - 0.01]])
         pi = np.array([0.5, 0.5])
         reads = [Read(id="r0", contig="test", mapq=60, alleles={}, quals={})]
-        assignments = self.post.assign_reads(reads, gamma, pi)
+        assignments = self.post.assign_reads(reads, gamma)
 
         self.assertFalse(assignments[0]["is_junk"])
         self.assertTrue(assignments[0]["is_ambiguous"])
@@ -1063,7 +1063,7 @@ class TestIntegration(unittest.TestCase):
             merged, final_gamma, final_pi = post.merge_similar_haplotypes(
                 haps, gamma, pi, window
             )
-            assignments = post.assign_reads(window.reads, final_gamma, final_pi)
+            assignments = post.assign_reads(window.reads, final_gamma)
             
             result = WindowResult(
                 window=window,
