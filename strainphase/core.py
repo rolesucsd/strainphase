@@ -121,13 +121,6 @@ class HaplotyperConfig:
     default_base_quality: int = 20
     # Cap per window; reads above this are uniformly subsampled with the config seed.
     max_reads_per_window: int = 500
-    # How the cap above picks WHICH reads to keep. False = an independent random draw
-    # per window (historic). True = the reads whose ids hash smallest, so overlapping
-    # windows keep the SAME reads out of the molecules they share - required for
-    # read-overlap linking, which otherwise sees (cap/N)^2 of the shared reads and
-    # reports a sampling artefact as a linking failure. Forced on by
-    # link_by_read_overlap; harmless (and more reproducible) on its own.
-    consistent_read_subsampling: bool = False
     # A read must physically cover at least this many bp of a window to be counted in it.
     # Without this a read overlapping by 1 bp entered n_reads_examined, the junk
     # classification and the abundance denominator identically to one spanning 20 kb.
@@ -137,12 +130,6 @@ class HaplotyperConfig:
     # (FIGURE4 diagnosis §6 #8, LEVEL 1).
     min_read_read_overlap_bp: int = 1000
 
-    # =========== MEMORY ===========
-    # Per-read hard assignments (WindowResult.assignments) are a debugging aid: one dict
-    # per read per window, never written to any output file and never read by any other
-    # function in the package. On a 146-sample MAG that is tens of millions of dicts
-    # retained for nothing, so they are off by default. Turn on to inspect them.
-    keep_read_assignments: bool = False
     # Spill per-sample WindowResults to <output_dir>/tmp during the first pass instead of
     # holding every sample's reads in RAM until the rescue pass. Cross-sample rescue only
     # ever reads `.haplotypes` off OTHER samples (build_anchor_panel_for_key /
@@ -170,18 +157,10 @@ class HaplotyperConfig:
     # switch that lets a caller drop indels or collapse alleles.
 
     # =========== GRAPH CONSTRUCTION ===========
-    min_shared_snvs_for_edge: int = 3
-    max_mismatch_frac: float = 0.01
+    min_shared_snvs_for_edge: int = 1
+    max_mismatch_frac: float = 0.02
     min_reads_per_cluster: int = 3
 
-    # =========== IDENTITY GATES (shared by all three linking levels) ===========
-    # The rate gate is applied as int(max_mismatch_frac * n_shared) - a FLOOR - so it
-    # already forces 0 mismatches below n_shared=100 and 1 below n_shared=200. The
-    # absolute cap therefore does nothing at low n_shared and becomes the binding gate
-    # at high n_shared, where a rate alone would tolerate 11 mismatches at n=1172.
-    # The two guard opposite ends of the range; both are required.
-    # (FIGURE4 diagnosis §6 #8.)
-    max_num_diff: int = 1
     # A within-sample link mismatch vetoes a cross-window lineage continuation
     # only when at least this many timepoints INDEPENDENTLY flag the same join.
     # 1 = the old behaviour (a single timepoint's per-window EM miscall cuts the
@@ -220,8 +199,8 @@ class HaplotyperConfig:
     junk_divergence_rate: float = 0.10
 
     # =========== POST-PROCESSING ===========
-    merge_distance_threshold: float = 0.01
-    min_shared_for_merge: int = 2  # Min shared SNVs with actual calls to consider merging
+    merge_distance_threshold: float = 0.02
+    min_shared_for_merge: int = 3  # Min shared SNVs with actual calls to consider merging
     assign_confidence_threshold: float = 0.90
 
     # =========== 1-SNP VALIDATION ===========
@@ -233,16 +212,16 @@ class HaplotyperConfig:
     binomial_alpha: float = 0.05
 
     # =========== LONGITUDINAL PARAMETERS ===========
-    min_weight_for_anchor: float = 0.2
-    rescue_match_distance: float = 0.01  # 1% divergence — matches unified distance threshold
-    min_shared_for_rescue: int = 2  # Min shared SNVs with actual calls for rescue matching
+    min_weight_for_anchor: float = 0.15
+    rescue_match_distance: float = 0.02  # 1% divergence — matches unified distance threshold
+    min_shared_for_rescue: int = 3  # Min shared SNVs with actual calls for rescue matching
     rescued_min_weight: float = 0.02
 
     # =========== CROSS-SAMPLE WINDOW GROUPING ===========
     # Groups haplotypes at ONE FIXED WINDOW across samples (the "vertical" axis).
     # Windows are fixed coordinate tiles, so every comparison here has an identical
     # footprint - no span gating, nothing to expand, no imputation gap.
-    lineage_merge_distance: float = 0.01  # Max mismatch rate to group
+    lineage_merge_distance: float = 0.02  # Max mismatch rate to group
     min_shared_for_lineage: int = 3  # Min shared markers (raised 2 -> 3 to match linking)
     # Fraction of testable samples allowed to disagree on abundance before the
     # abundance ELIMINATOR vetoes a cross-window continuation. 0.0 = zero
@@ -251,51 +230,11 @@ class HaplotyperConfig:
     # abundance estimates. Exposed so it can be relaxed; the veto still only
     # sees pairs that already PASSED the consensus gate, so relaxing it cannot
     # merge consensus-divergent strains.
-    lineage_max_bad_frac: float = 0.0
-    # Require a step-1 within-sample link vote to chain two window-groups into one
-    # lineage (default). When False, the "votes are the only score" rule is
-    # dropped: a vote-less join is allowed and ranked by consensus agreement
-    # instead (fewest mismatches, then most shared markers). Exposed to test
-    # whether the vote requirement is over-fragmenting consensus-identical joins.
-    require_link_votes: bool = True
-    # --- READ-OVERLAP THREADING (step 3 linker) ---------------------------------
-    # Chain two window-groups when the SAME PHYSICAL READS sit in both, instead of
-    # ranking candidates by consensus identity under a 1-to-1 reciprocal-best-match.
-    #
-    # Measured on div0050_k4 (per-window read->haplotype dump, w10k): read overlap
-    # linked 920 adjacent-window pairs with 100% same-strain and ZERO cross-strain
-    # errors, threading the dominant strain into ONE component spanning the whole
-    # 4.87 Mb contig - where the reciprocal-best linker emitted 93 pieces. Half of
-    # its cut points (76/152 chain terminations) were BYTE-IDENTICAL continuations
-    # (n_diff=0) rejected as `failed_not_mutual`: 67 of them because the single
-    # identical target preferred a rival that matched it equally well ("target
-    # contested"), 8 because the source itself had two identical targets. A strain
-    # that momentarily over-splits into two groups therefore loses one of them
-    # permanently. Read overlap has no such constraint: two groups sharing reads
-    # with one target simply merge, which is the correct answer when the split was
-    # the artifact.
-    #
-    # OFF by default: it needs per-read assignments (forced on below), so the
-    # existing consensus linker stays the shipped behaviour until this is scored.
-    link_by_read_overlap: bool = False
+    lineage_max_bad_frac: float = 0.25
     # Reads that must sit in BOTH groups before their join is made. A 15 kb read
     # spans ~3 windows at a 10 kb window / 5 kb step, and observed overlaps on real
     # joins were ~33 reads, so 3 is a floor against coincidence, not a real gate.
     min_shared_reads_for_link: int = 3
-    # Read-overlap linking, but a group may continue into only its STRICTLY best
-    # target by shared-read count (a tie links nothing). Many-to-one is preserved -
-    # two groups may still name the SAME target, which is the over-split merge this
-    # linker exists for - so this is not a return to reciprocity; it only stops one
-    # group fanning out into several targets at a boundary.
-    #
-    # Measured: on a 6-strain 0.25%-divergence set, plain read-overlap linking left
-    # assigned_fraction UP (0.941 -> 0.943) but nearly doubled the mis-merged share
-    # of discriminating reads (3.7% -> 6.3%). With several strains at 1-5% abundance
-    # the <=2% consensus gate has too few discriminating markers to refuse a bad
-    # pair, and with reciprocity gone nothing else did - one bad join then
-    # contaminates a whole component. Requiring a strict winner restores a second
-    # constraint without reinstating the orphaning.
-    read_link_unique_best: bool = False
     # Identity shape. This decision is still OPEN (FIGURE4 diagnosis §6 #9); both are
     # implemented so they can be compared on identical inputs.
     #   "clique"     - complete linkage: a group is a clique, every member passes the
@@ -335,14 +274,10 @@ class HaplotyperConfig:
     # 0.02 (2%): the per-window EM miscalls ~0.03%/site, so over a short window
     # overlap (~50 markers) a lone 1-SNV error is ~2%. At the old 0.01 that lone
     # error was a hard mismatch and severed same-strain tracks; the within-sample
-    # link check is a rate gate now (its absolute cap is off, see max_link_num_diff)
+    # link check is a rate gate (the absolute cap was removed 2026-08-30)
     # so it tolerates a couple of expected miscalls without merging cross-strain
     # pairs, which disagree at ~50% of markers.
     max_link_distance: float = 0.02  # Max mismatch fraction to link
-    # The absolute mismatch cap for the WITHIN-SAMPLE link gate only. Effectively off
-    # (rate-gate only) so a single EM-miscall SNV over a short overlap is not a hard
-    # mismatch. The cross-strain lineage gate keeps its own cap (config.max_num_diff).
-    max_link_num_diff: int = 1_000_000
     # Window-level shared SNV POSITIONS (does the window pair even have common sites).
     min_shared_snvs_for_link: int = 3
     # Haplotype-level shared ACTUAL CALLS. Previously the same knob as the line above,
@@ -372,15 +307,6 @@ class HaplotyperConfig:
 
     def __post_init__(self):
         """Validate configuration parameters."""
-        # Read-overlap threading reads WindowResult.assignments, which assign_reads
-        # only populates under keep_read_assignments. Forcing it here means the
-        # linker cannot be switched on into a silent no-op (every join would see
-        # zero shared reads and fail), at the cost of retaining one small dict per
-        # read - ~0.2% of a Read's footprint, which holds two position-keyed dicts.
-        if self.link_by_read_overlap:
-            self.keep_read_assignments = True
-            # Without this the linker measures the SUBSAMPLE's overlap, not the reads'.
-            self.consistent_read_subsampling = True
 
         # Junk divergence rate
         if not (0 < self.junk_divergence_rate < 0.75):
@@ -426,8 +352,6 @@ class HaplotyperConfig:
         if self.min_reads_for_rescue > self.min_reads_per_window:
             object.__setattr__(self, "min_reads_for_rescue", self.min_reads_per_window)
 
-        if self.max_num_diff < 0:
-            raise ValueError(f"max_num_diff must be >= 0, got {self.max_num_diff}")
 
         if not (0 <= self.min_cosupported_span_frac <= 1):
             raise ValueError(
@@ -662,7 +586,7 @@ class WindowResult:
         self.window.reads = []
         self.window._pos_sets = None
         # `assignments` is deliberately NOT cleared. It is populated only under
-        # keep_read_assignments, so dropping it here discarded the very thing that
+        # the read-overlap linker, so dropping it here discarded the very thing that
         # flag exists to produce - the per-window read->haplotype table came back
         # covering only the windows that happened to escape a spill (16 of 975
         # windows in one sample, 888 in another). It is also cheap next to what is
@@ -1682,8 +1606,8 @@ def iter_windows_lazy(
     if not snv_pos_sorted:
         return
 
-    rng = config.get_rng()
-
+    # No RNG here any more: the per-window read cap now selects by a stable hash of the
+    # read id (see the subsample below), so window contents no longer depend on a draw.
     bam = pysam.AlignmentFile(bam_path, "rb")
 
     # 50% overlap: step = window_size / 2
@@ -1982,27 +1906,22 @@ def iter_windows_lazy(
             if break_sites:
                 window_snvs.sort()
 
-        # Subsample if needed (reproducible)
+        # Subsample if needed. CONSISTENT across windows: keep the reads whose ids hash
+        # smallest, so two overlapping windows pick THE SAME reads out of the molecules
+        # they share. An independent draw per window kept a shared read in both only
+        # with probability (cap/N)^2 - at a 200-read cap over a few thousand reads that
+        # left ~2-3 shared reads where the biology has hundreds, and step-3 read-overlap
+        # linking read the sampling artefact as a linking failure. Selecting on a stable
+        # function of the read ID makes the loss LINEAR instead: a read kept in one
+        # window is kept in its neighbour too. No longer optional - the linker depends
+        # on it.
         if config.max_reads_per_window and len(reads) > config.max_reads_per_window:
-            if config.consistent_read_subsampling:
-                # CONSISTENT across windows: keep the reads whose id hashes smallest,
-                # so two overlapping windows pick THE SAME reads out of the molecules
-                # they share. An independent draw per window (the branch below) keeps
-                # a shared read in both only with probability (cap/N)^2 - at 20 kb
-                # windows and a 200-read cap over a few thousand reads that leaves
-                # ~2-3 shared reads where the biology has hundreds, which reads as a
-                # linking failure when it is really a sampling artefact. Selecting on
-                # a stable function of the read ID makes the loss LINEAR instead:
-                # a read kept in one window is kept in its neighbour too.
-                reads = [
-                    r for _, _, r in sorted(
-                        (_read_sort_hash(r.id, config.random_seed), i, r)
-                        for i, r in enumerate(reads)
-                    )[: config.max_reads_per_window]
-                ]
-            else:
-                indices = rng.permutation(len(reads))[: config.max_reads_per_window]
-                reads = [reads[i] for i in indices]
+            reads = [
+                r for _, _, r in sorted(
+                    (_read_sort_hash(r.id, config.random_seed), i, r)
+                    for i, r in enumerate(reads)
+                )[: config.max_reads_per_window]
+            ]
 
         # Window CREATION uses the lower rescue floor, so windows in the
         # [min_reads_for_rescue, min_reads_per_window) band still exist and can receive a
@@ -2083,13 +2002,13 @@ class GraphInitializer:
                 if 0 <= ov < self.config.min_read_read_overlap_bp:
                     continue
 
-                # Count mismatches with early exit. Two independent gates: the RATE
+                # Count mismatches with early exit. One gate: the RATE
                 # (floor(max_mismatch_frac * n_shared), which forces 0 mismatches below
-                # n_shared=100) and the ABSOLUTE cap, which is what actually binds once
-                # n_shared is large enough for the rate to go permissive.
-                max_allowed = min(
-                    int(self.config.max_mismatch_frac * n_shared), self.config.max_num_diff
-                )
+                # n_shared=50 at 2%). The absolute cap that used to sit alongside it was
+                # removed 2026-08-30 - it had been disabled in production for the whole
+                # of the read-overlap work, and a fixed count cannot be right across
+                # windows whose shared-marker counts differ by orders of magnitude.
+                max_allowed = int(self.config.max_mismatch_frac * n_shared)
                 mismatches = 0
                 exceeded = False
 
@@ -2593,13 +2512,11 @@ class PostProcessor:
     def assign_reads(self, reads: list[Read], gamma: np.ndarray, pi: np.ndarray) -> list[dict]:
         """Hard assignment of reads.
 
-        Skipped entirely unless ``config.keep_read_assignments`` is set - see that flag.
-        Returns ``[]`` in that case, which is what every downstream consumer already
-        tolerates (nothing reads this field).
+        Always computed: step-3 read-overlap linking joins window-groups on the reads
+        they share, so this is load-bearing rather than a debugging aid. It costs one
+        small dict per read against a Read's two position-keyed dicts (~90 KB for a
+        15 kb HiFi read), which are offloaded anyway.
         """
-        if not self.config.keep_read_assignments:
-            return []
-
         assignments = []
         n_reads, k_eff = gamma.shape
         junk_idx = k_eff - 1
@@ -3621,7 +3538,6 @@ def compare_consensus(
     region: tuple[int, int] | None = None,
     min_cospan_frac: float | None = None,
     max_rate: float | None = None,
-    max_num_diff: int | None = None,
     allow_fallback: bool = True,
     a_span: tuple[int, int] | None = None,
     b_span: tuple[int, int] | None = None,
@@ -3630,7 +3546,7 @@ def compare_consensus(
 
     Gates, in order: the two footprints must overlap by >= ``min_entity_overlap_bp``
     (and >= ``min_cospan_frac`` of ``region``); shared markers >= ``min_shared``;
-    absolute mismatches <= ``max_num_diff``; mismatch rate <= ``lineage_merge_distance``.
+    mismatch rate <= ``lineage_merge_distance``.
 
     The overlap gate asks only "how much sequence did both haplotypes cover", never
     where the markers within it happen to fall.
@@ -3655,8 +3571,6 @@ def compare_consensus(
         min_cospan_frac = config.min_cosupported_span_frac
     if max_rate is None:
         max_rate = config.lineage_merge_distance
-    if max_num_diff is None:
-        max_num_diff = config.max_num_diff
 
     def _restrict(positions):
         if region is None:
@@ -3715,7 +3629,7 @@ def compare_consensus(
 
     n_diff = sum(1 for p in shared if a[p] != b[p])
     rate = n_diff / n_shared
-    if n_diff > max_num_diff or rate > max_rate:
+    if rate > max_rate:
         return GateResult(False, "failed_mismatch", rate, n_shared, n_diff, used_fallback)
     return GateResult(True, "linked", rate, n_shared, n_diff, used_fallback)
 
@@ -3871,7 +3785,6 @@ def link_windows(
                         min_shared=config.min_shared_calls_for_link,
                         region=region,
                         max_rate=config.max_link_distance,
-                        max_num_diff=config.max_link_num_diff,
                         a_span=span_i[hi],
                         b_span=span_j[hj],
                     )

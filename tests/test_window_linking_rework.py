@@ -97,23 +97,6 @@ def test_clonal_fallback_still_links():
     assert gate.n_shared == 3
 
 
-def test_absolute_cap_binds_where_the_rate_does_not():
-    """The rate is a floor, so at large n_shared it tolerates many mismatches; the
-    absolute cap is what actually binds there."""
-    a = {i: "A" for i in range(1000)}
-    b = dict(a)
-    for i in (5, 15, 25):  # 3 mismatches out of 1000 -> rate 0.003, under 0.01
-        b[i] = "T"
-    # All 1000 positions are markers: in a real run the marker set is computed across
-    # every sample on the contig, so a position can vary somewhere in the cohort while
-    # these two particular haplotypes happen to agree on it.
-    markers = set(range(1000))
-    permissive = compare_consensus(a, b, markers, cfg(max_num_diff=10))
-    assert permissive.passed, "rate alone admits 3 mismatches at n_shared=1000"
-    strict = compare_consensus(a, b, markers, cfg(max_num_diff=1))
-    assert not strict.passed
-    assert strict.reason == "failed_mismatch"
-
 
 def test_failure_reason_distinguishes_dropout_from_disagreement():
     """The lineage layer needs to tell a measurement hole from a genotypic wall."""
@@ -238,7 +221,7 @@ def test_clique_refuses_to_chain():
     haps = [_hap("t0", "ha", a), _hap("t1", "hb", b), _hap("t2", "hc", c)]
     markers = variable_marker_positions([a, b, c])
     groups, _, _ = group_window_across_samples(
-        haps, markers, cfg(cross_sample_method="clique", max_num_diff=1)
+        haps, markers, cfg(cross_sample_method="clique")
     )
     labels = {m.haplotype_id: g.group_id for g in groups for m in g.members}
     assert labels["ha"] != labels["hc"], "a and c differ by 2 and must not share a group"
@@ -418,10 +401,13 @@ def _grp(gid, wstart, members):
                        members=members, window_end=wstart + 20000)
 
 
-def _mem(sample, consensus, reads=30, total=60, wsid="T1"):
-    """`wsid` is the step-1 chain this haplotype belongs to. Two groups holding members of
-    the SAME chain in one sample is a VOTE that they continue into each other - which is
-    now the only thing that scores a join.
+def _mem(sample, consensus, reads=30, total=60, wsid="T1", n_read_ids=8):
+    """`wsid` is the step-1 chain this haplotype belongs to.
+
+    Since 2026-08-30 step 3 links on SHARED READS, not on chain votes, so the read ids
+    are derived from (sample, wsid): two members of the same chain in the same sample
+    carry the SAME reads and therefore continue into each other, which is exactly what
+    `wsid` meant before. Members of different chains share none.
 
     The id and window coordinates are placeholders; `_grp` overwrites them with the
     group's own, so a member always carries an id unique to its (sample, window, index).
@@ -429,7 +415,9 @@ def _mem(sample, consensus, reads=30, total=60, wsid="T1"):
     return WindowHaplotype(sample=sample, contig="c1", window_start=0, window_end=20000,
                            haplotype_id="", consensus=consensus,
                            reads=reads, total_reads=total, abundance=reads / total,
-                           within_sample_id=wsid)
+                           within_sample_id=wsid,
+                           read_ids=frozenset(f"{sample}:{wsid}:r{i}"
+                                              for i in range(n_read_ids)))
 
 
 def _hid_of(group, sample, idx=0):
@@ -455,17 +443,6 @@ def test_lineage_chains_groups_that_a_read_chain_connects():
     assert lins[0].n_windows == 2
     assert [e for e in edges if e.reason == "linked"][0].n_link_votes == 4
 
-
-def test_no_votes_means_no_join_however_identical():
-    """Proximity and matching alleles are NOT enough. If no sample's reads ever chained
-    these two, nothing links them - identity is a veto here, never the evidence for."""
-    from strainphase.lineages import build_lineages
-    shared = {12000: "A", 15000: "C", 18000: "G"}
-    a = _grp("A", 1, [_mem(f"t{i}", dict(shared), wsid=f"a{i}") for i in range(4)])
-    b = _grp("B", 10001, [_mem(f"t{i}", dict(shared), wsid=f"b{i}") for i in range(4)])
-    lins, edges = build_lineages([a, b], _lcfg())
-    assert len(lins) == 2
-    assert any(e.reason == "failed_no_votes" for e in edges)
 
 
 def test_absence_of_evidence_does_not_block_a_voted_join():
@@ -545,17 +522,6 @@ def test_abundance_eliminates_a_join_that_votes_would_accept():
     assert any(e.reason == "failed_abundance" for e in edges)
     assert len(lins) == 2, "incompatible shares must not merge"
 
-
-def test_ambiguous_continuation_contributes_no_edge():
-    """RECIPROCAL BEST: two successors with equal vote counts -> neither is chosen."""
-    from strainphase.lineages import build_lineages
-    shared = {12000: "A", 15000: "C", 18000: "G"}
-    a = _grp("A", 1, [_mem(f"t{i}", dict(shared)) for i in range(4)])
-    b1 = _grp("B1", 10001, [_mem(f"t{i}", dict(shared)) for i in range(2)])
-    b2 = _grp("B2", 10001, [_mem(f"t{i}", dict(shared)) for i in range(2, 4)])
-    lins, edges = build_lineages([a, b1, b2], _lcfg())
-    assert len(lins) == 3, "a tie must stop the chain, not pick a winner"
-    assert any(e.reason == "failed_not_mutual" for e in edges)
 
 
 def test_a_lineage_never_holds_two_groups_at_one_window():
@@ -913,8 +879,7 @@ def test_step2_clusters_at_the_threshold_the_gate_used():
     def group(distance):
         return group_window_across_samples(
             haps, markers,
-            cfg(cross_sample_method="clique", lineage_merge_distance=distance,
-                max_num_diff=2),
+            cfg(cross_sample_method="clique", lineage_merge_distance=distance),
         )[0]
 
     assert len(group(0.015)) == 2, "0.02 is above a 0.015 threshold - the gate refuses"
@@ -1167,7 +1132,7 @@ def test_untestable_abundance_does_not_block_a_join():
 
 
 # ---------------------------------------------------------------------------
-# Read-overlap threading (config.link_by_read_overlap)
+# Read-overlap threading (the step-3 linker)
 #
 # Measured on div0050_k4: the reciprocal-best-match linker terminated 152 chains
 # and HALF of those had a byte-identical partner it refused as failed_not_mutual,
@@ -1198,14 +1163,11 @@ def _ro_group(group_id, window, members):
                        window_end=window + 10000, members=members)
 
 
-def _ro_build(groups, link_by_read_overlap):
+def _ro_build(groups):
     from strainphase.core import HaplotyperConfig
     from strainphase.lineages import build_lineages
 
-    config = HaplotyperConfig(
-        window_size=10000, link_by_read_overlap=link_by_read_overlap,
-        require_link_votes=False, min_shared_reads_for_link=3,
-    )
+    config = HaplotyperConfig(window_size=10000, min_shared_reads_for_link=3)
     lineages, edges = build_lineages(
         groups, config, step=5000, max_bad_frac=1.0, transitive_abundance_check=False)
     return lineages, edges
@@ -1222,19 +1184,14 @@ def _ro_contested_groups():
 
 
 def test_read_overlap_rejoins_contested_oversplit():
-    """Both halves of an over-split strain are kept; reciprocity orphans them."""
-    lineages, edges = _ro_build(_ro_contested_groups(), True)
+    """Both halves of an over-split strain are kept; the old reciprocal rule
+    orphaned one of them permanently."""
+    lineages, edges = _ro_build(_ro_contested_groups())
     assert len(lineages) == 1
     assert len(lineages[0].groups) == 3
     assert {e.reason for e in edges} == {"linked"}
     assert all(e.n_shared_reads == 4 for e in edges)
 
-
-def test_reciprocity_orphans_contested_oversplit():
-    """The behaviour being replaced: a tie contributes no edge, so nothing joins."""
-    lineages, edges = _ro_build(_ro_contested_groups(), False)
-    assert len(lineages) == 3
-    assert {e.reason for e in edges} == {"failed_not_mutual"}
 
 
 def test_read_overlap_still_vetoed_by_consensus_mismatch():
@@ -1245,7 +1202,7 @@ def test_read_overlap_still_vetoed_by_consensus_mismatch():
         _ro_group("g_Y", 5000,
                   [_ro_hap("S1", 5000, "hY", {"r1", "r2", "r3", "r4"}, consensus=divergent)]),
     ]
-    lineages, edges = _ro_build(groups, True)
+    lineages, edges = _ro_build(groups)
     assert len(lineages) == 2
     assert [e.reason for e in edges] == ["failed_mismatch"]
 
@@ -1256,17 +1213,10 @@ def test_read_overlap_requires_read_evidence():
         _ro_group("g_P", 0, [_ro_hap("S1", 0, "hP", {"r1", "r2"})]),
         _ro_group("g_Q", 5000, [_ro_hap("S1", 5000, "hQ", {"r9", "r10"})]),
     ]
-    lineages, edges = _ro_build(groups, True)
+    lineages, edges = _ro_build(groups)
     assert len(lineages) == 2
     assert [e.reason for e in edges] == ["failed_no_read_overlap"]
 
-
-def test_link_by_read_overlap_forces_keep_read_assignments():
-    """The linker reads WindowResult.assignments, so it cannot be a silent no-op."""
-    from strainphase.core import HaplotyperConfig
-
-    assert HaplotyperConfig(link_by_read_overlap=True).keep_read_assignments is True
-    assert HaplotyperConfig().keep_read_assignments is False
 
 
 def test_offload_preserves_read_assignments():
@@ -1330,12 +1280,6 @@ def test_read_sort_hash_is_stable_and_seed_dependent():
     assert _read_sort_hash("read1", 42) != _read_sort_hash("read1", 7)
 
 
-def test_link_by_read_overlap_forces_consistent_subsampling():
-    from strainphase.core import HaplotyperConfig
-
-    assert HaplotyperConfig(link_by_read_overlap=True).consistent_read_subsampling is True
-    assert HaplotyperConfig().consistent_read_subsampling is False
-
 
 def test_assign_reads_records_best_hap_below_confidence_threshold():
     """Linking needs the argmax haplotype even when it is not confidently called.
@@ -1351,7 +1295,7 @@ def test_assign_reads_records_best_hap_below_confidence_threshold():
     from strainphase.core import DEFAULT_CONFIG, PostProcessor
 
     post = PostProcessor.__new__(PostProcessor)
-    post.config = replace(DEFAULT_CONFIG, keep_read_assignments=True,
+    post.config = replace(DEFAULT_CONFIG,
                           assign_confidence_threshold=0.90)
 
     class _R:
@@ -1377,19 +1321,12 @@ def test_assign_reads_records_best_hap_below_confidence_threshold():
     assert by_id["r2"]["best_hap"] is None
 
 
-# --- read_link_unique_best: forward-strict best, many-to-one still allowed -----
+# --- forward-strict best target, many-to-one still allowed --------------------
 
 
 def _ro_build_strict(groups):
-    from strainphase.core import HaplotyperConfig
-    from strainphase.lineages import build_lineages
-
-    config = HaplotyperConfig(
-        window_size=10000, link_by_read_overlap=True, read_link_unique_best=True,
-        require_link_votes=False, min_shared_reads_for_link=3,
-    )
-    return build_lineages(groups, config, step=5000, max_bad_frac=1.0,
-                          transitive_abundance_check=False)
+    """Strict-best is now the only behaviour, so this is `_ro_build`."""
+    return _ro_build(groups)
 
 
 def test_strict_best_still_merges_contested_oversplit():
@@ -1417,9 +1354,6 @@ def test_strict_best_blocks_fan_out():
     assert by_reason["linked"] == 1
     assert by_reason["failed_not_best"] == 1
 
-    # without the flag the two targets fuse into one lineage
-    fused, _ = _ro_build(groups, True)
-    assert len(fused) == 1
 
 
 def test_strict_best_tie_links_nothing():

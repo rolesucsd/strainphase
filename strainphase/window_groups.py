@@ -95,7 +95,7 @@ class WindowHaplotype:
     # B at W+step, that sample is a vote for joining A and B.
     within_sample_id: str = ""
     # Ids of the reads confidently assigned to this haplotype, populated only under
-    # config.link_by_read_overlap (which forces keep_read_assignments). Step 3 joins
+    # Step 3 joins
     # two window-groups when the same physical reads sit in both - direct evidence
     # that they continue into each other, and unlike a consensus comparison it does
     # not have to re-establish identity from a string at every window boundary.
@@ -218,7 +218,7 @@ def _labels_clique(
     # above already ran at `config.lineage_merge_distance`, and clustering at a different
     # value meant a raised --lineage-merge-distance admitted pairs the gate called linked
     # and then split them anyway - steps 2 and 3 running at two different identities.
-    # How far raising it can reach is capped by `max_num_diff` regardless: a pair still
+    # A pair still
     # needs n_diff <= 1, so beyond 1/min_shared the absolute cap binds, not the rate.
     threshold = min(config.lineage_merge_distance, 0.999)
     return [int(x) for x in fcluster(linkage_matrix, t=threshold, criterion="distance")]

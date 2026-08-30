@@ -602,7 +602,7 @@ def _write_lineage_edges(edges, output_dir: str) -> None:
 def _write_read_assignments(rows: list[dict], output_dir: str) -> None:
     """PROTOTYPE dump: per-window read->haplotype assignments -> tmp/window_read_assignments.tsv.
 
-    Written only when ``config.keep_read_assignments`` is set. One row per assigned read
+    One row per assigned read
     per window: (sample, contig, window_start, window_end, read_id, hap_id, prob, is_junk,
     is_ambiguous). ``hap_id`` is the same global window-haplotype id as haplotypes.tsv, so
     a reader spanning two windows appears as two rows sharing ``read_id`` with different
@@ -673,7 +673,7 @@ def build_window_tables(
     within_mismatch_rows: list[dict] = []
     mag_of_contig: dict[str, str] = {}
     # PROTOTYPE (read-anchored threading experiment): per-window read->haplotype
-    # assignments, dumped only when config.keep_read_assignments is set. This is the
+    # assignments. This is the
     # one thing no existing table carries and it is what a read-overlap stitcher needs -
     # which physical read landed in which within-window haplotype, so reads spanning a
     # window boundary can tie two haplotypes together directly instead of via consensus.
@@ -729,21 +729,20 @@ def build_window_tables(
                     # threading (step 3). Built once per window and only when that
                     # linker is on, so a normal run neither builds nor retains it.
                     reads_by_hidx: dict[int, set] = {}
-                    if config.link_by_read_overlap:
-                        for a in getattr(wr, "assignments", None) or []:
-                            # best_hap, not hap_id: the argmax haplotype even when the
-                            # posterior is below assign_confidence_threshold. Linking
-                            # asks whether the same molecule is in both windows, which
-                            # does not need the read's haplotype called confidently -
-                            # and near-identical strains leave most reads ambiguous.
-                            k = a.get("best_hap", a.get("hap_id"))
-                            if k is None:
-                                continue
-                            reads_by_hidx.setdefault(int(k), set()).add(a.get("read_id"))
+                    for a in getattr(wr, "assignments", None) or []:
+                        # best_hap, not hap_id: the argmax haplotype even when the
+                        # posterior is below assign_confidence_threshold. Linking
+                        # asks whether the same molecule is in both windows, which
+                        # does not need the read's haplotype called confidently -
+                        # and near-identical strains leave most reads ambiguous.
+                        k = a.get("best_hap", a.get("hap_id"))
+                        if k is None:
+                            continue
+                        reads_by_hidx.setdefault(int(k), set()).add(a.get("read_id"))
 
                     # PROTOTYPE dump: one row per assigned read in this window. hap_id is
                     # the GLOBAL window-haplotype id (same scheme as haplotypes.tsv), blank
-                    # for junk/ambiguous reads. Only populated when keep_read_assignments.
+                    # for junk/ambiguous reads.
                     for a in getattr(wr, "assignments", None) or []:
                         k = a.get("hap_id")
                         read_assignment_rows.append({
@@ -956,8 +955,8 @@ def build_window_tables(
         _write_lineage_edges(lineage_edges, output_dir)
 
     # PROTOTYPE: dump per-window read->haplotype assignments for the read-anchored
-    # threading experiment (gated on keep_read_assignments so normal runs pay nothing).
-    if config.keep_read_assignments and read_assignment_rows:
+    # threading (also the input a future linker experiment would need).
+    if read_assignment_rows:
         _write_read_assignments(read_assignment_rows, output_dir)
 
     across_rows: list[dict] = []
@@ -1142,15 +1141,7 @@ def main():
         default=0.01,
         help="Max mismatch RATE to group haplotypes (default: 0.01 = 1%%). "
         "--max-num-diff caps its reach: a pair still needs that many differences or "
-        "fewer, so raising this above max_num_diff/min_shared stops changing anything.",
-    )
-    parser.add_argument(
-        "--max-num-diff",
-        type=int,
-        default=1,
-        help="Max ABSOLUTE mismatches. The rate gate is a floor, so it already forces 0 "
-        "mismatches below n_shared=100; this cap is what binds at high n_shared, where a "
-        "rate alone would tolerate 11 mismatches at n_shared=1172.",
+        "fewer.",
     )
     parser.add_argument(
         "--min-shared-for-lineage",
@@ -1185,13 +1176,6 @@ def main():
         help="Two reads must physically overlap by at least this much to be compared",
     )
     parser.add_argument(
-        "--keep-read-assignments",
-        action="store_true",
-        help="Retain the per-read hard assignments on every WindowResult. Debug only: "
-        "they are written to no output file and read by no other code, and on a "
-        "many-sample MAG they are tens of millions of dicts held for nothing.",
-    )
-    parser.add_argument(
         "--no-spill",
         action="store_true",
         help="Keep every sample's reads in memory until the whole MAG finishes (the old "
@@ -1209,30 +1193,10 @@ def main():
     # Kept in step with strainphase/cli.py's parser - two hand-maintained arg lists
     # over one HaplotyperConfig.
     parser.add_argument(
-        "--link-by-read-overlap",
-        action="store_true",
-        help="Chain two window-groups when the SAME PHYSICAL READS are assigned in "
-        "both, instead of a 1-to-1 reciprocal-best-match on consensus identity. "
-        "Every veto still runs first. Forces --keep-read-assignments.",
-    )
-    parser.add_argument(
         "--min-shared-reads-for-link",
         type=int,
         default=3,
         help="Reads that must sit in BOTH groups before --link-by-read-overlap joins them.",
-    )
-    parser.add_argument(
-        "--consistent-read-subsampling",
-        action="store_true",
-        help="Cap windows by smallest read-id hash instead of an independent random "
-        "draw, so overlapping windows keep the same shared reads. Forced on by "
-        "--link-by-read-overlap; set it explicitly on a non-linker comparison arm.",
-    )
-    parser.add_argument(
-        "--read-link-unique-best",
-        action="store_true",
-        help="With --link-by-read-overlap, keep only a group's STRICTLY best target "
-        "by shared reads (a tie links nothing). Many-to-one is preserved.",
     )
     parser.add_argument(
         "--lineage-max-bad-frac",
@@ -1240,12 +1204,6 @@ def main():
         default=0.0,
         help="Fraction of testable samples whose read shares may disagree before the "
         "abundance veto refuses a continuation. 0.0 = zero tolerance, 1.0 = disabled.",
-    )
-    parser.add_argument(
-        "--no-require-link-votes",
-        action="store_true",
-        help="Drop the step-1 vote requirement for a join. Moot under "
-        "--link-by-read-overlap.",
     )
     parser.add_argument(
         "--step1-veto-min-timepoints",
@@ -1335,20 +1293,14 @@ def main():
         # Identity gates
         lineage_merge_distance=args.lineage_merge_distance,
         min_shared_for_lineage=args.min_shared_for_lineage,
-        max_num_diff=args.max_num_diff,
         min_cosupported_span_frac=args.min_cosupported_span_frac,
         min_entity_overlap_bp=args.min_entity_overlap_bp,
         min_read_window_overlap_bp=args.min_read_window_overlap_bp,
         min_read_read_overlap_bp=args.min_read_read_overlap_bp,
         cross_sample_method=args.cross_sample_method,
         n_workers=max(1, args.workers),
-        keep_read_assignments=args.keep_read_assignments,
-        link_by_read_overlap=args.link_by_read_overlap,
-        consistent_read_subsampling=args.consistent_read_subsampling,
         min_shared_reads_for_link=args.min_shared_reads_for_link,
-        read_link_unique_best=args.read_link_unique_best,
         lineage_max_bad_frac=args.lineage_max_bad_frac,
-        require_link_votes=not args.no_require_link_votes,
         step1_veto_min_timepoints=args.step1_veto_min_timepoints,
         spill_results_to_disk=not args.no_spill,
         window_batch_factor=args.window_batch_factor,

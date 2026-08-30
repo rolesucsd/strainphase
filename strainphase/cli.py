@@ -173,18 +173,12 @@ def cmd_longitudinal(args: argparse.Namespace) -> int:
         min_shared_snvs_for_link=args.min_shared_snvs_for_link,
         min_shared_calls_for_link=args.min_shared_calls_for_link,
         max_link_distance=args.max_link_distance,
-        max_num_diff=args.max_num_diff,
         lineage_merge_distance=args.lineage_merge_distance,
         min_shared_for_lineage=args.min_shared_for_lineage,
         cross_sample_method=args.cross_sample_method,
         random_seed=args.seed,
-        keep_read_assignments=args.keep_read_assignments,
-        link_by_read_overlap=args.link_by_read_overlap,
-        consistent_read_subsampling=args.consistent_read_subsampling,
         min_shared_reads_for_link=args.min_shared_reads_for_link,
-        read_link_unique_best=args.read_link_unique_best,
         lineage_max_bad_frac=args.lineage_max_bad_frac,
-        require_link_votes=not args.no_require_link_votes,
         step1_veto_min_timepoints=args.step1_veto_min_timepoints,
         spill_results_to_disk=not args.no_spill,
         window_batch_factor=args.window_batch_factor,
@@ -427,15 +421,8 @@ Examples:
              "shared region. 0.25 rejects ~16%% of adjacent-window pairs; 0.50 rejects ~30%%.",
     )
     long_parser.add_argument(
-        "--max-num-diff", type=int, default=1,
-        help="Max ABSOLUTE mismatches. The rate gate is a floor, so it already forces 0 "
-             "mismatches below n_shared=100; this cap is what binds at high n_shared.",
-    )
-    long_parser.add_argument(
         "--lineage-merge-distance", type=float, default=0.01,
-        help="Max mismatch RATE to group haplotypes. --max-num-diff caps its reach: a "
-             "pair still needs that many differences or fewer, so raising this above "
-             "max_num_diff/min_shared stops changing anything.",
+        help="Max mismatch RATE to group haplotypes across samples.",
     )
     long_parser.add_argument(
         "--min-shared-for-lineage", type=int, default=3,
@@ -443,48 +430,16 @@ Examples:
     )
     # --- step 3 (build_lineages) linking + vetoes -------------------------------
     long_parser.add_argument(
-        "--link-by-read-overlap", action="store_true",
-        help="Chain two window-groups when the SAME PHYSICAL READS are assigned in "
-             "both, instead of ranking candidates by consensus identity under a "
-             "1-to-1 reciprocal-best-match. The reciprocal rule orphans a strain that "
-             "momentarily over-splits (measured: half of all chain terminations were "
-             "byte-identical partners it refused); read overlap keeps both halves. "
-             "Every veto still runs first, so the identity gate remains the wall "
-             "against merging different strains. Forces --keep-read-assignments.",
-    )
-    long_parser.add_argument(
         "--min-shared-reads-for-link", type=int, default=3,
         help="Reads that must sit in BOTH groups before --link-by-read-overlap joins "
              "them. Observed overlap on real joins was ~33 reads, so the default 3 is "
              "a floor against coincidence rather than a real gate.",
     )
     long_parser.add_argument(
-        "--consistent-read-subsampling", action="store_true",
-        help="When --max-reads caps a window, keep the reads whose ids hash smallest "
-             "instead of an independent random draw per window, so overlapping windows "
-             "select the SAME reads out of those they share. Required for read-overlap "
-             "linking (which forces it on) and worth setting explicitly on a comparison "
-             "arm that does NOT use that linker, so both arms phase the same reads.",
-    )
-    long_parser.add_argument(
-        "--read-link-unique-best", action="store_true",
-        help="With --link-by-read-overlap, a group continues into only its STRICTLY "
-             "best target by shared-read count (a tie links nothing). Many-to-one is "
-             "kept - two groups may still name one target, the over-split merge - so "
-             "this only forbids one group fanning out into several targets, which is "
-             "how a single bad join contaminated a whole lineage.",
-    )
-    long_parser.add_argument(
         "--lineage-max-bad-frac", type=float, default=0.0,
         help="Fraction of testable samples whose per-sample read shares may disagree "
              "before the abundance veto refuses a lineage continuation. 0.0 is zero "
              "tolerance; 1.0 disables the veto.",
-    )
-    long_parser.add_argument(
-        "--no-require-link-votes", action="store_true",
-        help="Drop the rule that a step-1 within-sample chain must vote for a join. "
-             "Vote-less joins are then ranked by consensus agreement. Moot under "
-             "--link-by-read-overlap, which decides before the vote check.",
     )
     long_parser.add_argument(
         "--step1-veto-min-timepoints", type=int, default=2,
@@ -507,11 +462,6 @@ Examples:
         help="Random seed. Seeded by default: it drives both read subsampling above "
              "--max-reads and Louvain read clustering, so an unseeded run is not "
              "reproducible.",
-    )
-    long_parser.add_argument(
-        "--keep-read-assignments", action="store_true",
-        help="Retain per-read hard assignments on every WindowResult. Debug only: they "
-             "are written to no output file and read by no other code.",
     )
     long_parser.add_argument(
         "--no-spill", action="store_true",
