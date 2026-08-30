@@ -654,46 +654,6 @@ def build_lineages(
                 e.reason = "failed_not_best"
                 edges.append(e)
 
-    # ---- TRACK-PRESERVING UNION: a lineage may never fragment a step-1 track ----
-    #
-    # step 1 chained these window-haplotypes inside ONE sample, on that sample's own
-    # reads, through the same gate stack used above. If two groups hold members of the
-    # same track, that sample's reads already say they are one strain, and a lineage
-    # that separates them contradicts evidence step 1 already accepted.
-    #
-    # Without this, longitudinal could be WORSE than single: on div0025_k2 sample T6,
-    # step 1 produced ONE track spanning the whole 4.87 Mb contig while the lineages
-    # built over it came out in 12 pieces capped at 1.85 Mb - and because a read is
-    # labelled by its lineage (the track is only a fallback), the intact chain was
-    # discarded. This makes "longitudinal >= single" structural rather than hoped for.
-    #
-    # It is also what makes reciprocity safe again: a continuation lost to a tie at one
-    # boundary is recovered here whenever any sample's own chain crossed it.
-    track_groups: dict[tuple[str, str], list[str]] = defaultdict(list)
-    for g in groups:
-        for m in g.members:
-            if m.within_sample_id:
-                track_groups[(m.sample, m.within_sample_id)].append(g.group_id)
-    # A track NEVER overrides the mismatch veto. Step 1 chained on one sample's
-    # haplotypes; step 3 compares the POOLED cross-sample group consensus, which can
-    # see a genuine difference that sample could not. Where the two disagree the veto
-    # wins, because it is the one verdict this module treats as absolute.
-    refused = {frozenset((e.group_a, e.group_b))
-               for e in edges if e.reason == "failed_mismatch"}
-    n_track_unions = 0
-    for _key, gids in track_groups.items():
-        uniq = sorted(set(gids))
-        for a, b in zip(uniq, uniq[1:]):
-            if frozenset((a, b)) in refused:
-                continue
-            if not graph.has_edge(a, b):
-                n_track_unions += 1
-            graph.add_edge(a, b)
-    if n_track_unions:
-        logging.info(
-            f"  track-preserving union: {n_track_unions} group pair(s) joined because a "
-            f"step-1 track spans them (lineages cannot fragment a within-sample chain)")
-
     gmap = {g.group_id: g for g in groups}
     # Each component is a chain of pairwise-approved joins. Re-test each one END TO
     # END and cut any that drifts; a chain of individually-fine links can still be
@@ -714,6 +674,66 @@ def build_lineages(
         logging.info(
             f"  transitive abundance check split {n_split} chain(s) into "
             f"{len(chains)} piece(s)")
+
+    # ---- TRACK-PRESERVING UNION: a lineage may never fragment a step-1 track ----
+    #
+    # Applied HERE, after the end-to-end coherence check, because that check cuts
+    # chains and would otherwise undo this: measured on real MAGs it "split 17 chains
+    # into 496 pieces" immediately after the union joined 266 group pairs, leaving 10%
+    # of tracks fragmented anyway. Whichever runs last wins, and the track must - it is
+    # direct read evidence from step 1, where the coherence check is an inference over
+    # pooled counts.
+    #
+    # step 1 chained these window-haplotypes inside ONE sample, on that sample's own
+    # reads, through the same gate stack step 3 uses. If two groups hold members of the
+    # same track, that sample's reads already say they are one strain. Without this,
+    # longitudinal can be WORSE than single: on div0025_k2 sample T6, step 1 produced
+    # ONE track spanning the whole 4.87 Mb contig while the lineages built over it came
+    # out in 12 pieces - and a read is labelled by its lineage, so the intact chain was
+    # discarded. This makes "longitudinal >= single" structural.
+    #
+    # A track NEVER overrides the mismatch veto: step 1 saw one sample, step 3 compares
+    # the pooled cross-sample consensus and can see a difference that sample could not.
+    refused = {frozenset((e.group_a, e.group_b))
+               for e in edges if e.reason == "failed_mismatch"}
+    piece_of: dict[str, int] = {}
+    for idx, members in enumerate(chains):
+        for g in members:
+            piece_of[g.group_id] = idx
+    parent = list(range(len(chains)))
+
+    def _find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    track_groups: dict[tuple[str, str], list[WindowGroup]] = defaultdict(list)
+    for g in groups:
+        for m in g.members:
+            if m.within_sample_id:
+                track_groups[(m.sample, m.within_sample_id)].append(g)
+    n_track_unions = 0
+    for _key, gs in track_groups.items():
+        # genomic order, not group-id string order: consecutive-in-string is not
+        # consecutive on the contig, and chaining the wrong neighbours makes the
+        # mismatch veto below refuse pairs that were never adjacent.
+        uniq = sorted({g.group_id: g for g in gs}.values(), key=lambda g: g.window_start)
+        for ga, gb in zip(uniq, uniq[1:]):
+            if frozenset((ga.group_id, gb.group_id)) in refused:
+                continue
+            ra, rb = _find(piece_of[ga.group_id]), _find(piece_of[gb.group_id])
+            if ra != rb:
+                parent[ra] = rb
+                n_track_unions += 1
+    if n_track_unions:
+        merged: dict[int, list[WindowGroup]] = defaultdict(list)
+        for idx, members in enumerate(chains):
+            merged[_find(idx)].extend(members)
+        chains = [sorted(m, key=lambda g: g.window_start) for m in merged.values()]
+        logging.info(
+            f"  track-preserving union: {n_track_unions} lineage piece(s) merged because "
+            f"a step-1 track spans them (a lineage may not fragment a within-sample chain)")
 
     lineages: list[Lineage] = []
     for i, members in enumerate(chains):

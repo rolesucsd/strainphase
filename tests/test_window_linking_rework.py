@@ -401,13 +401,18 @@ def _grp(gid, wstart, members):
                        members=members, window_end=wstart + 20000)
 
 
-def _mem(sample, consensus, reads=30, total=60, wsid="T1", n_read_ids=8):
+def _mem(sample, consensus, reads=30, total=60, wsid="T1", n_read_ids=8, reads_key=None):
     """`wsid` is the step-1 chain this haplotype belongs to.
 
     Since 2026-08-30 step 3 links on SHARED READS, not on chain votes, so the read ids
     are derived from (sample, wsid): two members of the same chain in the same sample
     carry the SAME reads and therefore continue into each other, which is exactly what
     `wsid` meant before. Members of different chains share none.
+
+    `reads_key` decouples the two when a test needs groups that LINK (shared reads) but
+    sit in DIFFERENT step-1 tracks - which is also the real case, since a read spanning
+    a window seam belongs to both windows whatever track they ended up in. Needed to
+    exercise the abundance checks, which the track-preserving union outranks.
 
     The id and window coordinates are placeholders; `_grp` overwrites them with the
     group's own, so a member always carries an id unique to its (sample, window, index).
@@ -416,7 +421,7 @@ def _mem(sample, consensus, reads=30, total=60, wsid="T1", n_read_ids=8):
                            haplotype_id="", consensus=consensus,
                            reads=reads, total_reads=total, abundance=reads / total,
                            within_sample_id=wsid,
-                           read_ids=frozenset(f"{sample}:{wsid}:r{i}"
+                           read_ids=frozenset(f"{sample}:{reads_key or wsid}:r{i}"
                                               for i in range(n_read_ids)))
 
 
@@ -516,8 +521,8 @@ def test_abundance_eliminates_a_join_that_votes_would_accept():
     """The ELIMINATOR: chained by reads, but the shares genuinely disagree."""
     from strainphase.lineages import build_lineages
     shared = {12000: "A", 15000: "C", 18000: "G"}
-    a = _grp("A", 1, [_mem(f"t{i}", shared, reads=95, total=100) for i in range(5)])
-    b = _grp("B", 10001, [_mem(f"t{i}", shared, reads=5, total=100) for i in range(5)])
+    a = _grp("A", 1, [_mem(f"t{i}", shared, reads=95, total=100, wsid="TA") for i in range(5)])
+    b = _grp("B", 10001, [_mem(f"t{i}", shared, reads=5, total=100, wsid="TB") for i in range(5)])
     lins, edges = build_lineages([a, b], _lcfg())
     assert any(e.reason == "failed_abundance" for e in edges)
     assert len(lins) == 2, "incompatible shares must not merge"
@@ -821,7 +826,7 @@ def test_a_genuinely_drifting_chain_of_split_groups_is_still_cut():
 
     ks = [70, 63, 56, 49, 42, 35]  # each member; the cell is twice this out of 200
     grps = [
-        _split_grp(chr(65 + w), 1 + w * 10000, ["S1", "S2", "S3", "S4"],
+        _split_grp(chr(65 + w), 1 + w * 10000, ["S1", "S2", "S3", "S4"], wsid=f"T{w}",
                    reads_each=(k, k), total=200)
         for w, k in enumerate(ks)
     ]
@@ -1065,7 +1070,11 @@ def test_transitive_abundance_check_splits_a_drifting_chain():
     """
     from strainphase.lineages import build_lineages
 
-    shared = {12000: "A", 15000: "C", 18000: "G"}
+    # Markers every 500 bp across the whole chain, so EVERY adjacent pair has markers
+    # inside its own shared region. Three fixed positions would only be shared by the
+    # first pair, and since 2026-08-30 `failed_no_evidence` blocks - the rest would be
+    # refused for lack of evidence and this would test nothing.
+    shared = {p: "A" for p in range(1000, 70000, 500)}
     # A GENTLE monotone drift, 140/200 down to 70/200 in six steps. Every ADJACENT
     # pair is comfortably coherent (min Fisher p = 0.17, well above alpha=0.01), so
     # the pairwise veto passes all of them; but 10 of the 15 pairs across the whole
@@ -1073,7 +1082,9 @@ def test_transitive_abundance_check_splits_a_drifting_chain():
     ks = [140, 126, 112, 98, 84, 70]
     grps = [
         _grp(chr(65 + w), 1 + w * 10000,
-             [_mem(f"t{i}", dict(shared), reads=k, total=200) for i in range(4)])
+             [_mem(f"t{i}", dict(shared), reads=k, total=200, wsid=f"T{w}",
+                   reads_key="CHAIN")
+              for i in range(4)])
         for w, k in enumerate(ks)
     ]
 
@@ -1097,8 +1108,10 @@ def test_any_testable_sample_may_veto():
 
     shared = {12000: "A", 15000: "C", 18000: "G"}
     # ONE sample, both windows deep enough to test, shares wildly different
-    a = _grp("A", 1, [_mem("t0", dict(shared), reads=95, total=100)])
-    b = _grp("B", 10001, [_mem("t0", dict(shared), reads=5, total=100)])
+    a = _grp("A", 1, [_mem("t0", dict(shared), reads=95, total=100, wsid="TA",
+                           reads_key="CHAIN")])
+    b = _grp("B", 10001, [_mem("t0", dict(shared), reads=5, total=100, wsid="TB",
+                               reads_key="CHAIN")])
 
     old, old_e = build_lineages([a, b], _lcfg(), min_samples_for_veto=3)
     new, new_e = build_lineages([a, b], _lcfg(), min_samples_for_veto=1)
@@ -1446,3 +1459,35 @@ def test_evidence_gate_blocks_a_join_with_too_few_markers():
                                      transitive_abundance_check=False)
     assert [e.reason for e in edges] == ["failed_no_evidence"]
     assert len(lineages) == 2
+
+
+def test_track_union_outranks_the_transitive_abundance_check():
+    """The union runs AFTER the end-to-end check, so a step-1 track survives it.
+
+    Measured on real MAGs before this ordering was fixed: the union joined 266 group
+    pairs and the coherence check then "split 17 chains into 496 pieces", leaving 10%
+    of tracks fragmented anyway. Whichever runs last wins, and the track must - it is
+    direct read evidence from one sample, where the coherence check is an inference
+    over pooled counts.
+    """
+    from strainphase.lineages import build_lineages
+
+    shared = {p: "A" for p in range(1000, 70000, 500)}
+    ks = [140, 126, 112, 98, 84, 70]          # the same drift the check cuts
+
+    def chain(wsid_per_window):
+        return [
+            _grp(chr(65 + w), 1 + w * 10000,
+                 [_mem(f"t{i}", dict(shared), reads=k, total=200,
+                       wsid=(f"T{w}" if wsid_per_window else "ONE"), reads_key="CHAIN")
+                  for i in range(4)])
+            for w, k in enumerate(ks)
+        ]
+
+    # distinct tracks -> nothing to preserve, the check cuts the drift
+    cut, _ = build_lineages(chain(True), _lcfg(), transitive_abundance_check=True)
+    # ONE track spans the whole chain -> the union puts it back together
+    whole, _ = build_lineages(chain(False), _lcfg(), transitive_abundance_check=True)
+
+    assert max(len(x.groups) for x in whole) > max(len(x.groups) for x in cut)
+    assert len(whole) == 1
