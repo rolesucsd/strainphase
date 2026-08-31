@@ -120,8 +120,13 @@ def build_lineages_from_tracks(
         raise ValueError("markers must be supplied; steps must judge identity on one set")
     tracks = tracks_of(haps)
     cons = {k: track_consensus(v, markers) for k, v in tracks.items()}
+    # A track carrying no marker cannot be MERGED - there is nothing to agree on - but it
+    # must still be REPORTED. On B. fragilis 000089747_1, 7,120 of 14,978 tracks (47%)
+    # carry no marker under the read-supported set, and dropping them would silently
+    # discard nearly half the phased sequence rather than emitting it as unmergeable.
+    # They become singleton lineages: no evidence to merge is not evidence of absence.
     keys = [k for k, c in cons.items() if c]
-    skipped = len(tracks) - len(keys)
+    unmergeable = [k for k, c in cons.items() if not c]
 
     parent: dict[tuple[str, str], tuple[str, str]] = {k: k for k in keys}
 
@@ -172,6 +177,8 @@ def build_lineages_from_tracks(
     entities: dict[tuple[str, str], list[tuple[str, str]]] = defaultdict(list)
     for k in keys:
         entities[find(k)].append(k)
+    for k in unmergeable:
+        entities[k].append(k)
 
     lineages: list[Lineage] = []
     for i, member_keys in enumerate(sorted(entities.values(), key=lambda v: -len(v))):
@@ -189,7 +196,8 @@ def build_lineages_from_tracks(
             lineages.append(Lineage(f"{lineage_prefix}{i:06d}", groups[0].contig, groups))
 
     logging.info(
-        f"  track merge: {len(tracks)} step-1 tracks ({skipped} with no marker) -> "
+        f"  track merge: {len(tracks)} step-1 tracks ({len(unmergeable)} carry no "
+        f"marker and stay singletons) -> "
         f"{len(lineages)} lineages | {n_merged} merges, {n_refused} refused by a "
         f"step-1 veto, min_shared_markers={min_shared}")
     return lineages

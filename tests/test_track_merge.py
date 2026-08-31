@@ -99,3 +99,27 @@ def test_entity_is_split_back_into_one_group_per_window():
 def test_markers_must_be_supplied():
     with pytest.raises(ValueError):
         build_lineages_from_tracks([_hap("S1", "T1", 0, {100: "A"})], _cfg())
+
+
+def test_markerless_tracks_are_reported_not_dropped():
+    """No evidence to merge is not evidence of absence.
+
+    A track carrying no identity marker cannot be merged with anything, but on a real
+    MAG that is 47% of tracks - dropping them would silently discard nearly half the
+    phased sequence. They come back as singleton lineages.
+    """
+    haps = [_hap("S1", "T1", 0, {999: "A"}),      # 999 is not in MARKERS
+            _hap("S2", "T1", 0, {999: "A"})]
+    lineages = build_lineages_from_tracks(haps, _cfg(), markers=MARKERS)
+    assert len(lineages) == 2, "unmergeable is not the same as absent"
+    assert {m.sample for lin in lineages for g in lin.groups for m in g.members} == {"S1", "S2"}
+
+
+def test_markerless_and_mergeable_tracks_coexist():
+    haps = [_hap("S1", "T1", 0, {100: "A", 200: "C"}),
+            _hap("S2", "T1", 0, {100: "A", 200: "C"}),   # merges with S1
+            _hap("S3", "T9", 0, {999: "G"})]             # no marker -> singleton
+    lineages = build_lineages_from_tracks(haps, _cfg(), markers=MARKERS)
+    assert len(lineages) == 2
+    sizes = sorted(len({m.sample for g in lin.groups for m in g.members}) for lin in lineages)
+    assert sizes == [1, 2]

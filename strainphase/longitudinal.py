@@ -38,7 +38,7 @@ import os
 import pickle
 import shutil
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 
 import pysam  # noqa: F401
 
@@ -53,8 +53,8 @@ from strainphase.core import (
     process_contig,
     supported_marker_positions,
 )
-from strainphase.lineages import build_lineages
-from strainphase.window_groups import WindowHaplotype, group_all_windows
+from strainphase.track_merge import build_lineages_from_tracks
+from strainphase.window_groups import WindowHaplotype
 
 # -----------------------------------------------------------------------------#
 # Helpers
@@ -575,29 +575,6 @@ def _lineage_rows(lineages, mag_name: str) -> list[dict]:
     return rows
 
 
-def _write_lineage_edges(edges, output_dir: str) -> None:
-    """Every attempted continuation with its outcome, into ``<output_dir>/tmp``.
-
-    Diagnostic, not a deliverable: which joins were refused and why is what distinguishes
-    a recombination breakpoint from a coverage hole, but it is O(groups^2). It lives
-    beside the run it describes rather than in a system temp directory, so it is findable,
-    cleanable, and cannot collide between concurrent runs.
-    """
-    import csv as _csv
-
-    if not edges:
-        return
-    tmp = os.path.join(output_dir, "tmp")
-    os.makedirs(tmp, exist_ok=True)
-    path = os.path.join(tmp, "lineage_edges.tsv")
-    with open(path, "w", newline="") as f:
-        w = _csv.DictWriter(f, fieldnames=list(vars(edges[0]).keys()), delimiter="\t")
-        w.writeheader()
-        w.writerows(vars(e) for e in edges)
-    from collections import Counter as _C
-    logging.info(f"  lineage edges (temp, diagnostic): {len(edges)} -> {path} | "
-                 f"{dict(_C(e.reason for e in edges))}")
-
 
 def _write_read_assignments(rows: list[dict], output_dir: str) -> None:
     """PROTOTYPE dump: per-window read->haplotype assignments -> tmp/window_read_assignments.tsv.
@@ -942,43 +919,56 @@ def build_window_tables(
         "  identity markers (read-supported, shared by steps 2 and 3): "
         + ", ".join(f"{c}: {len(m)}" for c, m in sorted(markers_by_contig.items())))
 
-    # ---- vertical axis: group across samples at each fixed window ----
-    groups, edges, edge_counts = group_all_windows(
-        window_haps, config, sample_order=sample_order, site_type=site_type_all,
-        markers_by_contig=markers_by_contig,
-    )
-
-    # ---- step 3: chain those groups along the genome into lineages ----
+    # ---- steps 2+3, MERGED: tracks across samples become lineages directly ----
     #
-    # Run here rather than from a separate driver because everything it needs is already
-    # in memory: the groups, the contig-wide marker set, and step 1's mismatch verdicts.
-    # Driving it externally meant re-reading a 224 MB haplotypes.tsv and, historically,
-    # meant the pipeline shipped a lineage table built by a different algorithm.
+    # Cross-sample window grouping and cross-window chaining used to be two passes over
+    # different units. That split one question - "are these the same strain?" - in a way
+    # that created three structural problems (see strainphase.track_merge): two groups at
+    # one window were never comparable, 78% of chaining comparisons could not be judged
+    # at all, and the repair for the resulting shattering had to run last or be undone.
+    #
+    # A step-1 track is already a within-sample chain built from that sample's own reads,
+    # and is not chimeric in practice, so the only work left is merging tracks ACROSS
+    # samples - one clustering, on byte-for-byte identity over the shared marker set.
     lineage_rows: list[dict] = []
+    groups: list = []
+    edges: list = []
+    edge_counts: Counter = Counter()
     if config.build_lineages:
-        # Map each flagged pair to the set of timepoints (samples) that flagged it,
-        # so build_lineages can require corroboration before a within-sample mismatch
-        # vetoes a cross-window continuation (config.step1_veto_min_timepoints).
-        step1_mm: dict[frozenset[str], set[str]] = defaultdict(set)
+        # Step 1's own refusals become cannot-link between the TRACKS holding those
+        # haplotypes. Both verdicts carry: a genuine allele disagreement and an
+        # incompatible within-sample share are equally reasons two things are not one
+        # strain. Byte-identity already refuses anything that disagrees where both
+        # called, so these bind on a looser pass rather than this one - they are wired
+        # now so the constraint is not lost when that pass is added.
+        hap_track: dict[str, tuple[str, str]] = {
+            h.haplotype_id: (h.sample, h.within_sample_id)
+            for h in window_haps if h.within_sample_id
+        }
+        cannot_link: set[frozenset] = set()
         for r in within_mismatch_rows:
-            if r["haplotype_a"] and r["haplotype_b"]:
-                step1_mm[frozenset((r["haplotype_a"], r["haplotype_b"]))].add(r["sample"])
-        by_contig: dict[str, list] = defaultdict(list)
-        for g in groups:
-            by_contig[g.contig].append(g)
-        lineage_edges: list = []
-        for contig_id_, cgroups in sorted(by_contig.items()):
-            lins, ledges = build_lineages(
-                cgroups, config, markers=markers_by_contig.get(contig_id_),
-                step1_mismatches=step1_mm,
-                step1_abundance_refusals=step1_abundance_refusals,
-                max_bad_frac=config.lineage_max_bad_frac,
-                min_mismatch_timepoints=config.step1_veto_min_timepoints,
-                transitive_abundance_check=config.transitive_abundance_check,
-                lineage_prefix=f"{contig_id_}_LIN")
-            lineage_edges.extend(ledges)
+            a, b = hap_track.get(r["haplotype_a"]), hap_track.get(r["haplotype_b"])
+            if a and b and a != b:
+                cannot_link.add(frozenset((a, b)))
+        for pair in step1_abundance_refusals:
+            ids = list(pair)
+            if len(ids) == 2:
+                a, b = hap_track.get(ids[0]), hap_track.get(ids[1])
+                if a and b and a != b:
+                    cannot_link.add(frozenset((a, b)))
+
+        by_contig_haps: dict[str, list] = defaultdict(list)
+        for h in window_haps:
+            by_contig_haps[h.contig].append(h)
+        for contig_id_, chaps in sorted(by_contig_haps.items()):
+            lins = build_lineages_from_tracks(
+                chaps, config, markers=markers_by_contig.get(contig_id_, frozenset()),
+                cannot_link=cannot_link, lineage_prefix=f"{contig_id_}_LIN")
+            # The per-window groups a lineage was split back into ARE the across-sample
+            # grouping now, so windows_across_samples.tsv keeps describing what it always
+            # described: which samples' haplotypes were judged one entity at one window.
+            groups.extend(g for lin in lins for g in lin.groups)
             lineage_rows.extend(_lineage_rows(lins, mag_of_contig.get(contig_id_, "")))
-        _write_lineage_edges(lineage_edges, output_dir)
 
     # PROTOTYPE: dump per-window read->haplotype assignments for the read-anchored
     # threading (also the input a future linker experiment would need).
