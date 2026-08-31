@@ -1696,3 +1696,86 @@ def test_one_impure_group_welds_two_strain_chains_into_one_lineage():
     assert not any(e.reason == "linked" for e in edges)  # nothing was actually joined
     assert len(lineages) == 1                            # <-- yet it is all one lineage
     assert len(lineages[0].groups) == 3
+
+
+# ---------------------------------------------------------------------------
+# Read-supported marker set (shared by steps 2 and 3)
+# ---------------------------------------------------------------------------
+
+
+def test_supported_markers_keep_a_swept_position():
+    """A swept position is FIXED within every sample - all one allele before the
+    sweep, all the other after - so a within-sample minor-allele test finds no
+    polymorphism and would discard exactly the event being tracked. Each allele is
+    therefore counted across samples INDEPENDENTLY.
+    """
+    from strainphase.core import supported_marker_positions
+
+    obs = [("S1", {10: "A"}, 20), ("S2", {10: "A"}, 20),      # allele A, 2 samples
+           ("S3", {10: "T"}, 20), ("S4", {10: "T"}, 20)]      # allele T, 2 samples
+    assert supported_marker_positions(obs, None, cfg()) == frozenset({10})
+
+
+def test_supported_markers_drop_unreplicated_and_invariant():
+    """Read support AND replication: one shallow miscall must not make a marker."""
+    from strainphase.core import supported_marker_positions
+
+    obs = [
+        ("S1", {20: "C", 30: "G"}, 20),
+        ("S2", {20: "C", 30: "G"}, 20),
+        ("S3", {20: "C", 30: "A"}, 1),    # 30: minor allele, 1 read, 1 sample
+    ]
+    markers = supported_marker_positions(obs, None, cfg())
+    assert 20 not in markers, "invariant position is not a marker"
+    assert 30 not in markers, "one unreplicated read is not a marker"
+
+
+def test_supported_markers_need_two_samples_per_allele():
+    from strainphase.core import supported_marker_positions
+
+    obs = [("S1", {10: "A"}, 20), ("S2", {10: "A"}, 20), ("S3", {10: "T"}, 20)]
+    assert supported_marker_positions(obs, None, cfg()) == frozenset()
+    obs.append(("S4", {10: "T"}, 20))
+    assert supported_marker_positions(obs, None, cfg()) == frozenset({10})
+
+
+# ---------------------------------------------------------------------------
+# Step-1 abundance verdicts propagate into step 3 (hybrid)
+# ---------------------------------------------------------------------------
+
+
+def test_step1_abundance_refusal_vetoes_the_join():
+    """A pair step 1 refused on abundance may not be re-joined downstream."""
+    groups = _par_groups()
+    ids = {m.haplotype_id for g in groups for m in g.members}
+    a = next(i for i in ids if i.endswith("a1"))
+    b = next(i for i in ids if i.endswith("b1"))
+    refusals = {frozenset((a, b)): {"S1", "S2"}}          # corroborated in 2 samples
+
+    from strainphase.core import HaplotyperConfig
+    from strainphase.lineages import build_lineages
+
+    config = HaplotyperConfig(window_size=10000, min_shared_reads_for_link=3)
+    _, edges = build_lineages(groups, config, step=5000, max_bad_frac=1.0,
+                              transitive_abundance_check=False,
+                              step1_abundance_refusals=refusals)
+    refused = [e for e in edges if {e.group_a, e.group_b} == {"A1", "B1"}]
+    assert refused and refused[0].reason == "failed_abundance"
+
+
+def test_step1_abundance_refusal_needs_corroboration():
+    """One sample's verdict is not enough - same rule the mismatch veto uses."""
+    groups = _par_groups()
+    ids = {m.haplotype_id for g in groups for m in g.members}
+    a = next(i for i in ids if i.endswith("a1"))
+    b = next(i for i in ids if i.endswith("b1"))
+
+    from strainphase.core import HaplotyperConfig
+    from strainphase.lineages import build_lineages
+
+    config = HaplotyperConfig(window_size=10000, min_shared_reads_for_link=3)
+    _, edges = build_lineages(groups, config, step=5000, max_bad_frac=1.0,
+                              transitive_abundance_check=False,
+                              step1_abundance_refusals={frozenset((a, b)): {"S1"}})
+    linked = [e for e in edges if {e.group_a, e.group_b} == {"A1", "B1"}]
+    assert linked and linked[0].reason == "linked"

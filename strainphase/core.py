@@ -30,7 +30,7 @@ import logging
 import os
 import warnings
 import zlib
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from multiprocessing import Pool
@@ -210,6 +210,24 @@ class HaplotyperConfig:
     # out, so those are a different error model and keep their own thresholds.
     identity_distance: float = 0.02
     min_shared_markers: int = 3
+    # --- MARKER SET (computed once, used by steps 2 and 3) ----------------------
+    # A position is a CANDIDATE marker when more than one allele is seen at it anywhere
+    # on the contig. These thresholds decide which candidates survive: an ALLELE is kept
+    # when it reaches `marker_min_frac` of a sample's reads at that position AND at least
+    # `marker_min_reads` reads, in at least `marker_min_samples` samples. The samples need
+    # not be the same for the two alleles - a swept position is FIXED within each sample
+    # (all one allele before the sweep, all the other after), so requiring both alleles in
+    # one sample would discard exactly the events this tool exists to find. A position
+    # survives when >= 2 alleles do.
+    #
+    # Without this, a marker was any position with two distinct CONSENSUS calls anywhere -
+    # no read backing, no replication - so one miscalled base in one shallow window
+    # promoted a position contig-wide. Measured on B. fragilis 000089747_1 contig_2:
+    # 66,183 of 170,694 positions (38.8%) qualified; with read support and replication,
+    # 1,346 (2.0% of candidates) do, and both positions of a real sweep are retained.
+    marker_min_frac: float = 0.10
+    marker_min_reads: int = 3
+    marker_min_samples: int = 2
     assign_confidence_threshold: float = 0.90
 
     # =========== 1-SNP VALIDATION ===========
@@ -562,6 +580,13 @@ class WindowResult:
     # merge rules treat as absolute. `failed_no_evidence` is a measurement hole and is
     # deliberately NOT recorded - reporting absence of coverage would bury the signal.
     link_mismatches: list[dict] = field(default_factory=list)
+    # Step-1 ABUNDANCE refusals, carried exactly like link_mismatches above. Both are
+    # verdicts step 1 already reached on evidence steps 2 and 3 cannot improve on - one
+    # sample, two adjacent windows, where a genome cannot sit at two frequencies at once.
+    # They were previously written only to the debug trace, so step 3 re-derived the same
+    # test pairwise AND again transitively over whole chains. Recording them makes the
+    # verdict propagate instead of being recomputed.
+    link_abundance_refusals: list[dict] = field(default_factory=list)
     n_reads_examined: int = 0
     reads_within_mismatch_per_hap: list[int] = field(default_factory=list)
     # Scalar summaries of `gamma`, recorded before the heavy fields are offloaded so the
@@ -3439,6 +3464,56 @@ def _merge_split_reads(
 # =============================================================================
 
 
+def supported_marker_positions(
+    observations,
+    site_type: dict[int, str] | None = None,
+    config: HaplotyperConfig = DEFAULT_CONFIG,
+) -> frozenset[int]:
+    """Identity markers that real, replicated reads support.
+
+    ``observations`` yields ``(sample, consensus, reads)`` - one per window-haplotype.
+
+    CANDIDACY is unchanged: a position with more than one allele anywhere. The thresholds
+    only decide which candidates SURVIVE, per allele:
+
+        an allele is kept if it reaches ``marker_min_frac`` of a sample's reads at that
+        position AND ``marker_min_reads`` reads, in ``marker_min_samples`` samples
+
+    counted for each allele INDEPENDENTLY - the two alleles need not appear together in
+    one sample. That matters: at a swept position every sample is FIXED (all one allele
+    before the sweep, all the other after), so a within-sample minor-allele test finds no
+    polymorphism at all and would discard the sweep. Measured on 000089747_1 contig_2,
+    requiring both alleles in one sample dropped both positions of a real sweep; counting
+    each allele across samples keeps them.
+
+    A position survives when at least two alleles do. Returned as a frozenset because
+    every consumer only ever tests membership or intersects.
+    """
+    # position -> sample -> allele -> reads
+    seen: dict[int, dict[str, dict[str, float]]] = defaultdict(
+        lambda: defaultdict(lambda: defaultdict(float)))
+    for sample, consensus, reads in observations:
+        for pos, base in consensus.items():
+            seen[pos][sample][base] += reads
+
+    keep: set[int] = set()
+    for pos, per_sample in seen.items():
+        qualifying: Counter = Counter()
+        for alleles in per_sample.values():
+            total = sum(alleles.values())
+            if not total:
+                continue
+            for base, n in alleles.items():
+                if n >= config.marker_min_reads and n / total >= config.marker_min_frac:
+                    qualifying[base] += 1
+        if sum(1 for c in qualifying.values() if c >= config.marker_min_samples) >= 2:
+            keep.add(pos)
+
+    if config.exclude_sv_from_identity and site_type:
+        keep -= {pos for pos in keep if site_type.get(pos) == "sv"}
+    return frozenset(keep)
+
+
 def variable_marker_positions(
     consensuses: Iterable[dict[int, str]],
     site_type: dict[int, str] | None = None,
@@ -3806,6 +3881,17 @@ def link_windows(
                                 "decision": "refused",
                                 "reason": "incompatible_abundance",
                             })
+                            # PROPAGATE, don't just trace: this pair may never be merged
+                            # later either, and steps 2/3 should not have to re-test it.
+                            curr_wr.link_abundance_refusals.append(
+                                {
+                                    "contig": curr_wr.window.contig,
+                                    "window_a": curr_wr.window.start,
+                                    "hap_a_idx": hi,
+                                    "window_b": next_wr.window.start,
+                                    "hap_b_idx": hj,
+                                }
+                            )
                             continue
                         # RANK BY SHARED READS (lower is better for unique_best):
                         # the same score step 3 uses. Consensus has already had its

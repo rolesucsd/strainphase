@@ -472,6 +472,11 @@ def build_lineages(
     lineage_prefix: str = "LIN",
     markers: set[int] | None = None,
     step1_mismatches: dict[frozenset[str], set[str]] | set[frozenset[str]] | None = None,
+    # Step 1's ABUNDANCE verdicts, keyed like step1_mismatches. Step 1 compared two
+    # adjacent windows inside ONE sample - a genome cannot sit at two frequencies at one
+    # moment - which is the only scope where the test means anything. Passing them makes
+    # the veto propagate; step 3 then never re-runs the comparison itself.
+    step1_abundance_refusals: dict[frozenset[str], set[str]] | None = None,
     # A step-1 within-sample mismatch vetoes only when >= this many DISTINCT
     # timepoints flag the group-to-group join. See config.step1_veto_min_timepoints.
     min_mismatch_timepoints: int = 2,
@@ -502,6 +507,7 @@ def build_lineages(
         mismatched = {pair: {f"_tp{i}"} for i, pair in enumerate(step1_mismatches)}
     else:
         mismatched = {}
+    abundance_refused = step1_abundance_refusals or {}
 
     by_key: dict[tuple[str, int], list[WindowGroup]] = defaultdict(list)
     for g in groups:
@@ -596,6 +602,28 @@ def build_lineages(
                         e.reason = "failed_mismatch"
                         edges.append(e)
                         continue
+                # ABUNDANCE, step 1's verdict FIRST. Step 1 ran this test where it is
+                # meaningful - one sample, two adjacent windows, where a genome cannot
+                # sit at two frequencies at one moment - so a pair it already refused is
+                # refused here without re-deriving anything. Corroboration matches the
+                # mismatch rule: one sample's noisy window does not veto, >= this many
+                # distinct samples do.
+                refused_tps: set[str] = set()
+                if abundance_refused:
+                    for a in hap_ids[ga.group_id]:
+                        for b in hap_ids[gb.group_id]:
+                            refused_tps |= abundance_refused.get(frozenset((a, b)), set())
+                if len(refused_tps) >= min_mismatch_timepoints:
+                    e.n_samples_tested = e.n_samples_incompatible = len(refused_tps)
+                    e.reason = "failed_abundance"
+                    edges.append(e)
+                    continue
+                # HYBRID FALLBACK. Step 1 only ever compared two adjacent windows inside
+                # ONE sample, so it has no opinion on a group pair it never paired -
+                # groups aggregate haplotypes across samples, and a pair whose members
+                # step 1 never put side by side would otherwise get no abundance check at
+                # all. Where step 1 has spoken the verdict above stands; where it has not,
+                # the comparison still has to happen somewhere.
                 veto, tested, bad = _abundance_incompatible(
                     counts[ga.group_id], counts[gb.group_id], config,
                     max_bad_frac, min_samples_for_veto)

@@ -62,7 +62,7 @@ from strainphase.core import (
     compare_consensus,
     consensus_footprint,
     unique_best_matches,
-    variable_marker_positions,
+    supported_marker_positions,
 )
 
 __all__ = [
@@ -344,12 +344,17 @@ def group_all_windows(
     config: HaplotyperConfig = DEFAULT_CONFIG,
     sample_order: list[str] | None = None,
     site_type: dict[int, str] | None = None,
+    markers_by_contig: dict[str, frozenset[int]] | None = None,
 ) -> tuple[list[WindowGroup], list[GroupEdge], Counter]:
     """Group every window of every contig, across samples.
 
     The marker set is computed ONCE PER CONTIG over every haplotype in every sample -
     the widest scope available, and the reason construction no longer prunes. Computing
     it per window would reintroduce a local definition of "variable".
+
+    ``markers_by_contig`` lets the caller supply that set instead, so steps 2 and 3 judge
+    identity on exactly the same positions. Passing it is the normal path; computing it
+    here is the fallback for direct callers and tests.
     """
     by_contig: dict[str, list[WindowHaplotype]] = {}
     for hap in haps:
@@ -360,9 +365,11 @@ def group_all_windows(
     counts: Counter = Counter()
 
     for contig, contig_haps in sorted(by_contig.items()):
-        markers = variable_marker_positions(
-            (h.consensus for h in contig_haps), site_type, config
-        )
+        markers = (markers_by_contig or {}).get(contig)
+        if markers is None:
+            markers = supported_marker_positions(
+                ((h.sample, h.consensus, h.reads) for h in contig_haps), site_type, config
+            )
         logging.info(
             f"  {contig}: {len(contig_haps)} window-haplotypes, "
             f"{len(markers)} identity markers, method={config.cross_sample_method}"

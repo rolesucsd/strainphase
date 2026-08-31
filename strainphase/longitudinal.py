@@ -51,7 +51,7 @@ from strainphase.core import (
     link_windows,
     make_worker_pool,
     process_contig,
-    variable_marker_positions,
+    supported_marker_positions,
 )
 from strainphase.lineages import build_lineages
 from strainphase.window_groups import WindowHaplotype, group_all_windows
@@ -671,6 +671,9 @@ def build_window_tables(
     window_haps: list[WindowHaplotype] = []
     site_type_all: dict[int, str] = {}
     within_mismatch_rows: list[dict] = []
+    # {frozenset(haplotype_a, haplotype_b): {samples that refused it}} - step 1's
+    # abundance verdicts, propagated rather than recomputed downstream.
+    step1_abundance_refusals: dict[frozenset, set] = defaultdict(set)
     mag_of_contig: dict[str, str] = {}
     # PROTOTYPE (read-anchored threading experiment): per-window read->haplotype
     # assignments. This is the
@@ -701,6 +704,13 @@ def build_window_tables(
                     return _window_haplotype_id(_s, _c, win_start, h_idx)
 
                 for wr in window_results:
+                    # Step-1 abundance refusals, keyed the same way as the mismatch rows
+                    # so step 3 can consult one veto set without re-testing anything.
+                    for m in getattr(wr, "link_abundance_refusals", []):
+                        a = _hid(m["window_a"], m["hap_a_idx"])
+                        b = _hid(m["window_b"], m["hap_b_idx"])
+                        if a and b:
+                            step1_abundance_refusals[frozenset((a, b))].add(sample_id)
                     for m in getattr(wr, "link_mismatches", []):
                         within_mismatch_rows.append(
                             {
@@ -917,9 +927,25 @@ def build_window_tables(
                         }
                     )
 
+    # ---- IDENTITY MARKERS: computed ONCE, here, and used by BOTH steps 2 and 3 ----
+    # They were previously derived twice, at different scopes - step 2 over every
+    # window-haplotype on the contig, step 3 over the members of the groups it had been
+    # handed - so the two steps could disagree about which positions were even
+    # comparable. One set, one definition, one place.
+    markers_by_contig: dict[str, frozenset[int]] = {}
+    for contig_id_ in {h.contig for h in window_haps}:
+        markers_by_contig[contig_id_] = supported_marker_positions(
+            ((h.sample, h.consensus, h.reads)
+             for h in window_haps if h.contig == contig_id_),
+            site_type_all, config)
+    logging.info(
+        "  identity markers (read-supported, shared by steps 2 and 3): "
+        + ", ".join(f"{c}: {len(m)}" for c, m in sorted(markers_by_contig.items())))
+
     # ---- vertical axis: group across samples at each fixed window ----
     groups, edges, edge_counts = group_all_windows(
-        window_haps, config, sample_order=sample_order, site_type=site_type_all
+        window_haps, config, sample_order=sample_order, site_type=site_type_all,
+        markers_by_contig=markers_by_contig,
     )
 
     # ---- step 3: chain those groups along the genome into lineages ----
@@ -942,10 +968,10 @@ def build_window_tables(
             by_contig[g.contig].append(g)
         lineage_edges: list = []
         for contig_id_, cgroups in sorted(by_contig.items()):
-            markers = variable_marker_positions(
-                (m.consensus for g in cgroups for m in g.members), site_type_all, config)
             lins, ledges = build_lineages(
-                cgroups, config, markers=markers, step1_mismatches=step1_mm,
+                cgroups, config, markers=markers_by_contig.get(contig_id_),
+                step1_mismatches=step1_mm,
+                step1_abundance_refusals=step1_abundance_refusals,
                 max_bad_frac=config.lineage_max_bad_frac,
                 min_mismatch_timepoints=config.step1_veto_min_timepoints,
                 transitive_abundance_check=config.transitive_abundance_check,
