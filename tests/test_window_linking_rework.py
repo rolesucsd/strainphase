@@ -1491,3 +1491,28 @@ def test_track_union_outranks_the_transitive_abundance_check():
 
     assert max(len(x.groups) for x in whole) > max(len(x.groups) for x in cut)
     assert len(whole) == 1
+
+
+def test_track_union_never_overrides_the_abundance_veto():
+    """A track outranks ABSENCE of evidence, never EVIDENCE OF DIFFERENCE.
+
+    Measured on div0050_k2 sample T3 (truth 0.663/0.337): step 1 produced two PURE
+    tracks - 12,029 reads at purity 1.000 and 6,392 at purity 1.000 - and the lineage
+    step merged them into one cluster of 18,417 reads at purity 0.653, taking
+    assigned_correct_fraction from 0.973 to 0.000. The pairwise abundance veto had
+    already refused that join on exactly those incompatible shares; the union then
+    overrode it, and one bad track in ONE sample fuses lineages for EVERY sample.
+    """
+    from strainphase.lineages import build_lineages
+
+    shared = {p: "A" for p in range(1000, 40000, 500)}
+    # one sample, two adjacent windows, wildly incompatible shares -> failed_abundance
+    a = _grp("A", 1, [_mem("t0", dict(shared), reads=95, total=100,
+                           wsid="ONE", reads_key="CHAIN")])
+    b = _grp("B", 10001, [_mem("t0", dict(shared), reads=5, total=100,
+                               wsid="ONE", reads_key="CHAIN")])
+    lineages, edges = build_lineages([a, b], _lcfg(), max_bad_frac=0.0,
+                                     transitive_abundance_check=False)
+    assert any(e.reason == "failed_abundance" for e in edges)
+    # the track spans both groups, but the veto wins
+    assert len(lineages) == 2

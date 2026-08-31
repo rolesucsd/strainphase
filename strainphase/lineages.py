@@ -692,10 +692,25 @@ def build_lineages(
     # out in 12 pieces - and a read is labelled by its lineage, so the intact chain was
     # discarded. This makes "longitudinal >= single" structural.
     #
-    # A track NEVER overrides the mismatch veto: step 1 saw one sample, step 3 compares
-    # the pooled cross-sample consensus and can see a difference that sample could not.
-    refused = {frozenset((e.group_a, e.group_b))
-               for e in edges if e.reason == "failed_mismatch"}
+    # A track NEVER overrides a VETO. The distinction is what the refusal means:
+    #
+    #   failed_mismatch / failed_abundance   EVIDENCE OF DIFFERENCE. The alleles
+    #       genuinely disagree, or the per-sample shares do. A track cannot outrank
+    #       this: step 1 saw one sample, step 3 compares the pooled cross-sample
+    #       consensus and counts, and can see a difference that sample could not.
+    #   everything else                      ABSENCE OF EVIDENCE. failed_no_evidence,
+    #       failed_not_mutual, failed_not_best and failed_no_read_overlap all mean "we
+    #       could not establish the join here", which is exactly what a track supplies.
+    #
+    # Adding failed_abundance here fixes a measured strain fusion: on div0050_k2 sample
+    # T3 (0.663/0.337) step 1 produced two PURE tracks - 12,029 reads at purity 1.000
+    # and 6,392 at purity 1.000 - and the lineage step merged them into one cluster of
+    # 18,417 reads at purity 0.653, taking assigned_correct_fraction from 0.973 to
+    # 0.000. The pairwise abundance veto had already refused that join on exactly the
+    # incompatible shares; the union then overrode it. One bad track in ONE sample
+    # merges two lineages for EVERY sample, so this needs the stricter rule.
+    refused = {frozenset((e.group_a, e.group_b)) for e in edges
+               if e.reason in ("failed_mismatch", "failed_abundance")}
     piece_of: dict[str, int] = {}
     for idx, members in enumerate(chains):
         for g in members:
@@ -714,6 +729,7 @@ def build_lineages(
             if m.within_sample_id:
                 track_groups[(m.sample, m.within_sample_id)].append(g)
     n_track_unions = 0
+    n_union_vetoed = 0
     for _key, gs in track_groups.items():
         # genomic order, not group-id string order: consecutive-in-string is not
         # consecutive on the contig, and chaining the wrong neighbours makes the
@@ -721,11 +737,16 @@ def build_lineages(
         uniq = sorted({g.group_id: g for g in gs}.values(), key=lambda g: g.window_start)
         for ga, gb in zip(uniq, uniq[1:]):
             if frozenset((ga.group_id, gb.group_id)) in refused:
+                n_union_vetoed += 1
                 continue
             ra, rb = _find(piece_of[ga.group_id]), _find(piece_of[gb.group_id])
             if ra != rb:
                 parent[ra] = rb
                 n_track_unions += 1
+    if n_union_vetoed:
+        logging.info(
+            f"  track-preserving union: {n_union_vetoed} track-spanned pair(s) REFUSED by "
+            f"a mismatch/abundance veto (evidence of difference outranks a track)")
     if n_track_unions:
         merged: dict[int, list[WindowGroup]] = defaultdict(list)
         for idx, members in enumerate(chains):
