@@ -1516,3 +1516,78 @@ def test_track_union_never_overrides_the_abundance_veto():
     assert any(e.reason == "failed_abundance" for e in edges)
     # the track spans both groups, but the veto wins
     assert len(lineages) == 2
+
+
+# ---------------------------------------------------------------------------
+# Redundant parallel lineages (observed on B. fragilis 000089747_1, upeY locus)
+#
+# Four lineages (LIN000290/284/285/286) came out of one real run all >=98.8%
+# identical to each other, spanning the same ~1.37-1.41 Mb interval, and
+# co-occurring in 14-32 of the same samples. They are one strain reported four
+# times.
+#
+# The 2% consensus gate is NOT what let this through - the pieces agree far
+# inside it. The cause is structural: build_lineages only ever compares a group
+# at window W with a group at W+step. Two groups sitting at the SAME window are
+# never candidates for each other, so once a strain is split across parallel
+# groups, each half chains forward independently and nothing downstream can
+# rejoin them. Step 2 is what should have grouped them in the first place.
+# ---------------------------------------------------------------------------
+
+
+def _par_groups():
+    """Two parallel, consensus-identical chains over the same two windows."""
+    reads = {"A1": {"r1", "r2", "r3", "r4"}, "A2": {"r5", "r6", "r7", "r8"}}
+    return [
+        _ro_group("A1", 0, [_ro_hap("S1", 0, "a1", reads["A1"])]),
+        _ro_group("A2", 0, [_ro_hap("S1", 0, "a2", reads["A2"])]),
+        _ro_group("B1", 5000, [_ro_hap("S1", 5000, "b1", reads["A1"])]),
+        _ro_group("B2", 5000, [_ro_hap("S1", 5000, "b2", reads["A2"])]),
+    ]
+
+
+def test_parallel_identical_chains_are_reported_separately():
+    """CHARACTERISATION of the redundancy: two identical chains stay separate.
+
+    This documents current behaviour so the mechanism cannot be misattributed to
+    the identity gate: every accepted edge here is a clean read-overlap link, and
+    the two lineages are consensus-identical over the same interval.
+    """
+    lineages, edges = _ro_build(_par_groups())
+    assert len(lineages) == 2
+    assert {e.reason for e in edges} == {"linked", "failed_no_read_overlap"}
+    # the two lineages chained forward correctly and independently
+    assert sorted(sorted(g.group_id for g in l.groups) for l in lineages) == [
+        ["A1", "B1"], ["A2", "B2"]
+    ]
+    # ...and they are the SAME entity by the pipeline's own identity rule
+    a, b = ({g.group_id for g in l.groups} for l in lineages)
+    ca = _group_consensus_of(lineages[0])
+    cb = _group_consensus_of(lineages[1])
+    shared = ca.keys() & cb.keys()
+    assert shared, "the two lineages must be comparable to make the point"
+    disagree = sum(1 for p in shared if ca[p] != cb[p])
+    assert disagree / len(shared) <= 0.02, "identical well inside the 2% gate"
+
+
+@pytest.mark.xfail(strict=True, reason=(
+    "Known gap: nothing merges consensus-identical lineages that occupy the same "
+    "windows. Observed on B. fragilis upeY, where one strain was reported as four "
+    "lineages. Needs a same-window merge (or step-2 grouping fix); flip this test "
+    "to a plain assert once that lands."))
+def test_parallel_identical_chains_should_merge():
+    """The behaviour we WANT: one strain, one lineage."""
+    lineages, _ = _ro_build(_par_groups())
+    assert len(lineages) == 1
+
+
+def _group_consensus_of(lineage):
+    """Majority allele per position across every member of every group."""
+    from collections import Counter, defaultdict
+
+    votes = defaultdict(Counter)
+    for g in lineage.groups:
+        for m in g.members:
+            for pos, base in m.consensus.items():
+                votes[pos][base] += 1
+    return {p: c.most_common(1)[0][0] for p, c in votes.items()}
