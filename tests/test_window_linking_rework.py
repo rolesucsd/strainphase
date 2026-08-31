@@ -1590,3 +1590,99 @@ def _group_consensus_of(lineage):
             for pos, base in m.consensus.items():
                 votes[pos][base] += 1
     return {p: c.most_common(1)[0][0] for p, c in votes.items()}
+
+
+# ---------------------------------------------------------------------------
+# REPRODUCTION: how two pure step-1 tracks end up in one over-merged lineage
+#
+# Observed on div0050_k2 sample T3 (truth 0.663/0.337): step 1 produced two
+# PURE tracks - 12,029 reads at purity 1.000 (strain2) and 6,392 at purity
+# 1.000 (strain1) - and BOTH landed entirely in one lineage of purity 0.653,
+# taking assigned_correct_fraction from 0.973 (single) to 0.000. No track was
+# split; two tracks that should be separate lineages were welded together.
+#
+# These tests pin the two links in that chain. They assert the CURRENT
+# behaviour, so they will fail loudly when either is fixed.
+# ---------------------------------------------------------------------------
+
+_FUSION_DISCRIM = [5000, 5500]                      # where two strains differ
+_FUSION_INVAR = list(range(6000, 20000, 100))       # identical in both
+
+
+def _fusion_haps():
+    a = {**{p: "A" for p in _FUSION_DISCRIM}, **{p: "G" for p in _FUSION_INVAR}}
+    b = {**{p: "T" for p in _FUSION_DISCRIM}, **{p: "G" for p in _FUSION_INVAR}}
+    return a, b
+
+
+def test_clonal_fallback_dilutes_a_real_difference_below_the_gate():
+    """ROOT CAUSE. Two haplotypes differing at EVERY discriminating marker they
+    share are declared identical once the fallback pads the comparison.
+
+    compare_consensus falls back to all co-covered positions when fewer than
+    min_shared_markers DISCRIMINATING markers are shared. Those extra positions are
+    invariant - they cannot disagree - so they only ever dilute. Here 2 real
+    differences over 2 markers (rate 1.000) become 2 over 142 (rate 0.014), which
+    clears the 2% gate.
+    """
+    from strainphase.core import compare_consensus
+
+    a, b = _fusion_haps()
+    markers = set(_FUSION_DISCRIM)
+    config = cfg()
+
+    strict = compare_consensus(a, b, markers, config, allow_fallback=False)
+    padded = compare_consensus(a, b, markers, config, allow_fallback=True)
+
+    assert strict.reason == "failed_no_evidence" and strict.rate == 1.0
+    assert padded.reason == "linked"                    # <-- the defect
+    assert padded.used_fallback and padded.rate < 0.02
+    # the two real differences survive into the padded verdict; only the
+    # DENOMINATOR changed, from 2 discriminating markers to 142 mostly-invariant
+    # positions, and that is what takes the rate under the gate
+    assert padded.n_diff == 2 and padded.n_shared == 142
+    assert strict.n_shared == 2
+
+
+def test_step2_merges_two_strains_into_one_group_via_the_fallback():
+    """Step 2 asks compare_consensus WITHOUT allow_fallback=False (step 3 passes it),
+    so the dilution above becomes a merge: one group holding both strains."""
+    from strainphase.window_groups import WindowHaplotype, group_window_across_samples
+
+    a, b = _fusion_haps()
+
+    def wh(sample, cons):
+        return WindowHaplotype(
+            sample=sample, contig="c1", window_start=0, window_end=20000,
+            haplotype_id=f"{sample}_h", consensus=dict(cons), reads=100,
+            total_reads=200, junk_reads=0, abundance=0.5,
+            within_sample_id=f"T_{sample}")
+
+    groups, _, _ = group_window_across_samples(
+        [wh("S1", a), wh("S2", b)], set(_FUSION_DISCRIM), cfg(), group_prefix="c1_")
+
+    assert len(groups) == 1                             # <-- the defect
+    assert {m.sample for m in groups[0].members} == {"S1", "S2"}
+
+
+def test_one_impure_group_welds_two_strain_chains_into_one_lineage():
+    """AMPLIFICATION. An impure group is a single NODE, so both strains' chains run
+    through it and the whole thing is one connected component - even with no edge
+    accepted between them. This is why one step-2 error fuses lineages for EVERY
+    sample, including samples the phasing had separated perfectly.
+    """
+    from strainphase.lineages import build_lineages
+
+    pos = list(range(1000, 70000, 500))
+    sa, sb = {p: "A" for p in pos}, {p: "T" for p in pos}
+    groups = [
+        _grp("A0", 1, [_mem("S1", sa, wsid="TA")]),
+        # step 2 wrongly put both strains in this one group
+        _grp("MIX", 10001, [_mem("S1", sa, wsid="TA"), _mem("S1", sb, wsid="TB")]),
+        _grp("B2", 20001, [_mem("S1", sb, wsid="TB")]),
+    ]
+    lineages, edges = build_lineages(groups, _lcfg(), transitive_abundance_check=False)
+
+    assert not any(e.reason == "linked" for e in edges)  # nothing was actually joined
+    assert len(lineages) == 1                            # <-- yet it is all one lineage
+    assert len(lineages[0].groups) == 3
