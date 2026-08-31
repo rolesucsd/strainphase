@@ -3515,9 +3515,6 @@ class GateResult:
     rate: float
     n_shared: int
     n_diff: int
-    # True when no discriminating markers were available and the comparison fell back to
-    # all co-covered positions. See compare_consensus for why that fallback exists.
-    used_fallback: bool = False
 
 
 def compare_consensus(
@@ -3529,7 +3526,6 @@ def compare_consensus(
     region: tuple[int, int] | None = None,
     min_cospan_frac: float | None = None,
     max_rate: float | None = None,
-    allow_fallback: bool = True,
     a_span: tuple[int, int] | None = None,
     b_span: tuple[int, int] | None = None,
 ) -> GateResult:
@@ -3546,11 +3542,14 @@ def compare_consensus(
     comparing many pairs - the footprint does not depend on the partner, and recomputing it
     per pair dominates the cost.
 
-    ``allow_fallback=False`` forbids the clonal fallback, so the verdict rests only on
-    genuinely discriminating markers. Use it whenever a NEGATIVE verdict will be treated
-    as absolute: the fallback pads the comparison with positions that are invariant in
-    scope and therefore cannot disagree, which is harmless for a merge but would let a
-    mismatch be declared off evidence that was never discriminating.
+    The verdict rests ONLY on genuinely discriminating markers. There was once a
+    "clonal fallback" that, when fewer than ``min_shared`` markers were shared, compared
+    all co-covered positions instead - including positions invariant across every
+    haplotype. Those cannot disagree, so they only ever diluted: two haplotypes
+    differing at BOTH of the 2 markers they shared (rate 1.000) were re-scored as 2
+    differences over 142 positions (rate 0.014) and declared identical. Step 2 used that
+    verdict to MERGE, so two distinct strains landed in one group and every lineage
+    built on it inherited the fusion. Removed 2026-08-30.
 
     The absolute cap and the rate guard opposite ends of the range: the rate is applied
     as a floor, so it already forces zero mismatches below n_shared=100, while at
@@ -3571,19 +3570,6 @@ def compare_consensus(
         return {p for p in positions if lo <= p <= hi}
 
     shared = _restrict(a.keys() & b.keys() & markers)
-    used_fallback = False
-
-    if len(shared) < min_shared and allow_fallback:
-        # No DISCRIMINATING markers between these two. Absence of discriminating
-        # evidence is not evidence of difference: a clonal locus legitimately has no
-        # variable positions at all, and a clonal SAMPLE can have almost none - 85% of
-        # windows on 000089747_1 hold a single haplotype. Restricting to markers would
-        # then make every comparison impossible and split a real lineage into singletons.
-        # Fall back to all co-covered positions, and record that we did so.
-        fallback = _restrict(a.keys() & b.keys())
-        if len(fallback) >= min_shared:
-            shared, used_fallback = fallback, True
-
     n_shared = len(shared)
 
     # HOW MUCH SEQUENCE DID WE ACTUALLY COMPARE? The stretch over which BOTH haplotypes
@@ -3606,23 +3592,22 @@ def compare_consensus(
     lo_b, hi_b = b_span if b_span is not None else consensus_footprint(b, region)
     overlap = (min(hi_a, hi_b) - max(lo_a, lo_b)) if (hi_a >= lo_a and hi_b >= lo_b) else 0
     if overlap < config.min_entity_overlap_bp:
-        return GateResult(False, "failed_no_evidence", 1.0, n_shared, 0, used_fallback)
+        return GateResult(False, "failed_no_evidence", 1.0, n_shared, 0)
     if region is not None:
         lo, hi = region
         if hi > lo and overlap < min_cospan_frac * (hi - lo):
-            return GateResult(False, "failed_no_evidence", 1.0, n_shared, 0, used_fallback)
+            return GateResult(False, "failed_no_evidence", 1.0, n_shared, 0)
 
     # ...AND WAS ANY OF IT INFORMATIVE? Separate question, separate gate. These two were
     # previously tangled into one number, which is also why min_shared ended up doubling
-    # as the trigger for the clonal fallback above.
     if n_shared < min_shared:
-        return GateResult(False, "failed_no_evidence", 1.0, n_shared, 0, used_fallback)
+        return GateResult(False, "failed_no_evidence", 1.0, n_shared, 0)
 
     n_diff = sum(1 for p in shared if a[p] != b[p])
     rate = n_diff / n_shared
     if rate > max_rate:
-        return GateResult(False, "failed_mismatch", rate, n_shared, n_diff, used_fallback)
-    return GateResult(True, "linked", rate, n_shared, n_diff, used_fallback)
+        return GateResult(False, "failed_mismatch", rate, n_shared, n_diff)
+    return GateResult(True, "linked", rate, n_shared, n_diff)
 
 
 def unique_best_matches(
@@ -3843,7 +3828,6 @@ def link_windows(
                                 "rate": round(gate.rate, 6),
                                 "n_shared": gate.n_shared,
                                 "n_diff": gate.n_diff,
-                                "used_fallback": gate.used_fallback,
                             }
                         )
 

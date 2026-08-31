@@ -714,7 +714,6 @@ def build_window_tables(
                                 "rate": m["rate"],
                                 "n_shared": m["n_shared"],
                                 "n_diff": m["n_diff"],
-                                "used_fallback": m["used_fallback"],
                             }
                         )
 

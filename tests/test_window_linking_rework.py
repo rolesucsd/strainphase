@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Tests for the window-linking rework.
 
-Covers the identity gate stack, the marker set (including the clonal-fallback that a
+Covers the identity gate stack, the marker set (positions that actually vary; a
 naive implementation gets wrong), both cross-sample grouping shapes, the abundance
 coherence test, the QC gate, and the zero-leak fix.
 """
@@ -81,20 +81,22 @@ def test_marker_set_is_empty_for_a_clonal_locus():
 # --------------------------------------------------------------------------- #
 
 
-def test_clonal_fallback_still_links():
-    """REGRESSION: with no discriminating markers, absence of evidence of difference is
-    not evidence of difference.
+def test_no_discriminating_markers_means_no_verdict():
+    """With no discriminating markers there is no verdict - not a link.
 
-    85% of windows hold a single haplotype, so a clonal sample can have almost no
-    variable positions at all. Restricting the comparison to markers would then make
-    every comparison impossible and shatter a real lineage into singletons.
+    A "clonal fallback" used to compare all co-covered positions here instead, so two
+    haplotypes with nothing informative in common were declared identical. That is
+    what let two distinct strains merge: positions invariant across every haplotype
+    cannot disagree, so padding with them only ever dilutes a real difference. The
+    cost of removing it is that genuinely clonal loci no longer link on absence of
+    evidence, which is the honest reading.
     """
     a = {10: "A", 20: "C", 30: "G"}
     b = {10: "A", 20: "C", 30: "G"}
     gate = compare_consensus(a, b, markers=set(), config=cfg())
-    assert gate.passed
-    assert gate.used_fallback
-    assert gate.n_shared == 3
+    assert not gate.passed
+    assert gate.reason == "failed_no_evidence"
+    assert gate.n_shared == 0
 
 
 
@@ -150,11 +152,12 @@ def test_cosupported_span_fraction_gate():
     """Two haplotypes touching only at the edge of a shared region are rejected."""
     a = {p: "A" for p in (100, 101, 102)}
     b = {p: "A" for p in (100, 101, 102)}
+    marks = {100, 101, 102}      # real markers: the gate needs a verdict to gate ON
     config = cfg(min_cosupported_span_frac=0.25, min_entity_overlap_bp=0)
     # co-supported span is 2 bp inside a 10 kb region -> far below 25%
-    assert not compare_consensus(a, b, set(), config, region=(1, 10001)).passed
+    assert not compare_consensus(a, b, marks, config, region=(1, 10001)).passed
     # same pair with no region constraint passes
-    assert compare_consensus(a, b, set(), config).passed
+    assert compare_consensus(a, b, marks, config).passed
 
 
 # --------------------------------------------------------------------------- #
@@ -193,7 +196,7 @@ def test_identical_haplotypes_group_together(method):
     cons = {100: "A", 2000: "C", 5000: "G"}
     haps = [_hap(f"t{i}", f"h{i}", dict(cons)) for i in range(4)]
     groups, edges, _ = group_window_across_samples(
-        haps, markers=set(), config=cfg(cross_sample_method=method)
+        haps, markers=set(cons), config=cfg(cross_sample_method=method)
     )
     assert len(groups) == 1
     assert groups[0].n_samples == 4
@@ -704,25 +707,34 @@ def test_step1_refuses_to_link_incompatible_abundances():
 
     shared = {12000: "A", 14000: "C", 16000: "G", 18000: "T"}
 
+    # A DECOY second haplotype so the marker set is non-empty. Markers are positions
+    # that VARY across a sample's haplotypes; with one identical haplotype per window
+    # nothing varies, there is nothing informative to compare, and no verdict is
+    # possible - which is the real situation in a clonal locus, not what this test is
+    # about. Real multi-strain data always has the variation this supplies.
+    decoy = {p: "G" for p in shared}
+
     def wr(start, reads, n_junk=0, n_total=100):
         w = Window(contig="c1", start=start, end=start + 20000)
         w.snv_pos = sorted(shared)
-        g = np.zeros((n_total, 2))
+        g = np.zeros((n_total, 3))
         g[:n_total - n_junk, 0] = 1.0
-        g[n_total - n_junk:, 1] = 1.0
-        return WindowResult(window=w, haplotypes=[Haplotype(consensus=dict(shared),
-                                                            supporting_reads=reads)],
-                            gamma=g, pi=np.array([1.0, 0.0]), log_likelihood=0.0,
-                            assignments=[], converged=True, iterations=1)
+        g[n_total - n_junk:, 2] = 1.0
+        return WindowResult(
+            window=w,
+            haplotypes=[Haplotype(consensus=dict(shared), supporting_reads=reads),
+                        Haplotype(consensus=dict(decoy), supporting_reads=1)],
+            gamma=g, pi=np.array([1.0, 0.0, 0.0]), log_likelihood=0.0,
+            assignments=[], converged=True, iterations=1)
 
     # 95/100 next to 5/100 - alleles identical, shares incompatible
     a = link_windows([wr(1, 95), wr(10001, 5)], cfg())
-    assert len({h.track_id for r in a for h in r.haplotypes}) == 2, \
+    assert len({r.haplotypes[0].track_id for r in a}) == 2, \
         "incompatible shares must not be linked"
 
     # same alleles, compatible shares -> linked
     b = link_windows([wr(1, 95), wr(10001, 93)], cfg())
-    assert len({h.track_id for r in b for h in r.haplotypes}) == 1
+    assert len({r.haplotypes[0].track_id for r in b}) == 1
 
 
 def test_lineage_abundance_pools_counts_rather_than_averaging_ratios():
@@ -1615,9 +1627,9 @@ def _fusion_haps():
     return a, b
 
 
-def test_clonal_fallback_dilutes_a_real_difference_below_the_gate():
-    """ROOT CAUSE. Two haplotypes differing at EVERY discriminating marker they
-    share are declared identical once the fallback pads the comparison.
+def test_a_real_difference_is_not_diluted_by_uninformative_positions():
+    """ROOT CAUSE, now fixed. Two haplotypes differing at EVERY discriminating marker
+    they share must not be declared identical.
 
     compare_consensus falls back to all co-covered positions when fewer than
     min_shared_markers DISCRIMINATING markers are shared. Those extra positions are
@@ -1631,22 +1643,19 @@ def test_clonal_fallback_dilutes_a_real_difference_below_the_gate():
     markers = set(_FUSION_DISCRIM)
     config = cfg()
 
-    strict = compare_consensus(a, b, markers, config, allow_fallback=False)
-    padded = compare_consensus(a, b, markers, config, allow_fallback=True)
+    gate = compare_consensus(a, b, markers, config)
 
-    assert strict.reason == "failed_no_evidence" and strict.rate == 1.0
-    assert padded.reason == "linked"                    # <-- the defect
-    assert padded.used_fallback and padded.rate < 0.02
-    # the two real differences survive into the padded verdict; only the
-    # DENOMINATOR changed, from 2 discriminating markers to 142 mostly-invariant
-    # positions, and that is what takes the rate under the gate
-    assert padded.n_diff == 2 and padded.n_shared == 142
-    assert strict.n_shared == 2
+    # Only the 2 DISCRIMINATING markers are compared, and they both disagree, so there
+    # is no verdict rather than a link. The removed fallback re-scored this as 2
+    # differences over 142 co-covered positions (rate 0.014) and called it identical.
+    assert gate.reason == "failed_no_evidence"
+    assert gate.n_shared == 2
 
 
-def test_step2_merges_two_strains_into_one_group_via_the_fallback():
-    """Step 2 asks compare_consensus WITHOUT allow_fallback=False (step 3 passes it),
-    so the dilution above becomes a merge: one group holding both strains."""
+def test_step2_keeps_two_strains_in_separate_groups():
+    """Step 2 is where a `linked` verdict MERGES, so it is where the diluted verdict
+    did its damage - two strains in one group, and every lineage built on that node
+    inherited the fusion."""
     from strainphase.window_groups import WindowHaplotype, group_window_across_samples
 
     a, b = _fusion_haps()
@@ -1661,8 +1670,9 @@ def test_step2_merges_two_strains_into_one_group_via_the_fallback():
     groups, _, _ = group_window_across_samples(
         [wh("S1", a), wh("S2", b)], set(_FUSION_DISCRIM), cfg(), group_prefix="c1_")
 
-    assert len(groups) == 1                             # <-- the defect
-    assert {m.sample for m in groups[0].members} == {"S1", "S2"}
+    # one group PER STRAIN - the two are no longer welded into a single node
+    assert len(groups) == 2
+    assert all(len(g.members) == 1 for g in groups)
 
 
 def test_one_impure_group_welds_two_strain_chains_into_one_lineage():

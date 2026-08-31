@@ -49,9 +49,9 @@ pairs it costs 0.9% of joins on the divergent panel but blocks 9,470 near-clonal
 points of read-placement accuracy. A pair we cannot judge is not a pair we may join.
 
 **Identity is a VETO, never the evidence for.** ``failed_mismatch`` refuses the join
-outright - one sample is enough. A veto is computed on real markers with the clonal
-fallback DISABLED, because a negative verdict must not rest on positions that were
-incapable of disagreeing.
+outright - one sample is enough. It is computed on real markers only: positions that are
+invariant across every haplotype cannot disagree, so including them would dilute a real
+difference rather than measure one.
 
 **Abundance is an ELIMINATOR, not an INDICATOR.** A strain sits at the same frequency in
 every window it occupies, so genuinely disagreeing shares cannot be one unit. But *agreeing*
@@ -561,7 +561,6 @@ def build_lineages(
                     cons[ga.group_id], cons[gb.group_id], markers,
                     config, min_shared=config.min_shared_markers, region=region,
                     min_cospan_frac=0.0,       # the region IS the constraint here
-                    allow_fallback=False,      # a veto may not rest on padded evidence
                     a_span=span[ga.group_id], b_span=span[gb.group_id],
                 )
                 e = LineageEdge(contig, w, w + step, ga.group_id, gb.group_id,

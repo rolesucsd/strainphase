@@ -498,6 +498,10 @@ class TestWindowLinking(unittest.TestCase):
             window_idx=0
         )
         hap1 = Haplotype(consensus={100: 'A', 200: 'C', 300: 'G'}, weight=0.5)
+        # A DECOY second haplotype so the sample HAS variable positions. Markers are
+        # positions that vary across a sample's haplotypes; with one identical
+        # haplotype per window nothing varies and no verdict is possible.
+        decoy1 = Haplotype(consensus={100: 'T', 200: 'T', 300: 'T'}, weight=0.1)
         
         # Window 2: positions 200-400 (overlaps on 200, 300)
         window2 = Window(
@@ -508,13 +512,14 @@ class TestWindowLinking(unittest.TestCase):
             window_idx=1
         )
         hap2 = Haplotype(consensus={200: 'C', 300: 'G', 400: 'T'}, weight=0.5)
+        decoy2 = Haplotype(consensus={200: 'T', 300: 'T', 400: 'A'}, weight=0.1)
         
         results = [
             WindowResult(
                 window=window1,
-                haplotypes=[hap1],
-                gamma=np.array([[1.0, 0.0]]),
-                pi=np.array([0.9, 0.1]),
+                haplotypes=[hap1, decoy1],
+                gamma=np.array([[1.0, 0.0, 0.0]]),
+                pi=np.array([0.85, 0.1, 0.05]),
                 log_likelihood=-10.0,
                 assignments=[],
                 converged=True,
@@ -522,9 +527,9 @@ class TestWindowLinking(unittest.TestCase):
             ),
             WindowResult(
                 window=window2,
-                haplotypes=[hap2],
-                gamma=np.array([[1.0, 0.0]]),
-                pi=np.array([0.9, 0.1]),
+                haplotypes=[hap2, decoy2],
+                gamma=np.array([[1.0, 0.0, 0.0]]),
+                pi=np.array([0.85, 0.1, 0.05]),
                 log_likelihood=-10.0,
                 assignments=[],
                 converged=True,
