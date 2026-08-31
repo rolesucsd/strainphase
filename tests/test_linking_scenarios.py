@@ -19,7 +19,6 @@ gap - remove the marker when a change fixes one, and it becomes a regression tes
 """
 from __future__ import annotations
 
-import numpy as np
 import pytest
 
 from strainphase.core import HaplotyperConfig
