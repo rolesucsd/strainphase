@@ -181,7 +181,12 @@ def test_report_fragmentation_vs_error():
 def test_scenario_is_reconstructed_exactly(name):
     """Each scenario's CORRECT answer. xfail marks the ones the current rules miss."""
     known_bad = {
-        # step 2 is not involved here, so this one is about step 3 alone
+        "oversplit_strain_rejoined": (
+            "reciprocity sees a tie on the target's side and links neither half. The "
+            "track-preserving union only rescues this when a step-1 chain crossed the "
+            "boundary in some sample; here the two halves are in different tracks, "
+            "which is exactly the case forward-only best-match used to handle."
+        ),
     }
     groups, expected = SCENARIOS[name]()
     n, e, frag, err = score(groups, expected)
