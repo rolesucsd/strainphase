@@ -1557,11 +1557,10 @@ def test_parallel_identical_chains_are_reported_separately():
     assert len(lineages) == 2
     assert {e.reason for e in edges} == {"linked", "failed_no_read_overlap"}
     # the two lineages chained forward correctly and independently
-    assert sorted(sorted(g.group_id for g in l.groups) for l in lineages) == [
+    assert sorted(sorted(g.group_id for g in lin.groups) for lin in lineages) == [
         ["A1", "B1"], ["A2", "B2"]
     ]
     # ...and they are the SAME entity by the pipeline's own identity rule
-    a, b = ({g.group_id for g in l.groups} for l in lineages)
     ca = _group_consensus_of(lineages[0])
     cb = _group_consensus_of(lineages[1])
     shared = ca.keys() & cb.keys()
