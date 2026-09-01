@@ -210,6 +210,14 @@ class HaplotyperConfig:
     # out, so those are a different error model and keep their own thresholds.
     identity_distance: float = 0.02
     min_shared_markers: int = 3
+    # Agreeing markers a track pair needs before the cross-sample merge will join them.
+    # 1 is a deliberately permissive FIRST pass: exact agreement cannot fuse two
+    # genotypes that disagree anywhere both called, so evidence volume is the only thing
+    # this trades. Measured on 000089747_1 contig_2 (7,858 tracks carrying a marker):
+    #     1 -> 118 entities, mean size 66.6      10 -> 6,009 entities, mean 1.31
+    #     3 -> 4,474 entities, mean size 1.76    50 -> 6,819 entities, mean 1.15
+    # Raising it splits hard and fast, so raise it only against a scored run.
+    track_merge_min_shared_markers: int = 1
     # --- MARKER SET (computed once, used by steps 2 and 3) ----------------------
     # A position is a CANDIDATE marker when more than one allele is seen at it anywhere
     # on the contig. These thresholds decide which candidates survive: an ALLELE is kept
@@ -353,6 +361,12 @@ class HaplotyperConfig:
         if not (0 < self.junk_divergence_rate < 0.75):
             raise ValueError(
                 f"junk_divergence_rate must be in (0, 0.75), got {self.junk_divergence_rate}"
+            )
+
+        if self.track_merge_min_shared_markers < 1:
+            raise ValueError(
+                "track_merge_min_shared_markers must be >= 1, got "
+                f"{self.track_merge_min_shared_markers}"
             )
 
         # Step-1 read reach. A reach below 1 would drop the overlapping-neighbour link

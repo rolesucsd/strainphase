@@ -152,8 +152,9 @@ def build_lineages_from_tracks(
 ) -> list[Lineage]:
     """Merge tracks across samples, then emit one Lineage per merged entity.
 
-    THE GRAPH. Every track pair sharing at least one marker is an edge weighted by how
-    many markers they AGREE on. A pair that disagrees at even one shared marker is not
+    THE GRAPH. Every track pair sharing at least
+    ``config.track_merge_min_shared_markers`` markers is an edge weighted by how many
+    markers they AGREE on. A pair that disagrees at even one shared marker is not
     an edge but a CANNOT-LINK: recorded, not merely skipped. That distinction is the
     reason this is not union-find over agreeing pairs. Byte-identity is not transitive
     across different marker subsets - A and B can agree on {1,2}, B and C on {3,4}, and
@@ -238,8 +239,13 @@ def build_lineages_from_tracks(
                         return False
         return True
 
-    n_merged = n_refused_link = n_refused_sample = 0
-    for pair, w in sorted(weight.items(), key=lambda kv: -kv[1]):
+    ordered = sorted(weight.items(), key=lambda kv: -kv[1])
+    n_merged = n_refused_link = n_refused_sample = n_too_weak = 0
+    for idx, (pair, w) in enumerate(ordered):
+        if w < config.track_merge_min_shared_markers:
+            # Weights descend, so no pair after this one clears the bar either.
+            n_too_weak = len(ordered) - idx
+            break
         a, b = tuple(pair)
         ra, rb = find(a), find(b)
         if ra == rb:
@@ -281,5 +287,6 @@ def build_lineages_from_tracks(
         f"and stay singletons) -> {len(lineages)} lineages | {len(weight)} candidate "
         f"edges, {len(conflict)} conflicting pairs | {n_merged} merged, "
         f"{n_refused_link} refused by cannot-link, {n_refused_sample} refused by a "
-        f"same-sample gate")
+        f"same-sample gate, {n_too_weak} below "
+        f"track_merge_min_shared_markers={config.track_merge_min_shared_markers}")
     return lineages

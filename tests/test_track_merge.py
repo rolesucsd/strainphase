@@ -155,3 +155,34 @@ def test_same_sample_tracks_more_than_one_window_apart_get_an_abundance_check():
     joined = [{(m.sample, m.within_sample_id) for g in lin.groups for m in g.members}
               for lin in lineages]
     assert not any({("S1", "T1"), ("S1", "T2")} <= j for j in joined)
+
+
+def test_track_merge_min_shared_markers_gates_the_merge():
+    """The threshold is real, and 1 is the default.
+
+    It was documented in the module docstring for weeks while the field did not exist,
+    so the merge ran at a hardcoded 1 with no way to change or benchmark it.
+    """
+    from dataclasses import replace
+
+    from strainphase.core import DEFAULT_CONFIG, HaplotyperConfig
+
+    assert HaplotyperConfig().track_merge_min_shared_markers == 1
+
+    # two samples' tracks agreeing at exactly ONE marker
+    markers = frozenset({100, 200})
+    haps = [
+        WindowHaplotype(sample="s1", contig="c", window_start=1, window_end=20001,
+                        haplotype_id="h1", consensus={100: "A"}, reads=10,
+                        total_reads=20, junk_reads=0, within_sample_id="T1"),
+        WindowHaplotype(sample="s2", contig="c", window_start=1, window_end=20001,
+                        haplotype_id="h2", consensus={100: "A"}, reads=10,
+                        total_reads=20, junk_reads=0, within_sample_id="T2"),
+    ]
+    one = build_lineages_from_tracks(haps, DEFAULT_CONFIG, markers=markers)
+    assert len(one) == 1, "one agreeing marker must merge at the default of 1"
+
+    two = build_lineages_from_tracks(
+        haps, replace(DEFAULT_CONFIG, track_merge_min_shared_markers=2), markers=markers
+    )
+    assert len(two) == 2, "one agreeing marker must not clear a threshold of 2"

@@ -173,6 +173,9 @@ def cmd_longitudinal(args: argparse.Namespace) -> int:
         min_shared_snvs_for_link=args.min_shared_snvs_for_link,
         identity_distance=args.identity_distance,
         min_shared_markers=args.min_shared_markers,
+        track_merge_min_shared_markers=args.track_merge_min_shared_markers,
+        link_window_reach=args.link_window_reach,
+        link_min_shared_reads=args.link_min_shared_reads,
         cross_sample_method=args.cross_sample_method,
         random_seed=args.seed,
         min_shared_reads_for_link=args.min_shared_reads_for_link,
@@ -442,6 +445,27 @@ Examples:
              "samples and along the genome. Read-level thresholds (--max-mismatch-frac, "
              "--rescue-match-distance) are separate on purpose - a read carries "
              "sequencing error a consensus has already averaged out.",
+    )
+    long_parser.add_argument(
+        "--link-window-reach", type=int, default=2,
+        help="How many windows ahead step 1 may link. 1 is the pre-2026-08-31 "
+             "overlap-only rule, which caps step 1 at a 10 kb reach on a 20 kb/10 kb "
+             "tiling while reads reach 30 kb; above 1 also links NON-overlapping "
+             "windows on shared reads.",
+    )
+    long_parser.add_argument(
+        "--link-min-shared-reads", type=int, default=2,
+        help="Reads two haplotypes must share to link a NON-overlapping window pair. "
+             "Those windows call disjoint positions so consensus cannot gate them, "
+             "making this and reciprocal best match the entire evidence bar.",
+    )
+    long_parser.add_argument(
+        "--track-merge-min-shared-markers", type=int, default=1,
+        help="Agreeing markers two step-1 tracks need before the cross-sample merge "
+             "joins them. 1 is a permissive first pass; exact agreement still cannot "
+             "fuse genotypes that disagree anywhere both called, so this trades only "
+             "evidence volume. Raising it splits hard: on 000089747_1 contig_2, 1 gives "
+             "118 entities and 3 gives 4,474.",
     )
     long_parser.add_argument(
         "--min-shared-markers", type=int, default=3,

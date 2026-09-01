@@ -1232,6 +1232,22 @@ def main():
              "sequencing error a consensus has already averaged out.",
     )
     parser.add_argument(
+        "--track-merge-min-shared-markers", type=int, default=1,
+        help="Agreeing markers two step-1 tracks need before the cross-sample merge "
+             "joins them (default 1, a permissive first pass).",
+    )
+    parser.add_argument(
+        "--link-window-reach", type=int, default=2,
+        help="How many windows ahead step 1 may link. 1 is the overlap-only rule; "
+             "above 1 also links NON-overlapping windows on shared reads, which is how "
+             "a marker-free window stops acting as a hub.",
+    )
+    parser.add_argument(
+        "--link-min-shared-reads", type=int, default=2,
+        help="Reads two haplotypes must share to link a NON-overlapping window pair. "
+             "Consensus cannot gate those pairs, so this is the whole evidence bar.",
+    )
+    parser.add_argument(
         "--min-shared-markers",
         type=int,
         default=3,
@@ -1318,6 +1334,14 @@ def main():
         min_reads_for_rescue=args.min_reads_for_rescue,
         # Identity gates
         min_cosupported_span_frac=args.min_cosupported_span_frac,
+        # These two were parsed and then dropped on the floor here - defined on this
+        # entry point's parser but never passed to the config, so setting them did
+        # nothing while the identical flags on `strainphase longitudinal` worked.
+        identity_distance=args.identity_distance,
+        min_shared_markers=args.min_shared_markers,
+        track_merge_min_shared_markers=args.track_merge_min_shared_markers,
+        link_window_reach=args.link_window_reach,
+        link_min_shared_reads=args.link_min_shared_reads,
         min_entity_overlap_bp=args.min_entity_overlap_bp,
         min_read_window_overlap_bp=args.min_read_window_overlap_bp,
         min_read_read_overlap_bp=args.min_read_read_overlap_bp,
