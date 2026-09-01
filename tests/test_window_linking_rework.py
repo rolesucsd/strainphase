@@ -1824,18 +1824,37 @@ def _reach_windows():
     return a, c
 
 
-def test_read_reach_is_off_by_default():
-    """Default reach 1 keeps the historical rule: only OVERLAPPING windows link.
+def test_reach_one_restores_the_overlap_only_rule():
+    """Reach 1 is the pre-2026-08-31 rule: only OVERLAPPING windows link.
 
-    The whole 236-test suite passing at this default is the real regression guard; this
-    pins the specific behaviour so a future default change cannot pass silently.
+    It is the escape hatch, so it has to keep working even though it is no longer the
+    default - a disjoint pair must be refused outright rather than falling through to
+    the read path, which an earlier `(k - i) > reach` bound got wrong for the immediate
+    neighbour.
     """
     from strainphase.core import link_windows
 
     a, c = _reach_windows()
-    out = link_windows([a, c], cfg())
+    out = link_windows([a, c], cfg(link_window_reach=1))
     ids = {h.track_id for wr_ in out for h in wr_.haplotypes}
-    assert len(ids) == 4, "non-overlapping windows must not link at the default reach"
+    assert len(ids) == 4, "reach 1 must not link a non-overlapping pair"
+
+
+def test_read_reach_is_on_by_default():
+    """The default reaches one window past the overlap.
+
+    Pinned because the default is what every pipeline run actually uses: a silent revert
+    to 1 would look like the read path simply finding nothing, which is exactly how it
+    fails when read assignments are missing.
+    """
+    from strainphase.core import HaplotyperConfig, link_windows
+
+    assert HaplotyperConfig().link_window_reach == 2
+
+    a, c = _reach_windows()
+    out = link_windows([a, c], cfg())
+    tracks = [[h.track_id for h in wr_.haplotypes] for wr_ in out]
+    assert tracks[0][0] == tracks[1][0] and tracks[0][1] == tracks[1][1]
 
 
 def test_read_reach_links_across_a_non_overlapping_gap():

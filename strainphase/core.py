@@ -316,9 +316,10 @@ class HaplotyperConfig:
     # veto can reach. Marker pairs co-covered by one read = 124,149 against 81,288
     # co-windowed, and 42,861 of those lie further apart than any 20 kb window can span.
     # Reach 2 recovered 25-29% of lineage fragmentation in prototype; reach 3 was flat
-    # (read sharing falls 42% at 20 kb to 14% at 30 kb, and 0.9% at 40 kb). Default 1 =
-    # historical behaviour.
-    link_window_reach: int = 1
+    # (read sharing falls 42% at 20 kb to 14% at 30 kb, and 0.9% at 40 kb), so 2 is the
+    # setting the measurement supports. Set 1 to restore the pre-2026-08-31 rule, which
+    # linked only overlapping windows and admitted no disjoint pair at all.
+    link_window_reach: int = 2
     # Shared reads required to link a NON-overlapping window pair. Consensus cannot gate
     # these - the two windows call disjoint positions - so this threshold and reciprocal
     # best match are the whole of the evidence, and it should not be lowered casually.
