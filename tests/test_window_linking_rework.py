@@ -1159,3 +1159,90 @@ def test_read_reach_rejects_invalid_settings():
         HaplotyperConfig(link_window_reach=0)
     with pytest.raises(ValueError, match="link_min_shared_reads"):
         HaplotyperConfig(link_min_shared_reads=0)
+
+
+# --------------------------------------------------------------------------- #
+# The 1-SNV validator: it has to RUN, and evidence has to beat the floor
+# --------------------------------------------------------------------------- #
+
+
+def _snv_pair(minor_weight, minor_reads, n_shared, n_timepoints=1, depth=130):
+    """Two haplotypes differing at exactly ONE of `n_shared` called positions.
+
+    Mirrors the real shape: a dominant haplotype and a minority splitting off a few
+    reads. `gamma` is built so the minority has exactly `minor_reads` confidently
+    assigned, which is what the validator counts.
+    """
+    from strainphase.core import Haplotype, PostProcessor, Window
+
+    pos = [1000 + 10 * i for i in range(n_shared)]
+    major = {p: "A" for p in pos}
+    minor = dict(major)
+    minor[pos[0]] = "G"                      # the single difference
+
+    w = Window(contig="c1", start=1, end=20001)
+    w.snv_pos = list(pos)
+    w.reads = []
+
+    g = np.zeros((depth, 2))
+    g[:depth - minor_reads, 0] = 1.0
+    g[depth - minor_reads:, 1] = 1.0
+
+    h_major = Haplotype(consensus=major, supporting_reads=depth - minor_reads)
+    h_minor = Haplotype(consensus=minor, supporting_reads=minor_reads)
+    h_major.weight = 1.0 - minor_weight
+    h_minor.weight = minor_weight
+
+    hp = PostProcessor.__new__(PostProcessor)
+    hp.config = cfg(marker_min_frac=0.10, marker_min_reads=3, marker_min_samples=2)
+    return hp, h_major, h_minor, w, g, n_timepoints
+
+
+def test_1snv_validator_runs_when_the_rate_would_reject():
+    """7 shared positions, 1 difference -> rate is 14%, far above identity_distance.
+
+    The validator used to sit INSIDE the rate gate, so this pair was split without the
+    count-based test that exists to judge it. This is the LS_11_5_16 shape: 3 reads of
+    130 splitting off a dominant haplotype.
+    """
+    hp, maj, minor, w, g, ntp = _snv_pair(minor_weight=0.023, minor_reads=3, n_shared=7)
+    assert 1 / 7 > hp.config.identity_distance, "the rate must reject, or this proves nothing"
+    # 3 reads is not < marker_min_reads, so read support passes; 1 timepoint sends it
+    # to the binomial, and with no reads recorded the guard merges.
+    assert hp.should_merge_1snp_pair(maj, minor, 0, 1, w, g, ntp) is True
+
+
+def test_1snv_thin_read_support_still_merges():
+    """2 reads is below marker_min_reads: still noise, still merged."""
+    hp, maj, minor, w, g, ntp = _snv_pair(minor_weight=0.30, minor_reads=2, n_shared=7)
+    assert hp.should_merge_1snp_pair(maj, minor, 0, 1, w, g, ntp) is True
+
+
+def test_1snv_persistent_minor_allele_is_kept_apart():
+    """A credible minor strain survives: >=3 reads, seen across timepoints.
+
+    30% with 45 reads over many timepoints is the case the tool exists to find - it
+    must NOT be merged away. Persistence short-circuits before the binomial, and the
+    frequency floor (now last) does not fire because 0.30 > marker_min_frac.
+    """
+    hp, maj, minor, w, g, ntp = _snv_pair(minor_weight=0.30, minor_reads=45,
+                                          n_shared=52, n_timepoints=3)
+    assert hp.should_merge_1snp_pair(maj, minor, 0, 1, w, g, ntp) is False
+
+
+def test_1snv_floor_is_a_backstop_not_a_pre_emption():
+    """A sub-10% haplotype with real read support reaches the later tests.
+
+    It used to be dismissed on the frequency floor before read support, persistence or
+    the binomial were consulted - 622 of 1,174 pairs on 000089747_1 contig_2 were
+    decided that way. The floor still applies, but only after the evidence has spoken,
+    so a persistent sub-10% allele is now judged rather than assumed to be noise.
+    """
+    hp, maj, minor, w, g, ntp = _snv_pair(minor_weight=0.048, minor_reads=8,
+                                          n_shared=52, n_timepoints=3)
+    # persistence is satisfied, so the run reaches the floor at the END and merges
+    assert hp.should_merge_1snp_pair(maj, minor, 0, 1, w, g, ntp) is True
+    # ...whereas the same allele above the floor is kept apart
+    hp2, maj2, minor2, w2, g2, ntp2 = _snv_pair(minor_weight=0.12, minor_reads=8,
+                                                n_shared=52, n_timepoints=3)
+    assert hp2.should_merge_1snp_pair(maj2, minor2, 0, 1, w2, g2, ntp2) is False

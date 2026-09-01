@@ -2444,9 +2444,17 @@ class PostProcessor:
         else:
             minor_hap, minor_k = hap2, k2
 
-        # Check frequency
-        if minor_hap.weight < self.config.marker_min_frac:
-            return True
+        # ORDER MATTERS (2026-09-01). The frequency floor used to come FIRST and return
+        # "merge" outright, so a differing marker on a sub-10% haplotype was dismissed
+        # before read support, persistence or the binomial were consulted - the tool
+        # decided it was noise without looking at the evidence for it, in exactly the
+        # low-abundance regime it exists to resolve. Read support leads now; the floor
+        # still applies, but last, as a backstop rather than a pre-emption.
+        #
+        # Measured on 000089747_1 contig_2: the floor decided 622 of the 1,174 pairs
+        # reaching this function, and only 82 change outcome - sub-10% haplotypes that
+        # DO carry >=3 reads (median 4.8%, range 1.0-9.8%). The other 540 merge on read
+        # support anyway.
 
         # Check supporting reads
         minor_supporting = int((gamma[:, minor_k] >= self.config.assign_confidence_threshold).sum())
@@ -2490,6 +2498,12 @@ class PostProcessor:
             if p_value > alpha_corrected:
                 return True
 
+        # The frequency floor, as a backstop. Everything above has already said this
+        # looks like a real allele; a haplotype below marker_min_frac is still not
+        # counted as a separate strain.
+        if minor_hap.weight < self.config.marker_min_frac:
+            return True
+
         return False
 
     def merge_similar_haplotypes(
@@ -2532,13 +2546,23 @@ class PostProcessor:
                 if n_shared < self.config.min_shared_markers:
                     continue
 
-                if dist <= self.config.identity_distance:
-                    if n_diff == 1:
-                        should_merge = self.should_merge_1snp_pair(
-                            haplotypes[i], haplotypes[j], i, j, window, gamma, n_timepoints_seen
-                        )
-                        if not should_merge:
-                            continue
+                # A SINGLE differing position is always adjudicated by the 1-SNV
+                # validator, never by the rate. The validator used to sit INSIDE the
+                # rate gate, so it ran only when the rate had already passed - i.e.
+                # when many positions were shared and the rate would have merged the
+                # pair anyway - and was skipped exactly where evidence is thin and a
+                # rate is meaningless. At 7 shared positions one difference is 14%,
+                # far above identity_distance, so the pair was split without the
+                # count-based test that exists to judge it. Measured on 000089747_1
+                # contig_2: 1,174 of 1,864 one-SNV pairs (63%) never reached it.
+                if n_diff == 1:
+                    if not self.should_merge_1snp_pair(
+                        haplotypes[i], haplotypes[j], i, j, window, gamma,
+                        n_timepoints_seen
+                    ):
+                        continue
+                    group.append(j)
+                elif dist <= self.config.identity_distance:
                     group.append(j)
 
             used.update(group)
