@@ -122,10 +122,10 @@ class HaplotyperConfig:
     # Without this a read overlapping by 1 bp entered n_reads_examined, the junk
     # classification and the abundance denominator identically to one spanning 20 kb.
     # (FIGURE4 diagnosis §6 #6b; costs ~8% of reads on 000089747_1.)
-    min_read_window_overlap_bp: int = 1000
+    min_read_window_overlap_bp: int = 500
     # Two reads must physically overlap by at least this much to be compared at all
     # (FIGURE4 diagnosis §6 #8, LEVEL 1).
-    min_read_read_overlap_bp: int = 1000
+    min_read_read_overlap_bp: int = 500
 
     # Spill per-sample WindowResults to <output_dir>/tmp during the first pass instead of
     # holding every sample's reads in RAM until the rescue pass. Cross-sample rescue only
@@ -160,7 +160,7 @@ class HaplotyperConfig:
 
     # Minimum physical overlap between two entities, below which the verdict is an
     # explicit NON-MERGE rather than "unknown" (Strainy's I = 1000).
-    min_entity_overlap_bp: int = 1000
+    min_entity_overlap_bp: int = 500
     # AUTHOR'S DECISION: structural variants are NEVER excluded from identity. Capturing
     # the trajectory of a flip is a goal of the analysis, not noise to be filtered, so an
     # inversion is a first-class marker like any other.
@@ -433,9 +433,6 @@ _CONFIG_FROM_ARG: dict[str, str] = {
     "rescued_min_weight": "rescued_min_weight",
     "min_reads_per_window": "min_reads_per_window",
     "min_reads_for_rescue": "min_reads_for_rescue",
-    "min_read_window_overlap_bp": "min_read_window_overlap_bp",
-    "min_read_read_overlap_bp": "min_read_read_overlap_bp",
-    "min_entity_overlap_bp": "min_entity_overlap_bp",
     "min_cosupported_span_frac": "min_cosupported_span_frac",
     "min_shared_snvs_for_link": "min_shared_snvs_for_link",
     "identity_distance": "identity_distance",
@@ -461,6 +458,16 @@ def config_from_args(args, **overrides) -> HaplotyperConfig:
     for cfg_field, attr in _CONFIG_FROM_ARG.items():
         if hasattr(args, attr):
             values[cfg_field] = getattr(args, attr)
+
+    # One --min-overlap-bp governs all three physical-overlap floors. They ask about
+    # different objects (read-vs-window, read-vs-read, entity-vs-entity) but they are one
+    # question - how much shared sequence is enough to compare two things - and three
+    # identically-worded flags at one value were impossible to tune with intent. The
+    # fields stay separate so a library caller can still set them apart.
+    if getattr(args, "min_overlap_bp", None) is not None:
+        values["min_read_window_overlap_bp"] = args.min_overlap_bp
+        values["min_read_read_overlap_bp"] = args.min_overlap_bp
+        values["min_entity_overlap_bp"] = args.min_overlap_bp
 
     # Inverted and derived flags.
     if hasattr(args, "validate_results"):

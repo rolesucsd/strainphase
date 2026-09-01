@@ -33,6 +33,8 @@ Example:
 from __future__ import annotations
 
 import argparse
+
+from strainphase.core import DEFAULT_CONFIG as _D
 import logging
 import os
 import pickle
@@ -1102,7 +1104,7 @@ def main():
     parser.add_argument(
         "--contig-filter", help="TSV or text file listing contigs to include (see docstring)"
     )
-    parser.add_argument("--window-size", type=int, default=20000, help="Window size for haplotyping")
+    parser.add_argument("--window-size", type=int, default=_D.window_size, help="Window size for haplotyping")
     parser.add_argument(
         "--max-reads",
         type=int,
@@ -1126,7 +1128,7 @@ def main():
         "cores are actually used; useful for large/high-coverage MAGs.",
     )
     parser.add_argument(
-        "--seed", type=int, default=42,
+        "--seed", type=int, default=_D.random_seed,
         help="Random seed. Seeded by default: it drives both read subsampling above "
         "--max-reads and Louvain read clustering, so an unseeded run is not reproducible.",
     )
@@ -1140,13 +1142,13 @@ def main():
     parser.add_argument(
         "--min-anchor-weight",
         type=float,
-        default=0.15,
+        default=_D.min_weight_for_anchor,
         help="Min mixture weight for a haplotype to serve as an anchor",
     )
     parser.add_argument(
         "--rescued-min-weight",
         type=float,
-        default=0.02,
+        default=_D.rescued_min_weight,
         help="Min mixture weight to assign to rescued haplotypes",
     )
 
@@ -1154,28 +1156,15 @@ def main():
     parser.add_argument(
         "--min-cosupported-span-frac",
         type=float,
-        default=0.25,
+        default=_D.min_cosupported_span_frac,
         help="Min co-supported span between two haplotypes, as a fraction of their shared "
         "region. 0.25 rejects 16%% of adjacent-window pairs; 0.50 rejects 30%%.",
     )
     parser.add_argument(
-        "--min-entity-overlap-bp",
-        type=int,
-        default=1000,
-        help="Min physical overlap between two entities; below this the verdict is an "
-        "explicit non-merge rather than 'unknown'",
-    )
-    parser.add_argument(
-        "--min-read-window-overlap-bp",
-        type=int,
-        default=1000,
-        help="A read must cover at least this many bp of a window to be counted in it",
-    )
-    parser.add_argument(
-        "--min-read-read-overlap-bp",
-        type=int,
-        default=1000,
-        help="Two reads must physically overlap by at least this much to be compared",
+        "--min-overlap-bp", type=int, default=_D.min_entity_overlap_bp,
+        help="Physical overlap two things must share before they are compared at "
+             "all - read against window, read against read, and entity against "
+             "entity. One question, so one knob.",
     )
     parser.add_argument(
         "--no-spill",
@@ -1187,7 +1176,7 @@ def main():
     parser.add_argument(
         "--window-batch-factor",
         type=int,
-        default=4,
+        default=_D.window_batch_factor,
         help="Windows are dispatched to the worker pool in batches of workers * this. "
         "Lower it to cut peak memory on variant-dense contigs; raise it to cut "
         "scheduling overhead.",
@@ -1197,7 +1186,7 @@ def main():
     parser.add_argument(
         "--identity-distance",
         type=float,
-        default=0.02,
+        default=_D.identity_distance,
         help="Max mismatch RATE at which two consensuses are one entity. ONE knob for "
              "every consensus-vs-consensus comparison: the post-EM merge inside a "
              "window, step 1's link across adjacent windows, and steps 2/3 across "
@@ -1206,12 +1195,12 @@ def main():
              "sequencing error a consensus has already averaged out.",
     )
     parser.add_argument(
-        "--track-merge-min-shared-markers", type=int, default=1,
+        "--track-merge-min-shared-markers", type=int, default=_D.track_merge_min_shared_markers,
         help="Agreeing markers two step-1 tracks need before the cross-sample merge "
              "joins them (default 1, a permissive first pass).",
     )
     parser.add_argument(
-        "--abundance-coherence-alpha", type=float, default=0.01,
+        "--abundance-coherence-alpha", type=float, default=_D.abundance_coherence_alpha,
         help="Significance at which two read counts are declared incompatible "
              "abundances. ONE threshold for every abundance verdict: step 1's "
              "adjacent-window eliminator, and the fresh test the cross-sample merge "
@@ -1219,39 +1208,39 @@ def main():
              "be stricter or looser than the refusal it inherits.",
     )
     parser.add_argument(
-        "--min-reads-for-coherence", type=int, default=10,
+        "--min-reads-for-coherence", type=int, default=_D.min_reads_for_coherence,
         help="Reads a window needs before its abundance is tested at all. Same scope "
              "as --abundance-coherence-alpha.",
     )
     parser.add_argument(
-        "--link-window-reach", type=int, default=2,
+        "--link-window-reach", type=int, default=_D.link_window_reach,
         help="How many windows ahead step 1 may link. 1 is the overlap-only rule; "
              "above 1 also links NON-overlapping windows on shared reads, which is how "
              "a marker-free window stops acting as a hub.",
     )
     parser.add_argument(
-        "--link-min-shared-reads", type=int, default=2,
+        "--link-min-shared-reads", type=int, default=_D.link_min_shared_reads,
         help="Reads two haplotypes must share to link a NON-overlapping window pair. "
              "Consensus cannot gate those pairs, so this is the whole evidence bar.",
     )
     parser.add_argument(
         "--min-shared-markers",
         type=int,
-        default=3,
+        default=_D.min_shared_markers,
         help="Shared markers required before that rate means anything. Same scope as "
              "--identity-distance.",
     )
     parser.add_argument(
         "--min-reads-for-rescue",
         type=int,
-        default=5,
+        default=_D.min_reads_for_rescue,
         help="Reads needed for a window to be BUILT (so rescue can populate it). De-novo "
         "phasing uses the higher --min-reads-per-window.",
     )
     parser.add_argument(
         "--min-reads-per-window",
         type=int,
-        default=10,
+        default=_D.min_reads_per_window,
         help="Reads needed to PHASE a window de novo. Below this no haplotype is invented "
         "and the trajectory carries a gap.",
     )
