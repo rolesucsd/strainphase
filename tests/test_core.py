@@ -73,19 +73,19 @@ class TestHaplotyperConfig(unittest.TestCase):
             HaplotyperConfig(assign_confidence_threshold=0.0)
 
     def test_invalid_min_minor_frequency(self):
-        """min_minor_frequency_1snp > 0.5 should raise."""
+        """marker_min_frac > 0.5 should raise - no allele pair can both clear half."""
         with self.assertRaises(ValueError):
-            HaplotyperConfig(min_minor_frequency_1snp=0.6)
+            HaplotyperConfig(marker_min_frac=0.6)
 
     def test_custom_config(self):
         """Custom config should store values."""
         config = HaplotyperConfig(
             window_size=5000,
-            max_mismatch_frac=0.03,
+            identity_distance=0.03,
             min_mapq=30
         )
         self.assertEqual(config.window_size, 5000)
-        self.assertEqual(config.max_mismatch_frac, 0.03)
+        self.assertEqual(config.identity_distance, 0.03)
         self.assertEqual(config.min_mapq, 30)
 
 
@@ -222,7 +222,7 @@ class TestGraphInitializer(unittest.TestCase):
         """Set up test fixtures."""
         self.config = HaplotyperConfig(
             min_shared_snvs_for_edge=2,
-            max_mismatch_frac=0.1,
+            identity_distance=0.1,
             min_reads_per_cluster=2
         )
         self.graph_init = GraphInitializer(self.config)
@@ -422,8 +422,8 @@ class TestPostProcessor(unittest.TestCase):
     def setUp(self):
         """Set up test fixtures."""
         self.config = HaplotyperConfig(
-            merge_distance_threshold=0.1,
-            min_shared_for_merge=2
+            identity_distance=0.1,
+            min_shared_markers=2
         )
         self.post = PostProcessor(self.config)
     
@@ -480,9 +480,9 @@ class TestWindowLinking(unittest.TestCase):
         # defaults (20 kb windows, 1 kb minimum overlap), so the physical-span gates
         # are relaxed here. This class tests the LINKING decision, not depth policy.
         self.config = HaplotyperConfig(
-            max_link_distance=0.1,
+            identity_distance=0.1,
             min_shared_snvs_for_link=2,
-            min_shared_calls_for_link=2,
+            min_shared_markers=2,
             min_entity_overlap_bp=0,
             min_cosupported_span_frac=0.0,
         )
@@ -498,6 +498,10 @@ class TestWindowLinking(unittest.TestCase):
             window_idx=0
         )
         hap1 = Haplotype(consensus={100: 'A', 200: 'C', 300: 'G'}, weight=0.5)
+        # A DECOY second haplotype so the sample HAS variable positions. Markers are
+        # positions that vary across a sample's haplotypes; with one identical
+        # haplotype per window nothing varies and no verdict is possible.
+        decoy1 = Haplotype(consensus={100: 'T', 200: 'T', 300: 'T'}, weight=0.1)
         
         # Window 2: positions 200-400 (overlaps on 200, 300)
         window2 = Window(
@@ -508,13 +512,14 @@ class TestWindowLinking(unittest.TestCase):
             window_idx=1
         )
         hap2 = Haplotype(consensus={200: 'C', 300: 'G', 400: 'T'}, weight=0.5)
+        decoy2 = Haplotype(consensus={200: 'T', 300: 'T', 400: 'A'}, weight=0.1)
         
         results = [
             WindowResult(
                 window=window1,
-                haplotypes=[hap1],
-                gamma=np.array([[1.0, 0.0]]),
-                pi=np.array([0.9, 0.1]),
+                haplotypes=[hap1, decoy1],
+                gamma=np.array([[1.0, 0.0, 0.0]]),
+                pi=np.array([0.85, 0.1, 0.05]),
                 log_likelihood=-10.0,
                 assignments=[],
                 converged=True,
@@ -522,9 +527,9 @@ class TestWindowLinking(unittest.TestCase):
             ),
             WindowResult(
                 window=window2,
-                haplotypes=[hap2],
-                gamma=np.array([[1.0, 0.0]]),
-                pi=np.array([0.9, 0.1]),
+                haplotypes=[hap2, decoy2],
+                gamma=np.array([[1.0, 0.0, 0.0]]),
+                pi=np.array([0.85, 0.1, 0.05]),
                 log_likelihood=-10.0,
                 assignments=[],
                 converged=True,
@@ -633,9 +638,9 @@ class TestAssignReads(unittest.TestCase):
     """Test PostProcessor.assign_reads directly."""
 
     def setUp(self):
-        # assign_reads is a debugging aid and is off by default (keep_read_assignments);
+        # assign_reads is always on: step-3 links on the reads a window assigned;
         # these tests exercise the function itself, so they opt in explicitly.
-        self.config = HaplotyperConfig(keep_read_assignments=True)
+        self.config = HaplotyperConfig()
         self.post = PostProcessor(self.config)
         self.reads = [
             Read(id=f"r{i}", contig="test", mapq=60, alleles={}, quals={})
@@ -649,8 +654,7 @@ class TestAssignReads(unittest.TestCase):
             [0.02, 0.96, 0.02],
             [0.01, 0.01, 0.98],
         ])
-        pi = np.array([0.45, 0.45, 0.10])
-        assignments = self.post.assign_reads(self.reads, gamma, pi)
+        assignments = self.post.assign_reads(self.reads, gamma)
 
         self.assertEqual(assignments[0]["hap_id"], 0)
         self.assertFalse(assignments[0]["is_junk"])
@@ -661,9 +665,8 @@ class TestAssignReads(unittest.TestCase):
     def test_junk_assignment(self):
         """Read whose best column is the last (junk) gets is_junk=True."""
         gamma = np.array([[0.05, 0.95]])  # 1 read, 1 hap + junk
-        pi = np.array([0.05, 0.95])
         reads = [Read(id="r0", contig="test", mapq=60, alleles={}, quals={})]
-        assignments = self.post.assign_reads(reads, gamma, pi)
+        assignments = self.post.assign_reads(reads, gamma)
 
         self.assertTrue(assignments[0]["is_junk"])
         self.assertIsNone(assignments[0]["hap_id"])
@@ -675,9 +678,8 @@ class TestAssignReads(unittest.TestCase):
         gamma = np.array([[low_prob, 1.0 - low_prob]])  # best is hap 0, but below threshold
         # Make hap 0 best but below threshold, junk (col 1) lower
         gamma = np.array([[low_prob + 0.01, 1.0 - low_prob - 0.01]])
-        pi = np.array([0.5, 0.5])
         reads = [Read(id="r0", contig="test", mapq=60, alleles={}, quals={})]
-        assignments = self.post.assign_reads(reads, gamma, pi)
+        assignments = self.post.assign_reads(reads, gamma)
 
         self.assertFalse(assignments[0]["is_junk"])
         self.assertTrue(assignments[0]["is_ambiguous"])
@@ -1063,7 +1065,7 @@ class TestIntegration(unittest.TestCase):
             merged, final_gamma, final_pi = post.merge_similar_haplotypes(
                 haps, gamma, pi, window
             )
-            assignments = post.assign_reads(window.reads, final_gamma, final_pi)
+            assignments = post.assign_reads(window.reads, final_gamma)
             
             result = WindowResult(
                 window=window,

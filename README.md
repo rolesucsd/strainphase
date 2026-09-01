@@ -54,8 +54,8 @@ from strainphase import HaplotyperConfig, process_contig
 
 config = HaplotyperConfig(
     window_size=20000,
-    max_mismatch_frac=0.01,
-    min_weight_for_anchor=0.20,
+    identity_distance=0.02,
+    min_weight_for_anchor=0.15,
 )
 
 results = process_contig(
@@ -93,7 +93,7 @@ Options:
   --window-size INT   Analysis window size [default: 20000]
   --max-reads INT     Max reads per window [default: 300]
   --min-mapq INT      Minimum MAPQ [default: 20]
-  --max-mismatch FLT  Max mismatch fraction [default: 0.02]
+  --identity-distance FLT  Max mismatch RATE at which two things are one entity [default: 0.02]
   --seed INT          Random seed for reproducibility
   --log-level LEVEL   Logging level [default: INFO]
 ```
@@ -124,11 +124,13 @@ Options:
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `window_size` | 20000 | Analysis window size (bp) |
-| `max_mismatch_frac` | 0.01 | Max Hamming distance for graph edges |
-| `min_shared_snvs_for_edge` | 2 | Min shared SNVs to connect reads |
-| `merge_distance_threshold` | 0.01 | Distance threshold for merging haplotypes |
+| `identity_distance` | 0.02 | Max mismatch RATE at which two things are one entity — read to read, haplotype to haplotype, and rescue |
+| `min_shared_snvs_for_edge` | 1 | Shared SNVs before that rate means anything, read to read |
+| `min_shared_markers` | 3 | Shared markers before it means anything, haplotype to haplotype |
+| `track_merge_min_shared_markers` | 1 | Agreeing markers before the cross-sample merge joins two tracks |
+| `link_window_reach` | 2 | Windows ahead step 1 may link; >1 links NON-overlapping windows on shared reads |
 | `assign_confidence_threshold` | 0.90 | γ threshold for hard read assignment |
-| `min_weight_for_anchor` | 0.20 | Min abundance for anchor panel |
+| `min_weight_for_anchor` | 0.15 | Min abundance for anchor panel |
 | `rescued_min_weight` | 0.02 | Min weight after longitudinal rescue |
 | `junk_divergence_rate` | 0.10 | Junk model divergence rate |
 

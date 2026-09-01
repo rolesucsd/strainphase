@@ -184,20 +184,6 @@ def test_window_batching_does_not_change_the_tables(dataset):
     _assert_tables_equivalent(small, big)
 
 
-def test_read_assignments_are_off_by_default_and_opt_in(dataset):
-    """The field costs one dict per read per window and nothing reads it, so it must be
-    empty unless explicitly requested - and still populated when it is."""
-    tmp, bams, vcfs = dataset
-    _o1, off, _t1 = _run(tmp, bams, vcfs, _cfg(), "assign_off")
-    assert not any(
-        wr.assignments for contigs in off.values() for wrs in contigs.values() for wr in wrs
-    ), "assignments retained despite keep_read_assignments=False"
-
-    _o2, on, _t2 = _run(tmp, bams, vcfs, _cfg(keep_read_assignments=True), "assign_on")
-    assert any(
-        wr.assignments for contigs in on.values() for wrs in contigs.values() for wr in wrs
-    ), "keep_read_assignments=True produced no assignments"
-
 
 def test_spill_directory_is_cleaned_up(dataset):
     tmp, bams, vcfs = dataset
@@ -331,12 +317,11 @@ def test_longitudinal_subcommand_accepts_the_memory_and_seed_flags(tmp_path, mon
     That mismatch shipped --seed to a cluster run that died on it immediately.
     """
     seen = _run_cli(tmp_path, monkeypatch,
-                    ["--seed", "7", "--window-batch-factor", "2", "--keep-read-assignments"])
+                    ["--seed", "7", "--window-batch-factor", "2",])
     cfg = seen.get("config")
     assert cfg is not None, "process_mag_longitudinal was never reached"
     assert cfg.random_seed == 7
     assert cfg.window_batch_factor == 2
-    assert cfg.keep_read_assignments is True
 
 
 def test_cmd_longitudinal_forwards_output_dir_so_spilling_is_actually_on(

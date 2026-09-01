@@ -7,13 +7,14 @@ with probabilistic EM refinement.
 
 Example usage:
     >>> from strainphase import HaplotyperConfig, process_contig
-    >>> config = HaplotyperConfig(window_size=20000, max_mismatch_frac=0.02)
+    >>> config = HaplotyperConfig(window_size=20000, identity_distance=0.02)
     >>> results = process_contig(bam, vcf, contig_id, contig_length, config)
 
 CLI usage:
     $ strainphase run --bam sample.bam --vcf variants.vcf --contig ctg1 --length 50000
     $ strainphase longitudinal --samples T1,T2,T3 --bams mapping/{sample}.bam ...
-    $ strainphase test --quick
+    $ strainphase sv reconcile ...
+    $ strainphase test
 """
 
 # Single source of truth is pyproject.toml. Hard-coding it here meant the two

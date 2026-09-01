@@ -28,6 +28,7 @@ dist/
 .DS_Store
 .idea/
 .vscode/
+.claude/
 
 # Private working directories, not distributed. docs/ holds the manuscript,
 # figure sources and working notes (agents.md, future_work.md live here now).

@@ -111,7 +111,7 @@ class TestCountTimepointsForHaplotype(unittest.TestCase):
 
     def setUp(self):
         self.config = HaplotyperConfig(
-            rescue_match_distance=0.02,
+            identity_distance=0.02,
             min_shared_for_rescue=2,
         )
         self.integrator = LongitudinalIntegrator(self.config)
@@ -206,7 +206,7 @@ class TestRescueBelowTheJunkFloor(unittest.TestCase):
                             iterations=5)
 
     def _rescue(self, wr):
-        config = HaplotyperConfig(rescue_match_distance=0.05, min_shared_for_rescue=2)
+        config = HaplotyperConfig(identity_distance=0.05, min_shared_for_rescue=2)
         integrator = LongitudinalIntegrator(config)
         donor = Haplotype(consensus={100: "G", 200: "G", 300: "G"}, weight=0.5)
         out = integrator.rescue_window_result(wr, [donor], ["T2"], {}, "T1")

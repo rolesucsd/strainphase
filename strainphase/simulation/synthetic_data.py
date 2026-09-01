@@ -547,23 +547,3 @@ def create_reference_scenarios(
         )
 
     return scenarios
-
-
-if __name__ == "__main__":
-    # Test the generator
-    scenarios = create_test_scenarios()
-
-    for name, scenario in scenarios.items():
-        print(f"\n=== Scenario: {name} ===")
-        print(f"  Contig: {scenario.contig_id} ({scenario.contig_length} bp)")
-        print(f"  SNVs: {scenario.total_snvs()}")
-        print(f"  True haplotypes: {scenario.n_true_haplotypes()}")
-        print(f"  Timepoints: {scenario.timepoints}")
-
-        if scenario.sweep_events:
-            print(f"  Sweep events: {scenario.sweep_events}")
-
-        print("  Abundance trajectories:")
-        for hap in scenario.true_haplotypes:
-            abunds = [f"{tp}={hap.get_abundance(tp):.2f}" for tp in scenario.timepoints]
-            print(f"    {hap.id}: {', '.join(abunds)}")

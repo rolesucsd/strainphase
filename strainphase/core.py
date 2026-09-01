@@ -29,7 +29,8 @@ import bisect
 import logging
 import os
 import warnings
-from collections import defaultdict
+import zlib
+from collections import Counter, defaultdict
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from multiprocessing import Pool
@@ -80,9 +81,6 @@ class WarningThrottler:
             warnings.warn(message, stacklevel=2)
             cls._warned.add(key)
 
-    @classmethod
-    def reset(cls):
-        cls._warned.clear()
 
 
 # =============================================================================
@@ -101,7 +99,6 @@ class HaplotyperConfig:
 
     # =========== WINDOW PARAMETERS ===========
     window_size: int = 20000
-    min_snvs_per_window: int = 1
     # Depth policy (FIGURE4 diagnosis §6 #3). Two DIFFERENT floors:
     #   min_reads_per_window  - reads needed to PHASE a window de novo. Separating two
     #                           haplotypes at 50/50 needs ~10-20 reads; 3 cannot resolve
@@ -111,6 +108,9 @@ class HaplotyperConfig:
     #                           Rescue matches an established anchor rather than doing de
     #                           novo separation, so it legitimately needs less evidence.
     # A window with min_reads_for_rescue <= n < min_reads_per_window is created but not phased.
+    # Windows with fewer than this many called SNVs are not phased. 1 means "skip only
+    # empty windows"; higher values are a real filter for sparse regions.
+    min_snvs_per_window: int = 1
     min_reads_per_window: int = 10
     min_reads_for_rescue: int = 5
 
@@ -124,17 +124,11 @@ class HaplotyperConfig:
     # Without this a read overlapping by 1 bp entered n_reads_examined, the junk
     # classification and the abundance denominator identically to one spanning 20 kb.
     # (FIGURE4 diagnosis §6 #6b; costs ~8% of reads on 000089747_1.)
-    min_read_window_overlap_bp: int = 1000
+    min_read_window_overlap_bp: int = 500
     # Two reads must physically overlap by at least this much to be compared at all
     # (FIGURE4 diagnosis §6 #8, LEVEL 1).
-    min_read_read_overlap_bp: int = 1000
+    min_read_read_overlap_bp: int = 500
 
-    # =========== MEMORY ===========
-    # Per-read hard assignments (WindowResult.assignments) are a debugging aid: one dict
-    # per read per window, never written to any output file and never read by any other
-    # function in the package. On a 146-sample MAG that is tens of millions of dicts
-    # retained for nothing, so they are off by default. Turn on to inspect them.
-    keep_read_assignments: bool = False
     # Spill per-sample WindowResults to <output_dir>/tmp during the first pass instead of
     # holding every sample's reads in RAM until the rescue pass. Cross-sample rescue only
     # ever reads `.haplotypes` off OTHER samples (build_anchor_panel_for_key /
@@ -162,30 +156,12 @@ class HaplotyperConfig:
     # switch that lets a caller drop indels or collapse alleles.
 
     # =========== GRAPH CONSTRUCTION ===========
-    min_shared_snvs_for_edge: int = 3
-    max_mismatch_frac: float = 0.01
+    min_shared_snvs_for_edge: int = 1
     min_reads_per_cluster: int = 3
 
-    # =========== IDENTITY GATES (shared by all three linking levels) ===========
-    # The rate gate is applied as int(max_mismatch_frac * n_shared) - a FLOOR - so it
-    # already forces 0 mismatches below n_shared=100 and 1 below n_shared=200. The
-    # absolute cap therefore does nothing at low n_shared and becomes the binding gate
-    # at high n_shared, where a rate alone would tolerate 11 mismatches at n=1172.
-    # The two guard opposite ends of the range; both are required.
-    # (FIGURE4 diagnosis §6 #8.)
-    max_num_diff: int = 1
-    # A within-sample link mismatch vetoes a cross-window lineage continuation
-    # only when at least this many timepoints INDEPENDENTLY flag the same join.
-    # 1 = the old behaviour (a single timepoint's per-window EM miscall cuts the
-    # link). The per-window EM miscalls ~0.03% of sites, so over a short overlap a
-    # lone 1-SNV error trips the zero-tolerance link gate in exactly one timepoint
-    # and severed strains the POOLED consensus agrees on over ~90 markers. Requiring
-    # corroboration (2) drops those: a genuine strain difference shows in every
-    # timepoint the two strains co-occur, a random EM miscall in only one.
-    step1_veto_min_timepoints: int = 2
     # Minimum physical overlap between two entities, below which the verdict is an
     # explicit NON-MERGE rather than "unknown" (Strainy's I = 1000).
-    min_entity_overlap_bp: int = 1000
+    min_entity_overlap_bp: int = 500
     # AUTHOR'S DECISION: structural variants are NEVER excluded from identity. Capturing
     # the trajectory of a flip is a goal of the analysis, not noise to be filtered, so an
     # inversion is a first-class marker like any other.
@@ -206,44 +182,71 @@ class HaplotyperConfig:
     dirichlet_alpha: float = 1.0
     min_hap_eff_weight: float = 3.0
     min_gamma_for_vote: float = 0.01
-    use_cluster_pi_init: bool = True
 
     # =========== JUNK MODEL ===========
     junk_divergence_rate: float = 0.10
 
-    # =========== POST-PROCESSING ===========
-    merge_distance_threshold: float = 0.01
-    min_shared_for_merge: int = 2  # Min shared SNVs with actual calls to consider merging
+    # ---- HAPLOTYPE IDENTITY: one rate, one marker floor, every stage ----------------
+    # "Are these two things the same entity?" is asked in five places - inside a window
+    # after EM, between reads when building the graph, across windows in step 1, when
+    # rescuing a haplotype across timepoints, and across samples in the merge. Each used
+    # to own a private copy of the same two thresholds, and they agreed only because
+    # someone had set them equal - nothing enforced it, and they drifted.
+    #
+    # NOW FOLDED IN TOO (2026-08-31). max_mismatch_frac (read vs read) and
+    # rescue_match_distance (read vs haplotype) were kept separate on the argument that a
+    # read carries sequencing error a consensus has already averaged out, so they deserve
+    # their own error model. That argument was never actually expressed: all three sat at
+    # 0.02, so the separation bought nothing and cost a sweep over "identity" three knobs
+    # to find. The rate now means one thing everywhere - what fraction of the sites two
+    # things both call may disagree - and the differing confidence in each object is
+    # carried by its own EVIDENCE threshold instead:
+    #
+    #   read vs read       min_shared_snvs_for_edge = 1   (one shared site is meaningful)
+    #   haplotype vs hap   min_shared_markers       = 3
+    #   read vs haplotype  min_shared_for_rescue    = 3
+    #   cross-sample       track_merge_min_shared_markers = 1
+    #
+    # Collapsing the rate is a no-op at these defaults; it only changes behaviour for a
+    # caller who had set them apart.
+    identity_distance: float = 0.02
+    min_shared_markers: int = 3
+    # Agreeing markers a track pair needs before the cross-sample merge will join them.
+    # 1 is a deliberately permissive FIRST pass: exact agreement cannot fuse two
+    # genotypes that disagree anywhere both called, so evidence volume is the only thing
+    # this trades. Measured on 000089747_1 contig_2 (7,858 tracks carrying a marker):
+    #     1 -> 118 entities, mean size 66.6      10 -> 6,009 entities, mean 1.31
+    #     3 -> 4,474 entities, mean size 1.76    50 -> 6,819 entities, mean 1.15
+    # Raising it splits hard and fast, so raise it only against a scored run.
+    track_merge_min_shared_markers: int = 1
+    # --- MARKER SET (computed once, used by steps 2 and 3) ----------------------
+    # A position is a CANDIDATE marker when more than one allele is seen at it anywhere
+    # on the contig. These thresholds decide which candidates survive: an ALLELE is kept
+    # when it reaches `marker_min_frac` of a sample's reads at that position AND at least
+    # `marker_min_reads` reads, in at least `marker_min_samples` samples. The samples need
+    # not be the same for the two alleles - a swept position is FIXED within each sample
+    # (all one allele before the sweep, all the other after), so requiring both alleles in
+    # one sample would discard exactly the events this tool exists to find. A position
+    # survives when >= 2 alleles do.
+    #
+    # Without this, a marker was any position with two distinct CONSENSUS calls anywhere -
+    # no read backing, no replication - so one miscalled base in one shallow window
+    # promoted a position contig-wide. Measured on B. fragilis 000089747_1 contig_2:
+    # 66,183 of 170,694 positions (38.8%) qualified; with read support and replication,
+    # 1,346 (2.0% of candidates) do, and both positions of a real sweep are retained.
+    marker_min_frac: float = 0.10
+    marker_min_reads: int = 3
+    marker_min_samples: int = 2
+
     assign_confidence_threshold: float = 0.90
 
-    # =========== 1-SNP VALIDATION ===========
-    validate_1snp_differences: bool = True
-    min_minor_frequency_1snp: float = 0.10
-    min_minor_supporting_reads_1snp: int = 3
-    min_timepoints_for_1snp: int = 2
-    use_binomial_test_1snp: bool = True
     binomial_alpha: float = 0.05
 
     # =========== LONGITUDINAL PARAMETERS ===========
-    min_weight_for_anchor: float = 0.2
-    rescue_match_distance: float = 0.01  # 1% divergence — matches unified distance threshold
-    min_shared_for_rescue: int = 2  # Min shared SNVs with actual calls for rescue matching
+    min_weight_for_anchor: float = 0.15
+    min_shared_for_rescue: int = 3  # Min shared SNVs with actual calls for rescue matching
     rescued_min_weight: float = 0.02
 
-    # =========== CROSS-SAMPLE WINDOW GROUPING ===========
-    # Groups haplotypes at ONE FIXED WINDOW across samples (the "vertical" axis).
-    # Windows are fixed coordinate tiles, so every comparison here has an identical
-    # footprint - no span gating, nothing to expand, no imputation gap.
-    lineage_merge_distance: float = 0.01  # Max mismatch rate to group
-    min_shared_for_lineage: int = 3  # Min shared markers (raised 2 -> 3 to match linking)
-    # Fraction of testable samples allowed to disagree on abundance before the
-    # abundance ELIMINATOR vetoes a cross-window continuation. 0.0 = zero
-    # tolerance (any one incompatible sample vetoes), which on real divergent
-    # data breaks clean (n_diff=0) same-strain links on noisy per-window
-    # abundance estimates. Exposed so it can be relaxed; the veto still only
-    # sees pairs that already PASSED the consensus gate, so relaxing it cannot
-    # merge consensus-divergent strains.
-    lineage_max_bad_frac: float = 0.0
     # Identity shape. This decision is still OPEN (FIGURE4 diagnosis §6 #9); both are
     # implemented so they can be compared on identical inputs.
     #   "clique"     - complete linkage: a group is a clique, every member passes the
@@ -255,13 +258,10 @@ class HaplotyperConfig:
     # SPLIT MOLECULES (troubleshooting U1). A molecule the aligner had to split across a
     # divergent segment is re-assembled into one Read, and the breakpoint is registered as
     # a site carrying BRK<resume_pos> / CONT. Off only to measure the difference.
-    merge_split_reads: bool = True
 
     # Step 3 runs inside the pipeline. Off only to skip it on a run that is producing the
     # window tables for something else.
-    build_lineages: bool = True
 
-    cross_sample_method: str = "clique"
 
     # =========== ABUNDANCE COHERENCE ===========
     # A genome cannot hold two frequencies at one locus at one time. Tested on RAW
@@ -275,27 +275,26 @@ class HaplotyperConfig:
     # =========== LINKING DIAGNOSTICS ===========
     linking_debug: bool = False  # Record detailed linking diagnostics
     linking_debug_max_records: int = 5000  # Cap to avoid massive files
-    max_span_gap_for_lineage: int = 10000  # Max gap between track spans to consider same locus
 
-    # =========== WINDOW LINKING PARAMETERS ===========
-    # Haplotypes in adjacent overlapping windows are linked if their
-    # consensus agrees on shared SNVs (Hamming distance <= max_link_distance).
-    # 0.02 (2%): the per-window EM miscalls ~0.03%/site, so over a short window
-    # overlap (~50 markers) a lone 1-SNV error is ~2%. At the old 0.01 that lone
-    # error was a hard mismatch and severed same-strain tracks; the within-sample
-    # link check is a rate gate now (its absolute cap is off, see max_link_num_diff)
-    # so it tolerates a couple of expected miscalls without merging cross-strain
-    # pairs, which disagree at ~50% of markers.
-    max_link_distance: float = 0.02  # Max mismatch fraction to link
-    # The absolute mismatch cap for the WITHIN-SAMPLE link gate only. Effectively off
-    # (rate-gate only) so a single EM-miscall SNV over a short overlap is not a hard
-    # mismatch. The cross-strain lineage gate keeps its own cap (config.max_num_diff).
-    max_link_num_diff: int = 1_000_000
     # Window-level shared SNV POSITIONS (does the window pair even have common sites).
     min_shared_snvs_for_link: int = 3
-    # Haplotype-level shared ACTUAL CALLS. Previously the same knob as the line above,
-    # which meant the two could not be set independently (FIGURE4 diagnosis §6 #8, LEVEL 2).
-    min_shared_calls_for_link: int = 3
+    # How many windows ahead link_windows may reach. Overlapping neighbours are compared
+    # on consensus as they always have been; a reach above 1 ADDITIONALLY admits
+    # NON-overlapping windows, which share no SNV positions and so are linked on shared
+    # reads alone. Measured on 000089747_1 (window 20 kb, step 10 kb, PacBio HiFi): the
+    # overlap rule caps step 1 at a 10 kb reach while reads reach 30 kb, so a single
+    # marker-free window between two informative ones becomes a hub that no pairwise
+    # veto can reach. Marker pairs co-covered by one read = 124,149 against 81,288
+    # co-windowed, and 42,861 of those lie further apart than any 20 kb window can span.
+    # Reach 2 recovered 25-29% of lineage fragmentation in prototype; reach 3 was flat
+    # (read sharing falls 42% at 20 kb to 14% at 30 kb, and 0.9% at 40 kb), so 2 is the
+    # setting the measurement supports. Set 1 to restore the pre-2026-08-31 rule, which
+    # linked only overlapping windows and admitted no disjoint pair at all.
+    link_window_reach: int = 2
+    # Shared reads required to link a NON-overlapping window pair. Consensus cannot gate
+    # these - the two windows call disjoint positions - so this threshold and reciprocal
+    # best match are the whole of the evidence, and it should not be lowered casually.
+    link_min_shared_reads: int = 2
     # The two haplotypes' CO-SUPPORTED SPAN inside the shared region, as a fraction of
     # that region. Window geometry itself is not a useful gate (tiles overlap by exactly
     # 50% or exactly 0%, nothing between). Measured on 000089747_1: 25% rejects 16.0% of
@@ -315,21 +314,44 @@ class HaplotyperConfig:
     # explicit integer to vary it deliberately (e.g. to check a result is not an artefact
     # of one draw); None restores the old unseeded behaviour.
     random_seed: int | None = 42
-    validate_results: bool = False  # Set False for production runs
     n_workers: int = 1  # Number of parallel workers for window processing (1=sequential)
 
     def __post_init__(self):
         """Validate configuration parameters."""
+
         # Junk divergence rate
         if not (0 < self.junk_divergence_rate < 0.75):
             raise ValueError(
                 f"junk_divergence_rate must be in (0, 0.75), got {self.junk_divergence_rate}"
             )
 
-        # Merge distance threshold
-        if not (0 <= self.merge_distance_threshold <= 1):
+        if self.track_merge_min_shared_markers < 1:
             raise ValueError(
-                f"merge_distance_threshold must be in [0, 1], got {self.merge_distance_threshold}"
+                "track_merge_min_shared_markers must be >= 1, got "
+                f"{self.track_merge_min_shared_markers}"
+            )
+
+        if self.marker_min_frac > 0.5:
+            raise ValueError(
+                f"marker_min_frac should be <= 0.5, got {self.marker_min_frac}"
+            )
+
+        # Step-1 read reach. A reach below 1 would drop the overlapping-neighbour link
+        # that every track is built from, and a non-overlapping pair linked on fewer than
+        # one shared read would be linked on nothing at all.
+        if self.link_window_reach < 1:
+            raise ValueError(
+                f"link_window_reach must be >= 1, got {self.link_window_reach}"
+            )
+        if self.link_min_shared_reads < 1:
+            raise ValueError(
+                f"link_min_shared_reads must be >= 1, got {self.link_min_shared_reads}"
+            )
+
+        # Merge distance threshold
+        if not (0 <= self.identity_distance <= 1):
+            raise ValueError(
+                f"identity_distance must be in [0, 1], got {self.identity_distance}"
             )
 
         # AF range (optional)
@@ -341,10 +363,6 @@ class HaplotyperConfig:
             )
 
         # Minor frequency for 1-SNP
-        if self.min_minor_frequency_1snp > 0.5:
-            raise ValueError(
-                f"min_minor_frequency_1snp should be <= 0.5, got {self.min_minor_frequency_1snp}"
-            )
 
         # Confidence threshold
         if not (0 < self.assign_confidence_threshold <= 1):
@@ -364,8 +382,6 @@ class HaplotyperConfig:
         if self.min_reads_for_rescue > self.min_reads_per_window:
             object.__setattr__(self, "min_reads_for_rescue", self.min_reads_per_window)
 
-        if self.max_num_diff < 0:
-            raise ValueError(f"max_num_diff must be >= 0, got {self.max_num_diff}")
 
         if not (0 <= self.min_cosupported_span_frac <= 1):
             raise ValueError(
@@ -373,11 +389,6 @@ class HaplotyperConfig:
                 f"{self.min_cosupported_span_frac}"
             )
 
-        if self.cross_sample_method not in ("clique", "reciprocal"):
-            raise ValueError(
-                f"cross_sample_method must be 'clique' or 'reciprocal', got "
-                f"{self.cross_sample_method!r}"
-            )
 
         if not (0 < self.abundance_coherence_alpha < 1):
             raise ValueError(
@@ -400,6 +411,77 @@ DEFAULT_CONFIG = HaplotyperConfig()
 # =============================================================================
 # DATA STRUCTURES
 # =============================================================================
+
+
+# config field -> the argparse attribute that sets it. Entry points define different
+# SUBSETS of these flags, and a field whose flag a parser does not define simply keeps
+# its dataclass default - which is what lets one builder serve every subcommand.
+#
+# There were three hand-maintained builders before this, and they drifted: `python -m
+# strainphase.longitudinal` parsed --identity-distance and --min-shared-markers and
+# then never passed either to the config, so both did nothing on that entry point while
+# the same flags worked under `strainphase longitudinal`. Declaring the mapping once
+# makes that class of bug unrepresentable - a flag either appears here or has no effect
+# anywhere, rather than having an effect on some entry points and not others.
+_CONFIG_FROM_ARG: dict[str, str] = {
+    "window_size": "window_size",
+    "max_reads_per_window": "max_reads",
+    "min_mapq": "min_mapq",
+    "min_depth_site": "min_depth_site",
+    "random_seed": "seed",
+    "min_weight_for_anchor": "min_anchor_weight",
+    "rescued_min_weight": "rescued_min_weight",
+    "min_reads_per_window": "min_reads_per_window",
+    "min_reads_for_rescue": "min_reads_for_rescue",
+    "min_cosupported_span_frac": "min_cosupported_span_frac",
+    "min_shared_snvs_for_link": "min_shared_snvs_for_link",
+    "identity_distance": "identity_distance",
+    "min_shared_markers": "min_shared_markers",
+    "track_merge_min_shared_markers": "track_merge_min_shared_markers",
+    "link_window_reach": "link_window_reach",
+    "link_min_shared_reads": "link_min_shared_reads",
+    "abundance_coherence_alpha": "abundance_coherence_alpha",
+    "min_reads_for_coherence": "min_reads_for_coherence",
+    "window_batch_factor": "window_batch_factor",
+}
+
+
+def config_from_args(args, **overrides) -> HaplotyperConfig:
+    """Build one ``HaplotyperConfig`` from any entry point's parsed arguments.
+
+    ``overrides`` win over the parsed values, for the few settings an entry point fixes
+    rather than exposes. Flags that invert or derive their field (``--no-spill``,
+    ``--workers``, ``--af-range``) are handled explicitly below, since a name-to-name
+    table cannot express them.
+    """
+    values: dict = {}
+    for cfg_field, attr in _CONFIG_FROM_ARG.items():
+        if hasattr(args, attr):
+            values[cfg_field] = getattr(args, attr)
+
+    # One --min-overlap-bp governs all three physical-overlap floors. They ask about
+    # different objects (read-vs-window, read-vs-read, entity-vs-entity) but they are one
+    # question - how much shared sequence is enough to compare two things - and three
+    # identically-worded flags at one value were impossible to tune with intent. The
+    # fields stay separate so a library caller can still set them apart.
+    if getattr(args, "min_overlap_bp", None) is not None:
+        values["min_read_window_overlap_bp"] = args.min_overlap_bp
+        values["min_read_read_overlap_bp"] = args.min_overlap_bp
+        values["min_entity_overlap_bp"] = args.min_overlap_bp
+
+    # argparse hands back a LIST for nargs=2, and af_range is part of the VCF-load
+    # cache key, which a list cannot be - so convert here rather than at the use site.
+    if getattr(args, "af_range", None):
+        values["af_range"] = tuple(args.af_range)
+
+    # Inverted and derived flags.
+    if hasattr(args, "no_spill"):
+        values["spill_results_to_disk"] = not args.no_spill
+    if hasattr(args, "workers"):
+        values["n_workers"] = max(1, args.workers)
+
+    values.update(overrides)
+    return HaplotyperConfig(**values)
 
 
 @dataclass
@@ -571,6 +653,13 @@ class WindowResult:
     # merge rules treat as absolute. `failed_no_evidence` is a measurement hole and is
     # deliberately NOT recorded - reporting absence of coverage would bury the signal.
     link_mismatches: list[dict] = field(default_factory=list)
+    # Step-1 ABUNDANCE refusals, carried exactly like link_mismatches above. Both are
+    # verdicts step 1 already reached on evidence steps 2 and 3 cannot improve on - one
+    # sample, two adjacent windows, where a genome cannot sit at two frequencies at once.
+    # They were previously written only to the debug trace, so step 3 re-derived the same
+    # test pairwise AND again transitively over whole chains. Recording them makes the
+    # verdict propagate instead of being recomputed.
+    link_abundance_refusals: list[dict] = field(default_factory=list)
     n_reads_examined: int = 0
     reads_within_mismatch_per_hap: list[int] = field(default_factory=list)
     # Scalar summaries of `gamma`, recorded before the heavy fields are offloaded so the
@@ -599,7 +688,14 @@ class WindowResult:
         reads = self.window.reads
         self.window.reads = []
         self.window._pos_sets = None
-        self.assignments = []
+        # `assignments` is deliberately NOT cleared. It is populated only under
+        # the read-overlap linker, so dropping it here discarded the very thing that
+        # flag exists to produce - the per-window read->haplotype table came back
+        # covering only the windows that happened to escape a spill (16 of 975
+        # windows in one sample, 888 in another). It is also cheap next to what is
+        # being offloaded: one small dict per read against a Read's two
+        # position-keyed dicts (~90 KB for a 15 kb HiFi read). Read-overlap
+        # threading reads it after every sample is phased, so it must survive.
         self.heavy_offloaded = True
         return reads
 
@@ -681,6 +777,20 @@ class _ReadRef:
         return f"_ReadRef({self.id!r})"
 
 
+def _read_sort_hash(read_id: str, seed: int | None) -> int:
+    """Stable per-read sort key for window-consistent subsampling.
+
+    ``hash()`` is salted per process for str, so it would pick a different subset on
+    every run and break reproducibility; CRC32 over the seeded id is stable across
+    processes, runs and machines. The seed is mixed in so a different ``random_seed``
+    still draws a different (but internally consistent) subset.
+    """
+    return zlib.crc32(f"{seed}:{read_id}".encode())
+
+
+_EMPTY_READS: frozenset = frozenset()
+
+
 def _detach_reads(wr: WindowResult) -> list:
     """Offload a window's reads, leaving id-only stand-ins in gamma-row order.
 
@@ -697,9 +807,9 @@ def _detach_reads(wr: WindowResult) -> list:
 def _compute_read_mismatch_counts(
     window: Window,
     haplotypes: list[Haplotype],
-    max_mismatch_frac: float,
+    identity_distance: float,
 ) -> tuple[int, list[int]]:
-    """Count reads within max_mismatch_frac of each haplotype consensus."""
+    """Count reads within ``identity_distance`` of each haplotype consensus."""
     n_reads = len(window.reads)
     if not haplotypes or n_reads == 0:
         return n_reads, [0] * len(haplotypes)
@@ -720,7 +830,7 @@ def _compute_read_mismatch_counts(
             for pos in shared_positions:
                 if read.alleles.get(pos) != hap.consensus.get(pos):
                     mismatches += 1
-            if (mismatches / n_shared) < max_mismatch_frac:
+            if (mismatches / n_shared) < identity_distance:
                 counts[hi] += 1
 
     return n_reads, counts
@@ -1602,8 +1712,8 @@ def iter_windows_lazy(
     if not snv_pos_sorted:
         return
 
-    rng = config.get_rng()
-
+    # No RNG here any more: the per-window read cap now selects by a stable hash of the
+    # read id (see the subsample below), so window contents no longer depend on a draw.
     bam = pysam.AlignmentFile(bam_path, "rb")
 
     # 50% overlap: step = window_size / 2
@@ -1615,7 +1725,7 @@ def iter_windows_lazy(
 
         # Note: no size-based window skipping. Small windows (including
         # trailing windows and contigs shorter than window_size) are kept
-        # and filtered downstream by min_snvs_per_window / min_reads_per_window.
+        # and filtered downstream by the empty-window check / min_reads_per_window.
 
         # Collect SNVs in this window. snv_pos_sorted is sorted, so bisect the
         # [start, end) slice instead of scanning all ~N variants per window - the
@@ -1891,21 +2001,32 @@ def iter_windows_lazy(
 
         # Re-assemble split molecules into single reads, and register the breakpoints
         # they reveal as sites. Done before subsampling so the cap counts molecules.
-        if config.merge_split_reads:
-            reads, break_sites = _merge_split_reads(reads, config, snv_set)
-            for bp in break_sites:
-                if bp not in snv_set and start <= bp < end:
-                    window_snvs.append(bp)
-                    snv_set.add(bp)
-                    ref_alleles[bp] = CONTINUOUS
-                    st[bp] = "sv"
-            if break_sites:
-                window_snvs.sort()
+        reads, break_sites = _merge_split_reads(reads, config, snv_set)
+        for bp in break_sites:
+            if bp not in snv_set and start <= bp < end:
+                window_snvs.append(bp)
+                snv_set.add(bp)
+                ref_alleles[bp] = CONTINUOUS
+                st[bp] = "sv"
+        if break_sites:
+            window_snvs.sort()
 
-        # Subsample if needed (reproducible)
+        # Subsample if needed. CONSISTENT across windows: keep the reads whose ids hash
+        # smallest, so two overlapping windows pick THE SAME reads out of the molecules
+        # they share. An independent draw per window kept a shared read in both only
+        # with probability (cap/N)^2 - at a 200-read cap over a few thousand reads that
+        # left ~2-3 shared reads where the biology has hundreds, and step-3 read-overlap
+        # linking read the sampling artefact as a linking failure. Selecting on a stable
+        # function of the read ID makes the loss LINEAR instead: a read kept in one
+        # window is kept in its neighbour too. No longer optional - the linker depends
+        # on it.
         if config.max_reads_per_window and len(reads) > config.max_reads_per_window:
-            indices = rng.permutation(len(reads))[: config.max_reads_per_window]
-            reads = [reads[i] for i in indices]
+            reads = [
+                r for _, _, r in sorted(
+                    (_read_sort_hash(r.id, config.random_seed), i, r)
+                    for i, r in enumerate(reads)
+                )[: config.max_reads_per_window]
+            ]
 
         # Window CREATION uses the lower rescue floor, so windows in the
         # [min_reads_for_rescue, min_reads_per_window) band still exist and can receive a
@@ -1986,13 +2107,13 @@ class GraphInitializer:
                 if 0 <= ov < self.config.min_read_read_overlap_bp:
                     continue
 
-                # Count mismatches with early exit. Two independent gates: the RATE
-                # (floor(max_mismatch_frac * n_shared), which forces 0 mismatches below
-                # n_shared=100) and the ABSOLUTE cap, which is what actually binds once
-                # n_shared is large enough for the rate to go permissive.
-                max_allowed = min(
-                    int(self.config.max_mismatch_frac * n_shared), self.config.max_num_diff
-                )
+                # Count mismatches with early exit. One gate: the RATE
+                # (floor(identity_distance * n_shared), which forces 0 mismatches below
+                # n_shared=50 at 2%). The absolute cap that used to sit alongside it was
+                # removed 2026-08-30 - it had been disabled in production for the whole
+                # of the read-overlap work, and a fixed count cannot be right across
+                # windows whose shared-marker counts differ by orders of magnitude.
+                max_allowed = int(self.config.identity_distance * n_shared)
                 mismatches = 0
                 exceeded = False
 
@@ -2110,24 +2231,7 @@ class EMHaplotyper:
         self._snv_set = set(window.snv_pos)
         self._support = [_read_support(r, self._snv_set) for r in self.reads]
 
-    def _compute_log_prob_read_hap(self, read: Read, haplotype: Haplotype) -> float | None:
-        """Compute log P(read | haplotype) over this read's fixed support."""
-        return _log_prob_read_hap(
-            read,
-            haplotype.consensus,
-            _read_support(read, self._snv_set),
-            self.config.default_base_quality,
-        )
 
-    def _compute_log_prob_read_junk(self, read: Read) -> float:
-        """Compute log P(read | junk) using the divergent reference model."""
-        return _log_prob_read_junk(
-            read,
-            _read_support(read, self._snv_set),
-            self.window.ref_alleles,
-            self.config.junk_divergence_rate,
-            self.config.default_base_quality,
-        )
 
     def run(self) -> tuple[list[Haplotype], np.ndarray, np.ndarray, float, bool, int]:
         """Run EM with cached log-probability computations."""
@@ -2146,7 +2250,7 @@ class EMHaplotyper:
         junk_idx = n_haps
 
         # Initialize mixture weights (pi): either from cluster sizes or uniform.
-        if self.config.use_cluster_pi_init and self.cluster_sizes:
+        if self.cluster_sizes:
             cluster_total = sum(self.cluster_sizes)
             junk_init = max(1, n_reads - cluster_total)
             pi = np.array(self.cluster_sizes + [junk_init], dtype=float)
@@ -2238,7 +2342,7 @@ class EMHaplotyper:
                     _em_n_alleles, _em_sites, _em_dec, _em_snv_pos,
                     self.config.min_gamma_for_vote,
                 )
-                if new_consensus:
+                if len(new_consensus) >= self.config.min_snvs_per_window:
                     new_haps.append(Haplotype(consensus=new_consensus))
                     surviving_indices.append(k)
 
@@ -2329,10 +2433,13 @@ class PostProcessor:
         gamma: np.ndarray,
         n_timepoints_seen: int = 1,
     ) -> bool:
-        """Determine if 1-SNP pair should be merged."""
-        if not self.config.validate_1snp_differences:
-            return True
+        """Determine if a pair differing at ONE SNV should be merged.
 
+        Always applied. It used to sit behind validate_1snp_differences, and the
+        binomial arm behind use_binomial_test_1snp, but a single differing site is
+        exactly where a real low-abundance strain and a sequencing artefact look alike -
+        turning the check off does not make that call easier, it just makes it silently.
+        """
         diff_positions = hap1.get_differing_positions(hap2, window.snv_pos)
         if len(diff_positions) != 1:
             return True
@@ -2346,51 +2453,50 @@ class PostProcessor:
             minor_hap, minor_k = hap2, k2
 
         # Check frequency
-        if minor_hap.weight < self.config.min_minor_frequency_1snp:
+        if minor_hap.weight < self.config.marker_min_frac:
             return True
 
         # Check supporting reads
         minor_supporting = int((gamma[:, minor_k] >= self.config.assign_confidence_threshold).sum())
-        if minor_supporting < self.config.min_minor_supporting_reads_1snp:
+        if minor_supporting < self.config.marker_min_reads:
             return True
 
         # Check timepoints
-        if n_timepoints_seen < self.config.min_timepoints_for_1snp:
-            if self.config.use_binomial_test_1snp:
-                minor_base = minor_hap.consensus.get(diff_pos)
-                if minor_base is None:
-                    return True
+        if n_timepoints_seen < self.config.marker_min_samples:
+            minor_base = minor_hap.consensus.get(diff_pos)
+            if minor_base is None:
+                return True
 
-                minor_count = 0
-                total_at_pos = 0
-                p_error_sum = 0.0
-                for read in window.reads:
-                    if diff_pos in read.alleles:
-                        total_at_pos += 1
-                        q = read.quals.get(diff_pos, self.config.default_base_quality)
-                        # /3: the null is that the minor calls are sequencing errors that
-                        # happened to produce THIS base, one of the three alternatives.
-                        p_error_sum += 10 ** (-q / 10.0) / 3.0
-                        if read.alleles[diff_pos] == minor_base:
-                            minor_count += 1
+            minor_count = 0
+            total_at_pos = 0
+            p_error_sum = 0.0
+            for read in window.reads:
+                if diff_pos in read.alleles:
+                    total_at_pos += 1
+                    q = read.quals.get(diff_pos, self.config.default_base_quality)
+                    # /3: the null is that the minor calls are sequencing errors that
+                    # happened to produce THIS base, one of the three alternatives.
+                    p_error_sum += 10 ** (-q / 10.0) / 3.0
+                    if read.alleles[diff_pos] == minor_base:
+                        minor_count += 1
 
-                if total_at_pos == 0:
-                    return True
+            if total_at_pos == 0:
+                return True
 
-                # The reads' own base qualities, not a fixed Q30. The bases at this
-                # position are in read.quals and min_base_quality — the gate that decided
-                # which of them got here at all — defaults to 20, so assuming Q30 asserted
-                # an accuracy the data does not have to carry. It errs towards SPLIT: at
-                # 3 minor reads of 40 in a 250-site window, Q30 gives p=3.6e-07 (split)
-                # where the reads' real Q20 gives 3.3e-04 (merge), i.e. a phantom strain
-                # above the 10% abundance floor. The binomial wants one rate, so the mean
-                # over the reads at the position stands in for the Poisson-binomial.
-                p_error = p_error_sum / total_at_pos
-                alpha_corrected = self.config.binomial_alpha / len(window.snv_pos)
-                p_value = 1 - binom.cdf(minor_count - 1, total_at_pos, p_error)
+            # The reads' own base qualities, not a fixed Q30. The bases at this
+            # position are in read.quals and min_base_quality — the gate that decided
+            # which of them got here at all — defaults to 20, so assuming Q30 asserted
+            # an accuracy the data does not have to carry. It errs towards SPLIT: at
+            # 3 minor reads of 40 in a 250-site window, Q30 gives p=3.6e-07 (split)
+            # where the reads' real Q20 gives 3.3e-04 (merge), i.e. a phantom strain
+            # above the 10% abundance floor. The binomial wants one rate, so the mean
+            # over the reads at the position stands in for the Poisson-binomial.
+            p_error = p_error_sum / total_at_pos
+            alpha_corrected = self.config.binomial_alpha / len(window.snv_pos)
+            p_value = 1 - binom.cdf(minor_count - 1, total_at_pos, p_error)
 
-                if p_value > alpha_corrected:
-                    return True
+            if p_value > alpha_corrected:
+                return True
 
         return False
 
@@ -2408,7 +2514,7 @@ class PostProcessor:
             return haplotypes, gamma, pi
 
         # Precompute max allowed mismatches for early exit when comparing haplotypes.
-        max_mismatches = int(self.config.merge_distance_threshold * len(window.snv_pos)) + 1
+        max_mismatches = int(self.config.identity_distance * len(window.snv_pos)) + 1
 
         used = set()
         new_haplotypes = []
@@ -2431,10 +2537,10 @@ class PostProcessor:
                 )
 
                 # Require minimum shared positions to consider merging
-                if n_shared < self.config.min_shared_for_merge:
+                if n_shared < self.config.min_shared_markers:
                     continue
 
-                if dist <= self.config.merge_distance_threshold:
+                if dist <= self.config.identity_distance:
                     if n_diff == 1:
                         should_merge = self.should_merge_1snp_pair(
                             haplotypes[i], haplotypes[j], i, j, window, gamma, n_timepoints_seen
@@ -2493,16 +2599,14 @@ class PostProcessor:
 
         return new_haplotypes, new_gamma, new_pi
 
-    def assign_reads(self, reads: list[Read], gamma: np.ndarray, pi: np.ndarray) -> list[dict]:
+    def assign_reads(self, reads: list[Read], gamma: np.ndarray) -> list[dict]:
         """Hard assignment of reads.
 
-        Skipped entirely unless ``config.keep_read_assignments`` is set - see that flag.
-        Returns ``[]`` in that case, which is what every downstream consumer already
-        tolerates (nothing reads this field).
+        Always computed: step-3 read-overlap linking joins window-groups on the reads
+        they share, so this is load-bearing rather than a debugging aid. It costs one
+        small dict per read against a Read's two position-keyed dicts (~90 KB for a
+        15 kb HiFi read), which are offloaded anyway.
         """
-        if not self.config.keep_read_assignments:
-            return []
-
         assignments = []
         n_reads, k_eff = gamma.shape
         junk_idx = k_eff - 1
@@ -2528,6 +2632,17 @@ class PostProcessor:
                 {
                     "read_id": reads[i].id,
                     "hap_id": hap_id,
+                    # The argmax haplotype REGARDLESS of confidence (None only when
+                    # the read is junk). `hap_id` above is deliberately withheld
+                    # below assign_confidence_threshold, which is right for calling
+                    # a read's haplotype but wrong for LINKING: read-overlap
+                    # threading only needs to know that the same molecule sits in
+                    # both windows, and two strains that differ at a couple of
+                    # markers leave most of their reads at gamma 0.6-0.89 - exactly
+                    # the near-identical case where linking evidence matters most.
+                    # Using hap_id there discarded that evidence and reported it as
+                    # failed_no_read_overlap.
+                    "best_hap": None if is_junk else best_k,
                     "prob": best_prob,
                     "is_junk": is_junk,
                     "is_ambiguous": is_ambiguous,
@@ -2591,7 +2706,7 @@ class LongitudinalIntegrator:
                 dist, _, n_shared = hap.distance_to(other_hap, positions)
                 # Require sufficient shared positions for meaningful comparison
                 if n_shared >= self.config.min_shared_for_rescue:
-                    if dist <= self.config.rescue_match_distance:
+                    if dist <= self.config.identity_distance:
                         count += 1
                         break
         return count
@@ -2660,7 +2775,7 @@ class LongitudinalIntegrator:
         )
 
         # Even a single junk read matching an anchor from another timepoint is meaningful,
-        # as long as the match is near-exact (controlled by rescue_match_distance).
+        # as long as the match is near-exact (controlled by identity_distance).
         if n_junk_reads < 1:
             # Not enough junk reads to rescue
             self.rescue_statistics.append(
@@ -2714,7 +2829,7 @@ class LongitudinalIntegrator:
         existing_consensuses = [h.consensus for h in haplotypes]
 
         # Matching thresholds for anchor comparisons.
-        max_distance = self.config.rescue_match_distance
+        max_distance = self.config.identity_distance
         min_shared = self.config.min_shared_for_rescue
         min_shared_for_read = 2  # Lower threshold for individual reads
 
@@ -2796,7 +2911,7 @@ class LongitudinalIntegrator:
                     if pos in anchor.consensus
                 }
 
-                if len(new_consensus) >= self.config.min_snvs_per_window:
+                if new_consensus:
                     rescued_weight = max(
                         n_matching_junk / len(reads),
                         self.config.rescued_min_weight,
@@ -2921,7 +3036,7 @@ class LongitudinalIntegrator:
 
         # Recompute assignments
         post = PostProcessor(self.config)
-        assignments = post.assign_reads(reads, gamma_new, pi_new)
+        assignments = post.assign_reads(reads, gamma_new)
 
         for k, hap in enumerate(haplotypes):
             hap.supporting_reads = int(
@@ -2929,7 +3044,7 @@ class LongitudinalIntegrator:
             )
 
         n_reads_examined, reads_within_mismatch_per_hap = _compute_read_mismatch_counts(
-            window, haplotypes, self.config.max_mismatch_frac
+            window, haplotypes, self.config.identity_distance
         )
 
         return WindowResult(
@@ -3181,7 +3296,7 @@ def process_window(
         gamma = np.ones((n_reads, 1))
         pi = np.array([1.0])
         n_reads_examined, reads_within_mismatch_per_hap = _compute_read_mismatch_counts(
-            window, [], config.max_mismatch_frac
+            window, [], config.identity_distance
         )
         return WindowResult(
             window=window,
@@ -3189,7 +3304,7 @@ def process_window(
             gamma=gamma,
             pi=pi,
             log_likelihood=-np.inf,
-            assignments=post.assign_reads(window.reads, gamma, pi),
+            assignments=post.assign_reads(window.reads, gamma),
             converged=True,
             iterations=0,
             n_reads_examined=n_reads_examined,
@@ -3206,10 +3321,10 @@ def process_window(
         n_reads = len(window.reads)
         gamma = np.ones((n_reads, 1))
         pi = np.array([1.0])
-        assignments = post.assign_reads(window.reads, gamma, pi)
+        assignments = post.assign_reads(window.reads, gamma)
 
         n_reads_examined, reads_within_mismatch_per_hap = _compute_read_mismatch_counts(
-            window, [], config.max_mismatch_frac
+            window, [], config.identity_distance
         )
         return WindowResult(
             window=window,
@@ -3230,9 +3345,9 @@ def process_window(
 
     if not haplotypes:
         # EM pruned all haplotypes; keep the (junk) assignments.
-        assignments = post.assign_reads(window.reads, gamma, pi)
+        assignments = post.assign_reads(window.reads, gamma)
         n_reads_examined, reads_within_mismatch_per_hap = _compute_read_mismatch_counts(
-            window, [], config.max_mismatch_frac
+            window, [], config.identity_distance
         )
         return WindowResult(
             window=window,
@@ -3272,10 +3387,10 @@ def process_window(
     #     Construction keeps everything; nothing is destroyed before the scope is known.
     #     (FIGURE4 diagnosis §2.6a.)
 
-    assignments = post.assign_reads(window.reads, final_gamma, final_pi)
+    assignments = post.assign_reads(window.reads, final_gamma)
 
     n_reads_examined, reads_within_mismatch_per_hap = _compute_read_mismatch_counts(
-        window, merged_haps, config.max_mismatch_frac
+        window, merged_haps, config.identity_distance
     )
 
     result = WindowResult(
@@ -3290,10 +3405,6 @@ def process_window(
         n_reads_examined=n_reads_examined,
         reads_within_mismatch_per_hap=reads_within_mismatch_per_hap,
     )
-
-    # 4) Optional validation checks on the WindowResult structure.
-    if config.validate_results:
-        result.validate()
 
     return result
 
@@ -3423,6 +3534,56 @@ def _merge_split_reads(
 # =============================================================================
 
 
+def supported_marker_positions(
+    observations,
+    site_type: dict[int, str] | None = None,
+    config: HaplotyperConfig = DEFAULT_CONFIG,
+) -> frozenset[int]:
+    """Identity markers that real, replicated reads support.
+
+    ``observations`` yields ``(sample, consensus, reads)`` - one per window-haplotype.
+
+    CANDIDACY is unchanged: a position with more than one allele anywhere. The thresholds
+    only decide which candidates SURVIVE, per allele:
+
+        an allele is kept if it reaches ``marker_min_frac`` of a sample's reads at that
+        position AND ``marker_min_reads`` reads, in ``marker_min_samples`` samples
+
+    counted for each allele INDEPENDENTLY - the two alleles need not appear together in
+    one sample. That matters: at a swept position every sample is FIXED (all one allele
+    before the sweep, all the other after), so a within-sample minor-allele test finds no
+    polymorphism at all and would discard the sweep. Measured on 000089747_1 contig_2,
+    requiring both alleles in one sample dropped both positions of a real sweep; counting
+    each allele across samples keeps them.
+
+    A position survives when at least two alleles do. Returned as a frozenset because
+    every consumer only ever tests membership or intersects.
+    """
+    # position -> sample -> allele -> reads
+    seen: dict[int, dict[str, dict[str, float]]] = defaultdict(
+        lambda: defaultdict(lambda: defaultdict(float)))
+    for sample, consensus, reads in observations:
+        for pos, base in consensus.items():
+            seen[pos][sample][base] += reads
+
+    keep: set[int] = set()
+    for pos, per_sample in seen.items():
+        qualifying: Counter = Counter()
+        for alleles in per_sample.values():
+            total = sum(alleles.values())
+            if not total:
+                continue
+            for base, n in alleles.items():
+                if n >= config.marker_min_reads and n / total >= config.marker_min_frac:
+                    qualifying[base] += 1
+        if sum(1 for c in qualifying.values() if c >= config.marker_min_samples) >= 2:
+            keep.add(pos)
+
+    if config.exclude_sv_from_identity and site_type:
+        keep -= {pos for pos in keep if site_type.get(pos) == "sv"}
+    return frozenset(keep)
+
+
 def variable_marker_positions(
     consensuses: Iterable[dict[int, str]],
     site_type: dict[int, str] | None = None,
@@ -3499,9 +3660,6 @@ class GateResult:
     rate: float
     n_shared: int
     n_diff: int
-    # True when no discriminating markers were available and the comparison fell back to
-    # all co-covered positions. See compare_consensus for why that fallback exists.
-    used_fallback: bool = False
 
 
 def compare_consensus(
@@ -3513,8 +3671,6 @@ def compare_consensus(
     region: tuple[int, int] | None = None,
     min_cospan_frac: float | None = None,
     max_rate: float | None = None,
-    max_num_diff: int | None = None,
-    allow_fallback: bool = True,
     a_span: tuple[int, int] | None = None,
     b_span: tuple[int, int] | None = None,
 ) -> GateResult:
@@ -3522,7 +3678,7 @@ def compare_consensus(
 
     Gates, in order: the two footprints must overlap by >= ``min_entity_overlap_bp``
     (and >= ``min_cospan_frac`` of ``region``); shared markers >= ``min_shared``;
-    absolute mismatches <= ``max_num_diff``; mismatch rate <= ``lineage_merge_distance``.
+    mismatch rate <= ``identity_distance``.
 
     The overlap gate asks only "how much sequence did both haplotypes cover", never
     where the markers within it happen to fall.
@@ -3531,24 +3687,25 @@ def compare_consensus(
     comparing many pairs - the footprint does not depend on the partner, and recomputing it
     per pair dominates the cost.
 
-    ``allow_fallback=False`` forbids the clonal fallback, so the verdict rests only on
-    genuinely discriminating markers. Use it whenever a NEGATIVE verdict will be treated
-    as absolute: the fallback pads the comparison with positions that are invariant in
-    scope and therefore cannot disagree, which is harmless for a merge but would let a
-    mismatch be declared off evidence that was never discriminating.
+    The verdict rests ONLY on genuinely discriminating markers. There was once a
+    "clonal fallback" that, when fewer than ``min_shared`` markers were shared, compared
+    all co-covered positions instead - including positions invariant across every
+    haplotype. Those cannot disagree, so they only ever diluted: two haplotypes
+    differing at BOTH of the 2 markers they shared (rate 1.000) were re-scored as 2
+    differences over 142 positions (rate 0.014) and declared identical. Step 2 used that
+    verdict to MERGE, so two distinct strains landed in one group and every lineage
+    built on it inherited the fusion. Removed 2026-08-30.
 
     The absolute cap and the rate guard opposite ends of the range: the rate is applied
     as a floor, so it already forces zero mismatches below n_shared=100, while at
     n_shared=1172 it would tolerate 11 - which is where the absolute cap binds.
     """
     if min_shared is None:
-        min_shared = config.min_shared_for_lineage
+        min_shared = config.min_shared_markers
     if min_cospan_frac is None:
         min_cospan_frac = config.min_cosupported_span_frac
     if max_rate is None:
-        max_rate = config.lineage_merge_distance
-    if max_num_diff is None:
-        max_num_diff = config.max_num_diff
+        max_rate = config.identity_distance
 
     def _restrict(positions):
         if region is None:
@@ -3558,19 +3715,6 @@ def compare_consensus(
         return {p for p in positions if lo <= p <= hi}
 
     shared = _restrict(a.keys() & b.keys() & markers)
-    used_fallback = False
-
-    if len(shared) < min_shared and allow_fallback:
-        # No DISCRIMINATING markers between these two. Absence of discriminating
-        # evidence is not evidence of difference: a clonal locus legitimately has no
-        # variable positions at all, and a clonal SAMPLE can have almost none - 85% of
-        # windows on 000089747_1 hold a single haplotype. Restricting to markers would
-        # then make every comparison impossible and split a real lineage into singletons.
-        # Fall back to all co-covered positions, and record that we did so.
-        fallback = _restrict(a.keys() & b.keys())
-        if len(fallback) >= min_shared:
-            shared, used_fallback = fallback, True
-
     n_shared = len(shared)
 
     # HOW MUCH SEQUENCE DID WE ACTUALLY COMPARE? The stretch over which BOTH haplotypes
@@ -3593,23 +3737,22 @@ def compare_consensus(
     lo_b, hi_b = b_span if b_span is not None else consensus_footprint(b, region)
     overlap = (min(hi_a, hi_b) - max(lo_a, lo_b)) if (hi_a >= lo_a and hi_b >= lo_b) else 0
     if overlap < config.min_entity_overlap_bp:
-        return GateResult(False, "failed_no_evidence", 1.0, n_shared, 0, used_fallback)
+        return GateResult(False, "failed_no_evidence", 1.0, n_shared, 0)
     if region is not None:
         lo, hi = region
         if hi > lo and overlap < min_cospan_frac * (hi - lo):
-            return GateResult(False, "failed_no_evidence", 1.0, n_shared, 0, used_fallback)
+            return GateResult(False, "failed_no_evidence", 1.0, n_shared, 0)
 
     # ...AND WAS ANY OF IT INFORMATIVE? Separate question, separate gate. These two were
     # previously tangled into one number, which is also why min_shared ended up doubling
-    # as the trigger for the clonal fallback above.
     if n_shared < min_shared:
-        return GateResult(False, "failed_no_evidence", 1.0, n_shared, 0, used_fallback)
+        return GateResult(False, "failed_no_evidence", 1.0, n_shared, 0)
 
     n_diff = sum(1 for p in shared if a[p] != b[p])
     rate = n_diff / n_shared
-    if n_diff > max_num_diff or rate > max_rate:
-        return GateResult(False, "failed_mismatch", rate, n_shared, n_diff, used_fallback)
-    return GateResult(True, "linked", rate, n_shared, n_diff, used_fallback)
+    if rate > max_rate:
+        return GateResult(False, "failed_mismatch", rate, n_shared, n_diff)
+    return GateResult(True, "linked", rate, n_shared, n_diff)
 
 
 def unique_best_matches(
@@ -3635,11 +3778,22 @@ def link_windows(
     results: list[WindowResult], config: HaplotyperConfig = DEFAULT_CONFIG
 ) -> list[WindowResult]:
     """
-    Link haplotypes across overlapping windows based on consensus similarity.
+    Link haplotypes across windows into tracks, on consensus and on shared reads.
 
-    Since windows overlap by 50%, adjacent windows share SNV positions.
-    Haplotypes are linked (assigned the same track_id) if their consensus agrees on the
-    shared SNVs AND their within-window shares are compatible.
+    Since windows overlap by 50%, adjacent windows share SNV positions. Haplotypes are
+    linked (assigned the same track_id) if their consensus agrees on the shared SNVs AND
+    their within-window shares are compatible.
+
+    That rule alone cannot reach past the overlap, which caps step 1 at a 10 kb horizon
+    on a 20 kb/10 kb tiling while the reads themselves reach 30 kb. A window with no
+    marker in it then becomes a hub: the informative windows on either side are never
+    compared, and phase has to route through a region with nothing to phase on. With
+    `link_window_reach` above 1, NON-overlapping windows within the reach are also
+    considered. Those call disjoint positions, so consensus agreement between them is
+    undefined rather than unknown, and the evidence is `link_min_shared_reads` shared
+    reads plus reciprocal best match - the same ranking the consensus path already used
+    to break ties. The abundance eliminator applies to both paths, since its argument is
+    about the timepoint rather than the overlap; on the read path it is the only veto.
 
     The abundance check is an ELIMINATOR, never an indicator: two adjacent windows in one
     sample are the same timepoint, so a genome cannot sit at two frequencies across them,
@@ -3711,32 +3865,46 @@ def link_windows(
         curr_wr = sorted_results[i]
         curr_snvs = set(curr_wr.window.snv_pos)
 
-        # Check next few windows for overlap
-        for k in range(i + 1, min(i + 3, len(sorted_results))):
+        # Check next few windows. Overlapping ones are compared on consensus; beyond the
+        # overlap, `link_window_reach` decides how far the READ path may still reach.
+        horizon = max(2, config.link_window_reach)
+        for k in range(i + 1, min(i + 1 + horizon, len(sorted_results))):
             next_wr = sorted_results[k]
 
-            # Check if windows overlap
-            if next_wr.window.start >= curr_wr.window.end:
-                break  # No more overlapping windows
+            overlapping = next_wr.window.start < curr_wr.window.end
+            if not overlapping:
+                # Reads can bridge a disjoint pair, but only within the configured reach
+                # - and reach 1 is the historical rule, which admits no such pair at all.
+                # Windows further apart than the reach are out of read range, and since
+                # `k` only increases, nothing beyond this one can link either.
+                if config.link_window_reach <= 1 or (k - i) > config.link_window_reach:
+                    break
 
-            next_snvs = set(next_wr.window.snv_pos)
-            shared_snvs = list(curr_snvs & next_snvs)
+            if overlapping:
+                next_snvs = set(next_wr.window.snv_pos)
+                shared_snvs = list(curr_snvs & next_snvs)
 
-            # Note: This checks window-level overlap, but the real check is below
-            # where we verify haplotypes actually have calls at shared positions
-            if len(shared_snvs) < config.min_shared_snvs_for_link:
-                continue
+                # Note: This checks window-level overlap, but the real check is below
+                # where we verify haplotypes actually have calls at shared positions
+                if len(shared_snvs) < config.min_shared_snvs_for_link:
+                    continue
 
-            # The region shared by the two windows; the co-supported span gate is
-            # measured as a fraction of it.
-            region = (
-                max(curr_wr.window.start, next_wr.window.start),
-                min(curr_wr.window.end, next_wr.window.end) - 1,
-            )
+                # The region shared by the two windows; the co-supported span gate is
+                # measured as a fraction of it.
+                region = (
+                    max(curr_wr.window.start, next_wr.window.start),
+                    min(curr_wr.window.end, next_wr.window.end) - 1,
+                )
+            else:
+                # Disjoint windows: there is no shared region and no shared position, so
+                # neither the SNV precheck nor the co-supported span gate has anything to
+                # measure. The pair loop below takes the read-only path instead.
+                region = None
 
             # Evaluate candidate pairings before linking (avoid cross-links).
-            # Full gate stack: shared markers >= min_shared_calls_for_link, co-supported
-            # span >= 25% of the shared region, num_diff <= 1, rate <= max_link_distance.
+            # Full gate stack: shared markers >= min_shared_markers, co-supported span
+            # >= 25% of the shared region, rate <= identity_distance - the SAME stack
+            # step 3 applies, reading the same two thresholds.
             candidates: list[tuple[int, int, float, int]] = []
 
             # Non-junk read count per window - the denominator the abundance eliminator
@@ -3749,65 +3917,124 @@ def link_windows(
 
             n_curr, n_next = _nonjunk(curr_wr), _nonjunk(next_wr)
 
+            # Reads backing each haplotype, for the SHARED-READ ranking below. Same
+            # signal step 3 uses, so the two steps rank candidates identically.
+            # `best_hap` is the argmax regardless of confidence: linking only asks
+            # whether the same molecule is in both windows, and near-identical strains
+            # leave most reads below assign_confidence_threshold.
+            def _hap_reads(wr) -> dict[int, set]:
+                out: dict[int, set] = {}
+                for a in getattr(wr, "assignments", None) or []:
+                    k = a.get("best_hap", a.get("hap_id"))
+                    if k is None:
+                        continue
+                    out.setdefault(int(k), set()).add(a.get("read_id"))
+                return out
+
+            reads_i, reads_j = _hap_reads(curr_wr), _hap_reads(next_wr)
+
             # per-haplotype footprints, clipped to the shared region, hoisted out of the
             # pairwise loop (see consensus_footprint)
-            span_i = [consensus_footprint(h.consensus, region) for h in curr_wr.haplotypes]
-            span_j = [consensus_footprint(h.consensus, region) for h in next_wr.haplotypes]
+            span_i = (
+                [consensus_footprint(h.consensus, region) for h in curr_wr.haplotypes]
+                if overlapping else []
+            )
+            span_j = (
+                [consensus_footprint(h.consensus, region) for h in next_wr.haplotypes]
+                if overlapping else []
+            )
             for hi, hap_i in enumerate(curr_wr.haplotypes):
                 for hj, hap_j in enumerate(next_wr.haplotypes):
-                    gate = compare_consensus(
-                        hap_i.consensus,
-                        hap_j.consensus,
-                        markers,
-                        config,
-                        min_shared=config.min_shared_calls_for_link,
-                        region=region,
-                        max_rate=config.max_link_distance,
-                        max_num_diff=config.max_link_num_diff,
-                        a_span=span_i[hi],
-                        b_span=span_j[hj],
+                    # Shared reads are needed by BOTH paths now - as the ranking score
+                    # where consensus has already vetoed, and as the sole evidence where
+                    # consensus cannot speak - so hoist the intersection above the branch.
+                    shared_reads = len(
+                        reads_i.get(hi, _EMPTY_READS) & reads_j.get(hj, _EMPTY_READS)
                     )
-                    if gate.passed:
-                        # ABUNDANCE AS AN ELIMINATOR (author's rule, 2026-07-28).
-                        #
-                        # This is a SINGLE-TIMEPOINT comparison - one sample, two adjacent
-                        # windows - so it is exactly the case the coherence test is for: a
-                        # genome cannot sit at two different frequencies at one moment.
-                        # Two window-haplotypes whose shares genuinely disagree are not the
-                        # same entity, however well their alleles match.
-                        #
-                        # ELIMINATOR ONLY. Agreement never scores and never rescues a
-                        # failed identity gate; it can only refuse. And the test is run on
-                        # RAW COUNTS, never the derived abundance, which is already
-                        # quantised onto unit fractions by a median denominator of 9.
-                        if not abundance_coherent(
-                            [(hap_i.supporting_reads, n_curr),
-                             (hap_j.supporting_reads, n_next)], config
-                        ).coherent:
-                            record_debug(curr_wr, {
-                                "contig": curr_wr.window.contig,
-                                "window_start": curr_wr.window.start,
-                                "next_window_start": next_wr.window.start,
-                                "hap_i": hi, "hap_j": hj,
-                                "decision": "refused",
-                                "reason": "incompatible_abundance",
-                            })
+                    if not overlapping:
+                        # NON-OVERLAPPING PAIR. The windows call disjoint positions, so
+                        # consensus agreement is undefined - not "unknown", genuinely not
+                        # measurable. A read carried by a haplotype in both windows is
+                        # direct evidence they are one molecule's lineage, and it is the
+                        # only evidence there is, so it must stand on its own count.
+                        if shared_reads < config.link_min_shared_reads:
                             continue
-                        candidates.append((hi, hj, gate.rate, gate.n_shared))
-                    elif gate.reason == "failed_mismatch":
-                        curr_wr.link_mismatches.append(
+                        gate = None
+                        score = -float(shared_reads)
+                        n_shared_out = 0
+                    else:
+                        gate = compare_consensus(
+                            hap_i.consensus,
+                            hap_j.consensus,
+                            markers,
+                            config,
+                            min_shared=config.min_shared_markers,
+                            region=region,
+                            max_rate=config.identity_distance,
+                            a_span=span_i[hi],
+                            b_span=span_j[hj],
+                        )
+                        if not gate.passed:
+                            if gate.reason == "failed_mismatch":
+                                curr_wr.link_mismatches.append(
+                                    {
+                                        "contig": curr_wr.window.contig,
+                                        "window_a": curr_wr.window.start,
+                                        "hap_a_idx": hi,
+                                        "window_b": next_wr.window.start,
+                                        "hap_b_idx": hj,
+                                        "rate": round(gate.rate, 6),
+                                        "n_shared": gate.n_shared,
+                                        "n_diff": gate.n_diff,
+                                    }
+                                )
+                            continue
+                        # RANK BY SHARED READS (lower is better for unique_best):
+                        # the same score step 3 uses. Consensus has already had its
+                        # say as a veto; where two candidates are byte-identical it
+                        # cannot discriminate, and shared reads can. Falls back to
+                        # the consensus rate when no read assignments are available.
+                        score = -float(shared_reads) if (reads_i or reads_j) else gate.rate
+                        n_shared_out = gate.n_shared
+                    # ABUNDANCE AS AN ELIMINATOR (author's rule, 2026-07-28).
+                    #
+                    # This is a SINGLE-TIMEPOINT comparison - one sample, two windows of
+                    # it - so it is exactly the case the coherence test is for: a genome
+                    # cannot sit at two different frequencies at one moment. Two
+                    # window-haplotypes whose shares genuinely disagree are not the same
+                    # entity, however well their alleles match. That argument is about the
+                    # timepoint, not the overlap, so it holds for the read path too - and
+                    # it is the ONLY veto that path has.
+                    #
+                    # ELIMINATOR ONLY. Agreement never scores and never rescues a failed
+                    # identity gate; it can only refuse. And the test is run on RAW
+                    # COUNTS, never the derived abundance, which is already quantised onto
+                    # unit fractions by a median denominator of 9.
+                    if not abundance_coherent(
+                        [(hap_i.supporting_reads, n_curr),
+                         (hap_j.supporting_reads, n_next)], config
+                    ).coherent:
+                        record_debug(curr_wr, {
+                            "contig": curr_wr.window.contig,
+                            "window_start": curr_wr.window.start,
+                            "next_window_start": next_wr.window.start,
+                            "hap_i": hi, "hap_j": hj,
+                            "decision": "refused",
+                            "reason": "incompatible_abundance",
+                        })
+                        # PROPAGATE, don't just trace: this pair may never be merged
+                        # later either, and steps 2/3 should not have to re-test it.
+                        curr_wr.link_abundance_refusals.append(
                             {
                                 "contig": curr_wr.window.contig,
                                 "window_a": curr_wr.window.start,
                                 "hap_a_idx": hi,
                                 "window_b": next_wr.window.start,
                                 "hap_b_idx": hj,
-                                "rate": round(gate.rate, 6),
-                                "n_shared": gate.n_shared,
-                                "n_diff": gate.n_diff,
-                                "used_fallback": gate.used_fallback,
                             }
                         )
+                        continue
+                    candidates.append((hi, hj, score, n_shared_out))
 
             if not candidates:
                 if config.linking_debug:
@@ -4292,52 +4519,3 @@ def results_to_dataframe(results: dict[str, list[WindowResult]]) -> list[dict]:
 # =============================================================================
 # CLI
 # =============================================================================
-
-if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser(
-        description="Haplotype reconstruction for PacBio HiFi metagenomics"
-    )
-    parser.add_argument("--bam", required=True)
-    parser.add_argument("--vcf", required=True)
-    parser.add_argument("--contig", required=True)
-    parser.add_argument("--length", type=int, required=True)
-    parser.add_argument("--sample", help="Sample ID")
-    parser.add_argument("--vcf-sample", help="Sample name in VCF")
-    parser.add_argument("--output", default="haplotypes.tsv")
-    parser.add_argument(
-        "--seed", type=int, default=42,
-        help="Random seed for reproducibility. Seeded by default - see HaplotyperConfig.random_seed.",
-    )
-    parser.add_argument("--window-size", type=int, default=20000)
-    parser.add_argument("--max-reads", type=int, default=10000)
-    parser.add_argument("--no-validate", action="store_true", help="Disable result validation")
-
-    args = parser.parse_args()
-
-    config = HaplotyperConfig(
-        window_size=args.window_size,
-        max_reads_per_window=args.max_reads,
-        random_seed=args.seed,
-        validate_results=not args.no_validate,
-    )
-
-    logging.basicConfig(level=logging.INFO)
-
-    results = process_contig(
-        args.bam, args.vcf, args.contig, args.length, config, args.sample, args.vcf_sample
-    )
-
-    records = results_to_dataframe({args.contig: results})
-
-    if records:
-        import csv
-
-        with open(args.output, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=records[0].keys(), delimiter="\t")
-            writer.writeheader()
-            writer.writerows(records)
-        print(f"Wrote {len(records)} haplotypes to {args.output}")
-    else:
-        print("No haplotypes found")
