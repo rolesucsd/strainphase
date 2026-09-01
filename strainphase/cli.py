@@ -176,7 +176,6 @@ def cmd_longitudinal(args: argparse.Namespace) -> int:
         cross_sample_method=args.cross_sample_method,
         random_seed=args.seed,
         min_shared_reads_for_link=args.min_shared_reads_for_link,
-        track_merge_min_shared_markers=args.track_merge_min_shared_markers,
         lineage_max_bad_frac=args.lineage_max_bad_frac,
         transitive_abundance_check=not args.no_transitive_abundance_check,
         step1_veto_min_timepoints=args.step1_veto_min_timepoints,
@@ -411,15 +410,6 @@ Examples:
              "shared region. 0.25 rejects ~16%% of adjacent-window pairs; 0.50 rejects ~30%%.",
     )
     # --- step 3 (build_lineages) linking + vetoes -------------------------------
-    long_parser.add_argument(
-        "--track-merge-min-shared-markers", type=int, default=1,
-        help="Shared identity markers two step-1 tracks must have in common before "
-             "byte-for-byte agreement merges them. The only threshold the track merge "
-             "has. At 1 a single agreeing marker is enough, which is permissive by "
-             "design (splitting passes follow); raise it to make the merge itself "
-             "conservative - measured on a real MAG, 10 keeps a sweep separated where "
-             "1 and 3 fuse it.",
-    )
     long_parser.add_argument(
         "--min-shared-reads-for-link", type=int, default=3,
         help="Reads that must sit in BOTH groups before --link-by-read-overlap joins "

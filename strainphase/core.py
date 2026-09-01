@@ -229,23 +229,6 @@ class HaplotyperConfig:
     marker_min_reads: int = 3
     marker_min_samples: int = 2
 
-    # --- TRACK MERGE (replaces cross-sample window grouping) --------------------
-    # Shared identity markers two step-1 tracks must have in common before
-    # byte-for-byte agreement is allowed to merge them. This is the ONLY threshold
-    # the merge has - there is no rate - so it alone decides how much evidence a
-    # merge needs. Measured on B. fragilis 000089747_1 contig_2 (7,858 tracks):
-    #
-    #   min_shared   entities   mean size   sweep fused?   upeY duplicates
-    #            1        118       66.6    YES            0
-    #            3      4,474       1.76    YES            0
-    #           10      6,009       1.31    no             0
-    #           50      6,819       1.15    no             0
-    #
-    # At 1 a single agreeing marker merges, so identity stops discriminating and a
-    # real sweep is fused. The default is 1 because the permissive merge is the
-    # intended FIRST pass, with splitting passes after it; raise it to make the
-    # merge itself conservative.
-    track_merge_min_shared_markers: int = 1
     assign_confidence_threshold: float = 0.90
 
     # =========== 1-SNP VALIDATION ===========

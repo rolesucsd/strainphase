@@ -68,15 +68,6 @@ def test_a_single_disagreement_prevents_the_merge():
     assert len(build_lineages_from_tracks(haps, _cfg(), markers=MARKERS)) == 2
 
 
-def test_min_shared_markers_governs_how_much_evidence_a_merge_needs():
-    """One agreeing marker is enough at the default and not at 2 - the single
-    threshold the merge has."""
-    haps = [_hap("S1", "T1", 0, {100: "A"}), _hap("S2", "T1", 0, {100: "A", 200: "C"})]
-    assert len(build_lineages_from_tracks(
-        haps, _cfg(track_merge_min_shared_markers=1), markers=MARKERS)) == 1
-    assert len(build_lineages_from_tracks(
-        haps, _cfg(track_merge_min_shared_markers=2), markers=MARKERS)) == 2
-
 
 def test_step1_veto_refuses_a_merge_identity_would_allow():
     haps = [_hap("S1", "T1", 0, {100: "A", 200: "C"}),
@@ -123,3 +114,44 @@ def test_markerless_and_mergeable_tracks_coexist():
     assert len(lineages) == 2
     sizes = sorted(len({m.sample for g in lin.groups for m in g.members}) for lin in lineages)
     assert sizes == [1, 2]
+
+
+def test_a_conflict_blocks_a_transitive_merge():
+    """Byte-identity is NOT transitive across different marker subsets.
+
+    A and B agree on {100}, B and C agree on {200}, A and C disagree at {300}. Merging
+    on agreement alone fuses A and C through B without ever comparing them - which is
+    what union-find did. A conflict is recorded, not merely skipped, and is checked
+    component-to-component.
+    """
+    haps = [_hap("S1", "T1", 0, {100: "A", 300: "G"}),
+            _hap("S2", "T1", 0, {100: "A", 200: "C"}),
+            _hap("S3", "T1", 0, {200: "C", 300: "T"})]      # 300 disagrees with S1
+    lineages = build_lineages_from_tracks(haps, _cfg(), markers=MARKERS)
+    got = [{m.sample for g in lin.groups for m in g.members} for lin in lineages]
+    assert {"S1", "S3"} not in got, "a recorded conflict must survive transitivity"
+    assert sum(len(x) for x in got) == 3
+
+
+def test_strongest_evidence_merges_first():
+    """Pairs are taken in descending agreeing-marker count, so a one-marker
+    coincidence can only join what the strong evidence already built."""
+    haps = [_hap("S1", "T1", 0, {100: "A", 200: "C", 300: "G"}),
+            _hap("S2", "T1", 0, {100: "A", 200: "C", 300: "G"}),   # 3 markers with S1
+            _hap("S3", "T1", 0, {100: "A", 400: "T"})]             # 1 marker with S1
+    lineages = build_lineages_from_tracks(haps, _cfg(), markers=MARKERS)
+    assert len(lineages) == 1
+    assert len(lineages[0].groups[0].members) == 3
+
+
+def test_same_sample_tracks_more_than_one_window_apart_get_an_abundance_check():
+    """link_windows never puts distant windows side by side, so its abundance verdict
+    does not exist for them and is taken at merge time instead."""
+    far = _hap("S1", "T2", 60000, {100: "A"}, reads=1)
+    far.total_reads = 500                       # 1/500 vs 20/40 - incoherent shares
+    haps = [_hap("S1", "T1", 0, {100: "A"}, reads=20), far,
+            _hap("S2", "T1", 0, {100: "A"}, reads=20)]
+    lineages = build_lineages_from_tracks(haps, _cfg(), markers=MARKERS)
+    joined = [{(m.sample, m.within_sample_id) for g in lin.groups for m in g.members}
+              for lin in lineages]
+    assert not any({("S1", "T1"), ("S1", "T2")} <= j for j in joined)
