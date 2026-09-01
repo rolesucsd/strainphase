@@ -474,7 +474,7 @@ def write_reconciled(
 
 
 def _verify_main(argv: list[str]) -> int:
-    p = argparse.ArgumentParser(prog="strainphase.sv_encoding verify")
+    p = argparse.ArgumentParser(prog="strainphase sv verify")
     p.add_argument("--sidecars", required=True, nargs="+", help="Sidecar TSVs to cross-check")
     p.add_argument("--out", help="Optional file to touch on success (Snakemake sentinel)")
     args = p.parse_args(argv)
@@ -497,7 +497,7 @@ def _verify_main(argv: list[str]) -> int:
 
 
 def _reconcile_main(argv: list[str]) -> int:
-    p = argparse.ArgumentParser(prog="strainphase.sv_encoding reconcile")
+    p = argparse.ArgumentParser(prog="strainphase sv reconcile")
     p.add_argument("--sidecars", required=True, nargs="+", help="Per-sample sidecar TSVs")
     p.add_argument(
         "--samples", nargs="+",

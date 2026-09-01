@@ -474,6 +474,11 @@ def config_from_args(args, **overrides) -> HaplotyperConfig:
         values["min_read_read_overlap_bp"] = args.min_overlap_bp
         values["min_entity_overlap_bp"] = args.min_overlap_bp
 
+    # argparse hands back a LIST for nargs=2, and af_range is part of the VCF-load
+    # cache key, which a list cannot be - so convert here rather than at the use site.
+    if getattr(args, "af_range", None):
+        values["af_range"] = tuple(args.af_range)
+
     # Inverted and derived flags.
     if hasattr(args, "no_spill"):
         values["spill_results_to_disk"] = not args.no_spill

@@ -449,6 +449,11 @@ Examples:
         help="Windows are dispatched to the worker pool in batches of workers * this. "
              "Lower it to cut peak memory on variant-dense contigs.",
     )
+    long_parser.add_argument(
+        "--af-range", type=float, nargs=2, metavar=("LOW", "HIGH"), default=None,
+        help="Only load VCF sites whose alt-allele frequency falls in [LOW, HIGH). "
+             "Off by default, which loads every site that clears --min-depth-site.",
+    )
     long_parser.set_defaults(func=cmd_longitudinal)
 
     # =========== SV subcommand ===========
