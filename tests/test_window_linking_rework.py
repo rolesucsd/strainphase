@@ -1246,3 +1246,35 @@ def test_1snv_floor_is_a_backstop_not_a_pre_emption():
     hp2, maj2, minor2, w2, g2, ntp2 = _snv_pair(minor_weight=0.12, minor_reads=8,
                                                 n_shared=52, n_timepoints=3)
     assert hp2.should_merge_1snp_pair(maj2, minor2, 0, 1, w2, g2, ntp2) is False
+
+
+def test_supported_markers_keep_a_low_abundance_allele_with_read_support():
+    """An allele may qualify on READ SUPPORT even when far below marker_min_frac.
+
+    The rule was frequency AND reads, so a strain at 2-5% could never contribute a
+    marker: it had nothing to be phased or linked by and was invisible downstream.
+    Read support is independent evidence, and at depth the stronger of the two - 10
+    reads at 2% is a better-supported call than 3 reads at 15%.
+    """
+    from strainphase.core import supported_marker_positions
+
+    # position 40: major allele at 490 reads, minor at 10 (2%) in two samples
+    obs = [
+        ("S1", {40: "C"}, 490), ("S1", {40: "T"}, 10),
+        ("S2", {40: "C"}, 490), ("S2", {40: "T"}, 10),
+    ]
+    assert 40 in supported_marker_positions(obs, None, cfg()), \
+        "2% with 10 reads in 2 samples must qualify on read support"
+
+
+def test_supported_markers_still_reject_thin_low_abundance_alleles():
+    """OR is not a free pass: below marker_min_reads AND below the frequency floor
+    an allele still fails, which is what keeps single stray reads out."""
+    from strainphase.core import supported_marker_positions
+
+    obs = [
+        ("S1", {50: "C"}, 490), ("S1", {50: "T"}, 2),   # 2 reads, 0.4%
+        ("S2", {50: "C"}, 490), ("S2", {50: "T"}, 2),
+    ]
+    assert 50 not in supported_marker_positions(obs, None, cfg()), \
+        "2 reads at 0.4% clears neither bar and must not qualify"

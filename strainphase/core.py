@@ -3563,7 +3563,7 @@ def supported_marker_positions(
     only decide which candidates SURVIVE, per allele:
 
         an allele is kept if it reaches ``marker_min_frac`` of a sample's reads at that
-        position AND ``marker_min_reads`` reads, in ``marker_min_samples`` samples
+        position OR ``marker_min_reads`` reads, in ``marker_min_samples`` samples
 
     counted for each allele INDEPENDENTLY - the two alleles need not appear together in
     one sample. That matters: at a swept position every sample is FIXED (all one allele
@@ -3590,7 +3590,21 @@ def supported_marker_positions(
             if not total:
                 continue
             for base, n in alleles.items():
-                if n >= config.marker_min_reads and n / total >= config.marker_min_frac:
+                # OR, not AND (2026-09-01). Requiring BOTH meant an allele had to be
+                # 10% of a sample's reads to be usable as a marker at all, so a strain
+                # at 2-5% never got discriminating markers and was invisible to
+                # everything downstream - it had nothing to be phased or linked BY.
+                # Read support is the independent evidence that an allele is real, and
+                # at depth it is the stronger one: 10 reads at 2% is a better-supported
+                # call than 3 reads at 15%.
+                #
+                # Measured on 000089747_1 contig_2 (reach2_452d45c): 1,362 -> 1,438
+                # markers, +6%. The added markers are SIX TIMES less clustered than the
+                # existing set (13% of adjacent gaps <=10bp against 77%), so they are
+                # spread like real variation rather than stacked like the mismapping
+                # the frequency floor was implicitly suppressing. The read threshold is
+                # not sensitive - >=5 gives +62 and >=10 gives +60, against +76 here.
+                if n >= config.marker_min_reads or n / total >= config.marker_min_frac:
                     qualifying[base] += 1
         if sum(1 for c in qualifying.values() if c >= config.marker_min_samples) >= 2:
             keep.add(pos)
