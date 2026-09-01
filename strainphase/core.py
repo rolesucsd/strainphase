@@ -158,15 +158,6 @@ class HaplotyperConfig:
     max_mismatch_frac: float = 0.02
     min_reads_per_cluster: int = 3
 
-    # A within-sample link mismatch vetoes a cross-window lineage continuation
-    # only when at least this many timepoints INDEPENDENTLY flag the same join.
-    # 1 = the old behaviour (a single timepoint's per-window EM miscall cuts the
-    # link). The per-window EM miscalls ~0.03% of sites, so over a short overlap a
-    # lone 1-SNV error trips the zero-tolerance link gate in exactly one timepoint
-    # and severed strains the POOLED consensus agrees on over ~90 markers. Requiring
-    # corroboration (2) drops those: a genuine strain difference shows in every
-    # timepoint the two strains co-occur, a random EM miscall in only one.
-    step1_veto_min_timepoints: int = 2
     # Minimum physical overlap between two entities, below which the verdict is an
     # explicit NON-MERGE rather than "unknown" (Strainy's I = 1000).
     min_entity_overlap_bp: int = 1000
@@ -261,26 +252,6 @@ class HaplotyperConfig:
     # sees pairs that already PASSED the consensus gate, so relaxing it cannot
     # merge consensus-divergent strains.
     lineage_max_bad_frac: float = 0.25
-    # Re-test each finished lineage END TO END and cut it where it drifts. The pairwise
-    # abundance veto only ever compares ADJACENT groups, so A-B and B-C can both pass
-    # while A and C are never compared; this pools every window of the chain into one
-    # per-sample Fisher test and recurses on the halves.
-    #
-    # CAVEAT (why it is exposed, 2026-08-30): the test's POWER GROWS WITH CHAIN LENGTH.
-    # A 761-window chain can reject "constant share" on fluctuations far smaller than
-    # the ones a short chain would survive, so the longest - i.e. best - lineages are
-    # the most likely to be cut. Measured on div0025_k2, linked components reaching
-    # 2.78 Mb came out of this step at ~1.85 Mb.
-    transitive_abundance_check: bool = True
-    # Reads that must sit in BOTH groups (or both haplotypes, in step 1) before their
-    # join is made. Lowered 3 -> 1 on 2026-08-30: measured on 5 datasets with exact
-    # truth labels, the threshold dominates every other linking choice - recall by k
-    # was 1:0.96-1.00, 3:0.94-0.98, 5:0.78-0.92, 10:0.38-0.68 - and k=1 buys +1.4 to
-    # +3.0% recall. On the near-clonal sets k=1 is strictly better (0.957 vs 0.943
-    # recall at identical 0.087 cross-strain error). One shared read is weak evidence
-    # on its own, which is why it is not the gate: the identity and evidence gates
-    # above decide admissibility, and this only sets the floor for ranking.
-    min_shared_reads_for_link: int = 1
     # Identity shape. This decision is still OPEN (FIGURE4 diagnosis §6 #9); both are
     # implemented so they can be compared on identical inputs.
     #   "clique"     - complete linkage: a group is a clique, every member passes the
@@ -298,7 +269,6 @@ class HaplotyperConfig:
     # window tables for something else.
     build_lineages: bool = True
 
-    cross_sample_method: str = "clique"
 
     # =========== ABUNDANCE COHERENCE ===========
     # A genome cannot hold two frequencies at one locus at one time. Tested on RAW
@@ -426,11 +396,6 @@ class HaplotyperConfig:
                 f"{self.min_cosupported_span_frac}"
             )
 
-        if self.cross_sample_method not in ("clique", "reciprocal"):
-            raise ValueError(
-                f"cross_sample_method must be 'clique' or 'reciprocal', got "
-                f"{self.cross_sample_method!r}"
-            )
 
         if not (0 < self.abundance_coherence_alpha < 1):
             raise ValueError(
@@ -453,6 +418,69 @@ DEFAULT_CONFIG = HaplotyperConfig()
 # =============================================================================
 # DATA STRUCTURES
 # =============================================================================
+
+
+# config field -> the argparse attribute that sets it. Entry points define different
+# SUBSETS of these flags, and a field whose flag a parser does not define simply keeps
+# its dataclass default - which is what lets one builder serve every subcommand.
+#
+# There were three hand-maintained builders before this, and they drifted: `python -m
+# strainphase.longitudinal` parsed --identity-distance and --min-shared-markers and
+# then never passed either to the config, so both did nothing on that entry point while
+# the same flags worked under `strainphase longitudinal`. Declaring the mapping once
+# makes that class of bug unrepresentable - a flag either appears here or has no effect
+# anywhere, rather than having an effect on some entry points and not others.
+_CONFIG_FROM_ARG: dict[str, str] = {
+    "window_size": "window_size",
+    "max_reads_per_window": "max_reads",
+    "min_mapq": "min_mapq",
+    "max_mismatch_frac": "max_mismatch",
+    "min_depth_site": "min_depth_site",
+    "random_seed": "seed",
+    "min_weight_for_anchor": "min_anchor_weight",
+    "rescued_min_weight": "rescued_min_weight",
+    "min_reads_per_window": "min_reads_per_window",
+    "min_reads_for_rescue": "min_reads_for_rescue",
+    "min_read_window_overlap_bp": "min_read_window_overlap_bp",
+    "min_read_read_overlap_bp": "min_read_read_overlap_bp",
+    "min_entity_overlap_bp": "min_entity_overlap_bp",
+    "min_cosupported_span_frac": "min_cosupported_span_frac",
+    "min_shared_snvs_for_link": "min_shared_snvs_for_link",
+    "identity_distance": "identity_distance",
+    "min_shared_markers": "min_shared_markers",
+    "track_merge_min_shared_markers": "track_merge_min_shared_markers",
+    "link_window_reach": "link_window_reach",
+    "link_min_shared_reads": "link_min_shared_reads",
+    "lineage_max_bad_frac": "lineage_max_bad_frac",
+    "window_batch_factor": "window_batch_factor",
+}
+
+
+def config_from_args(args, **overrides) -> HaplotyperConfig:
+    """Build one ``HaplotyperConfig`` from any entry point's parsed arguments.
+
+    ``overrides`` win over the parsed values, for the few settings an entry point fixes
+    rather than exposes. Flags that invert or derive their field (``--no-validate``,
+    ``--no-spill``, ``--workers``) are handled explicitly below, since a name-to-name
+    table cannot express them.
+    """
+    values: dict = {}
+    for cfg_field, attr in _CONFIG_FROM_ARG.items():
+        if hasattr(args, attr):
+            values[cfg_field] = getattr(args, attr)
+
+    # Inverted and derived flags.
+    if hasattr(args, "validate_results"):
+        values["validate_results"] = args.validate_results
+    if hasattr(args, "no_validate"):
+        values["validate_results"] = not args.no_validate
+    if hasattr(args, "no_spill"):
+        values["spill_results_to_disk"] = not args.no_spill
+    if hasattr(args, "workers"):
+        values["n_workers"] = max(1, args.workers)
+
+    values.update(overrides)
+    return HaplotyperConfig(**values)
 
 
 @dataclass

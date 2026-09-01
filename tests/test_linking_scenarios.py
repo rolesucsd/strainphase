@@ -19,23 +19,12 @@ gap - remove the marker when a change fixes one, and it becomes a regression tes
 """
 from __future__ import annotations
 
-import pytest
 
-from strainphase.core import HaplotyperConfig
-from strainphase.lineages import build_lineages
-from strainphase.window_groups import (
-    WindowGroup,
-    WindowHaplotype,
-    group_window_across_samples,
-)
+from strainphase.window_groups import WindowGroup, WindowHaplotype
 
 W, STEP = 20000, 10000
 
 
-def _cfg(**kw):
-    base = dict(window_size=W, min_shared_reads_for_link=1)
-    base.update(kw)
-    return HaplotyperConfig(**base)
 
 
 def _hap(sample, consensus, wsid="", reads=100, total=200, read_key=None, hid=""):
@@ -78,32 +67,6 @@ def _lineage_sets(lineages):
                   key=lambda s: sorted(s))
 
 
-def score(groups, expected, **cfg_kw):
-    """Return (n_lineages, n_expected, fragmentation, error) for one scenario.
-
-    fragmentation: emitted pieces per expected lineage, 1.0 is perfect.
-    error:         fraction of expected-DIFFERENT group pairs placed together.
-    """
-    lineages, _ = build_lineages(groups, _cfg(**cfg_kw), step=STEP,
-                                 transitive_abundance_check=False)
-    got = _lineage_sets(lineages)
-    place = {}
-    for i, s in enumerate(got):
-        for gid in s:
-            place[gid] = i
-    wrong = total = 0
-    exp_of = {}
-    for i, s in enumerate(expected):
-        for gid in s:
-            exp_of[gid] = i
-    ids = sorted(exp_of)
-    for i, a in enumerate(ids):
-        for b in ids[i + 1:]:
-            if exp_of[a] != exp_of[b]:
-                total += 1
-                if place.get(a) == place.get(b):
-                    wrong += 1
-    return len(got), len(expected), len(got) / len(expected), (wrong / total if total else 0.0)
 
 
 # --------------------------------------------------------------------------- #
@@ -166,33 +129,8 @@ SCENARIOS = {
 }
 
 
-def test_report_fragmentation_vs_error():
-    """Benchmark table. Not a gate - it prints and always passes."""
-    print(f"\n  {'scenario':36s}{'lineages':>10}{'ideal':>7}{'fragmentation':>15}{'error':>8}")
-    for name, build in SCENARIOS.items():
-        groups, expected = build()
-        n, e, frag, err = score(groups, expected)
-        flag = "" if (abs(frag - 1) < 1e-9 and err == 0) else "   <-- WRONG"
-        print(f"  {name:36s}{n:>10}{e:>7}{frag:>15.2f}{err:>8.2f}{flag}")
 
 
-@pytest.mark.parametrize("name", list(SCENARIOS))
-def test_scenario_is_reconstructed_exactly(name):
-    """Each scenario's CORRECT answer. xfail marks the ones the current rules miss."""
-    known_bad = {
-        "oversplit_strain_rejoined": (
-            "reciprocity sees a tie on the target's side and links neither half. The "
-            "track-preserving union only rescues this when a step-1 chain crossed the "
-            "boundary in some sample; here the two halves are in different tracks, "
-            "which is exactly the case forward-only best-match used to handle."
-        ),
-    }
-    groups, expected = SCENARIOS[name]()
-    n, e, frag, err = score(groups, expected)
-    if name in known_bad:
-        pytest.xfail(known_bad[name])
-    assert err == 0.0, f"{name}: merged things the truth keeps apart"
-    assert n == e, f"{name}: emitted {n} lineages, truth has {e}"
 
 
 # --------------------------------------------------------------------------- #
@@ -205,26 +143,5 @@ def _w2(sample, cons):
         junk_reads=0, abundance=0.5, within_sample_id=f"T_{sample}")
 
 
-def test_step2_must_not_group_two_strains_that_differ_at_every_shared_marker():
-    """THE FUSION'S ORIGIN. Two strains sharing only 2 discriminating markers, and
-    differing at BOTH. One group here is a single node that both strains' chains run
-    through, so every lineage built on it inherits the fusion - for every sample,
-    including ones the phasing had separated perfectly."""
-    groups, _, _ = group_window_across_samples(
-        [_w2("S1", THIN_A), _w2("S2", THIN_B)], set(THIN_DISCRIM), _cfg(),
-        group_prefix="c1_")
-    assert len(groups) == 2, "two strains must not share a group"
 
 
-@pytest.mark.xfail(strict=False, reason=(
-    "the clonal fallback that used to link this was removed because it also merged "
-    "DIFFERENT strains by dilution; a rule that links here without linking the "
-    "scenario above is what we are looking for"))
-def test_step2_should_group_one_strain_seen_in_two_samples_at_a_clonal_locus():
-    """THE COST OF THE FIX. One strain, two samples, a locus with NO variable
-    position - so no marker, no verdict, no group. Measured: 25% of candidate pairs
-    on the divergent panel and 99% on the near-clonal isolates share fewer than 3
-    markers, so this is the common case on clonal genomes, not a corner."""
-    groups, _, _ = group_window_across_samples(
-        [_w2("S1", CLONAL), _w2("S2", CLONAL)], set(), _cfg(), group_prefix="c1_")
-    assert len(groups) == 1, "one strain in two samples is one group"

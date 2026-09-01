@@ -45,6 +45,7 @@ import pysam  # noqa: F401
 from strainphase.core import (
     Haplotype,
     HaplotyperConfig,
+    config_from_args,
     LongitudinalIntegrator,
     WindowResult,
     _detach_reads,
@@ -992,7 +993,6 @@ def build_window_tables(
                 "n_markers": len({p for m in g.members for p in m.consensus}),
                 "samples": ",".join(sorted({m.sample for m in g.members})),
                 "haplotype_ids": ",".join(m.haplotype_id for m in g.members),
-                "method": config.cross_sample_method,
             }
         )
 
@@ -1195,30 +1195,11 @@ def main():
     # Kept in step with strainphase/cli.py's parser - two hand-maintained arg lists
     # over one HaplotyperConfig.
     parser.add_argument(
-        "--min-shared-reads-for-link",
-        type=int,
-        default=3,
-        help="Reads that must sit in BOTH groups before --link-by-read-overlap joins them.",
-    )
-    parser.add_argument(
-        "--no-transitive-abundance-check",
-        action="store_true",
-        help="Skip the end-to-end abundance re-test that cuts a drifting lineage. Its "
-        "power grows with chain length, so it cuts the longest lineages first.",
-    )
-    parser.add_argument(
         "--lineage-max-bad-frac",
         type=float,
-        default=0.0,
+        default=0.25,
         help="Fraction of testable samples whose read shares may disagree before the "
         "abundance veto refuses a continuation. 0.0 = zero tolerance, 1.0 = disabled.",
-    )
-    parser.add_argument(
-        "--step1-veto-min-timepoints",
-        type=int,
-        default=2,
-        help="Timepoints that must flag a within-sample mismatch before it vetoes a "
-        "cross-window continuation.",
     )
     parser.add_argument(
         "--identity-distance",
@@ -1253,15 +1234,6 @@ def main():
         default=3,
         help="Shared markers required before that rate means anything. Same scope as "
              "--identity-distance.",
-    )
-    parser.add_argument(
-        "--cross-sample-method",
-        choices=["clique", "reciprocal"],
-        default="clique",
-        help="How haplotypes are grouped across samples at a fixed window. 'clique' = "
-        "complete linkage, no time axis, immune to irregular timepoint spacing. "
-        "'reciprocal' = unique-best + mutual between consecutive samples; requires "
-        "--samples to be in true chronological order.",
     )
     parser.add_argument(
         "--min-reads-for-rescue",
@@ -1322,38 +1294,7 @@ def main():
         allowed_contigs = load_allowed_contigs(args.contig_filter)
 
     # Build config for haplotyper
-    config = HaplotyperConfig(
-        window_size=args.window_size,
-        max_reads_per_window=args.max_reads,
-        random_seed=args.seed,
-        validate_results=args.validate_results,
-        min_weight_for_anchor=args.min_anchor_weight,
-        rescued_min_weight=args.rescued_min_weight,
-        # Depth policy
-        min_reads_per_window=args.min_reads_per_window,
-        min_reads_for_rescue=args.min_reads_for_rescue,
-        # Identity gates
-        min_cosupported_span_frac=args.min_cosupported_span_frac,
-        # These two were parsed and then dropped on the floor here - defined on this
-        # entry point's parser but never passed to the config, so setting them did
-        # nothing while the identical flags on `strainphase longitudinal` worked.
-        identity_distance=args.identity_distance,
-        min_shared_markers=args.min_shared_markers,
-        track_merge_min_shared_markers=args.track_merge_min_shared_markers,
-        link_window_reach=args.link_window_reach,
-        link_min_shared_reads=args.link_min_shared_reads,
-        min_entity_overlap_bp=args.min_entity_overlap_bp,
-        min_read_window_overlap_bp=args.min_read_window_overlap_bp,
-        min_read_read_overlap_bp=args.min_read_read_overlap_bp,
-        cross_sample_method=args.cross_sample_method,
-        n_workers=max(1, args.workers),
-        min_shared_reads_for_link=args.min_shared_reads_for_link,
-        lineage_max_bad_frac=args.lineage_max_bad_frac,
-        transitive_abundance_check=not args.no_transitive_abundance_check,
-        step1_veto_min_timepoints=args.step1_veto_min_timepoints,
-        spill_results_to_disk=not args.no_spill,
-        window_batch_factor=args.window_batch_factor,
-    )
+    config = config_from_args(args)
 
     # Get MAG -> contigs map, optionally filtered by allowed_contigs
     all_mags = parse_reference_contigs(args.reference, allowed_contigs)
@@ -1418,7 +1359,7 @@ def main():
     logging.info(
         f"DONE: {len(mags_to_process)} MAGs | {len(hap_rows)} window-haplotypes | "
         f"{n_within} within-sample entities | {n_across} across-sample window groups "
-        f"(method={config.cross_sample_method}) | comparisons: "
+        f"| comparisons: "
         f"{n_linked} linked, "
         f"{n_failed_evidence} no-evidence, {n_failed_mismatch} mismatch | "
         f"mismatches written: {len(mismatch_rows)} within-sample, "

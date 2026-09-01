@@ -31,19 +31,12 @@ def setup_logging(level: str = "INFO") -> None:
 
 def cmd_run(args: argparse.Namespace) -> int:
     """Run haplotyper on a single contig."""
-    from strainphase import HaplotyperConfig, process_contig, results_to_dataframe
+    from strainphase import process_contig, results_to_dataframe
+    from strainphase.core import config_from_args
 
     setup_logging(args.log_level)
 
-    config = HaplotyperConfig(
-        window_size=args.window_size,
-        max_reads_per_window=args.max_reads,
-        min_mapq=args.min_mapq,
-        max_mismatch_frac=args.max_mismatch,
-        min_depth_site=args.min_depth_site,
-        random_seed=args.seed,
-        validate_results=not args.no_validate,
-    )
+    config = config_from_args(args)
 
     logging.info(f"Processing contig {args.contig} ({args.length} bp)")
 
@@ -86,7 +79,7 @@ def cmd_longitudinal(args: argparse.Namespace) -> int:
         )
         return 1
 
-    from strainphase import HaplotyperConfig
+    from strainphase.core import config_from_args
     from strainphase.longitudinal import (
         build_window_tables,
         load_allowed_contigs,
@@ -155,36 +148,9 @@ def cmd_longitudinal(args: argparse.Namespace) -> int:
     logging.info(f"Processing {len(mags)} MAGs")
 
     # Configure
-    config = HaplotyperConfig(
-        window_size=args.window_size,
-        max_reads_per_window=args.max_reads,
-        min_weight_for_anchor=args.min_anchor_weight,
-        rescued_min_weight=args.rescued_min_weight,
-        min_depth_site=args.min_depth_site,
-        n_workers=max(1, getattr(args, "workers", 1)),
-        validate_results=False,
-        # Depth policy + identity gates (see HaplotyperConfig for the reasoning).
-        min_reads_per_window=args.min_reads_per_window,
-        min_reads_for_rescue=args.min_reads_for_rescue,
-        min_read_window_overlap_bp=args.min_read_window_overlap_bp,
-        min_read_read_overlap_bp=args.min_read_read_overlap_bp,
-        min_entity_overlap_bp=args.min_entity_overlap_bp,
-        min_cosupported_span_frac=args.min_cosupported_span_frac,
-        min_shared_snvs_for_link=args.min_shared_snvs_for_link,
-        identity_distance=args.identity_distance,
-        min_shared_markers=args.min_shared_markers,
-        track_merge_min_shared_markers=args.track_merge_min_shared_markers,
-        link_window_reach=args.link_window_reach,
-        link_min_shared_reads=args.link_min_shared_reads,
-        cross_sample_method=args.cross_sample_method,
-        random_seed=args.seed,
-        min_shared_reads_for_link=args.min_shared_reads_for_link,
-        lineage_max_bad_frac=args.lineage_max_bad_frac,
-        transitive_abundance_check=not args.no_transitive_abundance_check,
-        step1_veto_min_timepoints=args.step1_veto_min_timepoints,
-        spill_results_to_disk=not args.no_spill,
-        window_batch_factor=args.window_batch_factor,
-    )
+    # `longitudinal` never validates per-contig results; the longitudinal driver
+    # does its own checks over the assembled tables.
+    config = config_from_args(args, validate_results=False)
 
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
@@ -230,8 +196,7 @@ def cmd_longitudinal(args: argparse.Namespace) -> int:
     n_noev = sum(1 for e in edge_rows if e["reason"] == "failed_no_evidence")
     logging.info(
         f"DONE: {len(hap_rows)} window-haplotypes | {n_within} within-sample entities | "
-        f"{len(across_rows)} across-sample window groups "
-        f"(method={config.cross_sample_method}) | comparisons: "
+        f"{len(across_rows)} across-sample window groups | comparisons: "
         f"{len(edge_rows) - n_mismatch - n_noev} linked, {n_noev} no-evidence, "
         f"{n_mismatch} mismatch"
     )
@@ -312,7 +277,9 @@ Examples:
     run_parser.add_argument("--max-reads", type=int, default=300, help="Max reads per window")
     run_parser.add_argument("--min-mapq", type=int, default=20, help="Minimum MAPQ")
     run_parser.add_argument(
-        "--max-mismatch", type=float, default=0.01, help="Max mismatch fraction"
+        "--max-mismatch", type=float, default=0.02,
+        help="Max mismatch fraction. Matches identity_distance, the one rate every "
+             "consensus-vs-consensus comparison uses."
     )
     run_parser.add_argument(
         "--min-depth-site",
@@ -414,28 +381,10 @@ Examples:
     )
     # --- step 3 (build_lineages) linking + vetoes -------------------------------
     long_parser.add_argument(
-        "--min-shared-reads-for-link", type=int, default=3,
-        help="Reads that must sit in BOTH groups before --link-by-read-overlap joins "
-             "them. Observed overlap on real joins was ~33 reads, so the default 3 is "
-             "a floor against coincidence rather than a real gate.",
-    )
-    long_parser.add_argument(
-        "--no-transitive-abundance-check", action="store_true",
-        help="Skip the END-TO-END abundance re-test that cuts a finished lineage where "
-             "it drifts. That test's power grows with chain length, so the longest "
-             "lineages are the most likely to be cut; turn it off to measure how much "
-             "contiguity it is costing.",
-    )
-    long_parser.add_argument(
-        "--lineage-max-bad-frac", type=float, default=0.0,
+        "--lineage-max-bad-frac", type=float, default=0.25,
         help="Fraction of testable samples whose per-sample read shares may disagree "
              "before the abundance veto refuses a lineage continuation. 0.0 is zero "
              "tolerance; 1.0 disables the veto.",
-    )
-    long_parser.add_argument(
-        "--step1-veto-min-timepoints", type=int, default=2,
-        help="Distinct timepoints that must flag a within-sample link mismatch before "
-             "it vetoes a cross-window lineage continuation.",
     )
     long_parser.add_argument(
         "--identity-distance", type=float, default=0.02,
@@ -471,13 +420,6 @@ Examples:
         "--min-shared-markers", type=int, default=3,
         help="Shared markers required before that rate means anything. Same scope as "
              "--identity-distance.",
-    )
-    long_parser.add_argument(
-        "--cross-sample-method", choices=["clique", "reciprocal"], default="clique",
-        help="How haplotypes are grouped across samples at a fixed window. 'clique' = "
-             "complete linkage, no time axis, immune to irregular timepoint spacing. "
-             "'reciprocal' = unique-best + mutual between consecutive samples; requires "
-             "--samples in true chronological order.",
     )
     # Keep these in step with the same flags on strainphase/longitudinal.py's parser -
     # they are two hand-maintained arg lists over one HaplotyperConfig, and a flag added
