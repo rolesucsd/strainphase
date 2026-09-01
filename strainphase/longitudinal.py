@@ -14,7 +14,6 @@ This script:
 Recommended usage for efficiency:
     * Run ONE MAG per job using --mags <MAG_NAME>
     * Use --contig-filter to restrict to high-coverage / high-breadth contigs
-    * Keep validate_results=False (default) for production
 
 Example:
     python run_longitudinal.py \
@@ -32,14 +31,11 @@ Example:
 
 from __future__ import annotations
 
-import argparse
 
-from strainphase.core import DEFAULT_CONFIG as _D
 import logging
 import os
 import pickle
 import shutil
-import sys
 from collections import Counter, defaultdict
 
 import pysam  # noqa: F401
@@ -47,7 +43,6 @@ import pysam  # noqa: F401
 from strainphase.core import (
     Haplotype,
     HaplotyperConfig,
-    config_from_args,
     LongitudinalIntegrator,
     WindowResult,
     _detach_reads,
@@ -937,41 +932,40 @@ def build_window_tables(
     groups: list = []
     edges: list = []
     edge_counts: Counter = Counter()
-    if config.build_lineages:
-        # Step 1's own refusals become cannot-link between the TRACKS holding those
-        # haplotypes. Both verdicts carry: a genuine allele disagreement and an
-        # incompatible within-sample share are equally reasons two things are not one
-        # strain. Byte-identity already refuses anything that disagrees where both
-        # called, so these bind on a looser pass rather than this one - they are wired
-        # now so the constraint is not lost when that pass is added.
-        hap_track: dict[str, tuple[str, str]] = {
-            h.haplotype_id: (h.sample, h.within_sample_id)
-            for h in window_haps if h.within_sample_id
-        }
-        cannot_link: set[frozenset] = set()
-        for r in within_mismatch_rows:
-            a, b = hap_track.get(r["haplotype_a"]), hap_track.get(r["haplotype_b"])
+    # Step 1's own refusals become cannot-link between the TRACKS holding those
+    # haplotypes. Both verdicts carry: a genuine allele disagreement and an
+    # incompatible within-sample share are equally reasons two things are not one
+    # strain. Byte-identity already refuses anything that disagrees where both
+    # called, so these bind on a looser pass rather than this one - they are wired
+    # now so the constraint is not lost when that pass is added.
+    hap_track: dict[str, tuple[str, str]] = {
+        h.haplotype_id: (h.sample, h.within_sample_id)
+        for h in window_haps if h.within_sample_id
+    }
+    cannot_link: set[frozenset] = set()
+    for r in within_mismatch_rows:
+        a, b = hap_track.get(r["haplotype_a"]), hap_track.get(r["haplotype_b"])
+        if a and b and a != b:
+            cannot_link.add(frozenset((a, b)))
+    for pair in step1_abundance_refusals:
+        ids = list(pair)
+        if len(ids) == 2:
+            a, b = hap_track.get(ids[0]), hap_track.get(ids[1])
             if a and b and a != b:
                 cannot_link.add(frozenset((a, b)))
-        for pair in step1_abundance_refusals:
-            ids = list(pair)
-            if len(ids) == 2:
-                a, b = hap_track.get(ids[0]), hap_track.get(ids[1])
-                if a and b and a != b:
-                    cannot_link.add(frozenset((a, b)))
 
-        by_contig_haps: dict[str, list] = defaultdict(list)
-        for h in window_haps:
-            by_contig_haps[h.contig].append(h)
-        for contig_id_, chaps in sorted(by_contig_haps.items()):
-            lins = build_lineages_from_tracks(
-                chaps, config, markers=markers_by_contig.get(contig_id_, frozenset()),
-                cannot_link=cannot_link, lineage_prefix=f"{contig_id_}_LIN")
-            # The per-window groups a lineage was split back into ARE the across-sample
-            # grouping now, so windows_across_samples.tsv keeps describing what it always
-            # described: which samples' haplotypes were judged one entity at one window.
-            groups.extend(g for lin in lins for g in lin.groups)
-            lineage_rows.extend(_lineage_rows(lins, mag_of_contig.get(contig_id_, "")))
+    by_contig_haps: dict[str, list] = defaultdict(list)
+    for h in window_haps:
+        by_contig_haps[h.contig].append(h)
+    for contig_id_, chaps in sorted(by_contig_haps.items()):
+        lins = build_lineages_from_tracks(
+            chaps, config, markers=markers_by_contig.get(contig_id_, frozenset()),
+            cannot_link=cannot_link, lineage_prefix=f"{contig_id_}_LIN")
+        # The per-window groups a lineage was split back into ARE the across-sample
+        # grouping now, so windows_across_samples.tsv keeps describing what it always
+        # described: which samples' haplotypes were judged one entity at one window.
+        groups.extend(g for lin in lins for g in lin.groups)
+        lineage_rows.extend(_lineage_rows(lins, mag_of_contig.get(contig_id_, "")))
 
     # PROTOTYPE: dump per-window read->haplotype assignments for the read-anchored
     # threading (also the input a future linker experiment would need).
@@ -1077,293 +1071,3 @@ def write_window_tables(
 # -----------------------------------------------------------------------------#
 # CLI
 # -----------------------------------------------------------------------------#
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Longitudinal haplotype integration across samples",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-
-    parser.add_argument("--samples", required=True, help="Comma-separated list of sample names")
-    parser.add_argument("--bams", required=True, help="BAM path template with {sample} placeholder")
-    parser.add_argument("--vcfs", required=True, help="VCF path template with {sample} placeholder")
-    parser.add_argument(
-        "--sv-sidecars",
-        help="Optional SV sidecar TSV path template with {sample} placeholder "
-        "(from strainphase.sv_encoding). Enables co-phasing of structural "
-        "variants as pseudo-SNVs.",
-    )
-    parser.add_argument("--reference", required=True, help="Combined reference FASTA")
-    parser.add_argument("--output-dir", required=True, help="Output directory")
-
-    # Optional / efficiency-related
-    parser.add_argument(
-        "--mags", help="Comma-separated list of MAGs to process (default: all MAGs in reference)"
-    )
-    parser.add_argument(
-        "--contig-filter", help="TSV or text file listing contigs to include (see docstring)"
-    )
-    parser.add_argument("--window-size", type=int, default=_D.window_size, help="Window size for haplotyping")
-    parser.add_argument(
-        "--max-reads",
-        type=int,
-        # 300, matching `strainphase longitudinal` and README.md. This parser stood at
-        # 500, and max_reads_per_window selects WHICH reads enter a window, upstream of
-        # the graph, the EM and every abundance denominator - so any window holding
-        # 301-500 reads was phased from a different read set depending on which of the
-        # two documented entry points the operator happened to use.
-        default=300,
-        help="Max reads per window; above this reads are uniformly subsampled with the "
-        "config seed. Applied to RAW reads before junk classification, so the effective "
-        "non-junk ceiling is lower.",
-    )
-    parser.add_argument(
-        "-j",
-        "--workers",
-        type=int,
-        default=1,
-        help="Parallel worker processes for within-MAG window processing "
-        "(default: 1 = sequential). Set this to --cpus-per-task so reserved "
-        "cores are actually used; useful for large/high-coverage MAGs.",
-    )
-    parser.add_argument(
-        "--seed", type=int, default=_D.random_seed,
-        help="Random seed. Seeded by default: it drives both read subsampling above "
-        "--max-reads and Louvain read clustering, so an unseeded run is not reproducible.",
-    )
-    parser.add_argument(
-        "--validate-results",
-        action="store_true",
-        help="Enable internal consistency checks on WindowResult (slower)",
-    )
-
-    # Longitudinal hyperparameters exposed for transparency
-    parser.add_argument(
-        "--min-anchor-weight",
-        type=float,
-        default=_D.min_weight_for_anchor,
-        help="Min mixture weight for a haplotype to serve as an anchor",
-    )
-    parser.add_argument(
-        "--rescued-min-weight",
-        type=float,
-        default=_D.rescued_min_weight,
-        help="Min mixture weight to assign to rescued haplotypes",
-    )
-
-    # Identity gates (shared across the three linking levels)
-    parser.add_argument(
-        "--min-cosupported-span-frac",
-        type=float,
-        default=_D.min_cosupported_span_frac,
-        help="Min co-supported span between two haplotypes, as a fraction of their shared "
-        "region. 0.25 rejects 16%% of adjacent-window pairs; 0.50 rejects 30%%.",
-    )
-    parser.add_argument(
-        "--min-overlap-bp", type=int, default=_D.min_entity_overlap_bp,
-        help="Physical overlap two things must share before they are compared at "
-             "all - read against window, read against read, and entity against "
-             "entity. One question, so one knob.",
-    )
-    parser.add_argument(
-        "--no-spill",
-        action="store_true",
-        help="Keep every sample's reads in memory until the whole MAG finishes (the old "
-        "behaviour). By default reads are parked in <output-dir>/tmp/spill after each "
-        "sample is phased and reloaded one sample at a time for the rescue pass.",
-    )
-    parser.add_argument(
-        "--window-batch-factor",
-        type=int,
-        default=_D.window_batch_factor,
-        help="Windows are dispatched to the worker pool in batches of workers * this. "
-        "Lower it to cut peak memory on variant-dense contigs; raise it to cut "
-        "scheduling overhead.",
-    )
-    # Kept in step with strainphase/cli.py's parser - two hand-maintained arg lists
-    # over one HaplotyperConfig.
-    parser.add_argument(
-        "--identity-distance",
-        type=float,
-        default=_D.identity_distance,
-        help="Max mismatch RATE at which two consensuses are one entity. ONE knob for "
-             "every consensus-vs-consensus comparison: the post-EM merge inside a "
-             "window, step 1's link across adjacent windows, and steps 2/3 across "
-             "samples and along the genome. Read-level thresholds (--max-mismatch-frac, "
-             "--rescue-match-distance) are separate on purpose - a read carries "
-             "sequencing error a consensus has already averaged out.",
-    )
-    parser.add_argument(
-        "--track-merge-min-shared-markers", type=int, default=_D.track_merge_min_shared_markers,
-        help="Agreeing markers two step-1 tracks need before the cross-sample merge "
-             "joins them (default 1, a permissive first pass).",
-    )
-    parser.add_argument(
-        "--abundance-coherence-alpha", type=float, default=_D.abundance_coherence_alpha,
-        help="Significance at which two read counts are declared incompatible "
-             "abundances. ONE threshold for every abundance verdict: step 1's "
-             "adjacent-window eliminator, and the fresh test the cross-sample merge "
-             "runs for tracks step 1 never compared. They must agree - a merge cannot "
-             "be stricter or looser than the refusal it inherits.",
-    )
-    parser.add_argument(
-        "--min-reads-for-coherence", type=int, default=_D.min_reads_for_coherence,
-        help="Reads a window needs before its abundance is tested at all. Same scope "
-             "as --abundance-coherence-alpha.",
-    )
-    parser.add_argument(
-        "--link-window-reach", type=int, default=_D.link_window_reach,
-        help="How many windows ahead step 1 may link. 1 is the overlap-only rule; "
-             "above 1 also links NON-overlapping windows on shared reads, which is how "
-             "a marker-free window stops acting as a hub.",
-    )
-    parser.add_argument(
-        "--link-min-shared-reads", type=int, default=_D.link_min_shared_reads,
-        help="Reads two haplotypes must share to link a NON-overlapping window pair. "
-             "Consensus cannot gate those pairs, so this is the whole evidence bar.",
-    )
-    parser.add_argument(
-        "--min-shared-markers",
-        type=int,
-        default=_D.min_shared_markers,
-        help="Shared markers required before that rate means anything. Same scope as "
-             "--identity-distance.",
-    )
-    parser.add_argument(
-        "--min-reads-for-rescue",
-        type=int,
-        default=_D.min_reads_for_rescue,
-        help="Reads needed for a window to be BUILT (so rescue can populate it). De-novo "
-        "phasing uses the higher --min-reads-per-window.",
-    )
-    parser.add_argument(
-        "--min-reads-per-window",
-        type=int,
-        default=_D.min_reads_per_window,
-        help="Reads needed to PHASE a window de novo. Below this no haplotype is invented "
-        "and the trajectory carries a gap.",
-    )
-
-    parser.add_argument(
-        "--log-level",
-        default="INFO",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-        help="Logging level",
-    )
-
-    args = parser.parse_args()
-
-    logging.basicConfig(
-        level=getattr(logging, args.log_level),
-        format="%(asctime)s [%(levelname)s] %(message)s",
-    )
-
-    # Parse samples
-    samples = [s.strip() for s in args.samples.split(",") if s.strip()]
-    if not samples:
-        logging.error("No valid samples provided in --samples")
-        sys.exit(1)
-    logging.info(f"Processing {len(samples)} samples: {samples}")
-
-    # Build file paths
-    bam_paths = {s: args.bams.replace("{sample}", s) for s in samples}
-    vcf_paths = {s: args.vcfs.replace("{sample}", s) for s in samples}
-    sv_sidecar_paths = None
-    if getattr(args, "sv_sidecars", None):
-        sv_sidecar_paths = {s: args.sv_sidecars.replace("{sample}", s) for s in samples}
-
-    # Validate files exist
-    for sample in samples:
-        checks = [(bam_paths[sample], "BAM"), (vcf_paths[sample], "VCF")]
-        if sv_sidecar_paths:
-            checks.append((sv_sidecar_paths[sample], "SV sidecar"))
-        for path, name in checks:
-            if not os.path.exists(path):
-                logging.error(f"{name} not found for {sample}: {path}")
-                sys.exit(1)
-
-    # Load optional contig filter
-    allowed_contigs: set[str] | None = None
-    if args.contig_filter:
-        allowed_contigs = load_allowed_contigs(args.contig_filter)
-
-    # Build config for haplotyper
-    config = config_from_args(args)
-
-    # Get MAG -> contigs map, optionally filtered by allowed_contigs
-    all_mags = parse_reference_contigs(args.reference, allowed_contigs)
-
-    mag_names_raw = args.mags.strip() if args.mags else ""
-    if mag_names_raw:
-        mag_names = [m.strip() for m in mag_names_raw.split(",") if m.strip()]
-        if not mag_names:
-            logging.error("--mags was provided but contains no valid MAG names after stripping whitespace")
-            sys.exit(1)
-        mags_to_process = {m: all_mags[m] for m in mag_names if m in all_mags}
-        missing = sorted(set(mag_names) - set(mags_to_process.keys()))
-        if missing:
-            logging.warning(f"Requested MAGs not found in reference: {missing}")
-    else:
-        mags_to_process = all_mags
-
-    if not mags_to_process:
-        logging.error("No MAGs to process after applying filters")
-        sys.exit(1)
-
-    logging.info(f"Processing {len(mags_to_process)} MAGs: {sorted(mags_to_process)}")
-
-    # Process each MAG with longitudinal integration
-    all_results: dict[str, dict[str, dict[str, list[WindowResult]]]] = {}
-    all_integrators = []
-
-    for mag_name, mag_contigs in mags_to_process.items():
-        mag_results, integrator = process_mag_longitudinal(
-            mag_name=mag_name,
-            mag_contigs=mag_contigs,
-            samples=samples,
-            bam_paths=bam_paths,
-            vcf_paths=vcf_paths,
-            config=config,
-            sv_sidecar_paths=sv_sidecar_paths,
-            output_dir=args.output_dir,
-        )
-        all_results[mag_name] = mag_results
-        if integrator:
-            all_integrators.append(integrator)
-
-    # ---- Window-level tables (the deliverables) ----
-    # lineages.tsv comes back from here too, under config.build_lineages (default on):
-    # composing the within-sample and across-sample axes was the open decision these
-    # tables were built as the substrate for, and step 3 now makes it.
-    logging.info("Building window tables across processed MAGs")
-    (hap_rows, within_rows, across_rows, edge_rows, mismatch_rows,
-     edge_counts, lineage_rows) = build_window_tables(
-        args.output_dir, all_results, config, sample_order=samples
-    )
-    write_window_tables(
-        hap_rows, within_rows, across_rows, edge_rows, args.output_dir, mismatch_rows,
-        lineage_rows
-    )
-
-    n_within = len({(r["sample"], r["contig"], r["within_sample_id"]) for r in within_rows})
-    n_across = len(across_rows)
-    n_failed_mismatch = edge_counts.get("failed_mismatch", 0)
-    n_failed_evidence = edge_counts.get("failed_no_evidence", 0)
-    n_linked = edge_counts.get("linked", 0)
-    logging.info(
-        f"DONE: {len(mags_to_process)} MAGs | {len(hap_rows)} window-haplotypes | "
-        f"{n_within} within-sample entities | {n_across} across-sample window groups "
-        f"| comparisons: "
-        f"{n_linked} linked, "
-        f"{n_failed_evidence} no-evidence, {n_failed_mismatch} mismatch | "
-        f"mismatches written: {len(mismatch_rows)} within-sample, "
-        f"{n_failed_mismatch} across-sample | "
-        f"lineages: {len({r['lineage_id'] for r in lineage_rows})} over "
-        f"{len(lineage_rows)} (lineage, sample) rows"
-    )
-
-
-
-if __name__ == "__main__":
-    main()

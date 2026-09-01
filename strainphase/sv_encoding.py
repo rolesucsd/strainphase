@@ -548,20 +548,20 @@ def _reconcile_main(argv: list[str]) -> int:
     return 0
 
 
-def main(argv: list[str] | None = None) -> int:
-    argv = sys.argv[1:] if argv is None else argv
-    if argv and argv[0] == "verify":
-        return _verify_main(argv[1:])
+def run_sv(argv=None) -> int:
+    """``strainphase sv {reconcile,verify}`` - the sidecar tools.
+
+    Not a ``main``: strainphase has exactly one entry point, so this is dispatched
+    from ``cli.main`` like every other subcommand.
+    """
+    argv = list(argv or [])
     if argv and argv[0] == "reconcile":
         return _reconcile_main(argv[1:])
+    if argv and argv[0] == "verify":
+        return _verify_main(argv[1:])
     sys.stderr.write(
-        "usage: python -m strainphase.sv_encoding {reconcile,verify} ...\n"
-        "The package is caller-agnostic and consumes the sidecar TSV format; "
-        "produce sidecars with your own adapter (e.g. the pipeline's "
-        "sniffles_to_sidecar.py).\n"
+        "usage: strainphase sv {reconcile,verify} ...\n"
+        "The package consumes the sidecar TSV format; produce sidecars with your "
+        "own adapter (e.g. the pipeline's sniffles_to_sidecar.py).\n"
     )
     return 2
-
-
-if __name__ == "__main__":
-    sys.exit(main())

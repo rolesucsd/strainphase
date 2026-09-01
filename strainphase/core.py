@@ -99,7 +99,6 @@ class HaplotyperConfig:
 
     # =========== WINDOW PARAMETERS ===========
     window_size: int = 20000
-    min_snvs_per_window: int = 1
     # Depth policy (FIGURE4 diagnosis §6 #3). Two DIFFERENT floors:
     #   min_reads_per_window  - reads needed to PHASE a window de novo. Separating two
     #                           haplotypes at 50/50 needs ~10-20 reads; 3 cannot resolve
@@ -109,6 +108,9 @@ class HaplotyperConfig:
     #                           Rescue matches an established anchor rather than doing de
     #                           novo separation, so it legitimately needs less evidence.
     # A window with min_reads_for_rescue <= n < min_reads_per_window is created but not phased.
+    # Windows with fewer than this many called SNVs are not phased. 1 means "skip only
+    # empty windows"; higher values are a real filter for sparse regions.
+    min_snvs_per_window: int = 1
     min_reads_per_window: int = 10
     min_reads_for_rescue: int = 5
 
@@ -155,7 +157,6 @@ class HaplotyperConfig:
 
     # =========== GRAPH CONSTRUCTION ===========
     min_shared_snvs_for_edge: int = 1
-    max_mismatch_frac: float = 0.02
     min_reads_per_cluster: int = 3
 
     # Minimum physical overlap between two entities, below which the verdict is an
@@ -181,7 +182,6 @@ class HaplotyperConfig:
     dirichlet_alpha: float = 1.0
     min_hap_eff_weight: float = 3.0
     min_gamma_for_vote: float = 0.01
-    use_cluster_pi_init: bool = True
 
     # =========== JUNK MODEL ===========
     junk_divergence_rate: float = 0.10
@@ -195,10 +195,22 @@ class HaplotyperConfig:
     # They agreed only because someone set them equal; nothing enforced it, and steps 1
     # and 3 drifted apart on exactly this kind of parallel knob. Collapsed 2026-08-30.
     #
-    # NOT folded in, deliberately: max_mismatch_frac / min_shared_snvs_for_edge compare
-    # READ to READ, and rescue_match_distance / min_shared_for_rescue compare READ to
-    # haplotype. A read carries sequencing error that a consensus has already averaged
-    # out, so those are a different error model and keep their own thresholds.
+    # NOW FOLDED IN TOO (2026-08-31). max_mismatch_frac (read vs read) and
+    # rescue_match_distance (read vs haplotype) were kept separate on the argument that a
+    # read carries sequencing error a consensus has already averaged out, so they deserve
+    # their own error model. That argument was never actually expressed: all three sat at
+    # 0.02, so the separation bought nothing and cost a sweep over "identity" three knobs
+    # to find. The rate now means one thing everywhere - what fraction of the sites two
+    # things both call may disagree - and the differing confidence in each object is
+    # carried by its own EVIDENCE threshold instead:
+    #
+    #   read vs read       min_shared_snvs_for_edge = 1   (one shared site is meaningful)
+    #   haplotype vs hap   min_shared_markers       = 3
+    #   read vs haplotype  min_shared_for_rescue    = 3
+    #   cross-sample       track_merge_min_shared_markers = 1
+    #
+    # Collapsing the rate is a no-op at these defaults; it only changes behaviour for a
+    # caller who had set them apart.
     identity_distance: float = 0.02
     min_shared_markers: int = 3
     # Agreeing markers a track pair needs before the cross-sample merge will join them.
@@ -232,15 +244,11 @@ class HaplotyperConfig:
 
     # =========== 1-SNP VALIDATION ===========
     validate_1snp_differences: bool = True
-    min_minor_frequency_1snp: float = 0.10
-    min_minor_supporting_reads_1snp: int = 3
-    min_timepoints_for_1snp: int = 2
     use_binomial_test_1snp: bool = True
     binomial_alpha: float = 0.05
 
     # =========== LONGITUDINAL PARAMETERS ===========
     min_weight_for_anchor: float = 0.15
-    rescue_match_distance: float = 0.02  # 1% divergence — matches unified distance threshold
     min_shared_for_rescue: int = 3  # Min shared SNVs with actual calls for rescue matching
     rescued_min_weight: float = 0.02
 
@@ -255,11 +263,9 @@ class HaplotyperConfig:
     # SPLIT MOLECULES (troubleshooting U1). A molecule the aligner had to split across a
     # divergent segment is re-assembled into one Read, and the breakpoint is registered as
     # a site carrying BRK<resume_pos> / CONT. Off only to measure the difference.
-    merge_split_reads: bool = True
 
     # Step 3 runs inside the pipeline. Off only to skip it on a run that is producing the
     # window tables for something else.
-    build_lineages: bool = True
 
 
     # =========== ABUNDANCE COHERENCE ===========
@@ -313,7 +319,6 @@ class HaplotyperConfig:
     # explicit integer to vary it deliberately (e.g. to check a result is not an artefact
     # of one draw); None restores the old unseeded behaviour.
     random_seed: int | None = 42
-    validate_results: bool = False  # Set False for production runs
     n_workers: int = 1  # Number of parallel workers for window processing (1=sequential)
 
     def __post_init__(self):
@@ -329,6 +334,11 @@ class HaplotyperConfig:
             raise ValueError(
                 "track_merge_min_shared_markers must be >= 1, got "
                 f"{self.track_merge_min_shared_markers}"
+            )
+
+        if self.marker_min_frac > 0.5:
+            raise ValueError(
+                f"marker_min_frac should be <= 0.5, got {self.marker_min_frac}"
             )
 
         # Step-1 read reach. A reach below 1 would drop the overlapping-neighbour link
@@ -358,10 +368,6 @@ class HaplotyperConfig:
             )
 
         # Minor frequency for 1-SNP
-        if self.min_minor_frequency_1snp > 0.5:
-            raise ValueError(
-                f"min_minor_frequency_1snp should be <= 0.5, got {self.min_minor_frequency_1snp}"
-            )
 
         # Confidence threshold
         if not (0 < self.assign_confidence_threshold <= 1):
@@ -426,7 +432,6 @@ _CONFIG_FROM_ARG: dict[str, str] = {
     "window_size": "window_size",
     "max_reads_per_window": "max_reads",
     "min_mapq": "min_mapq",
-    "max_mismatch_frac": "max_mismatch",
     "min_depth_site": "min_depth_site",
     "random_seed": "seed",
     "min_weight_for_anchor": "min_anchor_weight",
@@ -470,10 +475,6 @@ def config_from_args(args, **overrides) -> HaplotyperConfig:
         values["min_entity_overlap_bp"] = args.min_overlap_bp
 
     # Inverted and derived flags.
-    if hasattr(args, "validate_results"):
-        values["validate_results"] = args.validate_results
-    if hasattr(args, "no_validate"):
-        values["validate_results"] = not args.no_validate
     if hasattr(args, "no_spill"):
         values["spill_results_to_disk"] = not args.no_spill
     if hasattr(args, "workers"):
@@ -806,9 +807,9 @@ def _detach_reads(wr: WindowResult) -> list:
 def _compute_read_mismatch_counts(
     window: Window,
     haplotypes: list[Haplotype],
-    max_mismatch_frac: float,
+    identity_distance: float,
 ) -> tuple[int, list[int]]:
-    """Count reads within max_mismatch_frac of each haplotype consensus."""
+    """Count reads within ``identity_distance`` of each haplotype consensus."""
     n_reads = len(window.reads)
     if not haplotypes or n_reads == 0:
         return n_reads, [0] * len(haplotypes)
@@ -829,7 +830,7 @@ def _compute_read_mismatch_counts(
             for pos in shared_positions:
                 if read.alleles.get(pos) != hap.consensus.get(pos):
                     mismatches += 1
-            if (mismatches / n_shared) < max_mismatch_frac:
+            if (mismatches / n_shared) < identity_distance:
                 counts[hi] += 1
 
     return n_reads, counts
@@ -1724,7 +1725,7 @@ def iter_windows_lazy(
 
         # Note: no size-based window skipping. Small windows (including
         # trailing windows and contigs shorter than window_size) are kept
-        # and filtered downstream by min_snvs_per_window / min_reads_per_window.
+        # and filtered downstream by the empty-window check / min_reads_per_window.
 
         # Collect SNVs in this window. snv_pos_sorted is sorted, so bisect the
         # [start, end) slice instead of scanning all ~N variants per window - the
@@ -2000,16 +2001,15 @@ def iter_windows_lazy(
 
         # Re-assemble split molecules into single reads, and register the breakpoints
         # they reveal as sites. Done before subsampling so the cap counts molecules.
-        if config.merge_split_reads:
-            reads, break_sites = _merge_split_reads(reads, config, snv_set)
-            for bp in break_sites:
-                if bp not in snv_set and start <= bp < end:
-                    window_snvs.append(bp)
-                    snv_set.add(bp)
-                    ref_alleles[bp] = CONTINUOUS
-                    st[bp] = "sv"
-            if break_sites:
-                window_snvs.sort()
+        reads, break_sites = _merge_split_reads(reads, config, snv_set)
+        for bp in break_sites:
+            if bp not in snv_set and start <= bp < end:
+                window_snvs.append(bp)
+                snv_set.add(bp)
+                ref_alleles[bp] = CONTINUOUS
+                st[bp] = "sv"
+        if break_sites:
+            window_snvs.sort()
 
         # Subsample if needed. CONSISTENT across windows: keep the reads whose ids hash
         # smallest, so two overlapping windows pick THE SAME reads out of the molecules
@@ -2113,7 +2113,7 @@ class GraphInitializer:
                 # removed 2026-08-30 - it had been disabled in production for the whole
                 # of the read-overlap work, and a fixed count cannot be right across
                 # windows whose shared-marker counts differ by orders of magnitude.
-                max_allowed = int(self.config.max_mismatch_frac * n_shared)
+                max_allowed = int(self.config.identity_distance * n_shared)
                 mismatches = 0
                 exceeded = False
 
@@ -2250,7 +2250,7 @@ class EMHaplotyper:
         junk_idx = n_haps
 
         # Initialize mixture weights (pi): either from cluster sizes or uniform.
-        if self.config.use_cluster_pi_init and self.cluster_sizes:
+        if self.cluster_sizes:
             cluster_total = sum(self.cluster_sizes)
             junk_init = max(1, n_reads - cluster_total)
             pi = np.array(self.cluster_sizes + [junk_init], dtype=float)
@@ -2342,7 +2342,7 @@ class EMHaplotyper:
                     _em_n_alleles, _em_sites, _em_dec, _em_snv_pos,
                     self.config.min_gamma_for_vote,
                 )
-                if new_consensus:
+                if len(new_consensus) >= self.config.min_snvs_per_window:
                     new_haps.append(Haplotype(consensus=new_consensus))
                     surviving_indices.append(k)
 
@@ -2450,16 +2450,16 @@ class PostProcessor:
             minor_hap, minor_k = hap2, k2
 
         # Check frequency
-        if minor_hap.weight < self.config.min_minor_frequency_1snp:
+        if minor_hap.weight < self.config.marker_min_frac:
             return True
 
         # Check supporting reads
         minor_supporting = int((gamma[:, minor_k] >= self.config.assign_confidence_threshold).sum())
-        if minor_supporting < self.config.min_minor_supporting_reads_1snp:
+        if minor_supporting < self.config.marker_min_reads:
             return True
 
         # Check timepoints
-        if n_timepoints_seen < self.config.min_timepoints_for_1snp:
+        if n_timepoints_seen < self.config.marker_min_samples:
             if self.config.use_binomial_test_1snp:
                 minor_base = minor_hap.consensus.get(diff_pos)
                 if minor_base is None:
@@ -2704,7 +2704,7 @@ class LongitudinalIntegrator:
                 dist, _, n_shared = hap.distance_to(other_hap, positions)
                 # Require sufficient shared positions for meaningful comparison
                 if n_shared >= self.config.min_shared_for_rescue:
-                    if dist <= self.config.rescue_match_distance:
+                    if dist <= self.config.identity_distance:
                         count += 1
                         break
         return count
@@ -2827,7 +2827,7 @@ class LongitudinalIntegrator:
         existing_consensuses = [h.consensus for h in haplotypes]
 
         # Matching thresholds for anchor comparisons.
-        max_distance = self.config.rescue_match_distance
+        max_distance = self.config.identity_distance
         min_shared = self.config.min_shared_for_rescue
         min_shared_for_read = 2  # Lower threshold for individual reads
 
@@ -2909,7 +2909,7 @@ class LongitudinalIntegrator:
                     if pos in anchor.consensus
                 }
 
-                if len(new_consensus) >= self.config.min_snvs_per_window:
+                if new_consensus:
                     rescued_weight = max(
                         n_matching_junk / len(reads),
                         self.config.rescued_min_weight,
@@ -3042,7 +3042,7 @@ class LongitudinalIntegrator:
             )
 
         n_reads_examined, reads_within_mismatch_per_hap = _compute_read_mismatch_counts(
-            window, haplotypes, self.config.max_mismatch_frac
+            window, haplotypes, self.config.identity_distance
         )
 
         return WindowResult(
@@ -3294,7 +3294,7 @@ def process_window(
         gamma = np.ones((n_reads, 1))
         pi = np.array([1.0])
         n_reads_examined, reads_within_mismatch_per_hap = _compute_read_mismatch_counts(
-            window, [], config.max_mismatch_frac
+            window, [], config.identity_distance
         )
         return WindowResult(
             window=window,
@@ -3322,7 +3322,7 @@ def process_window(
         assignments = post.assign_reads(window.reads, gamma)
 
         n_reads_examined, reads_within_mismatch_per_hap = _compute_read_mismatch_counts(
-            window, [], config.max_mismatch_frac
+            window, [], config.identity_distance
         )
         return WindowResult(
             window=window,
@@ -3345,7 +3345,7 @@ def process_window(
         # EM pruned all haplotypes; keep the (junk) assignments.
         assignments = post.assign_reads(window.reads, gamma)
         n_reads_examined, reads_within_mismatch_per_hap = _compute_read_mismatch_counts(
-            window, [], config.max_mismatch_frac
+            window, [], config.identity_distance
         )
         return WindowResult(
             window=window,
@@ -3388,7 +3388,7 @@ def process_window(
     assignments = post.assign_reads(window.reads, final_gamma)
 
     n_reads_examined, reads_within_mismatch_per_hap = _compute_read_mismatch_counts(
-        window, merged_haps, config.max_mismatch_frac
+        window, merged_haps, config.identity_distance
     )
 
     result = WindowResult(
@@ -3403,10 +3403,6 @@ def process_window(
         n_reads_examined=n_reads_examined,
         reads_within_mismatch_per_hap=reads_within_mismatch_per_hap,
     )
-
-    # 4) Optional validation checks on the WindowResult structure.
-    if config.validate_results:
-        result.validate()
 
     return result
 
@@ -4521,52 +4517,3 @@ def results_to_dataframe(results: dict[str, list[WindowResult]]) -> list[dict]:
 # =============================================================================
 # CLI
 # =============================================================================
-
-if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser(
-        description="Haplotype reconstruction for PacBio HiFi metagenomics"
-    )
-    parser.add_argument("--bam", required=True)
-    parser.add_argument("--vcf", required=True)
-    parser.add_argument("--contig", required=True)
-    parser.add_argument("--length", type=int, required=True)
-    parser.add_argument("--sample", help="Sample ID")
-    parser.add_argument("--vcf-sample", help="Sample name in VCF")
-    parser.add_argument("--output", default="haplotypes.tsv")
-    parser.add_argument(
-        "--seed", type=int, default=42,
-        help="Random seed for reproducibility. Seeded by default - see HaplotyperConfig.random_seed.",
-    )
-    parser.add_argument("--window-size", type=int, default=20000)
-    parser.add_argument("--max-reads", type=int, default=10000)
-    parser.add_argument("--no-validate", action="store_true", help="Disable result validation")
-
-    args = parser.parse_args()
-
-    config = HaplotyperConfig(
-        window_size=args.window_size,
-        max_reads_per_window=args.max_reads,
-        random_seed=args.seed,
-        validate_results=not args.no_validate,
-    )
-
-    logging.basicConfig(level=logging.INFO)
-
-    results = process_contig(
-        args.bam, args.vcf, args.contig, args.length, config, args.sample, args.vcf_sample
-    )
-
-    records = results_to_dataframe({args.contig: results})
-
-    if records:
-        import csv
-
-        with open(args.output, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=records[0].keys(), delimiter="\t")
-            writer.writeheader()
-            writer.writerows(records)
-        print(f"Wrote {len(records)} haplotypes to {args.output}")
-    else:
-        print("No haplotypes found")

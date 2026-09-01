@@ -150,9 +150,7 @@ def cmd_longitudinal(args: argparse.Namespace) -> int:
     logging.info(f"Processing {len(mags)} MAGs")
 
     # Configure
-    # `longitudinal` never validates per-contig results; the longitudinal driver
-    # does its own checks over the assembled tables.
-    config = config_from_args(args, validate_results=False)
+    config = config_from_args(args)
 
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
@@ -233,6 +231,12 @@ def cmd_version(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_sv(args) -> int:
+    from strainphase.sv_encoding import run_sv
+
+    return run_sv(args.sv_args)
+
+
 def main(argv: list | None = None) -> int:
     """Main entry point."""
     parser = argparse.ArgumentParser(
@@ -279,9 +283,10 @@ Examples:
     run_parser.add_argument("--max-reads", type=int, default=_D.max_reads_per_window, help="Max reads per window")
     run_parser.add_argument("--min-mapq", type=int, default=_D.min_mapq, help="Minimum MAPQ")
     run_parser.add_argument(
-        "--max-mismatch", type=float, default=0.02,
-        help="Max mismatch fraction. Matches identity_distance, the one rate every "
-             "consensus-vs-consensus comparison uses."
+        "--identity-distance", type=float, default=_D.identity_distance,
+        help="Max mismatch RATE at which two things are one entity. ONE rate for "
+             "every comparison - read to read, haplotype to haplotype, and rescue. "
+             "How much evidence each needs first is a separate per-stage threshold.",
     )
     run_parser.add_argument(
         "--min-depth-site",
@@ -445,6 +450,16 @@ Examples:
              "Lower it to cut peak memory on variant-dense contigs.",
     )
     long_parser.set_defaults(func=cmd_longitudinal)
+
+    # =========== SV subcommand ===========
+    sv_parser = subparsers.add_parser(
+        "sv", help="SV sidecar tools (reconcile, verify)",
+    )
+    sv_parser.add_argument(
+        "sv_args", nargs=argparse.REMAINDER,
+        help="{reconcile,verify} plus that tool's own arguments",
+    )
+    sv_parser.set_defaults(func=cmd_sv)
 
     # =========== TEST subcommand ===========
     test_parser = subparsers.add_parser(

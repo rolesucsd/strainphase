@@ -93,7 +93,7 @@ Options:
   --window-size INT   Analysis window size [default: 20000]
   --max-reads INT     Max reads per window [default: 300]
   --min-mapq INT      Minimum MAPQ [default: 20]
-  --max-mismatch FLT  Max mismatch fraction [default: 0.02]
+  --identity-distance FLT  Max mismatch RATE at which two things are one entity [default: 0.02]
   --seed INT          Random seed for reproducibility
   --log-level LEVEL   Logging level [default: INFO]
 ```

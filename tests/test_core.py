@@ -73,19 +73,19 @@ class TestHaplotyperConfig(unittest.TestCase):
             HaplotyperConfig(assign_confidence_threshold=0.0)
 
     def test_invalid_min_minor_frequency(self):
-        """min_minor_frequency_1snp > 0.5 should raise."""
+        """marker_min_frac > 0.5 should raise - no allele pair can both clear half."""
         with self.assertRaises(ValueError):
-            HaplotyperConfig(min_minor_frequency_1snp=0.6)
+            HaplotyperConfig(marker_min_frac=0.6)
 
     def test_custom_config(self):
         """Custom config should store values."""
         config = HaplotyperConfig(
             window_size=5000,
-            max_mismatch_frac=0.03,
+            identity_distance=0.03,
             min_mapq=30
         )
         self.assertEqual(config.window_size, 5000)
-        self.assertEqual(config.max_mismatch_frac, 0.03)
+        self.assertEqual(config.identity_distance, 0.03)
         self.assertEqual(config.min_mapq, 30)
 
 
@@ -222,7 +222,7 @@ class TestGraphInitializer(unittest.TestCase):
         """Set up test fixtures."""
         self.config = HaplotyperConfig(
             min_shared_snvs_for_edge=2,
-            max_mismatch_frac=0.1,
+            identity_distance=0.1,
             min_reads_per_cluster=2
         )
         self.graph_init = GraphInitializer(self.config)
