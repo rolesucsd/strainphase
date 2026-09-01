@@ -1779,3 +1779,102 @@ def test_step1_abundance_refusal_needs_corroboration():
                               step1_abundance_refusals={frozenset((a, b)): {"S1"}})
     linked = [e for e in edges if {e.group_a, e.group_b} == {"A1", "B1"}]
     assert linked and linked[0].reason == "linked"
+
+
+# --------------------------------------------------------------------------- #
+# Step-1 read reach (link_window_reach)
+# --------------------------------------------------------------------------- #
+
+
+def _reach_windows():
+    """Two NON-overlapping windows, A=[1,20001) and C=[20001,40001).
+
+    They call disjoint positions, so consensus agreement between them is not merely
+    unknown - it is undefined, and no amount of marker comparison can produce a verdict.
+    Reads carried by a haplotype in both windows are the only evidence there is.
+
+    Read layout pairs A0 with C0 and A1 with C1, and gives each pair a clear margin over
+    the crossing alternative so reciprocal best match has something to choose on.
+    """
+    from strainphase.core import Haplotype, Window, WindowResult
+
+    def wr(start, pos, reads_by_hap):
+        w = Window(contig="c1", start=start, end=start + 20000)
+        w.snv_pos = sorted(pos)
+        g = np.zeros((100, 3))
+        g[:, 0] = 1.0
+        haps = [
+            Haplotype(consensus=dict(pos), supporting_reads=50),
+            Haplotype(consensus={p: "T" for p in pos}, supporting_reads=50),
+        ]
+        assignments = [
+            {"best_hap": h, "read_id": r}
+            for h, rs in enumerate(reads_by_hap)
+            for r in rs
+        ]
+        return WindowResult(
+            window=w, haplotypes=haps, gamma=g, pi=np.array([0.5, 0.5, 0.0]),
+            log_likelihood=0.0, assignments=assignments, converged=True, iterations=1,
+        )
+
+    a = wr(1, {2000: "A", 4000: "C", 6000: "G"},
+           [["r1", "r2", "r3", "r4"], ["r5", "r6", "r7", "r8"]])
+    c = wr(20001, {22000: "A", 24000: "C", 26000: "G"},
+           [["r1", "r2", "r3", "r9"], ["r5", "r6", "r7", "r10"]])
+    return a, c
+
+
+def test_read_reach_is_off_by_default():
+    """Default reach 1 keeps the historical rule: only OVERLAPPING windows link.
+
+    The whole 236-test suite passing at this default is the real regression guard; this
+    pins the specific behaviour so a future default change cannot pass silently.
+    """
+    from strainphase.core import link_windows
+
+    a, c = _reach_windows()
+    out = link_windows([a, c], cfg())
+    ids = {h.track_id for wr_ in out for h in wr_.haplotypes}
+    assert len(ids) == 4, "non-overlapping windows must not link at the default reach"
+
+
+def test_read_reach_links_across_a_non_overlapping_gap():
+    """With reach 2, shared reads link A to C even though no position is shared.
+
+    This is the case the overlap rule could not express: `link_windows` stopped at
+    `next.start >= curr.end`, so with 20 kb windows on a 10 kb step it never reached
+    past its immediate neighbour - a 10 kb horizon against reads that reach 30 kb.
+    """
+    from strainphase.core import link_windows
+
+    a, c = _reach_windows()
+    out = link_windows([a, c], cfg(link_window_reach=2, link_min_shared_reads=2))
+    tracks = [[h.track_id for h in wr_.haplotypes] for wr_ in out]
+
+    assert tracks[0][0] == tracks[1][0], "A0 and C0 share 3 reads and must link"
+    assert tracks[0][1] == tracks[1][1], "A1 and C1 share 3 reads and must link"
+    assert tracks[0][0] != tracks[0][1], "the two strains must stay apart"
+
+
+def test_read_reach_respects_the_shared_read_threshold():
+    """Below `link_min_shared_reads` the pair is not linked.
+
+    Consensus cannot veto a disjoint pair, so this threshold and reciprocal best match
+    are the entire evidence bar - it is the one knob standing between read chaining and
+    fusing two strains on a single mis-assigned read.
+    """
+    from strainphase.core import link_windows
+
+    a, c = _reach_windows()
+    out = link_windows([a, c], cfg(link_window_reach=2, link_min_shared_reads=4))
+    ids = {h.track_id for wr_ in out for h in wr_.haplotypes}
+    assert len(ids) == 4, "3 shared reads must not clear a threshold of 4"
+
+
+def test_read_reach_rejects_invalid_settings():
+    from strainphase.core import HaplotyperConfig
+
+    with pytest.raises(ValueError, match="link_window_reach"):
+        HaplotyperConfig(link_window_reach=0)
+    with pytest.raises(ValueError, match="link_min_shared_reads"):
+        HaplotyperConfig(link_min_shared_reads=0)

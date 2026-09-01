@@ -307,6 +307,22 @@ class HaplotyperConfig:
 
     # Window-level shared SNV POSITIONS (does the window pair even have common sites).
     min_shared_snvs_for_link: int = 3
+    # How many windows ahead link_windows may reach. Overlapping neighbours are compared
+    # on consensus as they always have been; a reach above 1 ADDITIONALLY admits
+    # NON-overlapping windows, which share no SNV positions and so are linked on shared
+    # reads alone. Measured on 000089747_1 (window 20 kb, step 10 kb, PacBio HiFi): the
+    # overlap rule caps step 1 at a 10 kb reach while reads reach 30 kb, so a single
+    # marker-free window between two informative ones becomes a hub that no pairwise
+    # veto can reach. Marker pairs co-covered by one read = 124,149 against 81,288
+    # co-windowed, and 42,861 of those lie further apart than any 20 kb window can span.
+    # Reach 2 recovered 25-29% of lineage fragmentation in prototype; reach 3 was flat
+    # (read sharing falls 42% at 20 kb to 14% at 30 kb, and 0.9% at 40 kb). Default 1 =
+    # historical behaviour.
+    link_window_reach: int = 1
+    # Shared reads required to link a NON-overlapping window pair. Consensus cannot gate
+    # these - the two windows call disjoint positions - so this threshold and reciprocal
+    # best match are the whole of the evidence, and it should not be lowered casually.
+    link_min_shared_reads: int = 2
     # The two haplotypes' CO-SUPPORTED SPAN inside the shared region, as a fraction of
     # that region. Window geometry itself is not a useful gate (tiles overlap by exactly
     # 50% or exactly 0%, nothing between). Measured on 000089747_1: 25% rejects 16.0% of
@@ -336,6 +352,18 @@ class HaplotyperConfig:
         if not (0 < self.junk_divergence_rate < 0.75):
             raise ValueError(
                 f"junk_divergence_rate must be in (0, 0.75), got {self.junk_divergence_rate}"
+            )
+
+        # Step-1 read reach. A reach below 1 would drop the overlapping-neighbour link
+        # that every track is built from, and a non-overlapping pair linked on fewer than
+        # one shared read would be linked on nothing at all.
+        if self.link_window_reach < 1:
+            raise ValueError(
+                f"link_window_reach must be >= 1, got {self.link_window_reach}"
+            )
+        if self.link_min_shared_reads < 1:
+            raise ValueError(
+                f"link_min_shared_reads must be >= 1, got {self.link_min_shared_reads}"
             )
 
         # Merge distance threshold
@@ -3709,11 +3737,22 @@ def link_windows(
     results: list[WindowResult], config: HaplotyperConfig = DEFAULT_CONFIG
 ) -> list[WindowResult]:
     """
-    Link haplotypes across overlapping windows based on consensus similarity.
+    Link haplotypes across windows into tracks, on consensus and on shared reads.
 
-    Since windows overlap by 50%, adjacent windows share SNV positions.
-    Haplotypes are linked (assigned the same track_id) if their consensus agrees on the
-    shared SNVs AND their within-window shares are compatible.
+    Since windows overlap by 50%, adjacent windows share SNV positions. Haplotypes are
+    linked (assigned the same track_id) if their consensus agrees on the shared SNVs AND
+    their within-window shares are compatible.
+
+    That rule alone cannot reach past the overlap, which caps step 1 at a 10 kb horizon
+    on a 20 kb/10 kb tiling while the reads themselves reach 30 kb. A window with no
+    marker in it then becomes a hub: the informative windows on either side are never
+    compared, and phase has to route through a region with nothing to phase on. With
+    `link_window_reach` above 1, NON-overlapping windows within the reach are also
+    considered. Those call disjoint positions, so consensus agreement between them is
+    undefined rather than unknown, and the evidence is `link_min_shared_reads` shared
+    reads plus reciprocal best match - the same ranking the consensus path already used
+    to break ties. The abundance eliminator applies to both paths, since its argument is
+    about the timepoint rather than the overlap; on the read path it is the only veto.
 
     The abundance check is an ELIMINATOR, never an indicator: two adjacent windows in one
     sample are the same timepoint, so a genome cannot sit at two frequencies across them,
@@ -3785,28 +3824,41 @@ def link_windows(
         curr_wr = sorted_results[i]
         curr_snvs = set(curr_wr.window.snv_pos)
 
-        # Check next few windows for overlap
-        for k in range(i + 1, min(i + 3, len(sorted_results))):
+        # Check next few windows. Overlapping ones are compared on consensus; beyond the
+        # overlap, `link_window_reach` decides how far the READ path may still reach.
+        horizon = max(2, config.link_window_reach)
+        for k in range(i + 1, min(i + 1 + horizon, len(sorted_results))):
             next_wr = sorted_results[k]
 
-            # Check if windows overlap
-            if next_wr.window.start >= curr_wr.window.end:
-                break  # No more overlapping windows
+            overlapping = next_wr.window.start < curr_wr.window.end
+            if not overlapping:
+                # Reads can bridge a disjoint pair, but only within the configured reach
+                # - and reach 1 is the historical rule, which admits no such pair at all.
+                # Windows further apart than the reach are out of read range, and since
+                # `k` only increases, nothing beyond this one can link either.
+                if config.link_window_reach <= 1 or (k - i) > config.link_window_reach:
+                    break
 
-            next_snvs = set(next_wr.window.snv_pos)
-            shared_snvs = list(curr_snvs & next_snvs)
+            if overlapping:
+                next_snvs = set(next_wr.window.snv_pos)
+                shared_snvs = list(curr_snvs & next_snvs)
 
-            # Note: This checks window-level overlap, but the real check is below
-            # where we verify haplotypes actually have calls at shared positions
-            if len(shared_snvs) < config.min_shared_snvs_for_link:
-                continue
+                # Note: This checks window-level overlap, but the real check is below
+                # where we verify haplotypes actually have calls at shared positions
+                if len(shared_snvs) < config.min_shared_snvs_for_link:
+                    continue
 
-            # The region shared by the two windows; the co-supported span gate is
-            # measured as a fraction of it.
-            region = (
-                max(curr_wr.window.start, next_wr.window.start),
-                min(curr_wr.window.end, next_wr.window.end) - 1,
-            )
+                # The region shared by the two windows; the co-supported span gate is
+                # measured as a fraction of it.
+                region = (
+                    max(curr_wr.window.start, next_wr.window.start),
+                    min(curr_wr.window.end, next_wr.window.end) - 1,
+                )
+            else:
+                # Disjoint windows: there is no shared region and no shared position, so
+                # neither the SNV precheck nor the co-supported span gate has anything to
+                # measure. The pair loop below takes the read-only path instead.
+                region = None
 
             # Evaluate candidate pairings before linking (avoid cross-links).
             # Full gate stack: shared markers >= min_shared_markers, co-supported span
@@ -3842,81 +3894,106 @@ def link_windows(
 
             # per-haplotype footprints, clipped to the shared region, hoisted out of the
             # pairwise loop (see consensus_footprint)
-            span_i = [consensus_footprint(h.consensus, region) for h in curr_wr.haplotypes]
-            span_j = [consensus_footprint(h.consensus, region) for h in next_wr.haplotypes]
+            span_i = (
+                [consensus_footprint(h.consensus, region) for h in curr_wr.haplotypes]
+                if overlapping else []
+            )
+            span_j = (
+                [consensus_footprint(h.consensus, region) for h in next_wr.haplotypes]
+                if overlapping else []
+            )
             for hi, hap_i in enumerate(curr_wr.haplotypes):
                 for hj, hap_j in enumerate(next_wr.haplotypes):
-                    gate = compare_consensus(
-                        hap_i.consensus,
-                        hap_j.consensus,
-                        markers,
-                        config,
-                        min_shared=config.min_shared_markers,
-                        region=region,
-                        max_rate=config.identity_distance,
-                        a_span=span_i[hi],
-                        b_span=span_j[hj],
+                    # Shared reads are needed by BOTH paths now - as the ranking score
+                    # where consensus has already vetoed, and as the sole evidence where
+                    # consensus cannot speak - so hoist the intersection above the branch.
+                    shared_reads = len(
+                        reads_i.get(hi, _EMPTY_READS) & reads_j.get(hj, _EMPTY_READS)
                     )
-                    if gate.passed:
-                        # ABUNDANCE AS AN ELIMINATOR (author's rule, 2026-07-28).
-                        #
-                        # This is a SINGLE-TIMEPOINT comparison - one sample, two adjacent
-                        # windows - so it is exactly the case the coherence test is for: a
-                        # genome cannot sit at two different frequencies at one moment.
-                        # Two window-haplotypes whose shares genuinely disagree are not the
-                        # same entity, however well their alleles match.
-                        #
-                        # ELIMINATOR ONLY. Agreement never scores and never rescues a
-                        # failed identity gate; it can only refuse. And the test is run on
-                        # RAW COUNTS, never the derived abundance, which is already
-                        # quantised onto unit fractions by a median denominator of 9.
-                        if not abundance_coherent(
-                            [(hap_i.supporting_reads, n_curr),
-                             (hap_j.supporting_reads, n_next)], config
-                        ).coherent:
-                            record_debug(curr_wr, {
-                                "contig": curr_wr.window.contig,
-                                "window_start": curr_wr.window.start,
-                                "next_window_start": next_wr.window.start,
-                                "hap_i": hi, "hap_j": hj,
-                                "decision": "refused",
-                                "reason": "incompatible_abundance",
-                            })
-                            # PROPAGATE, don't just trace: this pair may never be merged
-                            # later either, and steps 2/3 should not have to re-test it.
-                            curr_wr.link_abundance_refusals.append(
-                                {
-                                    "contig": curr_wr.window.contig,
-                                    "window_a": curr_wr.window.start,
-                                    "hap_a_idx": hi,
-                                    "window_b": next_wr.window.start,
-                                    "hap_b_idx": hj,
-                                }
-                            )
+                    if not overlapping:
+                        # NON-OVERLAPPING PAIR. The windows call disjoint positions, so
+                        # consensus agreement is undefined - not "unknown", genuinely not
+                        # measurable. A read carried by a haplotype in both windows is
+                        # direct evidence they are one molecule's lineage, and it is the
+                        # only evidence there is, so it must stand on its own count.
+                        if shared_reads < config.link_min_shared_reads:
+                            continue
+                        gate = None
+                        score = -float(shared_reads)
+                        n_shared_out = 0
+                    else:
+                        gate = compare_consensus(
+                            hap_i.consensus,
+                            hap_j.consensus,
+                            markers,
+                            config,
+                            min_shared=config.min_shared_markers,
+                            region=region,
+                            max_rate=config.identity_distance,
+                            a_span=span_i[hi],
+                            b_span=span_j[hj],
+                        )
+                        if not gate.passed:
+                            if gate.reason == "failed_mismatch":
+                                curr_wr.link_mismatches.append(
+                                    {
+                                        "contig": curr_wr.window.contig,
+                                        "window_a": curr_wr.window.start,
+                                        "hap_a_idx": hi,
+                                        "window_b": next_wr.window.start,
+                                        "hap_b_idx": hj,
+                                        "rate": round(gate.rate, 6),
+                                        "n_shared": gate.n_shared,
+                                        "n_diff": gate.n_diff,
+                                    }
+                                )
                             continue
                         # RANK BY SHARED READS (lower is better for unique_best):
                         # the same score step 3 uses. Consensus has already had its
                         # say as a veto; where two candidates are byte-identical it
                         # cannot discriminate, and shared reads can. Falls back to
                         # the consensus rate when no read assignments are available.
-                        shared_reads = len(
-                            reads_i.get(hi, _EMPTY_READS) & reads_j.get(hj, _EMPTY_READS)
-                        )
                         score = -float(shared_reads) if (reads_i or reads_j) else gate.rate
-                        candidates.append((hi, hj, score, gate.n_shared))
-                    elif gate.reason == "failed_mismatch":
-                        curr_wr.link_mismatches.append(
+                        n_shared_out = gate.n_shared
+                    # ABUNDANCE AS AN ELIMINATOR (author's rule, 2026-07-28).
+                    #
+                    # This is a SINGLE-TIMEPOINT comparison - one sample, two windows of
+                    # it - so it is exactly the case the coherence test is for: a genome
+                    # cannot sit at two different frequencies at one moment. Two
+                    # window-haplotypes whose shares genuinely disagree are not the same
+                    # entity, however well their alleles match. That argument is about the
+                    # timepoint, not the overlap, so it holds for the read path too - and
+                    # it is the ONLY veto that path has.
+                    #
+                    # ELIMINATOR ONLY. Agreement never scores and never rescues a failed
+                    # identity gate; it can only refuse. And the test is run on RAW
+                    # COUNTS, never the derived abundance, which is already quantised onto
+                    # unit fractions by a median denominator of 9.
+                    if not abundance_coherent(
+                        [(hap_i.supporting_reads, n_curr),
+                         (hap_j.supporting_reads, n_next)], config
+                    ).coherent:
+                        record_debug(curr_wr, {
+                            "contig": curr_wr.window.contig,
+                            "window_start": curr_wr.window.start,
+                            "next_window_start": next_wr.window.start,
+                            "hap_i": hi, "hap_j": hj,
+                            "decision": "refused",
+                            "reason": "incompatible_abundance",
+                        })
+                        # PROPAGATE, don't just trace: this pair may never be merged
+                        # later either, and steps 2/3 should not have to re-test it.
+                        curr_wr.link_abundance_refusals.append(
                             {
                                 "contig": curr_wr.window.contig,
                                 "window_a": curr_wr.window.start,
                                 "hap_a_idx": hi,
                                 "window_b": next_wr.window.start,
                                 "hap_b_idx": hj,
-                                "rate": round(gate.rate, 6),
-                                "n_shared": gate.n_shared,
-                                "n_diff": gate.n_diff,
                             }
                         )
+                        continue
+                    candidates.append((hi, hj, score, n_shared_out))
 
             if not candidates:
                 if config.linking_debug:
