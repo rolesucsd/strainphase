@@ -87,7 +87,7 @@ def _window_haplotype_id(sample_id: str, contig_id: str, window_start: int, h_id
     those loops spelled the id differently - one pipe-separated and track-prefixed, the
     other underscore-separated and window-keyed - the veto set could not match a single
     member id, so the "a sample whose own reads disagree vetoes the join outright"
-    safeguard in build_lineages never once fired.
+    safeguard in the old cross-window chaining pass never once fired.
     """
     return f"{sample_id}_{contig_id}_{window_start}_H{h_idx}"
 
@@ -636,7 +636,7 @@ def build_window_tables(
         Attempted continuations tallied by reason, for the run log.
 
     ``lineages``
-        One row per (lineage, sample), produced here whenever ``config.build_lineages``
+        One row per (lineage, sample), produced here whenever lineages were built
         is set - which it is by default. It is built in this function rather than by a
         separate driver because everything step 3 needs is already in memory: the groups,
         the contig-wide marker set, and step 1's mismatch verdicts.

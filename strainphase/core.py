@@ -187,13 +187,11 @@ class HaplotyperConfig:
     junk_divergence_rate: float = 0.10
 
     # ---- HAPLOTYPE IDENTITY: one rate, one marker floor, every stage ----------------
-    # "Are these two consensuses the same entity?" is asked at three places - the post-EM
-    # merge inside a window, step 1's link across adjacent windows, and steps 2/3 across
-    # samples and along the genome - and each used to own a private copy of the same two
-    # thresholds (max_link_distance / lineage_merge_distance / merge_distance_threshold,
-    # and min_shared_calls_for_link / min_shared_for_lineage / min_shared_for_merge).
-    # They agreed only because someone set them equal; nothing enforced it, and steps 1
-    # and 3 drifted apart on exactly this kind of parallel knob. Collapsed 2026-08-30.
+    # "Are these two things the same entity?" is asked in five places - inside a window
+    # after EM, between reads when building the graph, across windows in step 1, when
+    # rescuing a haplotype across timepoints, and across samples in the merge. Each used
+    # to own a private copy of the same two thresholds, and they agreed only because
+    # someone had set them equal - nothing enforced it, and they drifted.
     #
     # NOW FOLDED IN TOO (2026-08-31). max_mismatch_frac (read vs read) and
     # rescue_match_distance (read vs haplotype) were kept separate on the argument that a
@@ -2113,7 +2111,7 @@ class GraphInitializer:
                     continue
 
                 # Count mismatches with early exit. One gate: the RATE
-                # (floor(max_mismatch_frac * n_shared), which forces 0 mismatches below
+                # (floor(identity_distance * n_shared), which forces 0 mismatches below
                 # n_shared=50 at 2%). The absolute cap that used to sit alongside it was
                 # removed 2026-08-30 - it had been disabled in production for the whole
                 # of the read-overlap work, and a fixed count cannot be right across
@@ -2778,7 +2776,7 @@ class LongitudinalIntegrator:
         )
 
         # Even a single junk read matching an anchor from another timepoint is meaningful,
-        # as long as the match is near-exact (controlled by rescue_match_distance).
+        # as long as the match is near-exact (controlled by identity_distance).
         if n_junk_reads < 1:
             # Not enough junk reads to rescue
             self.rescue_statistics.append(

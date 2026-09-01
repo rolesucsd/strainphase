@@ -179,7 +179,7 @@ def cmd_longitudinal(args: argparse.Namespace) -> int:
             all_integrators.append(integrator)
 
     # ---- Window-level tables (the deliverables) ----
-    # lineages.tsv comes back from here too, under config.build_lineages (default on):
+    # lineages.tsv comes back from here too:
     # composing the within-sample and across-sample linking axes was the open decision
     # these tables were built as the substrate for, and step 3 now makes it.
     (hap_rows, within_rows, across_rows, edge_rows, mismatch_rows,
@@ -379,7 +379,7 @@ Examples:
         help="Min co-supported span between two haplotypes as a fraction of their "
              "shared region. 0.25 rejects ~16%% of adjacent-window pairs; 0.50 rejects ~30%%.",
     )
-    # --- step 3 (build_lineages) linking + vetoes -------------------------------
+    # --- cross-sample merge (track_merge) ---------------------------------------
     long_parser.add_argument(
         "--identity-distance", type=float, default=_D.identity_distance,
         help="Max mismatch RATE at which two consensuses are one entity. ONE knob for "
