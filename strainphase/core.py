@@ -240,9 +240,6 @@ class HaplotyperConfig:
 
     assign_confidence_threshold: float = 0.90
 
-    # =========== 1-SNP VALIDATION ===========
-    validate_1snp_differences: bool = True
-    use_binomial_test_1snp: bool = True
     binomial_alpha: float = 0.05
 
     # =========== LONGITUDINAL PARAMETERS ===========
@@ -2436,10 +2433,13 @@ class PostProcessor:
         gamma: np.ndarray,
         n_timepoints_seen: int = 1,
     ) -> bool:
-        """Determine if 1-SNP pair should be merged."""
-        if not self.config.validate_1snp_differences:
-            return True
+        """Determine if a pair differing at ONE SNV should be merged.
 
+        Always applied. It used to sit behind validate_1snp_differences, and the
+        binomial arm behind use_binomial_test_1snp, but a single differing site is
+        exactly where a real low-abundance strain and a sequencing artefact look alike -
+        turning the check off does not make that call easier, it just makes it silently.
+        """
         diff_positions = hap1.get_differing_positions(hap2, window.snv_pos)
         if len(diff_positions) != 1:
             return True
@@ -2463,41 +2463,40 @@ class PostProcessor:
 
         # Check timepoints
         if n_timepoints_seen < self.config.marker_min_samples:
-            if self.config.use_binomial_test_1snp:
-                minor_base = minor_hap.consensus.get(diff_pos)
-                if minor_base is None:
-                    return True
+            minor_base = minor_hap.consensus.get(diff_pos)
+            if minor_base is None:
+                return True
 
-                minor_count = 0
-                total_at_pos = 0
-                p_error_sum = 0.0
-                for read in window.reads:
-                    if diff_pos in read.alleles:
-                        total_at_pos += 1
-                        q = read.quals.get(diff_pos, self.config.default_base_quality)
-                        # /3: the null is that the minor calls are sequencing errors that
-                        # happened to produce THIS base, one of the three alternatives.
-                        p_error_sum += 10 ** (-q / 10.0) / 3.0
-                        if read.alleles[diff_pos] == minor_base:
-                            minor_count += 1
+            minor_count = 0
+            total_at_pos = 0
+            p_error_sum = 0.0
+            for read in window.reads:
+                if diff_pos in read.alleles:
+                    total_at_pos += 1
+                    q = read.quals.get(diff_pos, self.config.default_base_quality)
+                    # /3: the null is that the minor calls are sequencing errors that
+                    # happened to produce THIS base, one of the three alternatives.
+                    p_error_sum += 10 ** (-q / 10.0) / 3.0
+                    if read.alleles[diff_pos] == minor_base:
+                        minor_count += 1
 
-                if total_at_pos == 0:
-                    return True
+            if total_at_pos == 0:
+                return True
 
-                # The reads' own base qualities, not a fixed Q30. The bases at this
-                # position are in read.quals and min_base_quality — the gate that decided
-                # which of them got here at all — defaults to 20, so assuming Q30 asserted
-                # an accuracy the data does not have to carry. It errs towards SPLIT: at
-                # 3 minor reads of 40 in a 250-site window, Q30 gives p=3.6e-07 (split)
-                # where the reads' real Q20 gives 3.3e-04 (merge), i.e. a phantom strain
-                # above the 10% abundance floor. The binomial wants one rate, so the mean
-                # over the reads at the position stands in for the Poisson-binomial.
-                p_error = p_error_sum / total_at_pos
-                alpha_corrected = self.config.binomial_alpha / len(window.snv_pos)
-                p_value = 1 - binom.cdf(minor_count - 1, total_at_pos, p_error)
+            # The reads' own base qualities, not a fixed Q30. The bases at this
+            # position are in read.quals and min_base_quality — the gate that decided
+            # which of them got here at all — defaults to 20, so assuming Q30 asserted
+            # an accuracy the data does not have to carry. It errs towards SPLIT: at
+            # 3 minor reads of 40 in a 250-site window, Q30 gives p=3.6e-07 (split)
+            # where the reads' real Q20 gives 3.3e-04 (merge), i.e. a phantom strain
+            # above the 10% abundance floor. The binomial wants one rate, so the mean
+            # over the reads at the position stands in for the Poisson-binomial.
+            p_error = p_error_sum / total_at_pos
+            alpha_corrected = self.config.binomial_alpha / len(window.snv_pos)
+            p_value = 1 - binom.cdf(minor_count - 1, total_at_pos, p_error)
 
-                if p_value > alpha_corrected:
-                    return True
+            if p_value > alpha_corrected:
+                return True
 
         return False
 
