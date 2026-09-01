@@ -231,6 +231,114 @@ def cmd_version(args: argparse.Namespace) -> int:
     return 0
 
 
+# Tuning flags shared by every subcommand that phases reads. `run` used to carry an
+# arbitrary 7-field subset of these - it calls process_contig, which calls link_windows,
+# so almost every gate `longitudinal` exposes was already in force on `run` with no way
+# to see or set it. Declared once so the two cannot drift.
+def _add_phasing_args(p) -> None:
+    p.add_argument("--window-size", type=int, default=_D.window_size, help="Window size (bp)")
+    p.add_argument("--max-reads", type=int, default=_D.max_reads_per_window,
+                   help="Max reads per window")
+    p.add_argument("--min-mapq", type=int, default=_D.min_mapq, help="Minimum MAPQ")
+    p.add_argument(
+        "--min-depth-site", type=int, default=_D.min_depth_site,
+        help="Min VCF DP to load a site. Set 1 for pre-called SNV lists (e.g. SNooPy) "
+             "where the BAM re-genotyping is the real depth gate.",
+    )
+    p.add_argument(
+        "--af-range", type=float, nargs=2, metavar=("LOW", "HIGH"), default=None,
+        help="Only load VCF sites whose alt-allele frequency falls in [LOW, HIGH). "
+             "Off by default, which loads every site that clears --min-depth-site.",
+    )
+    p.add_argument(
+        "--seed", type=int, default=_D.random_seed,
+        help="Random seed. Seeded by default: it drives both read subsampling above "
+             "--max-reads and Louvain read clustering, so an unseeded run is not "
+             "reproducible.",
+    )
+    # --- depth policy ---
+    p.add_argument(
+        "--min-reads-per-window", type=int, default=_D.min_reads_per_window,
+        help="Reads needed to PHASE a window de novo.",
+    )
+    p.add_argument(
+        "--min-reads-for-rescue", type=int, default=_D.min_reads_for_rescue,
+        help="Reads needed for a window to be BUILT, so rescue can still populate it.",
+    )
+    # --- identity: ONE rate, and per-stage evidence ---
+    p.add_argument(
+        "--identity-distance", type=float, default=_D.identity_distance,
+        help="Max mismatch RATE at which two things are one entity. ONE rate for every "
+             "comparison - read to read, haplotype to haplotype, and rescue. How much "
+             "evidence each needs first is a separate per-stage threshold.",
+    )
+    p.add_argument(
+        "--min-shared-markers", type=int, default=_D.min_shared_markers,
+        help="Shared markers required before that rate means anything, comparing two "
+             "haplotype consensuses.",
+    )
+    p.add_argument(
+        "--min-shared-snvs-for-link", type=int, default=_D.min_shared_snvs_for_link,
+        help="Shared SNV POSITIONS two overlapping windows need before their haplotypes "
+             "are compared at all. A cheap precheck for --min-shared-markers.",
+    )
+    p.add_argument(
+        "--min-overlap-bp", type=int, default=_D.min_entity_overlap_bp,
+        help="Physical overlap two things must share before they are compared at all - "
+             "read against window, read against read, and entity against entity.",
+    )
+    p.add_argument(
+        "--min-cosupported-span-frac", type=float, default=_D.min_cosupported_span_frac,
+        help="Min co-supported span between two haplotypes as a fraction of their "
+             "shared region.",
+    )
+    # --- abundance: one threshold for every abundance verdict ---
+    p.add_argument(
+        "--abundance-coherence-alpha", type=float, default=_D.abundance_coherence_alpha,
+        help="Significance at which two read counts are declared incompatible "
+             "abundances. Step 1's eliminator and the merge's gap-filling test share it.",
+    )
+    p.add_argument(
+        "--min-reads-for-coherence", type=int, default=_D.min_reads_for_coherence,
+        help="Reads a window needs before its abundance is tested at all.",
+    )
+    # --- step-1 linking ---
+    p.add_argument(
+        "--link-window-reach", type=int, default=_D.link_window_reach,
+        help="How many windows ahead step 1 may link. 1 is the overlap-only rule; above "
+             "1 also links NON-overlapping windows on shared reads.",
+    )
+    p.add_argument(
+        "--link-min-shared-reads", type=int, default=_D.link_min_shared_reads,
+        help="Reads two haplotypes must share to link a NON-overlapping window pair. "
+             "Consensus cannot gate those, so this is the whole evidence bar.",
+    )
+
+
+# Flags that only mean something with MANY samples: the cross-sample merge, the
+# cross-timepoint anchor panel, and the multi-sample driver's memory behaviour.
+def _add_longitudinal_args(p) -> None:
+    p.add_argument(
+        "--track-merge-min-shared-markers", type=int,
+        default=_D.track_merge_min_shared_markers,
+        help="Agreeing markers two step-1 tracks need before the cross-sample merge "
+             "joins them. 1 is a permissive first pass.",
+    )
+    p.add_argument("--min-anchor-weight", type=float, default=_D.min_weight_for_anchor,
+                   help="Min weight for anchor")
+    p.add_argument("--rescued-min-weight", type=float, default=_D.rescued_min_weight,
+                   help="Min weight after rescue")
+    p.add_argument(
+        "--no-spill", action="store_true",
+        help="Keep every sample's reads in memory until the whole MAG finishes.",
+    )
+    p.add_argument(
+        "--window-batch-factor", type=int, default=_D.window_batch_factor,
+        help="Windows are dispatched to the worker pool in batches of workers * this. "
+             "Lower it to cut peak memory on variant-dense contigs.",
+    )
+
+
 def cmd_sv(args) -> int:
     from strainphase.sv_encoding import run_sv
 
@@ -279,31 +387,10 @@ Examples:
     run_parser.add_argument("--sample", help="Sample ID")
     run_parser.add_argument("--vcf-sample", help="Sample name in VCF")
     run_parser.add_argument("--output", "-o", default="haplotypes.tsv", help="Output file")
-    run_parser.add_argument("--window-size", type=int, default=_D.window_size, help="Window size (bp)")
-    run_parser.add_argument("--max-reads", type=int, default=_D.max_reads_per_window, help="Max reads per window")
-    run_parser.add_argument("--min-mapq", type=int, default=_D.min_mapq, help="Minimum MAPQ")
-    run_parser.add_argument(
-        "--identity-distance", type=float, default=_D.identity_distance,
-        help="Max mismatch RATE at which two things are one entity. ONE rate for "
-             "every comparison - read to read, haplotype to haplotype, and rescue. "
-             "How much evidence each needs first is a separate per-stage threshold.",
-    )
-    run_parser.add_argument(
-        "--min-depth-site",
-        type=int,
-        default=_D.min_depth_site,
-        help="Min VCF DP to load a site. Set 1 for pre-called SNV lists (e.g. "
-        "SNooPy) where the BAM re-genotyping is the real depth gate.",
-    )
-    run_parser.add_argument(
-        "--seed", type=int, default=_D.random_seed,
-        help="Random seed. Seeded by default: it drives both read subsampling above "
-        "--max-reads and Louvain read clustering, so an unseeded run is not reproducible.",
-    )
-    run_parser.add_argument("--no-validate", action="store_true", help="Skip result validation")
     run_parser.add_argument(
         "--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"]
     )
+    _add_phasing_args(run_parser)
     run_parser.set_defaults(func=cmd_run)
 
     # =========== LONGITUDINAL subcommand ===========
@@ -324,8 +411,6 @@ Examples:
     long_parser.add_argument("--output-dir", "-o", required=True, help="Output directory")
     long_parser.add_argument("--mags", help="Comma-separated MAG names (default: all)")
     long_parser.add_argument("--contig-filter", help="File with allowed contig names")
-    long_parser.add_argument("--window-size", type=int, default=_D.window_size, help="Window size (bp)")
-    long_parser.add_argument("--max-reads", type=int, default=_D.max_reads_per_window, help="Max reads per window")
     long_parser.add_argument(
         "-j",
         "--workers",
@@ -335,125 +420,10 @@ Examples:
         "(default: 1). Set to --cpus-per-task so reserved cores are used.",
     )
     long_parser.add_argument(
-        "--min-anchor-weight", type=float, default=_D.min_weight_for_anchor, help="Min weight for anchor"
-    )
-    long_parser.add_argument(
-        "--rescued-min-weight", type=float, default=_D.rescued_min_weight, help="Min weight after rescue"
-    )
-    long_parser.add_argument(
-        "--min-depth-site",
-        type=int,
-        default=_D.min_depth_site,
-        help="Min VCF DP to load a site. Set 1 for pre-called SNV lists (e.g. "
-        "SNooPy) where the BAM re-genotyping is the real depth gate.",
-    )
-    long_parser.add_argument(
         "--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"]
     )
-    # --- depth policy ---
-    long_parser.add_argument(
-        "--min-reads-per-window", type=int, default=_D.min_reads_per_window,
-        help="Reads needed to PHASE a window de novo. Below this no haplotype is "
-             "invented and the trajectory carries a gap.",
-    )
-    long_parser.add_argument(
-        "--min-reads-for-rescue", type=int, default=_D.min_reads_for_rescue,
-        help="Reads needed for a window to be BUILT, so rescue can still populate it. "
-             "Clamped to --min-reads-per-window if higher.",
-    )
-    # --- identity gates ---
-    long_parser.add_argument(
-        "--min-overlap-bp", type=int, default=_D.min_entity_overlap_bp,
-        help="Physical overlap two things must share before they are compared at "
-             "all - read against window, read against read, and entity against "
-             "entity. One question, so one knob.",
-    )
-    # --- within-sample window linking (the HORIZONTAL axis) ---
-    long_parser.add_argument(
-        "--min-shared-snvs-for-link", type=int, default=_D.min_shared_snvs_for_link,
-        help="Min shared SNV POSITIONS between two overlapping windows before their "
-             "haplotypes are even compared.",
-    )
-    long_parser.add_argument(
-        "--min-cosupported-span-frac", type=float, default=_D.min_cosupported_span_frac,
-        help="Min co-supported span between two haplotypes as a fraction of their "
-             "shared region. 0.25 rejects ~16%% of adjacent-window pairs; 0.50 rejects ~30%%.",
-    )
-    # --- cross-sample merge (track_merge) ---------------------------------------
-    long_parser.add_argument(
-        "--identity-distance", type=float, default=_D.identity_distance,
-        help="Max mismatch RATE at which two consensuses are one entity. ONE knob for "
-             "every consensus-vs-consensus comparison: the post-EM merge inside a "
-             "window, step 1's link across adjacent windows, and steps 2/3 across "
-             "samples and along the genome. Read-level thresholds (--max-mismatch-frac, "
-             "--rescue-match-distance) are separate on purpose - a read carries "
-             "sequencing error a consensus has already averaged out.",
-    )
-    long_parser.add_argument(
-        "--abundance-coherence-alpha", type=float, default=_D.abundance_coherence_alpha,
-        help="Significance at which two read counts are declared incompatible "
-             "abundances. ONE threshold for every abundance verdict: step 1's "
-             "adjacent-window eliminator, and the fresh test the cross-sample merge "
-             "runs for tracks step 1 never compared. They must agree - a merge cannot "
-             "be stricter or looser than the refusal it inherits.",
-    )
-    long_parser.add_argument(
-        "--min-reads-for-coherence", type=int, default=_D.min_reads_for_coherence,
-        help="Reads a window needs before its abundance is tested at all. Same scope "
-             "as --abundance-coherence-alpha.",
-    )
-    long_parser.add_argument(
-        "--link-window-reach", type=int, default=_D.link_window_reach,
-        help="How many windows ahead step 1 may link. 1 is the pre-2026-08-31 "
-             "overlap-only rule, which caps step 1 at a 10 kb reach on a 20 kb/10 kb "
-             "tiling while reads reach 30 kb; above 1 also links NON-overlapping "
-             "windows on shared reads.",
-    )
-    long_parser.add_argument(
-        "--link-min-shared-reads", type=int, default=_D.link_min_shared_reads,
-        help="Reads two haplotypes must share to link a NON-overlapping window pair. "
-             "Those windows call disjoint positions so consensus cannot gate them, "
-             "making this and reciprocal best match the entire evidence bar.",
-    )
-    long_parser.add_argument(
-        "--track-merge-min-shared-markers", type=int, default=_D.track_merge_min_shared_markers,
-        help="Agreeing markers two step-1 tracks need before the cross-sample merge "
-             "joins them. 1 is a permissive first pass; exact agreement still cannot "
-             "fuse genotypes that disagree anywhere both called, so this trades only "
-             "evidence volume. Raising it splits hard: on 000089747_1 contig_2, 1 gives "
-             "118 entities and 3 gives 4,474.",
-    )
-    long_parser.add_argument(
-        "--min-shared-markers", type=int, default=_D.min_shared_markers,
-        help="Shared markers required before that rate means anything. Same scope as "
-             "--identity-distance.",
-    )
-    # Keep these in step with the same flags on strainphase/longitudinal.py's parser -
-    # they are two hand-maintained arg lists over one HaplotyperConfig, and a flag added
-    # to only one of them is accepted by `python -m strainphase.longitudinal` but
-    # rejected by `strainphase longitudinal`. That is exactly how --seed broke.
-    long_parser.add_argument(
-        "--seed", type=int, default=_D.random_seed,
-        help="Random seed. Seeded by default: it drives both read subsampling above "
-             "--max-reads and Louvain read clustering, so an unseeded run is not "
-             "reproducible.",
-    )
-    long_parser.add_argument(
-        "--no-spill", action="store_true",
-        help="Keep every sample's reads in memory until the whole MAG finishes (the old "
-             "behaviour). By default reads are parked in <output-dir>/tmp/spill after "
-             "each sample is phased and reloaded one sample at a time for rescue.",
-    )
-    long_parser.add_argument(
-        "--window-batch-factor", type=int, default=_D.window_batch_factor,
-        help="Windows are dispatched to the worker pool in batches of workers * this. "
-             "Lower it to cut peak memory on variant-dense contigs.",
-    )
-    long_parser.add_argument(
-        "--af-range", type=float, nargs=2, metavar=("LOW", "HIGH"), default=None,
-        help="Only load VCF sites whose alt-allele frequency falls in [LOW, HIGH). "
-             "Off by default, which loads every site that clears --min-depth-site.",
-    )
+    _add_phasing_args(long_parser)
+    _add_longitudinal_args(long_parser)
     long_parser.set_defaults(func=cmd_longitudinal)
 
     # =========== SV subcommand ===========

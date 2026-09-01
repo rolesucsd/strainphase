@@ -450,8 +450,8 @@ def config_from_args(args, **overrides) -> HaplotyperConfig:
     """Build one ``HaplotyperConfig`` from any entry point's parsed arguments.
 
     ``overrides`` win over the parsed values, for the few settings an entry point fixes
-    rather than exposes. Flags that invert or derive their field (``--no-validate``,
-    ``--no-spill``, ``--workers``) are handled explicitly below, since a name-to-name
+    rather than exposes. Flags that invert or derive their field (``--no-spill``,
+    ``--workers``, ``--af-range``) are handled explicitly below, since a name-to-name
     table cannot express them.
     """
     values: dict = {}
