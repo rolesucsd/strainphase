@@ -1195,13 +1195,6 @@ def main():
     # Kept in step with strainphase/cli.py's parser - two hand-maintained arg lists
     # over one HaplotyperConfig.
     parser.add_argument(
-        "--lineage-max-bad-frac",
-        type=float,
-        default=0.25,
-        help="Fraction of testable samples whose read shares may disagree before the "
-        "abundance veto refuses a continuation. 0.0 = zero tolerance, 1.0 = disabled.",
-    )
-    parser.add_argument(
         "--identity-distance",
         type=float,
         default=0.02,
@@ -1216,6 +1209,19 @@ def main():
         "--track-merge-min-shared-markers", type=int, default=1,
         help="Agreeing markers two step-1 tracks need before the cross-sample merge "
              "joins them (default 1, a permissive first pass).",
+    )
+    parser.add_argument(
+        "--abundance-coherence-alpha", type=float, default=0.01,
+        help="Significance at which two read counts are declared incompatible "
+             "abundances. ONE threshold for every abundance verdict: step 1's "
+             "adjacent-window eliminator, and the fresh test the cross-sample merge "
+             "runs for tracks step 1 never compared. They must agree - a merge cannot "
+             "be stricter or looser than the refusal it inherits.",
+    )
+    parser.add_argument(
+        "--min-reads-for-coherence", type=int, default=10,
+        help="Reads a window needs before its abundance is tested at all. Same scope "
+             "as --abundance-coherence-alpha.",
     )
     parser.add_argument(
         "--link-window-reach", type=int, default=2,

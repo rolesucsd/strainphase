@@ -244,14 +244,6 @@ class HaplotyperConfig:
     min_shared_for_rescue: int = 3  # Min shared SNVs with actual calls for rescue matching
     rescued_min_weight: float = 0.02
 
-    # Fraction of testable samples allowed to disagree on abundance before the
-    # abundance ELIMINATOR vetoes a cross-window continuation. 0.0 = zero
-    # tolerance (any one incompatible sample vetoes), which on real divergent
-    # data breaks clean (n_diff=0) same-strain links on noisy per-window
-    # abundance estimates. Exposed so it can be relaxed; the veto still only
-    # sees pairs that already PASSED the consensus gate, so relaxing it cannot
-    # merge consensus-divergent strains.
-    lineage_max_bad_frac: float = 0.25
     # Identity shape. This decision is still OPEN (FIGURE4 diagnosis §6 #9); both are
     # implemented so they can be compared on identical inputs.
     #   "clique"     - complete linkage: a group is a clique, every member passes the
@@ -451,7 +443,8 @@ _CONFIG_FROM_ARG: dict[str, str] = {
     "track_merge_min_shared_markers": "track_merge_min_shared_markers",
     "link_window_reach": "link_window_reach",
     "link_min_shared_reads": "link_min_shared_reads",
-    "lineage_max_bad_frac": "lineage_max_bad_frac",
+    "abundance_coherence_alpha": "abundance_coherence_alpha",
+    "min_reads_for_coherence": "min_reads_for_coherence",
     "window_batch_factor": "window_batch_factor",
 }
 

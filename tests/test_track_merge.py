@@ -186,3 +186,44 @@ def test_track_merge_min_shared_markers_gates_the_merge():
         haps, replace(DEFAULT_CONFIG, track_merge_min_shared_markers=2), markers=markers
     )
     assert len(two) == 2, "one agreeing marker must not clear a threshold of 2"
+
+
+def test_gap_filling_abundance_test_uses_the_step1_threshold():
+    """Tracks step 1 never compared get a FRESH abundance test on the SAME knob.
+
+    `link_windows` only ever judges windows within its reach, so two tracks further
+    apart in one sample carry no step-1 verdict to inherit. The merge takes that
+    verdict itself - and must take it at the same threshold, or a pair would be
+    refused at one distance and merged at another purely by which code asked.
+    """
+    from dataclasses import replace
+
+    from strainphase.core import DEFAULT_CONFIG
+
+    markers = frozenset({100, 90000})
+    # one sample, two tracks four windows apart, shares that plainly disagree
+    haps = [
+        WindowHaplotype(sample="s1", contig="c", window_start=1, window_end=20001,
+                        haplotype_id="h1", consensus={100: "A"}, reads=95,
+                        total_reads=100, junk_reads=0, within_sample_id="T1"),
+        WindowHaplotype(sample="s1", contig="c", window_start=80001, window_end=100001,
+                        haplotype_id="h2", consensus={90000: "A"}, reads=3,
+                        total_reads=100, junk_reads=0, within_sample_id="T2"),
+        # a second sample bridging them, so an edge exists to be gated at all
+        WindowHaplotype(sample="s2", contig="c", window_start=1, window_end=20001,
+                        haplotype_id="h3", consensus={100: "A"}, reads=50,
+                        total_reads=100, junk_reads=0, within_sample_id="T3"),
+        WindowHaplotype(sample="s2", contig="c", window_start=80001, window_end=100001,
+                        haplotype_id="h4", consensus={90000: "A"}, reads=50,
+                        total_reads=100, junk_reads=0, within_sample_id="T3"),
+    ]
+    strict = build_lineages_from_tracks(haps, DEFAULT_CONFIG, markers=markers)
+
+    # Loosening the SHARED knob must loosen this test too - that is the whole point.
+    loose = build_lineages_from_tracks(
+        haps, replace(DEFAULT_CONFIG, abundance_coherence_alpha=1e-12), markers=markers
+    )
+    assert len(loose) <= len(strict), (
+        "the gap-filling test must respond to --abundance-coherence-alpha, the same "
+        "knob step 1's eliminator reads"
+    )

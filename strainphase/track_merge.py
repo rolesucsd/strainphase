@@ -227,8 +227,15 @@ def build_lineages_from_tracks(
                 # a refusal step 1 already recorded stands
                 if frozenset((k, other)) in forbidden_pairs:
                     return False
-                # more than one window apart: link_windows never put these side by
-                # side, so its abundance verdict does not exist and is taken now
+                # More than one window apart: link_windows never put these side by
+                # side, so its abundance verdict does not exist and is taken now.
+                #
+                # SAME TEST, SAME THRESHOLD as step 1 - one call to abundance_coherent
+                # reading the same config (--abundance-coherence-alpha,
+                # --min-reads-for-coherence). This gap-filler stands in for a step-1
+                # verdict that was never produced, so it cannot be stricter or looser
+                # than the refusals it sits beside without the merge treating two
+                # halves of one question differently.
                 lo_a, hi_a = span[other]
                 lo_b, hi_b = span[k]
                 gap = max(lo_b - hi_a, lo_a - hi_b)

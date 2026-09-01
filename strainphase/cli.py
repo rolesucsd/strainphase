@@ -381,12 +381,6 @@ Examples:
     )
     # --- step 3 (build_lineages) linking + vetoes -------------------------------
     long_parser.add_argument(
-        "--lineage-max-bad-frac", type=float, default=0.25,
-        help="Fraction of testable samples whose per-sample read shares may disagree "
-             "before the abundance veto refuses a lineage continuation. 0.0 is zero "
-             "tolerance; 1.0 disables the veto.",
-    )
-    long_parser.add_argument(
         "--identity-distance", type=float, default=0.02,
         help="Max mismatch RATE at which two consensuses are one entity. ONE knob for "
              "every consensus-vs-consensus comparison: the post-EM merge inside a "
@@ -394,6 +388,19 @@ Examples:
              "samples and along the genome. Read-level thresholds (--max-mismatch-frac, "
              "--rescue-match-distance) are separate on purpose - a read carries "
              "sequencing error a consensus has already averaged out.",
+    )
+    long_parser.add_argument(
+        "--abundance-coherence-alpha", type=float, default=0.01,
+        help="Significance at which two read counts are declared incompatible "
+             "abundances. ONE threshold for every abundance verdict: step 1's "
+             "adjacent-window eliminator, and the fresh test the cross-sample merge "
+             "runs for tracks step 1 never compared. They must agree - a merge cannot "
+             "be stricter or looser than the refusal it inherits.",
+    )
+    long_parser.add_argument(
+        "--min-reads-for-coherence", type=int, default=10,
+        help="Reads a window needs before its abundance is tested at all. Same scope "
+             "as --abundance-coherence-alpha.",
     )
     long_parser.add_argument(
         "--link-window-reach", type=int, default=2,
