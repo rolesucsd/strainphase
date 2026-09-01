@@ -10,23 +10,6 @@ This script:
    - lineages.tsv        (one row per (MAG, contig, window, sample, lineage))
    - longitudinal_summary.tsv
    - <sample>.rescued.tsv (per-sample haplotypes after rescue)
-
-Recommended usage for efficiency:
-    * Run ONE MAG per job using --mags <MAG_NAME>
-    * Use --contig-filter to restrict to high-coverage / high-breadth contigs
-
-Example:
-    python run_longitudinal.py \
-        --samples bc2001,bc2002,... \
-        --bams /ddn_scratch/.../mapping/{sample}.sorted.bam \
-        --vcfs /ddn_scratch/.../variants/clair3/{sample}/pileup.vcf.gz \
-        --reference /ddn_scratch/.../references/combined_bins.fasta \
-        --output-dir /ddn_scratch/.../haplotypes/longitudinal/BF_MAG_01 \
-        --mags BF_MAG_01 \
-        --contig-filter good_contigs.tsv \
-        --window-size 3000 \
-        --max-reads 300 \
-        --log-level INFO
 """
 
 from __future__ import annotations
@@ -1066,8 +1049,3 @@ def write_window_tables(
         logging.info(f"Wrote {len(rows)} rows to {path}")
 
     return written
-
-
-# -----------------------------------------------------------------------------#
-# CLI
-# -----------------------------------------------------------------------------#

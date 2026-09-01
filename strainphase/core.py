@@ -1,14 +1,6 @@
 #!/usr/bin/env python3
 """
 Hybrid Graph-Probabilistic Haplotype Reconstruction for Long-Read Metagenomics
-Version 3.1 - With Window Linking for Contig-Spanning Haplotypes
-
-Key Features:
-- Overlapping windows (50% step) enable haplotype linking across windows
-- Haplotypes are linked based on consensus similarity in shared SNV positions
-- Output is TRACK-based: span_start/span_end reflect full linked extent
-- Track length limited only by SNV density and haplotype consistency
-
 Algorithm:
 1. Create overlapping windows (step = window_size / 2)
 2. For each window: graph initialization + EM refinement
@@ -99,7 +91,7 @@ class HaplotyperConfig:
 
     # =========== WINDOW PARAMETERS ===========
     window_size: int = 20000
-    # Depth policy (FIGURE4 diagnosis §6 #3). Two DIFFERENT floors:
+    # Depth policy - two DIFFERENT floors, deliberately:
     #   min_reads_per_window  - reads needed to PHASE a window de novo. Separating two
     #                           haplotypes at 50/50 needs ~10-20 reads; 3 cannot resolve
     #                           anything and manufactures the abundance==1.0 artifact.
@@ -4514,8 +4506,3 @@ def results_to_dataframe(results: dict[str, list[WindowResult]]) -> list[dict]:
     records.sort(key=lambda r: (r["contig"], r["span_start"]))
 
     return records
-
-
-# =============================================================================
-# CLI
-# =============================================================================
