@@ -1278,3 +1278,68 @@ def test_supported_markers_still_reject_thin_low_abundance_alleles():
     ]
     assert 50 not in supported_marker_positions(obs, None, cfg()), \
         "2 reads at 0.4% clears neither bar and must not qualify"
+
+
+# --------------------------------------------------------------------------- #
+# The within-window merge compares over INFORMATIVE positions, without a rate
+# --------------------------------------------------------------------------- #
+
+
+def _window_haps(pairs, n_invariant, depth=100):
+    """Haplotypes differing at `pairs` positions, padded with `n_invariant` agreeing ones.
+
+    The padding is the point: it is what `window.snv_pos` accumulates as coverage rises,
+    and what used to dilute the merge rate.
+    """
+    from strainphase.core import Haplotype, PostProcessor, Window
+
+    var = {1000 + 10 * i: ("A", "G") for i in range(pairs)}
+    inv = {5000 + 10 * i: "C" for i in range(n_invariant)}
+    a = {**{p: v[0] for p, v in var.items()}, **inv}
+    b = {**{p: v[1] for p, v in var.items()}, **inv}
+    w = Window(contig="c1", start=1, end=20001)
+    w.snv_pos = sorted(set(a) | set(b))
+    w.reads = []
+    h1, h2 = Haplotype(consensus=a, supporting_reads=depth // 2), \
+             Haplotype(consensus=b, supporting_reads=depth // 2)
+    h1.weight = h2.weight = 0.5
+    g = np.zeros((depth, 2))
+    g[: depth // 2, 0] = 1.0
+    g[depth // 2:, 1] = 1.0
+    hp = PostProcessor.__new__(PostProcessor)
+    hp.config = cfg(min_shared_markers=2)
+    return hp, [h1, h2], g, np.array([0.5, 0.5]), w
+
+
+def test_window_merge_is_not_diluted_by_agreeing_positions():
+    """Two REAL differences must survive however many agreeing sites surround them.
+
+    Under the old rate over `window.snv_pos`, 2 differences among 400 agreeing sites is
+    0.005 - under identity_distance - so the pair merged, and merged harder as coverage
+    added more agreeing sites. Measured on group4.seed2 contig_1:280,001 (truth 3),
+    cov100 collapsed 3-4 haplotypes to 1 in all six samples.
+    """
+    for n_invariant in (10, 100, 400):
+        hp, haps, g, pi, w = _window_haps(pairs=2, n_invariant=n_invariant)
+        out, _, _ = hp.merge_similar_haplotypes(haps, g, pi, w)
+        assert len(out) == 2, (
+            f"2 real differences must not merge with {n_invariant} agreeing sites; "
+            "the decision must not depend on how many positions were called"
+        )
+
+
+def test_window_merge_still_collapses_identical_haplotypes():
+    """Byte-identical on informative positions still merges - the rule is not just
+    'never merge'. With no differing site there is nothing to keep apart."""
+    hp, haps, g, pi, w = _window_haps(pairs=0, n_invariant=50)
+    out, _, _ = hp.merge_similar_haplotypes(haps, g, pi, w)
+    assert len(out) == 1, "identical haplotypes must still collapse"
+
+
+def test_window_merge_defers_one_difference_to_the_validator():
+    """Exactly ONE differing position is the validator's case, not the rate's."""
+    hp, haps, g, pi, w = _window_haps(pairs=1, n_invariant=100, depth=130)
+    haps[1].weight = 0.02          # 2% minor: below marker_min_frac
+    haps[0].weight = 0.98
+    out, _, _ = hp.merge_similar_haplotypes(haps, g, pi, w)
+    assert len(out) == 1, "a 1-SNV difference on a sub-threshold minor must merge"

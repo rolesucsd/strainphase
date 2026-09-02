@@ -2531,8 +2531,37 @@ class PostProcessor:
         if n_haps <= 1:
             return haplotypes, gamma, pi
 
-        # Precompute max allowed mismatches for early exit when comparing haplotypes.
-        max_mismatches = int(self.config.identity_distance * len(window.snv_pos)) + 1
+        # COMPARE OVER INFORMATIVE POSITIONS ONLY (2026-09-01).
+        #
+        # This used to compare over `window.snv_pos` - every called site in the window -
+        # and merge on the RATE n_diff / n_shared. The numerator is fixed by biology (two
+        # strains differ where they differ) but the denominator grows with depth, because
+        # more marginal sites clear the depth filters, and almost all of them are sites
+        # where both haplotypes AGREE. So the same true difference is diluted as coverage
+        # rises and the gate silently loosens.
+        #
+        # Measured on group4.seed2, window contig_1:280,001, truth 3 haplotypes:
+        #
+        #     depth   louvain  after_em  merged
+        #     cov50       3         3      1-2
+        #     cov100    3-4       3-4        1   (all six samples)
+        #
+        # Louvain and EM both recover the structure - Louvain finds MORE at cov100, not
+        # less - and this merge destroys it. Across the dataset, windows resolving >=2
+        # haplotypes fall 47.2% -> 16.2% -> 6.8% over cov20/50/100 against a truth of
+        # 22.4%.
+        #
+        # `link_windows` never had this problem: it filters to the marker set before
+        # comparing (see variable_marker_positions, whose docstring gives the reason -
+        # invariant positions "carry zero identity information, yet still inflate
+        # n_shared and dilute the mismatch rate"). This is the one comparison that was
+        # never updated. Filtering here is a COMPARISON-time concern only; nothing is
+        # pruned from any consensus, so wider-scope steps still see every position.
+        markers = variable_marker_positions(
+            (h.consensus for h in haplotypes), window.site_type, self.config
+        )
+        compare_positions = sorted(markers) if markers else list(window.snv_pos)
+        max_mismatches = None
 
         used = set()
         new_haplotypes = []
@@ -2549,14 +2578,25 @@ class PostProcessor:
                 if j in used:
                     continue
 
-                # OPTIMIZATION: Use early exit distance
-                dist, n_diff, n_shared = haplotypes[i].distance_to(
-                    haplotypes[j], window.snv_pos, max_mismatches
+                # TWO DIFFERENT QUESTIONS, so two different denominators.
+                #
+                # "Do these two overlap enough to be compared at all?" is about
+                # CO-SUPPORT and is asked over every called position - that is what
+                # min_shared_markers was calibrated against. Asking it over the
+                # informative positions alone would refuse any pair whose only
+                # informative site is the one they differ at, which is the commonest
+                # real case and would turn this into an over-splitter.
+                #
+                # "Are they the same entity?" is about IDENTITY and is asked only over
+                # the informative positions, where a difference means something.
+                _d, _nd, n_shared = haplotypes[i].distance_to(
+                    haplotypes[j], window.snv_pos, None
                 )
-
-                # Require minimum shared positions to consider merging
                 if n_shared < self.config.min_shared_markers:
                     continue
+                _d2, n_diff, _ns = haplotypes[i].distance_to(
+                    haplotypes[j], compare_positions, max_mismatches
+                )
 
                 # A SINGLE differing position is always adjudicated by the 1-SNV
                 # validator, never by the rate. The validator used to sit INSIDE the
@@ -2567,14 +2607,21 @@ class PostProcessor:
                 # far above identity_distance, so the pair was split without the
                 # count-based test that exists to judge it. Measured on 000089747_1
                 # contig_2: 1,174 of 1,864 one-SNV pairs (63%) never reached it.
-                if n_diff == 1:
+                # NO RATE. On informative positions a rate has no denominator to
+                # inflate and nothing to dilute it with: two haplotypes that agree
+                # everywhere they both call an informative site are one entity, one
+                # differing site is the case should_merge_1snp_pair exists to judge,
+                # and two or more differing informative sites is a real difference at
+                # any depth. This is the rule track_merge already applies across
+                # samples - byte-identity plus a 1-SNV guard - so the two now agree.
+                if n_diff == 0:
+                    group.append(j)
+                elif n_diff == 1:
                     if not self.should_merge_1snp_pair(
                         haplotypes[i], haplotypes[j], i, j, window, gamma,
                         n_timepoints_seen
                     ):
                         continue
-                    group.append(j)
-                elif dist <= self.config.identity_distance:
                     group.append(j)
 
             used.update(group)
