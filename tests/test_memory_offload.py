@@ -146,12 +146,10 @@ def test_the_fixture_actually_phases_something(dataset):
 
 
 def test_two_runs_of_the_same_config_are_bit_identical(dataset):
-    """The pipeline must be reproducible: same inputs, same config, same bits.
-
-    It was not, until both randomness sources were seeded - read subsampling above
-    max_reads_per_window (config.get_rng) and Louvain read clustering (random_state).
-    Before that, identical runs disagreed on abundance at ~1e-7 AND drew different reads
-    in any window above the cap, so a rerun of a published number would not reproduce it.
+    """The pipeline is reproducible: same inputs, same config, same bits. Both
+    randomness sources are seeded - read subsampling above ``max_reads_per_window`` and
+    Louvain read clustering - so identical runs no longer disagree on ``abundance`` or
+    draw different reads.
     """
     tmp, bams, vcfs = dataset
     _o1, _r1, a = _run(tmp, bams, vcfs, _cfg(), "repro_a")
@@ -194,14 +192,10 @@ def test_spill_directory_is_cleaned_up(dataset):
 
 
 def test_reads_are_released_after_the_run(dataset):
-    """The point of the exercise: once a MAG is done, no WindowResult should still be
-    pinning a read's PAYLOAD - the two position-keyed dicts that make a read expensive.
-
-    Released is not the same as gone. This asserted `len(window.reads) == 0` for a while,
-    which is a stricter thing than the offload exists to do and is wrong: a caller
-    scoring reads rather than haplotypes needs to know which read each gamma row is, and
-    with the list emptied every returned window read as "phased nothing". What must
-    survive is the id and the row order; what must not is `.alleles`.
+    """Once a MAG is done, no WindowResult still pins a read's payload - the
+    position-keyed dicts that make a read expensive. Released is not gone: the id and
+    gamma-row order must survive so a caller scoring reads can recover the partition;
+    only ``.alleles`` is dropped.
     """
     from strainphase.core import _ReadRef
 
@@ -229,17 +223,10 @@ def test_reads_are_released_after_the_run(dataset):
 
 
 def test_a_read_partition_can_still_be_built_from_the_returned_windows(dataset):
-    """REGRESSION (N1): the returned WindowResults ARE the read partition.
-
-    The post-rescue cleanup used to call offload_heavy() on the very objects it handed
-    back, so every returned window held zero reads against a gamma of 50-odd rows. A
-    caller scoring reads rather than haplotypes - which is what the benchmark's
-    longitudinal partition is - then saw nothing assigned and read as "phased nothing".
-    The failure looked like a bad score rather than like missing plumbing, because
-    single-sample mode never offloads and so never showed it.
-
-    This walks the return value the way such a caller does: gamma row i belongs to
-    window.reads[i], and its cluster is the winning column.
+    """The returned WindowResults are the read partition: gamma row i belongs to
+    ``window.reads[i]``, and its cluster is the winning column. The offload must not
+    strip the reads off the objects it hands back, or a caller scoring reads sees
+    nothing assigned.
     """
     tmp, bams, vcfs = dataset
     _out, results, _tables = _run(tmp, bams, vcfs, _cfg(spill_results_to_disk=True), "partition")
@@ -263,21 +250,16 @@ def test_a_read_partition_can_still_be_built_from_the_returned_windows(dataset):
 # ---------------------------------------------------------------------------
 # CLI wiring
 # ---------------------------------------------------------------------------
-# The tests above call process_mag_longitudinal directly, so they all passed while
-# `strainphase longitudinal` was in fact running with spilling DISABLED: cli.py's
-# cmd_longitudinal never forwarded output_dir, so _SpillStore.create fell back to
-# _NullSpill and every sample's reads stayed resident. Nothing caught it because
-# nothing exercised the console-script path. These tests do.
+# The tests above call process_mag_longitudinal directly, so they cannot see whether
+# `strainphase longitudinal` forwards output_dir: without it, _SpillStore falls back to
+# _NullSpill and every sample's reads stay resident. These tests exercise the
+# console-script path.
 
 
 def _run_cli(tmp_path, monkeypatch, extra):
-    """Drive the real `strainphase longitudinal ...` entry point and capture the kwargs
-    that reach process_mag_longitudinal.
-
-    Deliberately goes through cli.main rather than hand-building a Namespace: a
-    hand-built one silently drifts from the parser (it grows attributes the test does
-    not know about), and it would not catch an 'unrecognized arguments' failure at all -
-    which is precisely how --seed reached a cluster run before dying.
+    """Drive the real ``strainphase longitudinal`` entry point and capture the kwargs
+    that reach process_mag_longitudinal. Goes through ``cli.main`` rather than a
+    hand-built Namespace so it catches an 'unrecognized arguments' failure.
     """
     import strainphase.cli as cli
     import strainphase.longitudinal as L
@@ -309,12 +291,8 @@ def _run_cli(tmp_path, monkeypatch, extra):
 
 
 def test_longitudinal_subcommand_accepts_the_memory_and_seed_flags(tmp_path, monkeypatch):
-    """`strainphase longitudinal --seed ...` must not die with 'unrecognized arguments'.
-
-    cli.py's long_parser and longitudinal.py's parser are two hand-maintained arg lists
-    over one config; a flag added to only the second is accepted by
-    `python -m strainphase.longitudinal` and rejected by `strainphase longitudinal`.
-    That mismatch shipped --seed to a cluster run that died on it immediately.
+    """``strainphase longitudinal --seed ...`` must accept the memory and seed flags and
+    forward them into the shared config, not die with 'unrecognized arguments'.
     """
     seen = _run_cli(tmp_path, monkeypatch,
                     ["--seed", "7", "--window-batch-factor", "2",])
@@ -327,9 +305,9 @@ def test_longitudinal_subcommand_accepts_the_memory_and_seed_flags(tmp_path, mon
 def test_cmd_longitudinal_forwards_output_dir_so_spilling_is_actually_on(
     tmp_path, monkeypatch
 ):
-    """The regression that mattered: without output_dir the spill store is a no-op, so
-    every sample's reads stay resident and the OOM the spill work exists to prevent
-    comes straight back - with every unit test still green."""
+    """Without output_dir the spill store is a no-op, so every sample's reads stay
+    resident and the OOM the spill work prevents comes back. cmd_longitudinal must
+    forward output_dir."""
     seen = _run_cli(tmp_path, monkeypatch, [])
     assert seen.get("output_dir") == str(tmp_path / "OUTDIR"), (
         "cmd_longitudinal did not forward output_dir -> _SpillStore falls back to "
@@ -373,12 +351,9 @@ class _FakeRead:
 
 
 class _FakeWR:
-    """A stand-in for WindowResult with the shape _SpillStore actually reaches into.
-
-    The store goes through ``_detach_reads``, which reads ``wr.window.reads`` to build
-    the id-only stand-ins before calling ``offload_heavy``. A stub with a bare ``reads``
-    attribute and no ``window`` stopped modelling the collaborator the moment those
-    stand-ins existed, and would have gone on passing while the real store crashed.
+    """A stand-in for WindowResult with the shape ``_SpillStore`` reaches into. The store
+    reads ``wr.window.reads`` to build the id-only stand-ins before calling
+    ``offload_heavy``, so a stub with a bare ``reads`` attribute would not model it.
     """
 
     def __init__(self, reads):
@@ -442,11 +417,8 @@ def test_an_unreadable_spill_file_raises_rather_than_silently_dropping_reads(tmp
 
 
 def test_spill_leaves_id_only_stand_ins_and_round_trips_the_reads(tmp_path):
-    """Spilling releases the PAYLOAD and keeps the row correspondence.
-
-    This asserted `w.reads == []` after the offload, which is the behaviour that made
-    the returned partition empty. What the store owes the caller is the ids, in gamma
-    order, until the real reads come back over the top of them.
+    """Spilling releases the payload and keeps the row correspondence: the store owes
+    the caller the ids in gamma order until the real reads come back over them.
     """
     from strainphase.core import _ReadRef
     from strainphase.longitudinal import _SpillStore
@@ -472,11 +444,9 @@ def test_spill_leaves_id_only_stand_ins_and_round_trips_the_reads(tmp_path):
 
 
 def test_the_real_cli_actually_writes_spill_files(dataset, monkeypatch):
-    """End-to-end proof that spilling happens through `strainphase longitudinal`.
-
-    This is the test that would have caught cmd_longitudinal dropping output_dir: it
-    watches the spill directory being used during a real run rather than inspecting
-    kwargs. The directory is cleaned up on success, so the check hooks the write.
+    """End-to-end proof that spilling happens through ``strainphase longitudinal``. It
+    watches the spill directory being written during a real run rather than inspecting
+    kwargs, hooking the write since the directory is cleaned up on success.
     """
     import strainphase.longitudinal as L
 

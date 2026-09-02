@@ -1,15 +1,11 @@
 #!/usr/bin/env python3
-"""
-Longitudinal integration script for haplotyper v3.
+"""Longitudinal integration: phase each sample, rescue across timepoints, merge into lineages.
 
-This script:
-1. Runs haplotyping per contig, per sample (using haplotyper.process_contig)
-2. Performs cross-timepoint rescue of low-abundance haplotypes (LongitudinalIntegrator)
-3. Builds a lineage table by clustering similar haplotypes across samples
-4. Writes:
-   - lineages.tsv        (one row per (MAG, contig, window, sample, lineage))
-   - longitudinal_summary.tsv
-   - <sample>.rescued.tsv (per-sample haplotypes after rescue)
+Each contig is phased per sample (``process_contig``), low-abundance haplotypes are
+rescued from the other timepoints (``LongitudinalIntegrator``), and within-sample tracks
+are merged across samples into contig-spanning lineages (``build_lineages_from_tracks``).
+Deliverable tables: haplotypes.tsv, windows_within_sample.tsv, windows_across_samples.tsv,
+lineages.tsv (one row per (lineage, sample)); allele-disagreement diagnostics under tmp/.
 """
 
 from __future__ import annotations
@@ -45,12 +41,8 @@ from strainphase.window_groups import WindowHaplotype
 def _window_conditional_abundance(pi_vec, hap_idx: int) -> float | None:
     """Per-window abundance ``pi_k / (1 - pi_junk)``, or ``None`` when unmeasurable.
 
-    Returning ``None`` rather than ``0.0`` is the point. A window with no ``pi`` vector,
-    a short one, or one that is entirely junk (``pi_junk == 1``) has *no measurement* -
-    it is not a measurement of zero. Collapsing the two let a junk-dominated window
-    contribute a hard 0.0 carrying full window-read weight, and since the aggregate is a
-    weighted median (a selection operator, which returns one input verbatim) that
-    spurious 0.0 could be the value actually reported for the timepoint.
+    ``None`` (no ``pi`` vector, too short, or all-junk) marks absence of a measurement, kept
+    distinct from a measured zero so a junk-dominated window cannot report a spurious 0.
     """
     if pi_vec is None or len(pi_vec) <= hap_idx:
         return None
@@ -62,28 +54,18 @@ def _window_conditional_abundance(pi_vec, hap_idx: int) -> float | None:
 
 
 def _window_haplotype_id(sample_id: str, contig_id: str, window_start: int, h_idx: int) -> str:
-    """The step-0 haplotype id, ``sample_contig_windowstart_H<idx>``.
+    """The window-haplotype id, ``sample_contig_windowstart_H<idx>``.
 
-    ONE definition, because a second spelling of it is a silent no-op rather than a
-    mismatch anyone notices. The step-1 mismatch rows and the WindowHaplotype objects
-    step 3 vetoes against are built in different loops of build_window_tables, and while
-    those loops spelled the id differently - one pipe-separated and track-prefixed, the
-    other underscore-separated and window-keyed - the veto set could not match a single
-    member id, so the "a sample whose own reads disagree vetoes the join outright"
-    safeguard in the old cross-window chaining pass never once fired.
+    One definition, used by every loop in build_window_tables, so the step-1 mismatch rows
+    and the WindowHaplotype objects the merge vetoes against spell it identically and the
+    cannot-link set matches member ids. History: docs/design/longitudinal.md.
     """
     return f"{sample_id}_{contig_id}_{window_start}_H{h_idx}"
 
 
 def load_allowed_contigs(path: str) -> set[str]:
-    """
-    Load an optional contig filter file.
-
-    Expected formats:
-      - Simple 1-column file: each line is a contig name
-      - TSV with header containing a 'contig' column
-
-    Returns a set of contig IDs to keep.
+    """Load an optional contig filter file: a 1-column list of contig names, or a TSV with
+    a 'contig' header column. Returns the set of contig IDs to keep.
     """
     allowed: set[str] = set()
     with open(path) as f:
@@ -123,15 +105,8 @@ def load_allowed_contigs(path: str) -> set[str]:
 def parse_reference_contigs(
     fasta_path: str, allowed_contigs: set[str] | None = None
 ) -> dict[str, dict[str, int]]:
-    """
-    Parse reference .fai to get contig info grouped by MAG.
-
-    Headers are assumed to look like:
-        MAGNAME_contig_1
-        MAGNAME_contig_2
-        ...
-
-    If allowed_contigs is provided, only those contigs are kept.
+    """Parse reference .fai into contig lengths grouped by MAG. Headers are assumed to look
+    like ``MAGNAME_contig_1``; ``allowed_contigs``, if given, restricts which contigs are kept.
     """
     fai_path = fasta_path + ".fai"
     mags: dict[str, dict[str, int]] = defaultdict(dict)
@@ -165,18 +140,13 @@ def parse_reference_contigs(
 class _SpillStore:
     """Parks per-sample read lists on disk between the phasing pass and the rescue pass.
 
-    Only ``window.reads`` moves - see WindowResult.offload_heavy for why that is the
-    field worth moving and why the WindowResult objects themselves must stay resident.
-    An id-only stand-in is left in each read's place (``_detach_reads``) so the window
-    still knows which read each gamma row is.
+    Only ``window.reads`` moves; the WindowResult objects stay resident. An id-only stand-in
+    replaces each read (``_detach_reads``) so the window still knows which read each gamma row
+    is. Reads are spilled, not re-read from the BAM, because a re-drawn per-window subsample
+    could drift which haplotypes are called; round-tripping cannot (full reasoning: docs).
 
-    Reads are spilled rather than re-read from the BAM because re-deriving them would
-    have to reproduce the per-window subsample exactly (make_windows_lazy draws
-    max_reads_per_window with config.get_rng()); any drift there would silently change
-    which haplotypes are called. Round-tripping the objects cannot drift.
-
-    ``_NullSpill`` is the same interface with every method a no-op, used when spilling is
-    switched off or no output directory is available (tests, library callers).
+    ``_NullSpill`` is the same interface, every method a no-op, for when spilling is off or
+    no output directory is available (tests, library callers).
     """
 
     def __init__(self, root: str):
@@ -193,9 +163,8 @@ class _SpillStore:
         try:
             return _SpillStore(root)
         except OSError as e:
-            # Not a warning: the resource tiers are sized on the assumption that reads
-            # are spilled. Falling back to holding them all makes an OOM likely, so say
-            # so at ERROR rather than burying it in an INFO-level log.
+            # Logged at ERROR, not INFO: the resource tiers assume reads are spilled, so
+            # falling back to holding every sample's reads makes an OOM likely.
             logging.error(
                 f"Cannot create spill dir {root} ({e}); keeping every sample's reads in "
                 f"memory. Expect much higher peak memory and possible OOM."
@@ -205,12 +174,9 @@ class _SpillStore:
     def offload(self, sample_id: str, contig_map: dict[str, list]) -> None:
         """Detach and persist every contig's reads for one sample.
 
-        A failed write must NOT be shrugged off. offload_heavy() has already detached
-        the reads by the time the write is attempted, so silently continuing would leave
-        rescue running against read-less windows - which does not crash, it just quietly
-        produces different numbers. On a shared scratch filesystem a full disk is a
-        realistic event, so the reads go back into memory instead: the run then costs
-        more memory (the old behaviour) but stays correct.
+        Reads are already off the windows when the write is attempted, so a failed write
+        cannot be ignored: the reads go back into memory (``restore_heavy``) rather than
+        leave rescue running against read-less windows.
         """
         for contig_id, window_results in contig_map.items():
             payload = [_detach_reads(wr) for wr in window_results]
@@ -229,18 +195,17 @@ class _SpillStore:
                     if reads:
                         wr.restore_heavy(reads)
                 continue
-            # Registered only AFTER a successful write, so a key in _paths means
-            # "a file really is on disk" and restore() can treat a miss as an error.
+            # Registered only after a successful write, so a _paths key means the file really
+            # is on disk and restore() can treat a miss as an error.
             self._n += 1
             self._paths[(sample_id, contig_id)] = tmp_path
 
     def restore(self, sample_id: str, contig_id: str, window_results: list) -> None:
-        """Re-attach reads spilled for one sample+contig.
+        """Re-attach reads spilled for one sample+contig; raises rather than degrade.
 
-        Raises rather than degrading. If a spill file was written but cannot be read
-        back, the reads are gone and there is no correct way to continue: rescue would
-        run on empty windows and emit plausible-looking but wrong abundances. Failing
-        loudly is the only safe option.
+        A spill file written but unreadable means the reads are gone and there is no correct
+        way to continue - rescue would run on empty windows and emit wrong abundances - so
+        this fails loudly.
         """
         path = self._paths.get((sample_id, contig_id))
         if path is None:
@@ -306,28 +271,19 @@ def process_mag_longitudinal(
     sv_sidecar_paths: dict[str, str] | None = None,
     output_dir: str | None = None,
 ) -> tuple[dict[str, dict[str, list[WindowResult]]], LongitudinalIntegrator | None]:
-    """
-    Process a single MAG across all samples with longitudinal rescue.
-
-    Haplotypes are linked across windows after processing and after rescue.
+    """Process a single MAG across all samples with longitudinal rescue; windows are linked
+    after processing and after rescue.
 
     Reads are offloaded to ``<output_dir>/tmp/spill`` as each sample finishes
-    (config.spill_results_to_disk) and reloaded one sample at a time during rescue.
-    Without that, every sample's reads stay resident until the whole MAG is done, which
-    on a 146-sample variant-dense MAG is what runs the job out of memory. Gamma is ~1000x
-    smaller and stays resident throughout. The WindowResult objects themselves stay in RAM
-    too - the rescue panel holds references to their Haplotype objects and mutates weights
-    in place, so they must not be replaced.
+    (config.spill_results_to_disk) and reloaded one at a time during rescue, so not every
+    sample's reads are resident at once (what OOMs a variant-dense MAG). The WindowResult
+    objects stay in RAM - the rescue panel mutates their Haplotype weights in place, so they
+    must not be replaced. Memory measurements: docs/design/longitudinal.md.
 
-    Returns:
-        Tuple of:
-        - {sample_id: {contig_id: [WindowResult, ...]}}
-        - LongitudinalIntegrator instance (or None if single timepoint)
-
-    The returned windows carry ``_ReadRef`` stand-ins rather than Read objects wherever
-    the alleles have been released: ``window.reads[i].id`` still names the read gamma row
-    ``i`` describes, which is what a caller scoring the read partition needs, but the
-    alleles are gone and must not be read.
+    Returns ``({sample_id: {contig_id: [WindowResult, ...]}}, LongitudinalIntegrator or None
+    if single timepoint)``. The returned windows carry ``_ReadRef`` stand-ins, not Read objects,
+    wherever alleles were released: ``window.reads[i].id`` still names the read gamma row it
+    describes, but the alleles are gone.
     """
     mag_label = mag_name or "<unknown>"
     logging.info(
@@ -335,12 +291,10 @@ def process_mag_longitudinal(
     )
 
     # ------------------ First pass: per-sample EM haplotyping ------------------
-    # (process_contig now includes window linking)
     all_results: dict[str, dict[str, list[WindowResult]]] = {}
 
-    # Build one worker pool for the whole MAG run so we don't pay spawn /
-    # re-import / config-pickling cost per contig. Workers are initialized
-    # once with `config`; process_contig forwards `pool` and uses it directly.
+    # One worker pool for the whole MAG run, so spawn / re-import / config-pickling cost is
+    # paid once, not per contig; process_contig forwards `pool` and uses it directly.
     n_workers = max(1, getattr(config, "n_workers", 1))
     worker_pool = make_worker_pool(n_workers, config) if n_workers > 1 else None
 
@@ -368,7 +322,6 @@ def process_mag_longitudinal(
                 if results:
                     all_results[sample_id][contig_id] = results
                     n_haps = sum(len(wr.haplotypes) for wr in results)
-                    # Count unique tracks
                     track_ids = {h.track_id for wr in results for h in wr.haplotypes if h.track_id}
                     logging.debug(
                         f"    {contig_id}: {len(results)} windows, {n_haps} haplotypes, "
@@ -388,7 +341,6 @@ def process_mag_longitudinal(
         integrator = LongitudinalIntegrator(config)
 
         for contig_id in mag_contigs.keys():
-            # Collect results for this contig across samples
             results_by_timepoint: dict[str, list[WindowResult]] = {}
             for sample_id in samples:
                 sample_contigs = all_results.get(sample_id, {})
@@ -396,11 +348,10 @@ def process_mag_longitudinal(
                     results_by_timepoint[sample_id] = sample_contigs[contig_id]
 
             if len(results_by_timepoint) >= 2:
-                # Diagnostic: log window counts and junk statistics before rescue
+                # Diagnostic: window counts and junk stats before rescue
                 n_windows_per_sample = {s: len(wrs) for s, wrs in results_by_timepoint.items()}
                 total_haps = sum(len(wr.haplotypes) for wrs in results_by_timepoint.values() for wr in wrs)
 
-                # Count junk reads across all windows
                 total_reads = 0
                 total_junk_reads = 0
                 for wrs in results_by_timepoint.values():
@@ -417,10 +368,9 @@ def process_mag_longitudinal(
                     f"haplotypes={total_haps}, junk_reads={total_junk_reads}/{total_reads} ({junk_pct:.1f}%)"
                 )
 
-                # Apply rescue. One sample is resident at a time: every OTHER sample
-                # contributes only its haplotypes to the anchor panel, which survives
-                # offloading. Iteration order matches the all-at-once call, so the
-                # in-place weight updates propagate through the panel identically.
+                # Rescue one resident sample at a time: every other sample contributes only its
+                # haplotypes to the anchor panel, which survives offloading. Iteration order
+                # matches the all-at-once call, so in-place weight updates propagate identically.
                 for sample_id in samples:
                     originals = results_by_timepoint.get(sample_id)
                     if originals is None:
@@ -431,35 +381,26 @@ def process_mag_longitudinal(
                     )
                     window_results = rescued.get(sample_id)
                     if window_results is not None:
-                        # Re-link windows, because rescue may have added haplotypes. This
-                        # is the second link_windows call on these objects; it resets
-                        # link_mismatches itself, so the rows are re-derived rather than
-                        # duplicated.
+                        # Re-link, since rescue may have added haplotypes. This second
+                        # link_windows resets link_mismatches, so rows are re-derived, not doubled.
                         all_results[sample_id][contig_id] = link_windows(window_results, config)
-                    # `results_by_timepoint` deliberately keeps pointing at the PRE-rescue
-                    # objects, so later samples see the same panel the all-at-once call
-                    # gave them: weights mutated in place, newly rescued haplotypes not
-                    # yet included. Their read ALLELES are finished with - the panel needs
-                    # only haplotypes - so release them for good rather than re-spilling.
-                    # The ids stay: a rescued WindowResult wraps the SAME Window object,
-                    # so emptying it outright handed the caller a window with zero reads
-                    # against a full gamma, i.e. an empty read partition.
+                    # results_by_timepoint keeps pointing at the PRE-rescue objects, so later
+                    # samples see the same panel (weights mutated in place). Read alleles are done
+                    # with, so release them - but the ids stay: the rescued WindowResult wraps the
+                    # SAME Window, so emptying it would hand back zero reads against a full gamma.
                     for wr in originals:
                         _detach_reads(wr)
-                    # Those rescued results share that Window, so they already hold the
-                    # stand-ins and only their own flag has to agree. Deliberately NOT
-                    # offload_heavy(), which would also clear `assignments` - the one
-                    # place --keep-read-assignments' output survives the rescue pass.
+                    # These share that Window, so already hold the stand-ins; only their flag
+                    # must agree. NOT offload_heavy(), which would clear `assignments` - the one
+                    # place --keep-read-assignments output survives the rescue pass.
                     for wr in all_results[sample_id].get(contig_id, ()):
                         wr.heavy_offloaded = True
                     spill.discard(sample_id, contig_id)
 
-        # Log rescue statistics
         n_rescued = sum(1 for s in integrator.rescue_statistics if s.was_rescued)
         n_total = len(integrator.rescue_statistics)
         logging.info(f"  Rescue completed: {n_rescued}/{n_total} haplotypes rescued")
 
-    # Log integrator status for debugging
     if integrator:
         logging.info(f"  Returning integrator with {len(integrator.rescue_statistics)} statistics records")
     else:
@@ -469,8 +410,8 @@ def process_mag_longitudinal(
         worker_pool.close()
         worker_pool.join()
 
-    # Anything still parked (contigs that never entered rescue, single-timepoint runs)
-    # is finished with - the output tables need haplotypes and gamma, not reads.
+    # Anything still parked (contigs that never entered rescue, single-timepoint runs) is done
+    # with - the output tables need haplotypes and gamma, not reads.
     spill.cleanup()
 
     return all_results, integrator
@@ -483,26 +424,17 @@ def _group_marker_span(group) -> tuple[int, int]:
 
 
 def _median_member_span(group) -> float:
-    """Median marker span of the INDIVIDUAL members.
-
-    Distinguishes a group whose members each cover the whole window from one where every
-    member covers a sliver and only the union looks wide - which is the difference between
-    a haplotype that can chain into the next window and one that cannot.
+    """Median marker span of the INDIVIDUAL members, distinguishing a group whose members
+    each cover the window from one where only the union looks wide (can chain vs cannot).
     """
     spans = sorted(max(m.consensus) - min(m.consensus) for m in group.members if m.consensus)
     return float(spans[len(spans) // 2]) if spans else 0.0
 
 
 def _read_counts(wr) -> tuple[int, int]:
-    """``(resolved, junk)`` reads in this window. One definition, used everywhere.
-
-    Both are reported because the choice of denominator is a real one and should not be
-    baked in. Dividing by RESOLVED reads alone answers "of the reads that phased, what
-    share is this haplotype" - which renormalises away the fact that a window where 10%
-    of reads resolved is far weaker evidence than one where 90% did. Including junk
-    answers "what share of the reads at this locus is this haplotype", which degrades
-    gracefully instead: a poorly-resolving window pulls the estimate down rather than
-    being silently rescaled up to look like a good one.
+    """``(resolved, junk)`` reads in this window. One definition, used everywhere; both are
+    returned because the denominator choice matters (junk lets a poorly-resolving window
+    pull the estimate down rather than renormalise it away).
     """
     n = getattr(wr, "n_reads_examined", len(wr.window.reads))
     if wr.gamma is None or wr.gamma.size == 0:
@@ -512,13 +444,10 @@ def _read_counts(wr) -> tuple[int, int]:
 
 
 def _lineage_rows(lineages, mag_name: str) -> list[dict]:
-    """ONE row per (lineage, sample) - the grain where identity, abundance and membership
-    all fit in a single table.
-
-    Lineage-level fields repeat down the rows; ``abundance`` is that sample's POOLED
-    estimate (Sum reads / Sum denominator over the windows this lineage occupies in that
-    sample, never an average of per-window ratios); ``haplotype_ids`` lists that sample's
-    members so the row joins straight back to haplotypes.tsv.
+    """One row per (lineage, sample): the grain where identity, abundance and membership fit
+    one table. Lineage-level fields repeat down the rows. ``abundance`` is that sample's
+    pooled estimate (sum reads / sum denominator over the lineage's windows in the sample,
+    never an average of per-window ratios); ``haplotype_ids`` joins the row back to haplotypes.tsv.
     """
     rows: list[dict] = []
     for lin in lineages:
@@ -558,13 +487,11 @@ def _lineage_rows(lineages, mag_name: str) -> list[dict]:
 
 
 def _write_read_assignments(rows: list[dict], output_dir: str) -> None:
-    """PROTOTYPE dump: per-window read->haplotype assignments -> tmp/window_read_assignments.tsv.
+    """Prototype dump: per-window read->haplotype assignments to tmp/window_read_assignments.tsv.
 
-    One row per assigned read
-    per window: (sample, contig, window_start, window_end, read_id, hap_id, prob, is_junk,
-    is_ambiguous). ``hap_id`` is the same global window-haplotype id as haplotypes.tsv, so
-    a reader spanning two windows appears as two rows sharing ``read_id`` with different
-    ``hap_id`` - the raw material for a read-overlap stitcher.
+    One row per assigned read per window; ``hap_id`` is the global window-haplotype id, so a
+    read spanning two windows appears as two rows sharing ``read_id`` - raw material for a
+    read-overlap stitcher. Columns: docs/design/longitudinal.md.
     """
     import csv as _csv
 
@@ -588,56 +515,23 @@ def build_window_tables(
 ) -> tuple[
     list[dict], list[dict], list[dict], list[dict], list[dict], dict[str, int], list[dict]
 ]:
-    """Build the window-level tables plus the recorded cross-sample comparisons.
+    """Build the window-level tables and the lineages, plus the recorded mismatches.
 
     Returns ``(haplotypes, windows_within_sample, windows_across_samples, edges,
-    within_mismatches, edge_counts, lineages)``:
-
-    ``haplotypes``
-        One row per haplotype per window per sample. The raw unit; no merging applied.
-
-    ``windows_within_sample``
-        Windows merged WITHIN one sample, across windows - the ``link_windows`` output
-        (the "horizontal" axis). One row per (sample, contig, entity).
-
-    ``windows_across_samples``
-        Windows merged ACROSS samples at ONE FIXED window - the "vertical" axis. One row
-        per (contig, window, group).
-
-    ``edges``
-        Every cross-sample comparison that was attempted, passed or failed, with the
-        reason. ``failed_no_evidence`` (a dropout) and ``failed_mismatch`` (a genuine
-        genotypic difference, i.e. a candidate recombination breakpoint) must stay
-        distinguishable; a discarded comparison cannot be told apart from one never made.
-
-    ``within_mismatches``
-        The step-1 rows where one sample's own reads disagreed across a window boundary.
-        They are also step 3's veto set, which is why they carry the same haplotype ids
-        as the rows above.
-
-    ``edge_counts``
-        Attempted continuations tallied by reason, for the run log.
-
-    ``lineages``
-        One row per (lineage, sample), produced here whenever lineages were built
-        is set - which it is by default. It is built in this function rather than by a
-        separate driver because everything step 3 needs is already in memory: the groups,
-        the contig-wide marker set, and step 1's mismatch verdicts.
+    within_mismatches, edge_counts, lineages)``. ``within_mismatches`` doubles as the merge's
+    cannot-link set, carrying the same haplotype ids as the haplotype rows; ``edges`` is empty
+    under the merged pipeline. Per-table field semantics: docs/design/longitudinal.md.
     """
     haplotype_rows: list[dict] = []
     within_rows: list[dict] = []
     window_haps: list[WindowHaplotype] = []
     site_type_all: dict[int, str] = {}
     within_mismatch_rows: list[dict] = []
-    # {frozenset(haplotype_a, haplotype_b): {samples that refused it}} - step 1's
-    # abundance verdicts, propagated rather than recomputed downstream.
+    # {frozenset(hap_a, hap_b): {samples that refused it}} - step 1's abundance verdicts, propagated not recomputed.
     step1_abundance_refusals: dict[frozenset, set] = defaultdict(set)
     mag_of_contig: dict[str, str] = {}
-    # PROTOTYPE (read-anchored threading experiment): per-window read->haplotype
-    # assignments. This is the
-    # one thing no existing table carries and it is what a read-overlap stitcher needs -
-    # which physical read landed in which within-window haplotype, so reads spanning a
-    # window boundary can tie two haplotypes together directly instead of via consensus.
+    # Prototype (read-anchored threading): per-window read->haplotype assignments - the only record
+    # of which physical read landed in which within-window haplotype (input to a read-overlap stitcher).
     read_assignment_rows: list[dict] = []
 
     for mag_name, mag_results in all_results.items():
@@ -647,11 +541,9 @@ def build_window_tables(
                 # Group by the within-sample entity id assigned by link_windows.
                 entities: dict[str, list[tuple[WindowResult, Haplotype, int]]] = defaultdict(list)
 
-                # Step-1 mismatches, resolved through the SAME id helper the haplotype
-                # rows and the WindowHaplotype objects use below, so they join back to
-                # haplotypes.tsv and so step 3's veto set speaks the members' language.
-                # Only genuine allele disagreements are here; dropouts are not recorded
-                # (see WindowResult.link_mismatches).
+                # Step-1 mismatches resolved through the same id helper as the haplotype rows below,
+                # so they join back to haplotypes.tsv and the cannot-link set speaks the members'
+                # ids. Only allele disagreements, not dropouts (see link_mismatches).
                 by_start = {wr.window.start: wr for wr in window_results}
 
                 def _hid(win_start: int, h_idx: int, _bs=by_start,
@@ -662,8 +554,8 @@ def build_window_tables(
                     return _window_haplotype_id(_s, _c, win_start, h_idx)
 
                 for wr in window_results:
-                    # Step-1 abundance refusals, keyed the same way as the mismatch rows
-                    # so step 3 can consult one veto set without re-testing anything.
+                    # Step-1 abundance refusals, keyed like the mismatch rows so the merge
+                    # consults one cannot-link set without re-testing anything.
                     for m in getattr(wr, "link_abundance_refusals", []):
                         a = _hid(m["window_a"], m["hap_a_idx"])
                         b = _hid(m["window_b"], m["hap_b_idx"])
@@ -692,24 +584,20 @@ def build_window_tables(
                     n_junk_w = int((wr.gamma[:, junk_col] >= 0.5).sum())
                     nonjunk = n_reads_w - n_junk_w
 
-                    # Read ids per within-window haplotype index, for read-overlap
-                    # threading (step 3). Built once per window and only when that
-                    # linker is on, so a normal run neither builds nor retains it.
+                    # Read ids per within-window haplotype index, for the threading prototype.
+                    # Built only when that linker is on, so a normal run neither builds nor keeps it.
                     reads_by_hidx: dict[int, set] = {}
                     for a in getattr(wr, "assignments", None) or []:
-                        # best_hap, not hap_id: the argmax haplotype even when the
-                        # posterior is below assign_confidence_threshold. Linking
-                        # asks whether the same molecule is in both windows, which
-                        # does not need the read's haplotype called confidently -
-                        # and near-identical strains leave most reads ambiguous.
+                        # best_hap, not hap_id: the argmax even below assign_confidence_threshold.
+                        # Linking asks only whether the same molecule is in both windows, which
+                        # near-identical strains leave ambiguous - no confident call needed.
                         k = a.get("best_hap", a.get("hap_id"))
                         if k is None:
                             continue
                         reads_by_hidx.setdefault(int(k), set()).add(a.get("read_id"))
 
-                    # PROTOTYPE dump: one row per assigned read in this window. hap_id is
-                    # the GLOBAL window-haplotype id (same scheme as haplotypes.tsv), blank
-                    # for junk/ambiguous reads.
+                    # PROTOTYPE dump: one row per assigned read; hap_id is the global
+                    # window-haplotype id (as haplotypes.tsv), blank for junk/ambiguous reads.
                     for a in getattr(wr, "assignments", None) or []:
                         k = a.get("hap_id")
                         read_assignment_rows.append({
@@ -733,17 +621,8 @@ def build_window_tables(
                         })
 
                     for h_idx, hap in enumerate(wr.haplotypes):
-                        # Haplotypes with no CONFIDENT read are emitted too, with reads=0.
-                        # supporting_reads counts gamma[:, k] >= assign_confidence_threshold
-                        # (0.90); nothing prunes a haplotype on read support, so a real
-                        # mixture component can hold pi weight and still have every one of
-                        # its reads sitting at gamma 0.6-0.89 - two strains agreeing on all
-                        # but a couple of markers at ~10x depth do exactly that. Skipping
-                        # them kept them out of EVERY table, and since `abundance` below is
-                        # pi_k / (1 - pi_junk), which sums to 1 over all k by construction,
-                        # the published abundances then summed to less than 1 with no
-                        # residual column and no log line - a reader could not tell mass
-                        # was missing. Emitting the row is what makes the window audit.
+                        # Haplotypes with no confident read are emitted too, at reads=0, so the
+                        # per-window abundances (pi_k/(1-pi_junk)) still sum to 1. Why: docs.
                         raw_eid = hap.track_id or f"unlinked_{wr.window.start}"
                         eid = f"{sample_id}_{contig_id}_{raw_eid}"
                         entities[eid].append((wr, hap, h_idx))
@@ -751,29 +630,17 @@ def build_window_tables(
                         abundance = _window_conditional_abundance(
                             getattr(wr, "pi", None), h_idx
                         )
-                        # UNIFORM ID SCHEME (author's, 2026-07-28). Every id carries the
-                        # scope it is unique within, so no id needs a companion column to
-                        # be a key:
-                        #   step 0  haplotype  sample_contig_window_H<idx>
-                        #   step 1  track      sample_contig_T<idx>
-                        #   step 2  group      contig_window_H<idx>
-                        # Nothing here restarts per scope the way the raw counters do -
-                        # link_windows assigns track_id per (sample, contig), so bare
-                        # "T0001" recurred in every sample AND every contig, and joining
-                        # on it inflated haplotypes.tsv x windows_within_sample.tsv 94x.
+                        # Uniform id scheme: sample_contig_window_H<idx> here, sample_contig_T<idx>
+                        # for tracks, contig_window_H<idx> for groups; the scope prefix makes each
+                        # id a unique key with no companion column. Why (bare "T0001" recurred): docs.
                         hap_id = _window_haplotype_id(
                             sample_id, contig_id, wr.window.start, h_idx
                         )
                         consensus_str = "|".join(
                             f"{p}:{b}" for p, b in sorted(hap.consensus.items())
                         )
-                        # Footprint the haplotype's MARKERS actually occupy, as distinct
-                        # from the window tile it sits in. A haplotype can carry 3 markers
-                        # across 200 bp inside a 20 kb window, and reporting only the tile
-                        # makes that indistinguishable from one spanning the whole window.
-                        # That distinction is what separates "linking failed" from "there
-                        # was no variation here to link on" - the latter is a fact about
-                        # the biology, not a defect.
+                        # Marker footprint the haplotype occupies, distinct from its window tile
+                        # (3 markers across 200 bp in a 20 kb window): "linking failed" vs "no variation".
                         if hap.consensus:
                             hap_start = min(hap.consensus)
                             hap_end = max(hap.consensus)
@@ -818,11 +685,9 @@ def build_window_tables(
                                 total_reads=nonjunk,
                                 junk_reads=n_junk_w,
                                 abundance=abundance if abundance is not None else float("nan"),
-                                # Step 1's chain id. Step 3 votes on this to join two
-                                # window groups; without it every edge is
-                                # `failed_no_votes` and NO lineage can span more than a
-                                # single window. It was written to the TSV above but
-                                # never onto the object step 3 actually reads.
+                                # Step 1's chain (track) id: the merge groups window-haplotypes
+                                # by it, so without it a haplotype is its own track and no lineage
+                                # spans more than one window. Set on the object the merge reads.
                                 within_sample_id=eid,
                                 read_ids=frozenset(reads_by_hidx.get(h_idx, ())),
                             )
@@ -853,31 +718,20 @@ def build_window_tables(
                             "hap_end": he,
                             "hap_span_bp": he - hs,
                             "n_markers": len(set(mpos)),
-                            # POOLED READ COUNTS, not an average of per-window ratios.
-                            # Sum(supporting) / Sum(non-junk) over the track's windows is
-                            # a proper pooled estimate; a mean or median of the per-window
-                            # abundances is not, because each window has its own
-                            # denominator (median 9 non-junk reads, varying ~4x across one
-                            # sample's windows) and 46% of windows hold a single haplotype
-                            # whose abundance is 1.000 by construction.
-                            #
-                            # CAVEAT: adjacent windows overlap by 50%, so a read spanning
-                            # the overlap is counted in both. Numerator and denominator
-                            # inflate together so the ratio holds, but the overlap region
-                            # is effectively double-weighted.
+                            # Pooled read counts, not an average of per-window ratios:
+                            # Sum(supporting)/Sum(non-junk) over the track's windows, since each
+                            # window has its own denominator. Caveat: adjacent windows overlap
+                            # 50%, so a read in the overlap is counted in both - the ratio holds
+                            # but the overlap is double-weighted.
                             "reads": track_reads,
                             "total_reads": track_total,
                             "junk_reads": track_junk,
-                            # share of the reads that PHASED (renormalises away how much
-                            # of the window resolved)
+                            # share of the reads that PHASED (renormalises away how much of the window resolved)
                             "abundance": (track_reads / track_total) if track_total else float("nan"),
-                            # share of ALL reads at these loci - does not hide a window
-                            # where most reads went to junk
+                            # share of ALL reads at these loci - does not hide a window where most went to junk
                             "abundance_all_reads": (track_reads / track_all) if track_all else float("nan"),
-                            # The SAME id as haplotypes.tsv, so the member list joins
-                            # back directly. It previously used the track-prefixed form,
-                            # which matched nothing in that table; it now comes from the
-                            # one helper, so it cannot drift again.
+                            # Same id as haplotypes.tsv (one id helper), so the member list
+                            # joins back directly and cannot drift from that table.
                             "haplotype_ids": ",".join(
                                 _window_haplotype_id(sample_id, contig_id, wr.window.start, i)
                                 for wr, _, i in members
@@ -885,11 +739,8 @@ def build_window_tables(
                         }
                     )
 
-    # ---- IDENTITY MARKERS: computed ONCE, here, and used by BOTH steps 2 and 3 ----
-    # They were previously derived twice, at different scopes - step 2 over every
-    # window-haplotype on the contig, step 3 over the members of the groups it had been
-    # handed - so the two steps could disagree about which positions were even
-    # comparable. One set, one definition, one place.
+    # Identity markers, computed once here per contig, so the comparable-position set the merge
+    # uses is consistent across the whole contig.
     markers_by_contig: dict[str, frozenset[int]] = {}
     for contig_id_ in {h.contig for h in window_haps}:
         markers_by_contig[contig_id_] = supported_marker_positions(
@@ -897,30 +748,18 @@ def build_window_tables(
              for h in window_haps if h.contig == contig_id_),
             site_type_all, config)
     logging.info(
-        "  identity markers (read-supported, shared by steps 2 and 3): "
+        "  identity markers (read-supported): "
         + ", ".join(f"{c}: {len(m)}" for c, m in sorted(markers_by_contig.items())))
 
-    # ---- steps 2+3, MERGED: tracks across samples become lineages directly ----
-    #
-    # Cross-sample window grouping and cross-window chaining used to be two passes over
-    # different units. That split one question - "are these the same strain?" - in a way
-    # that created three structural problems (see strainphase.track_merge): two groups at
-    # one window were never comparable, 78% of chaining comparisons could not be judged
-    # at all, and the repair for the resulting shattering had to run last or be undone.
-    #
-    # A step-1 track is already a within-sample chain built from that sample's own reads,
-    # and is not chimeric in practice, so the only work left is merging tracks ACROSS
-    # samples - one clustering, on byte-for-byte identity over the shared marker set.
+    # Merge tracks across samples into lineages. A step-1 track is already a within-sample
+    # chain from that sample's reads and is not chimeric in practice, so the only work left
+    # is one clustering on byte-for-byte identity over the shared markers (see track_merge).
     lineage_rows: list[dict] = []
     groups: list = []
     edges: list = []
     edge_counts: Counter = Counter()
-    # Step 1's own refusals become cannot-link between the TRACKS holding those
-    # haplotypes. Both verdicts carry: a genuine allele disagreement and an
-    # incompatible within-sample share are equally reasons two things are not one
-    # strain. Byte-identity already refuses anything that disagrees where both
-    # called, so these bind on a looser pass rather than this one - they are wired
-    # now so the constraint is not lost when that pass is added.
+    # Step 1's refusals become cannot-link between the tracks holding those haplotypes (an allele
+    # disagreement or an incompatible within-sample share both mean not-one-strain); never merged.
     hap_track: dict[str, tuple[str, str]] = {
         h.haplotype_id: (h.sample, h.within_sample_id)
         for h in window_haps if h.within_sample_id
@@ -944,14 +783,12 @@ def build_window_tables(
         lins = build_lineages_from_tracks(
             chaps, config, markers=markers_by_contig.get(contig_id_, frozenset()),
             cannot_link=cannot_link, lineage_prefix=f"{contig_id_}_LIN")
-        # The per-window groups a lineage was split back into ARE the across-sample
-        # grouping now, so windows_across_samples.tsv keeps describing what it always
-        # described: which samples' haplotypes were judged one entity at one window.
+        # The per-window groups within each lineage ARE the across-sample grouping now, so
+        # windows_across_samples.tsv reports which samples were judged one entity at a window.
         groups.extend(g for lin in lins for g in lin.groups)
         lineage_rows.extend(_lineage_rows(lins, mag_of_contig.get(contig_id_, "")))
 
-    # PROTOTYPE: dump per-window read->haplotype assignments for the read-anchored
-    # threading (also the input a future linker experiment would need).
+    # PROTOTYPE: dump per-window read->haplotype assignments for the read-anchored threading.
     if read_assignment_rows:
         _write_read_assignments(read_assignment_rows, output_dir)
 
@@ -975,7 +812,8 @@ def build_window_tables(
             }
         )
 
-    # `edges` now holds ONLY mismatches - the other outcomes are counted, not stored.
+    # `edges` is empty under the merged pipeline; the cross-sample comparison log the
+    # old two-pass design produced is no longer generated.
     edge_rows = [
         {
             "contig": e.contig,
@@ -1005,14 +843,12 @@ def write_window_tables(
     within_mismatch_rows: list[dict] | None = None,
     lineage_rows: list[dict] | None = None,
 ) -> dict[str, str]:
-    """Write the window-level tables, plus the two MISMATCH tables.
+    """Write the window-level tables, plus the two mismatch tables.
 
-    A link that was not made for lack of shared markers is a measurement hole and is not
-    reported - there is nothing to say about it, and at cohort scale those rows are what
-    made the full comparison log unaffordable. A link that was not made because the
-    alleles genuinely DISAGREE is a finding: a candidate recombination breakpoint, and
-    the one negative the merge rules treat as absolute. Those are written, from both
-    linking steps.
+    A link not made for lack of shared markers is a measurement hole and is not reported; a
+    link not made because the alleles disagree is a finding (a candidate recombination
+    breakpoint, the negative the merge treats as absolute) and is written. The within-sample
+    mismatches carry these; the across-sample table is empty under the merged pipeline.
     """
     import csv as _csv
 
@@ -1021,13 +857,10 @@ def write_window_tables(
     os.makedirs(tmp_dir, exist_ok=True)
     written: dict[str, str] = {}
 
-    # The FULL comparison log is still not written: it was ~144 MB for a single MAG
-    # (1.27M rows), ~30 GB across a 233-MAG cohort, and almost all of it is
-    # failed_no_evidence. Only the mismatches are kept - 11% of rows on 000089747_1.
-    # DELIVERABLES in output_dir; DIAGNOSTICS in output_dir/tmp beside the run they
-    # describe, so they are findable and cleanable and cannot collide between concurrent
-    # runs. The mismatch tables are diagnostics: they carry the cannot-link constraints
-    # step 3 consumes internally, and at 2.3M rows for one MAG they are not a deliverable.
+    # The full comparison log is not written (almost all failed_no_evidence; sizes in docs).
+    # Deliverables go in output_dir; diagnostics in output_dir/tmp beside the run, so they
+    # are findable, cleanable and cannot collide between concurrent runs. The mismatch tables
+    # are diagnostics carrying the cannot-link constraints, not a deliverable.
     tables = [
         ("haplotypes.tsv", haplotype_rows, output_dir),
         ("windows_within_sample.tsv", within_rows, output_dir),

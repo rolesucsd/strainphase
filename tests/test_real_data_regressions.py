@@ -77,9 +77,9 @@ def test_upey_fixture_documents_the_redundancy():
 @pytest.mark.xfail(strict=True, reason=(
     "Known defect: one strain at the upeY locus is reported as four lineages "
     "(LIN000290/284/285/286 on 000089747_1). They are >=98% identical, span the "
-    "same ~1.37-1.41 Mb interval and share 14-32 samples each. Nothing merges "
-    "lineages that occupy the same windows, and step-2 grouping had already "
-    "split them. Flip to a plain assert when same-window merging lands."))
+    "same ~1.37-1.41 Mb interval and share 14-32 samples each. The cross-sample "
+    "track merge leaves them separate, and nothing re-merges lineages that occupy "
+    "the same windows. Flip to a plain assert when same-window merging lands."))
 def test_upey_should_be_one_lineage():
     """No two reported lineages should be this similar, co-located and co-occurring."""
     lin = _load_lineages("bfragilis_upey_lineages.tsv.gz")
@@ -110,7 +110,7 @@ UPAY_SWEEP_NEW_SAMPLES = 5
 @pytest.mark.xfail(strict=True, reason=(
     "Known defect: a sweeping strain (old LIN000088, upaY) survives with its "
     "identity intact (99.88% over 859 markers) but is reported in 5 of its 35 "
-    "timepoints, because step-2 grouped only 5 samples' haplotypes together. A "
+    "timepoints, because the cross-sample merge groups only 5 samples' tracks. A "
     "sweep cannot be seen from 14% of its observations. No fix has landed yet, "
     "so this records the target rather than a reproduction."))
 def test_sweeping_strain_retains_its_timepoints():

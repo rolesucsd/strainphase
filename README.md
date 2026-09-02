@@ -7,12 +7,14 @@
 
 ## Overview
 
-Strainphase reconstructs distinct bacterial haplotypes (strain-specific SNV patterns) from mixed metagenomic reads. It uses a hybrid approach combining:
-
-1. **Graph-based initialization** - Louvain clustering of read overlap networks
-2. **Probabilistic EM refinement** - Quality-weighted soft assignments
-3. **Window linking** - Track assembly across overlapping genomic windows
-4. **Longitudinal rescue** - Cross-timepoint detection of low-abundance strains
+Strainphase phases strain-resolved haplotypes from PacBio HiFi metagenomes. It
+divides each genome into overlapping windows and, within each window, clusters
+reads that share alleles into candidate haplotypes, refines them with a
+quality-weighted expectation–maximization model, and links haplotypes across
+windows and timepoints into contig-spanning lineages. Indels and structural
+variants are phased as alleles rather than discarded, and low-abundance
+haplotypes below single-timepoint detection are recovered from the other
+timepoints. It resolves intra-strain lineages differing by less than 0.5%.
 
 ## Installation
 
@@ -22,7 +24,7 @@ cd strainphase
 pip install -e .
 ```
 
-**Dependencies:** `numpy`, `scipy`, `networkx`, `pandas`, `python-louvain`, `pysam`
+**Dependencies:** `numpy`, `scipy`, `networkx`, `python-louvain`, `pysam`
 
 ## Quick Start
 
@@ -153,19 +155,14 @@ Options:
 ## Algorithm Overview
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│ 1. INPUT: BAM + VCF → Overlapping windows (50% step)       │
-├─────────────────────────────────────────────────────────────┤
-│ 2. GRAPH: Build read overlap network → Louvain clustering   │
-├─────────────────────────────────────────────────────────────┤
-│ 3. EM: E-step (γ responsibilities) ↔ M-step (π, consensus) │
-├─────────────────────────────────────────────────────────────┤
-│ 4. POST: Merge similar haplotypes, validate 1-SNP diffs    │
-├─────────────────────────────────────────────────────────────┤
-│ 5. LINK: Connect haplotypes across windows → tracks        │
-├─────────────────────────────────────────────────────────────┤
-│ 6. RESCUE: Cross-timepoint anchor matching (longitudinal)  │
-└─────────────────────────────────────────────────────────────┘
+1. WINDOWS   BAM + VCF → overlapping 20 kb windows, 10 kb step
+2. GRAPH     read-similarity graph per window → Louvain communities
+3. EM        γ responsibilities ↔ π weights and consensus, with a junk component
+4. MERGE     within-window: merge haplotypes within identity_distance;
+             a one-marker difference is adjudicated against a sequencing-error null
+5. LINK      chain a sample's haplotypes across windows into tracks
+6. RESCUE    recover low-abundance haplotypes from other timepoints (longitudinal)
+7. LINEAGES  merge tracks across samples into contig-spanning lineages
 ```
 
 ## License

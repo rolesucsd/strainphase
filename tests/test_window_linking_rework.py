@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """Tests for the window-linking rework.
 
-Covers the identity gate stack, the marker set (positions that actually vary; a
-naive implementation gets wrong), both cross-sample grouping shapes, the abundance
-coherence test, the QC gate, and the zero-leak fix.
+Covers the identity gate stack, the marker set (positions that actually vary), the
+abundance coherence test, the QC gate, read-overlap linking, and the zero-leak fix.
 """
 
 from __future__ import annotations
@@ -54,12 +53,10 @@ def test_marker_set_keeps_only_variable_positions():
 
 
 def test_sv_sites_are_identity_markers_by_default():
-    """AUTHOR'S DECISION: SVs are NEVER excluded from identity. Capturing the trajectory
-    of a flip is a goal of the analysis, so an inversion is a marker like any other. The
-    flip then shows up as two entities trading frequency, which IS the trajectory.
-
-    The exclusion path is still reachable so the effect can be measured, but it must not
-    be the default - it was set True in code while diagnosis §6 #16 was still open.
+    """SVs are kept as identity markers by default: an inversion is a marker like any
+    other, and its flip shows up as two entities trading frequency. The exclusion path
+    stays reachable (``exclude_sv_from_identity``) so the effect can be measured, but is
+    off by default.
     """
     consensuses = [{10: "A", 99: "ev.INV.1"}, {10: "T", 99: "ev.INV.2"}]
     site_type = {10: "snv", 99: "sv"}
@@ -71,7 +68,7 @@ def test_sv_sites_are_identity_markers_by_default():
 
 
 def test_marker_set_is_empty_for_a_clonal_locus():
-    """The precondition for the fallback below: a clonal sample has NO variable sites."""
+    """A clonal sample has no variable sites, so its marker set is empty."""
     consensuses = [{10: "A", 20: "C"}, {10: "A", 20: "C"}]
     assert variable_marker_positions(consensuses) == set()
 
@@ -82,14 +79,9 @@ def test_marker_set_is_empty_for_a_clonal_locus():
 
 
 def test_no_discriminating_markers_means_no_verdict():
-    """With no discriminating markers there is no verdict - not a link.
-
-    A "clonal fallback" used to compare all co-covered positions here instead, so two
-    haplotypes with nothing informative in common were declared identical. That is
-    what let two distinct strains merge: positions invariant across every haplotype
-    cannot disagree, so padding with them only ever dilutes a real difference. The
-    cost of removing it is that genuinely clonal loci no longer link on absence of
-    evidence, which is the honest reading.
+    """With no discriminating markers the verdict is no-evidence, not a link. Invariant
+    positions cannot disagree, so comparing them would only dilute a real difference;
+    the cost is that genuinely clonal loci no longer link on absence of evidence.
     """
     a = {10: "A", 20: "C", 30: "G"}
     b = {10: "A", 20: "C", 30: "G"}
@@ -121,14 +113,9 @@ def test_min_entity_overlap_is_an_explicit_non_merge():
 
 
 def test_overlap_gate_ignores_where_the_markers_sit():
-    """REGRESSION: the overlap gate asks how much SEQUENCE was compared, never how
-    spread out the markers are.
-
-    It used to measure ``max(shared) - min(shared)`` over the MARKER subset. On
-    000066952_0 window 1,880,001 that rejected all 703 pairs - each overlapped by
-    6,126 bp, but its only 2 markers sat 190 bp apart - and emitted a 2-genotype locus
-    as 38 singleton groups. Clustered variation (recombination tracts, hypervariable
-    loci) is exactly where markers bunch up, so the old rule penalised the most
+    """The overlap gate measures how much sequence was compared, not how spread out the
+    markers are. Clustered variation (recombination tracts, hypervariable loci) is
+    exactly where markers bunch up, so measuring their spread would penalise the most
     informative sites.
     """
     # Both cover 1000..7000 (6 kb of shared sequence); the only two markers are the
@@ -166,15 +153,14 @@ def test_cosupported_span_fraction_gate():
 
 
 def test_tie_contributes_no_edge():
-    """A tied best match is ambiguous and must yield nothing -- this is what bounds
-    entity size by construction rather than by tuning."""
+    """A tied best match is ambiguous and yields no edge, which bounds entity size."""
     assert unique_best_matches({0: [(0.0, 1)]}) == {0: 1}
     assert unique_best_matches({0: [(0.0, 1), (0.0, 2)]}) == {}
     assert unique_best_matches({0: [(0.0, 1), (0.5, 2)]}) == {0: 1}
 
 
 # --------------------------------------------------------------------------- #
-# Cross-sample grouping
+# Window-haplotype fixture
 # --------------------------------------------------------------------------- #
 
 
@@ -302,12 +288,9 @@ def test_read_overlap_unknown_is_minus_one_not_zero():
 
 
 def test_window_carries_site_type():
-    """REGRESSION: Window must expose site_type.
-
-    The SV-exclusion rule reads it off the Window. When the field did not exist, the
-    lookup used a getattr default and silently returned {} - so the exclusion no-opped
-    and inversions were being used as identity markers after all. A getattr with a
-    default cannot distinguish "no SVs here" from "the plumbing is missing".
+    """Window must expose ``site_type`` as a real field. The SV-exclusion rule reads it
+    off the Window, and a ``getattr`` default of {} could not tell "no SVs here" from
+    "the field is missing", so the exclusion would silently no-op.
     """
     from strainphase.core import Window
 
@@ -317,9 +300,8 @@ def test_window_carries_site_type():
 
     w.site_type = {10: "snv", 50: "sv"}
     consensuses = [{10: "A", 50: "ev.INV.1"}, {10: "T", 50: "ev.INV.2"}]
-    # The plumbing must REACH the exclusion path - a getattr default returning {} could
-    # not be told apart from "no SVs here". Exercised with the flag forced on, since the
-    # shipping default keeps SVs as markers (see test_sv_sites_are_identity_markers).
+    # Exercised with the flag forced on, since the shipping default keeps SVs as markers
+    # (see test_sv_sites_are_identity_markers).
     assert variable_marker_positions(
         consensuses, w.site_type, cfg(exclude_sv_from_identity=True)
     ) == {10}
@@ -327,19 +309,16 @@ def test_window_carries_site_type():
 
 
 # --------------------------------------------------------------------------- #
-# STEP 3: chaining window groups into lineages
+# Window-group fixtures for the cross-sample table tests
 # --------------------------------------------------------------------------- #
 
 
 def _grp(gid, wstart, members):
-    """Build a WindowGroup, giving its members the ids the pipeline would emit.
+    """Build a WindowGroup, stamping its members with the ids the pipeline would emit.
 
-    The window coordinates and the haplotype id belong to the GROUP, so they are stamped
-    here rather than guessed by `_mem`. Before that, `_mem` spelled every id
-    `sample|h` with no window component, so two groups' members collided: a veto set of
-    `frozenset(("t0|h", "t0|h"))` is the degenerate ONE-element frozenset, which is a
-    state the pipeline cannot produce and which made the step-1 veto test pass on the
-    collision instead of on the veto.
+    The window coordinates and haplotype id belong to the group, so they are set here
+    rather than guessed by ``_mem``; a window-unique id keeps two groups' members from
+    colliding.
     """
     from strainphase.longitudinal import _window_haplotype_id
     from strainphase.window_groups import WindowGroup
@@ -355,20 +334,13 @@ def _grp(gid, wstart, members):
 
 
 def _mem(sample, consensus, reads=30, total=60, wsid="T1", n_read_ids=8, reads_key=None):
-    """`wsid` is the step-1 chain this haplotype belongs to.
+    """``wsid`` is the within-sample track this haplotype belongs to.
 
-    Since 2026-08-30 step 3 links on SHARED READS, not on chain votes, so the read ids
-    are derived from (sample, wsid): two members of the same chain in the same sample
-    carry the SAME reads and therefore continue into each other, which is exactly what
-    `wsid` meant before. Members of different chains share none.
-
-    `reads_key` decouples the two when a test needs groups that LINK (shared reads) but
-    sit in DIFFERENT step-1 tracks - which is also the real case, since a read spanning
-    a window seam belongs to both windows whatever track they ended up in. Needed to
-    exercise the abundance checks, which the track-preserving union outranks.
-
-    The id and window coordinates are placeholders; `_grp` overwrites them with the
-    group's own, so a member always carries an id unique to its (sample, window, index).
+    Read ids are derived from (sample, wsid): two members of the same track in one
+    sample carry the same reads and so continue into each other, while members of
+    different tracks share none. ``reads_key`` decouples the two when a test needs
+    members that share reads but sit in different tracks. The id and window coordinates
+    are placeholders that ``_grp`` overwrites with the group's own.
     """
     return WindowHaplotype(sample=sample, contig="c1", window_start=0, window_end=20000,
                            haplotype_id="", consensus=consensus,
@@ -407,7 +379,7 @@ def _lcfg(**kw):
 
 
 # --------------------------------------------------------------------------- #
-# SPLIT MOLECULES: re-assembly + the BREAK marker (troubleshooting U1)
+# Split molecules: re-assembly and the BREAK marker
 # --------------------------------------------------------------------------- #
 
 
@@ -420,11 +392,9 @@ def _seg(name, rs, re_, alleles):
 
 
 def test_split_molecule_becomes_one_read_carrying_both_sides():
-    """The whole point: a molecule the aligner split is ONE observation of ONE strain.
-
-    Kept apart, its two halves phase into two haplotypes and the window's mixture weight
-    is divided between fragments of the same strain. Merged, the read spans the break and
-    the halves cannot come apart.
+    """A molecule the aligner split is one observation of one strain, so its segments
+    must merge into a single read. Kept apart, the two halves phase into two haplotypes
+    and split one strain's weight; merged, the read spans the break.
     """
     from strainphase.core import _merge_split_reads
 
@@ -471,9 +441,8 @@ def test_unsplit_reads_are_untouched_and_overlapping_segments_make_no_break():
 
 
 def test_step1_records_mismatches_but_not_dropouts():
-    """Only a genuine allele disagreement is reported. A dropout is a measurement hole -
-    recording those is what made the full comparison log unaffordable, and it buries the
-    finding."""
+    """Only a genuine allele disagreement is recorded, not a dropout. A dropout is a
+    measurement hole, and logging every one buries the real disagreements."""
     from strainphase.core import Haplotype, Window, WindowResult, link_windows
 
     def wr(start, cons_list):
@@ -500,24 +469,19 @@ def test_step1_records_mismatches_but_not_dropouts():
 
 
 def test_step1_refuses_to_link_incompatible_abundances():
-    """ABUNDANCE AS AN ELIMINATOR AT STEP 1 (author's rule, 2026-07-28).
-
-    Within ONE sample two adjacent windows are the same timepoint, so a genome cannot sit
-    at two different frequencies across them. Identical alleles are therefore not enough:
-    a haplotype at 95% in one window and 5% in the next is not the same entity.
-
-    Eliminator only - agreement never scores, and the test runs on RAW COUNTS because the
-    derived abundance is quantised onto unit fractions by a median denominator of 9.
+    """Step 1 uses abundance only as an eliminator. Two adjacent windows in one sample
+    are the same timepoint, so a genome cannot sit at 95% in one and 5% in the next;
+    identical alleles are not enough to link such a pair. Agreement never scores, and
+    the test runs on raw counts because the derived abundance is quantised by a small
+    median denominator.
     """
     from strainphase.core import Haplotype, Window, WindowResult, link_windows
 
     shared = {12000: "A", 14000: "C", 16000: "G", 18000: "T"}
 
-    # A DECOY second haplotype so the marker set is non-empty. Markers are positions
-    # that VARY across a sample's haplotypes; with one identical haplotype per window
-    # nothing varies, there is nothing informative to compare, and no verdict is
-    # possible - which is the real situation in a clonal locus, not what this test is
-    # about. Real multi-strain data always has the variation this supplies.
+    # A decoy second haplotype so the marker set is non-empty: markers are positions
+    # that vary across a sample's haplotypes, and one identical haplotype per window
+    # would leave nothing to compare. Real multi-strain data always supplies this.
     decoy = {p: "G" for p in shared}
 
     def wr(start, reads, n_junk=0, n_total=100):
@@ -546,24 +510,20 @@ def test_step1_refuses_to_link_incompatible_abundances():
 
 
 # --------------------------------------------------------------------------- #
-# TWO MEMBERS OF ONE SAMPLE IN ONE GROUP
+# Two members of one sample in one group
 # --------------------------------------------------------------------------- #
-# Every other fixture in this file puts one member per (sample, window), and that is
-# the ONE shape in which summing a shared denominator, collapsing a sample's members,
-# and handing them to Fisher as separate windows are all indistinguishable from
-# correct. The pipeline produces the two-member shape routinely:
-# merge_similar_haplotypes deliberately declines some 1-SNP pairs and both halves then
-# clear the step-2 gate - which is a real strain split, i.e. exactly the event the
-# analysis exists to find. coherence.py:157 flags three per cell, not two.
+# Most fixtures here put one member per (sample, window). The pipeline also produces
+# two members per cell routinely: merge_similar_haplotypes declines some 1-SNV pairs
+# and both halves survive as a real strain split. coherence.py flags three per cell,
+# not two.
 
 
 def _split_grp(gid, wstart, samples, reads_each, total, wsid="T1"):
-    """A group where every sample contributes TWO near-identical members.
+    """A group where every sample contributes two near-identical members.
 
-    ``reads_each`` is a per-member pair; the two halves of a split are rarely equal, and
-    equal halves are the one case that hides feeding them to Fisher as separate windows.
-    The denominator is one window's non-junk total, carried identically on every member
-    of that (sample, window) cell - it is a property of the window, not of the member.
+    ``reads_each`` is a per-member pair; the two halves of a split are rarely equal. The
+    denominator is one window's non-junk total, carried identically on every member of
+    that (sample, window) cell, since it is a property of the window, not the member.
     """
     members = []
     for s in samples:
@@ -586,20 +546,16 @@ def _split_grp(gid, wstart, samples, reads_each, total, wsid="T1"):
 
 
 def test_load_snvs_is_cached_across_samples():
-    """A longitudinal run calls process_contig once PER SAMPLE, and under a cohort union
-    VCF every call parses the identical file. On 000066952_0 that was the same 76,988
-    records re-read 146 times, once per sample, for a result that cannot differ.
-
-    The cache is keyed on the settings that change what is kept, so a config change still
-    re-parses.
+    """A longitudinal run calls process_contig once per sample, and under a cohort union
+    VCF every call parses the identical file, so ``load_snvs`` caches the result. The
+    cache is keyed on the settings that change what is kept, so a config change re-parses.
     """
     from strainphase import core
 
     calls = {"n": 0}
     real = core._load_snvs_uncached
 
-    # The real loader returns EIGHT tables; a shorter stub was accepted here for a while
-    # and nothing noticed, which is how the aliasing contract below stayed untested.
+    # The real loader returns eight tables, so the stub must too.
     def counting(*a, **k):
         calls["n"] += 1
         return ([1], {1: "A"}, {1: 9}, {1: 0.5}, {1: "snv"}, {1: frozenset({"alt"})},
@@ -623,16 +579,10 @@ def test_load_snvs_is_cached_across_samples():
 
 
 def test_a_cached_load_snvs_caller_cannot_reach_the_next_callers_tables():
-    """REGRESSION (R1-4): each call gets its OWN containers, hit or miss.
-
-    process_contig APPENDS SV pseudo-sites to snv_pos and writes their anchor bases and
-    site types; iter_windows_lazy registers split-read breakpoints the same way. Handing
-    back the cached objects meant sample 1's SV anchors were already present when sample
-    2 ran under the same union VCF, so sample 2 saw them as collisions with a called
-    variant and dropped its own SV sites - one timepoint kept the event, every other
-    timepoint lost it, and the loss was logged as a legitimate collision.
-
-    Asserting the call count alone cannot see this: the cache was already working.
+    """Each ``load_snvs`` call gets its own containers, hit or miss. process_contig
+    appends SV pseudo-sites to the returned tables, so handing back the cached objects
+    would let one sample's SV anchors reach the next sample under the same union VCF,
+    where they read as collisions and its own SV sites are dropped.
     """
     from strainphase import core
 
@@ -663,11 +613,9 @@ def test_a_cached_load_snvs_caller_cannot_reach_the_next_callers_tables():
 
 
 def test_a_run_writes_lineages_tsv_and_puts_diagnostics_in_tmp(tmp_path):
-    """END TO END: build_window_tables -> write_window_tables produces the deliverables in
-    output_dir and the diagnostics in output_dir/tmp.
-
-    Guards the wiring, not the algorithm: step 3 was previously never called by the
-    pipeline at all, so a run produced no lineage output.
+    """End to end: ``build_window_tables`` -> ``write_window_tables`` writes the
+    deliverable tables in output_dir and the diagnostics in output_dir/tmp. Guards the
+    wiring that produces the lineage output, not the algorithm.
     """
     import numpy as np
 
@@ -719,13 +667,11 @@ def test_a_run_writes_lineages_tsv_and_puts_diagnostics_in_tmp(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Read-overlap threading (the step-3 linker)
+# Read-overlap threading
 #
-# Measured on div0050_k4: the reciprocal-best-match linker terminated 152 chains
-# and HALF of those had a byte-identical partner it refused as failed_not_mutual,
-# 67 of them because that partner preferred an equally identical rival. These
-# tests pin the three behaviours that matter: the over-split is rejoined, the
-# 2% consensus gate still vetoes first, and no read evidence means no join.
+# link_windows joins haplotypes across windows on the reads they share. These
+# fixtures cover the behaviours that matter: an over-split strain is rejoined,
+# the consensus gate still vetoes first, and no shared-read evidence means no join.
 # ---------------------------------------------------------------------------
 
 _OVERLAP_REGION = range(5000, 8000, 50)   # inside the [0,10000]/[5000,15000] overlap
@@ -832,12 +778,9 @@ def test_read_sort_hash_is_stable_and_seed_dependent():
 
 def test_assign_reads_records_best_hap_below_confidence_threshold():
     """Linking needs the argmax haplotype even when it is not confidently called.
-
-    hap_id is withheld below assign_confidence_threshold, which is correct for
-    CALLING a read's haplotype. Read-overlap threading only asks whether the same
-    molecule sits in both windows, and two strains differing at a couple of markers
-    leave most reads at gamma 0.6-0.89 - so gating on hap_id discarded exactly the
-    evidence that near-identical strains depend on.
+    ``hap_id`` is withheld below ``assign_confidence_threshold``, but read-overlap
+    linking only asks whether a molecule sits in both windows, and near-identical
+    strains leave most reads at gamma 0.6-0.89, so ``best_hap`` is recorded regardless.
     """
     import numpy as np
 
@@ -900,17 +843,10 @@ def test_assign_reads_records_best_hap_below_confidence_threshold():
 # ---------------------------------------------------------------------------
 # Redundant parallel lineages (observed on B. fragilis 000089747_1, upeY locus)
 #
-# Four lineages (LIN000290/284/285/286) came out of one real run all >=98.8%
-# identical to each other, spanning the same ~1.37-1.41 Mb interval, and
-# co-occurring in 14-32 of the same samples. They are one strain reported four
-# times.
-#
-# The 2% consensus gate is NOT what let this through - the pieces agree far
-# inside it. The cause is structural: build_lineages only ever compares a group
-# at window W with a group at W+step. Two groups sitting at the SAME window are
-# never candidates for each other, so once a strain is split across parallel
-# groups, each half chains forward independently and nothing downstream can
-# rejoin them. Step 2 is what should have grouped them in the first place.
+# One real run reported four lineages (LIN000290/284/285/286) all >=98.8%
+# identical, spanning the same ~1.37-1.41 Mb interval and co-occurring in 14-32
+# of the same samples. They are one strain reported four times: once a strain is
+# split across parallel groups at the same window, nothing rejoins them.
 # ---------------------------------------------------------------------------
 
 
@@ -942,16 +878,12 @@ def _group_consensus_of(lineage):
 
 
 # ---------------------------------------------------------------------------
-# REPRODUCTION: how two pure step-1 tracks end up in one over-merged lineage
+# How two pure step-1 tracks end up in one over-merged lineage
 #
-# Observed on div0050_k2 sample T3 (truth 0.663/0.337): step 1 produced two
-# PURE tracks - 12,029 reads at purity 1.000 (strain2) and 6,392 at purity
-# 1.000 (strain1) - and BOTH landed entirely in one lineage of purity 0.653,
-# taking assigned_correct_fraction from 0.973 (single) to 0.000. No track was
-# split; two tracks that should be separate lineages were welded together.
-#
-# These tests pin the two links in that chain. They assert the CURRENT
-# behaviour, so they will fail loudly when either is fixed.
+# Observed on div0050_k2 T3 (truth 0.663/0.337): step 1 produced two pure tracks,
+# and both landed in one lineage of purity 0.653, taking assigned_correct_fraction
+# from 0.973 to 0.000. The test below pins the compare_consensus behaviour that
+# would let that happen, and asserts the current (fixed) behaviour.
 # ---------------------------------------------------------------------------
 
 _FUSION_DISCRIM = [5000, 5500]                      # where two strains differ
@@ -965,14 +897,10 @@ def _fusion_haps():
 
 
 def test_a_real_difference_is_not_diluted_by_uninformative_positions():
-    """ROOT CAUSE, now fixed. Two haplotypes differing at EVERY discriminating marker
-    they share must not be declared identical.
-
-    compare_consensus falls back to all co-covered positions when fewer than
-    min_shared_markers DISCRIMINATING markers are shared. Those extra positions are
-    invariant - they cannot disagree - so they only ever dilute. Here 2 real
-    differences over 2 markers (rate 1.000) become 2 over 142 (rate 0.014), which
-    clears the 2% gate.
+    """Two haplotypes differing at every discriminating marker they share must not be
+    declared identical. Only the discriminating markers are compared; the removed clonal
+    fallback used to pad with invariant co-covered positions, diluting 2 real differences
+    over 2 markers into 2 over 142 and clearing the 2% gate.
     """
     from strainphase.core import compare_consensus
 
@@ -994,7 +922,7 @@ def test_a_real_difference_is_not_diluted_by_uninformative_positions():
 
 
 # ---------------------------------------------------------------------------
-# Read-supported marker set (shared by steps 2 and 3)
+# Read-supported marker set
 # ---------------------------------------------------------------------------
 
 
@@ -1035,7 +963,7 @@ def test_supported_markers_need_two_samples_per_allele():
 
 
 # ---------------------------------------------------------------------------
-# Step-1 abundance verdicts propagate into step 3 (hybrid)
+# Step-1 abundance refusals carry over into the cross-sample merge
 # ---------------------------------------------------------------------------
 
 
@@ -1056,7 +984,7 @@ def _reach_windows():
     Reads carried by a haplotype in both windows are the only evidence there is.
 
     Read layout pairs A0 with C0 and A1 with C1, and gives each pair a clear margin over
-    the crossing alternative so reciprocal best match has something to choose on.
+    the crossing alternative so the best-match linker has a unique winner to choose.
     """
     from strainphase.core import Haplotype, Window, WindowResult
 
@@ -1087,12 +1015,9 @@ def _reach_windows():
 
 
 def test_reach_one_restores_the_overlap_only_rule():
-    """Reach 1 is the pre-2026-08-31 rule: only OVERLAPPING windows link.
-
-    It is the escape hatch, so it has to keep working even though it is no longer the
-    default - a disjoint pair must be refused outright rather than falling through to
-    the read path, which an earlier `(k - i) > reach` bound got wrong for the immediate
-    neighbour.
+    """Reach 1 restricts linking to overlapping windows, the escape hatch from the
+    read-reach default. A disjoint pair must be refused outright rather than falling
+    through to the read path.
     """
     from strainphase.core import link_windows
 
@@ -1103,11 +1028,9 @@ def test_reach_one_restores_the_overlap_only_rule():
 
 
 def test_read_reach_is_on_by_default():
-    """The default reaches one window past the overlap.
-
-    Pinned because the default is what every pipeline run actually uses: a silent revert
-    to 1 would look like the read path simply finding nothing, which is exactly how it
-    fails when read assignments are missing.
+    """The default ``link_window_reach`` is 2, reaching one window past the overlap.
+    Pinned because a silent revert to 1 would look like the read path simply finding
+    nothing.
     """
     from strainphase.core import HaplotyperConfig, link_windows
 
@@ -1138,10 +1061,8 @@ def test_read_reach_links_across_a_non_overlapping_gap():
 
 
 def test_read_reach_respects_the_shared_read_threshold():
-    """Below `link_min_shared_reads` the pair is not linked.
-
-    Consensus cannot veto a disjoint pair, so this threshold and reciprocal best match
-    are the entire evidence bar - it is the one knob standing between read chaining and
+    """Below ``link_min_shared_reads`` the pair is not linked. Consensus cannot veto a
+    disjoint pair, so this threshold is the evidence bar between read chaining and
     fusing two strains on a single mis-assigned read.
     """
     from strainphase.core import link_windows
@@ -1199,11 +1120,9 @@ def _snv_pair(minor_weight, minor_reads, n_shared, n_timepoints=1, depth=130):
 
 
 def test_1snv_validator_runs_when_the_rate_would_reject():
-    """7 shared positions, 1 difference -> rate is 14%, far above identity_distance.
-
-    The validator used to sit INSIDE the rate gate, so this pair was split without the
-    count-based test that exists to judge it. This is the LS_11_5_16 shape: 3 reads of
-    130 splitting off a dominant haplotype.
+    """7 shared positions with 1 difference is a 14% rate, above identity_distance, yet
+    the 1-SNV validator still runs and judges the pair on read counts rather than the
+    rate. The shape is 3 reads of 130 splitting off a dominant haplotype.
     """
     hp, maj, minor, w, g, ntp = _snv_pair(minor_weight=0.023, minor_reads=3, n_shared=7)
     assert 1 / 7 > hp.config.identity_distance, "the rate must reject, or this proves nothing"
@@ -1219,11 +1138,9 @@ def test_1snv_thin_read_support_still_merges():
 
 
 def test_1snv_persistent_minor_allele_is_kept_apart():
-    """A credible minor strain survives: >=3 reads, seen across timepoints.
-
-    30% with 45 reads over many timepoints is the case the tool exists to find - it
-    must NOT be merged away. Persistence short-circuits before the binomial, and the
-    frequency floor (now last) does not fire because 0.30 > marker_min_frac.
+    """A credible minor strain survives: >=3 reads, seen across timepoints. Persistence
+    short-circuits before the binomial, and the frequency floor does not fire because
+    0.30 > marker_min_frac.
     """
     hp, maj, minor, w, g, ntp = _snv_pair(minor_weight=0.30, minor_reads=45,
                                           n_shared=52, n_timepoints=3)
@@ -1231,12 +1148,9 @@ def test_1snv_persistent_minor_allele_is_kept_apart():
 
 
 def test_1snv_floor_is_a_backstop_not_a_pre_emption():
-    """A sub-10% haplotype with real read support reaches the later tests.
-
-    It used to be dismissed on the frequency floor before read support, persistence or
-    the binomial were consulted - 622 of 1,174 pairs on 000089747_1 contig_2 were
-    decided that way. The floor still applies, but only after the evidence has spoken,
-    so a persistent sub-10% allele is now judged rather than assumed to be noise.
+    """A sub-10% haplotype with real read support reaches the later tests. The frequency
+    floor still applies, but only after read support, persistence, and the binomial have
+    spoken, so a persistent sub-10% allele is judged rather than assumed to be noise.
     """
     hp, maj, minor, w, g, ntp = _snv_pair(minor_weight=0.048, minor_reads=8,
                                           n_shared=52, n_timepoints=3)
@@ -1249,12 +1163,10 @@ def test_1snv_floor_is_a_backstop_not_a_pre_emption():
 
 
 def test_supported_markers_keep_a_low_abundance_allele_with_read_support():
-    """An allele may qualify on READ SUPPORT even when far below marker_min_frac.
-
-    The rule was frequency AND reads, so a strain at 2-5% could never contribute a
-    marker: it had nothing to be phased or linked by and was invisible downstream.
-    Read support is independent evidence, and at depth the stronger of the two - 10
-    reads at 2% is a better-supported call than 3 reads at 15%.
+    """An allele qualifies as a marker on read support (``n >= marker_min_reads``) even
+    when far below ``marker_min_frac``. The rule is reads OR frequency, not AND, so a
+    strain at 2-5% can still contribute a marker: 10 reads at 2% is a better-supported
+    call than 3 reads at 15%.
     """
     from strainphase.core import supported_marker_positions
 
@@ -1286,10 +1198,9 @@ def test_supported_markers_still_reject_thin_low_abundance_alleles():
 
 
 def _window_haps(pairs, n_invariant, depth=100):
-    """Haplotypes differing at `pairs` positions, padded with `n_invariant` agreeing ones.
-
-    The padding is the point: it is what `window.snv_pos` accumulates as coverage rises,
-    and what used to dilute the merge rate.
+    """Haplotypes differing at ``pairs`` positions, padded with ``n_invariant`` agreeing
+    ones. The padding is what ``window.snv_pos`` accumulates as coverage rises, and what
+    used to dilute the merge rate.
     """
     from strainphase.core import Haplotype, PostProcessor, Window
 
@@ -1312,12 +1223,10 @@ def _window_haps(pairs, n_invariant, depth=100):
 
 
 def test_window_merge_is_not_diluted_by_agreeing_positions():
-    """Two REAL differences must survive however many agreeing sites surround them.
-
-    Under the old rate over `window.snv_pos`, 2 differences among 400 agreeing sites is
-    0.005 - under identity_distance - so the pair merged, and merged harder as coverage
-    added more agreeing sites. Measured on group4.seed2 contig_1:280,001 (truth 3),
-    cov100 collapsed 3-4 haplotypes to 1 in all six samples.
+    """Two real differences survive however many agreeing sites surround them, because
+    the merge compares informative positions rather than a rate over ``window.snv_pos``.
+    The old rate diluted 2 differences among 400 agreeing sites to 0.005, below
+    identity_distance, and merged harder as coverage added more sites.
     """
     for n_invariant in (10, 100, 400):
         hp, haps, g, pi, w = _window_haps(pairs=2, n_invariant=n_invariant)

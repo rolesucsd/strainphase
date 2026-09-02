@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """
-Synthetic data generator for haplotyper pipeline testing.
+Synthetic data generator for haplotyper testing.
 
-Creates realistic synthetic metagenomic data with:
-- Multiple true haplotypes with defined consensus sequences
-- Reads sampled from haplotypes with configurable error rates
-- Temporal dynamics (abundance changes over timepoints)
-- Option for selective sweep events
+Builds Window and Read objects directly in memory, bypassing BAM/VCF I/O, so
+tests can run the pipeline on data with known ground truth. A scenario defines
+true haplotypes as substitution profiles over a set of SNV positions; reads are
+sampled from those haplotypes in proportion to per-timepoint abundances, with a
+uniform per-site error rate and an optional selective sweep.
 
-This allows testing pipeline behavior without real BAM/VCF files.
+Deliberately simple: it models substitutions at predeclared SNV sites only, not
+alignment, indels, structural variants, or read-length structure. It is a
+unit-test fixture, not a benchmark read simulator.
 """
 
 import os
@@ -129,7 +131,7 @@ class SyntheticDataGenerator:
         )
 
     def _generate_snv_positions(self, contig_length: int, n_snvs: int) -> list[int]:
-        """Generate SNV positions with some clustering (realistic)."""
+        """Evenly spaced SNV positions with Gaussian jitter, deduplicated and sorted."""
         # Start with even spacing
         base_spacing = contig_length / (n_snvs + 1)
         positions = []
@@ -208,10 +210,10 @@ class SyntheticDataGenerator:
         self, hap_idx: int, n_haplotypes: int, timepoints: list[str], include_sweep: bool
     ) -> dict[str, float]:
         """
-        Generate realistic abundance trajectory for a haplotype.
+        Abundance trajectory for a haplotype across timepoints.
 
-        If include_sweep is True, haplotype 0 will sweep to dominance
-        while haplotype 1 decreases.
+        If include_sweep is True, haplotype 0 sweeps to dominance while
+        haplotype 1 declines.
         """
         abundances = {}
         n_tp = len(timepoints)

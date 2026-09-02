@@ -140,13 +140,9 @@ def test_distinct_events_at_one_anchor_stay_distinct(tmp_path):
 
 
 def test_sv_present_requires_span_overlap(tmp_path):
-    """A read in the support set whose alignment doesn't reach the anchor is not
-    called present here (its other split segment supports it elsewhere).
-
-    The far reads must genuinely REACH the window, or the assertion is on a read that
-    was never built and cannot fail. An earlier version of this fixture produced no
-    windows at all (four reads, below the phasing floor) and guarded the only assertion
-    behind a membership test on the resulting empty dict.
+    """A read in the support set whose alignment does not reach the anchor is not called
+    present here; its other split segment supports it elsewhere. The far reads must
+    genuinely reach the window, or the assertion would be vacuous.
     """
     ref_seq = "A" * 2000
     write_fasta(tmp_path, {"c1": ref_seq})
@@ -223,8 +219,8 @@ def test_process_contig_merges_and_drops_collisions(tmp_path):
 
 
 def test_event_consistency_check(tmp_path):
-    """verification #2: an event ID at different loci across sidecars is flagged;
-    the same ID at the same locus is fine."""
+    """An event ID at different loci across sidecars is flagged; the same ID at the same
+    locus is fine."""
     s1 = _write_sidecar(tmp_path, [_rec("c1", 600, "ev.1", "INS", {"a"})], name="s1.tsv")
     s2_ok = _write_sidecar(tmp_path, [_rec("c1", 600, "ev.1", "INS", {"b"})], name="s2ok.tsv")
     s2_bad = _write_sidecar(tmp_path, [_rec("c1", 650, "ev.1", "INS", {"b"})], name="s2bad.tsv")
@@ -300,13 +296,9 @@ def test_reconcile_respects_type_and_length(tmp_path):
 
 
 def test_negative_svlen_still_reconciles(tmp_path):
-    """SVLEN is compared on MAGNITUDE (R1-18).
-
-    VCF INFO/SVLEN is negative for a deletion by convention, and a cohort assembled
-    from several callers can mix the two conventions. Scaling the tolerance by the
-    SIGNED maximum floors it at 1 bp for any negative pair, so every merge of two
-    deletions is refused - and the refusal is counted in no statistic, so the run log
-    reads "0 merged; declined 0 of 0" and looks like a clean run with nothing nearby.
+    """SVLEN is compared on magnitude. VCF INFO/SVLEN is negative for a deletion by
+    convention, and a cohort can mix conventions, so two deletions given as negative
+    lengths must still reconcile; genuinely discordant magnitudes stay apart.
     """
     s1 = _write_sidecar(tmp_path, [_rec("c1", 1000, "ev.n1", "DEL", {"r1"}, svlen=-1200)], name="s1.tsv")
     s2 = _write_sidecar(tmp_path, [_rec("c1", 1030, "ev.n2", "DEL", {"r2"}, svlen=-1180)], name="s2.tsv")
@@ -322,14 +314,10 @@ def test_negative_svlen_still_reconciles(tmp_path):
 
 
 def test_an_id_reused_on_another_contig_cannot_damage_this_one(tmp_path):
-    """R-C: events are keyed on (contig, event_id), never on the id alone.
-
-    The id is the phasing allele and the spec requires it to be globally unique, but a
-    sidecar that breaks that must only spoil its own records. Under id-only keys the
-    duplicate on ctg2 imports its sample into ev.B's cluster - so the legitimate 20 bp
-    ctg1 merge is refused and logged as the documented multi-allelic protection - and
-    imports its POSITION, dragging ev.B's ctg1 anchor hundreds of kb away, out of every
-    supporting read's span bracket.
+    """Events are keyed on (contig, event_id), never on the id alone, so an id reused on
+    a second contig spoils only its own records. Under id-only keys the duplicate on c2
+    would import its sample and position into ev.B's cluster on c1, vetoing the
+    legitimate merge and dragging its anchor off its supporting reads.
     """
     a = _write_sidecar(
         tmp_path,
@@ -350,14 +338,10 @@ def test_an_id_reused_on_another_contig_cannot_damage_this_one(tmp_path):
 
 
 def test_per_sample_directories_are_distinct_samples(tmp_path):
-    """R1-9 + R1-10: sample identity is the sidecar's PATH, not its basename.
-
-    Per-sample directories are the normal layout, and under basename identity every
-    one of them is the same sample "sv.tsv": the same-sample veto then refuses every
-    legitimate cross-timepoint merge and logs it as multi-allelic protection. The
-    output side of the same mistake is worse - all of them are written to one file,
-    the caller gets a path per input, and every timepoint is phased against whichever
-    sample happened to be written last.
+    """Sample identity is the sidecar's path, not its basename. Per-sample directories
+    are the normal layout, where every file is "sv.tsv", so basename identity would
+    collapse them into one sample, veto every cross-timepoint merge, and write them all
+    to one output file.
     """
     s1 = _write_sidecar(tmp_path, [_rec("c1", 1000, "ev.A1", "DEL", {"r1"}, svlen=1200)],
                         name="sv.tsv", subdir="S1")
@@ -384,11 +368,10 @@ def test_per_sample_directories_are_distinct_samples(tmp_path):
 
 
 def test_one_sample_split_across_sidecars_is_named_explicitly(tmp_path):
-    """The one case a path cannot express: several sidecars, one sample.
-
-    Path identity fails OPEN there - it reads the two files as two samples and
-    collapses a real multi-allelic site - so ``samples`` names them, and a list that
-    does not correspond one-to-one is an error rather than a silent zip truncation.
+    """One sample split across several sidecars is the case a path cannot express: path
+    identity reads the files as distinct samples and collapses a real multi-allelic
+    site. ``samples`` names them explicitly, and a list not in one-to-one correspondence
+    is an error, not a silent truncation.
     """
     a = _write_sidecar(tmp_path, [_rec("c1", 1000, "ev.P", "DEL", {"r1"}, svlen=1000)], name="a.tsv")
     b = _write_sidecar(tmp_path, [_rec("c1", 1020, "ev.Q", "DEL", {"r2"}, svlen=1000)], name="b.tsv")
@@ -405,12 +388,10 @@ def test_one_sample_split_across_sidecars_is_named_explicitly(tmp_path):
 
 
 def test_an_already_spread_event_is_left_where_it_is(tmp_path):
-    """R1-11: the span cap applies to the finished cluster, singletons included.
-
-    An id arriving with two positions further apart than the pad is malformed input no
-    merge decision can see. Relocating it to their median would push the anchor outside
-    both supporting reads' brackets - and would launder the violation past a later
-    ``verify``, which is how it would stay unnoticed.
+    """The span cap applies to the finished cluster, singletons included. An id arriving
+    with two positions further apart than the pad is malformed input; relocating it to
+    their median would push the anchor off both supporting reads, so it is left where it
+    is and the violation stays visible to ``verify``.
     """
     spread = _write_sidecar(
         tmp_path,

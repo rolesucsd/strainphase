@@ -1,4 +1,4 @@
-"""Merging step-1 tracks across samples, in place of cross-sample window grouping."""
+"""Merging within-sample tracks across samples into contig-spanning lineages."""
 
 from __future__ import annotations
 
@@ -158,10 +158,8 @@ def test_same_sample_tracks_more_than_one_window_apart_get_an_abundance_check():
 
 
 def test_track_merge_min_shared_markers_gates_the_merge():
-    """The threshold is real, and 1 is the default.
-
-    It was documented in the module docstring for weeks while the field did not exist,
-    so the merge ran at a hardcoded 1 with no way to change or benchmark it.
+    """``track_merge_min_shared_markers`` gates the merge; its default is 1. One
+    agreeing marker merges at the default and does not clear a threshold of 2.
     """
     from dataclasses import replace
 
@@ -189,12 +187,10 @@ def test_track_merge_min_shared_markers_gates_the_merge():
 
 
 def test_gap_filling_abundance_test_uses_the_step1_threshold():
-    """Tracks step 1 never compared get a FRESH abundance test on the SAME knob.
-
-    `link_windows` only ever judges windows within its reach, so two tracks further
-    apart in one sample carry no step-1 verdict to inherit. The merge takes that
-    verdict itself - and must take it at the same threshold, or a pair would be
-    refused at one distance and merged at another purely by which code asked.
+    """Tracks that step 1 never compared get a fresh abundance test at merge time, on
+    the same ``abundance_coherence_alpha`` knob step 1's eliminator reads. ``link_windows``
+    judges only windows within its reach, so distant tracks in one sample carry no
+    verdict to inherit.
     """
     from dataclasses import replace
 
@@ -219,7 +215,7 @@ def test_gap_filling_abundance_test_uses_the_step1_threshold():
     ]
     strict = build_lineages_from_tracks(haps, DEFAULT_CONFIG, markers=markers)
 
-    # Loosening the SHARED knob must loosen this test too - that is the whole point.
+    # Loosening the shared knob must loosen this test too.
     loose = build_lineages_from_tracks(
         haps, replace(DEFAULT_CONFIG, abundance_coherence_alpha=1e-12), markers=markers
     )

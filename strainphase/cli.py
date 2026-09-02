@@ -5,6 +5,7 @@ Strainphase command-line interface.
 Usage:
     strainphase run          # Process single contig
     strainphase longitudinal # Process MAG across timepoints
+    strainphase sv           # Sidecar tools (reconcile, verify)
     strainphase test         # Run test suite
     strainphase version      # Show version
 """
@@ -130,12 +131,10 @@ def cmd_longitudinal(args: argparse.Namespace) -> int:
     if getattr(args, "sv_sidecars", None):
         sv_sidecar_paths = {s: args.sv_sidecars.format(sample=s) for s in samples}
 
-    # A --bams template without {sample} in it resolves to ONE alignment file for
-    # every timepoint, and the existence check below then passes for all of them.
-    # Nothing downstream can notice: every timepoint is phased from one sample's
-    # reads and the run looks entirely normal. A shared --vcfs (a cohort/union VCF)
-    # or a shared --sv-sidecars is legitimate by contrast — those are variant
-    # catalogues, and the BAM is what makes a sample a sample.
+    # A --bams template without {sample} resolves to ONE BAM for every timepoint, so
+    # every timepoint is phased from one sample's reads and the run looks normal. A
+    # shared --vcfs or --sv-sidecars is legitimate by contrast (variant catalogues);
+    # the BAM is what makes a sample a sample.
     if len(set(bam_paths.values())) != len(samples):
         logging.error(
             f"--bams does not resolve to a distinct BAM per sample: {args.bams!r} -> "
@@ -207,9 +206,8 @@ def cmd_longitudinal(args: argparse.Namespace) -> int:
         _report_mem_profile()
 
     # ---- Window-level tables (the deliverables) ----
-    # lineages.tsv comes back from here too:
-    # composing the within-sample and across-sample linking axes was the open decision
-    # these tables were built as the substrate for, and step 3 now makes it.
+    # lineages.tsv comes back from here too: the cross-sample track merge that
+    # produces the lineages runs inside build_window_tables.
     (hap_rows, within_rows, across_rows, edge_rows, mismatch_rows,
      edge_counts, lineage_rows) = build_window_tables(
         args.output_dir, all_results, config, sample_order=samples
@@ -259,10 +257,9 @@ def cmd_version(args: argparse.Namespace) -> int:
     return 0
 
 
-# Tuning flags shared by every subcommand that phases reads. `run` used to carry an
-# arbitrary 7-field subset of these - it calls process_contig, which calls link_windows,
-# so almost every gate `longitudinal` exposes was already in force on `run` with no way
-# to see or set it. Declared once so the two cannot drift.
+# Tuning flags shared by every subcommand that phases reads. `run` calls
+# process_contig, which calls link_windows, so these gates already act on `run`.
+# Declared once so `run` and `longitudinal` cannot drift.
 def _add_phasing_args(p) -> None:
     p.add_argument("--window-size", type=int, default=_D.window_size, help="Window size (bp)")
     p.add_argument("--max-reads", type=int, default=_D.max_reads_per_window,
