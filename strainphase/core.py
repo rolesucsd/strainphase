@@ -3391,8 +3391,20 @@ def process_window(
         )
 
     # 3) Post-processing: merge near-duplicate haplotypes with 1-SNP guard.
+    n_after_em = len(haplotypes)
     merged_haps, final_gamma, final_pi = post.merge_similar_haplotypes(
         haplotypes, gamma, pi, window, n_timepoints_seen
+    )
+
+    # STAGE COUNTS. K is set by Louvain (one haplotype per community), EM can only
+    # PRUNE it (min_hap_eff_weight in the M-step), and this merge can only SHRINK it
+    # further. Logging all three separates "Louvain found less structure at depth" from
+    # "the merge collapsed it", which the post-hoc tables cannot distinguish because
+    # they are written after all three have run.
+    logging.debug(
+        "stage_counts\t%s\t%d\t%d\t%d\t%d\t%d",
+        window.contig, window.start, len(window.reads),
+        len(initial_haps), n_after_em, len(merged_haps),
     )
 
     # 3b) NO invariant-site pruning here.
