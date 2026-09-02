@@ -287,6 +287,13 @@ class HaplotyperConfig:
     # these - the two windows call disjoint positions - so this threshold and reciprocal
     # best match are the whole of the evidence, and it should not be lowered casually.
     link_min_shared_reads: int = 2
+    # Coverage-invariant companion to link_min_shared_reads for the NON-overlapping gate:
+    # a link also needs shared_reads >= frac * min(each hap's CONTINUING reads). Taking the
+    # fraction of each haplotype's OWN continuing reads (not junction depth) makes the bar
+    # rise with depth for abundant strains while staying at the floor for rare ones, so the
+    # spurious 2-read links that collapse the assembly stop passing at high coverage.
+    # 0.0 = disabled (floor only, i.e. current behaviour).
+    link_shared_read_frac: float = 0.0
     # The two haplotypes' CO-SUPPORTED SPAN inside the shared region, as a fraction of
     # that region. Window geometry itself is not a useful gate (tiles overlap by exactly
     # 50% or exactly 0%, nothing between). Measured on 000089747_1: 25% rejects 16.0% of
@@ -338,6 +345,10 @@ class HaplotyperConfig:
         if self.link_min_shared_reads < 1:
             raise ValueError(
                 f"link_min_shared_reads must be >= 1, got {self.link_min_shared_reads}"
+            )
+        if not (0.0 <= self.link_shared_read_frac < 1.0):
+            raise ValueError(
+                f"link_shared_read_frac must be in [0, 1), got {self.link_shared_read_frac}"
             )
 
         # Merge distance threshold
@@ -432,6 +443,7 @@ _CONFIG_FROM_ARG: dict[str, str] = {
     "track_merge_min_shared_markers": "track_merge_min_shared_markers",
     "link_window_reach": "link_window_reach",
     "link_min_shared_reads": "link_min_shared_reads",
+    "link_shared_read_frac": "link_shared_read_frac",
     "abundance_coherence_alpha": "abundance_coherence_alpha",
     "min_reads_for_coherence": "min_reads_for_coherence",
     "window_batch_factor": "window_batch_factor",
@@ -3962,6 +3974,10 @@ def link_windows(
                 return out
 
             reads_i, reads_j = _hap_reads(curr_wr), _hap_reads(next_wr)
+            # union of reads placed in each window, for the coverage-invariant link gate:
+            # a hap's "continuing reads" = its reads that also appear in the other window.
+            reads_i_all = set().union(*reads_i.values()) if reads_i else _EMPTY_READS
+            reads_j_all = set().union(*reads_j.values()) if reads_j else _EMPTY_READS
 
             # per-haplotype footprints, clipped to the shared region, hoisted out of the
             # pairwise loop (see consensus_footprint)
@@ -3987,7 +4003,16 @@ def link_windows(
                         # measurable. A read carried by a haplotype in both windows is
                         # direct evidence they are one molecule's lineage, and it is the
                         # only evidence there is, so it must stand on its own count.
-                        if shared_reads < config.link_min_shared_reads:
+                        need = config.link_min_shared_reads
+                        if config.link_shared_read_frac > 0.0:
+                            # Also require a fraction of each hap's OWN continuing reads, so
+                            # the bar scales with depth for abundant strains (rejecting the
+                            # spurious 2-read links that over-merge at high coverage) while
+                            # staying at the floor for rare strains (few continuing reads).
+                            cont_i = len(reads_i.get(hi, _EMPTY_READS) & reads_j_all)
+                            cont_j = len(reads_j.get(hj, _EMPTY_READS) & reads_i_all)
+                            need = max(need, int(np.ceil(config.link_shared_read_frac * min(cont_i, cont_j))))
+                        if shared_reads < need:
                             continue
                         gate = None
                         score = -float(shared_reads)

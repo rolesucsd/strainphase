@@ -68,9 +68,34 @@ def cmd_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def _report_mem_profile() -> None:
+    """Log tracemalloc peak + top allocation sites. Call at the integration point."""
+    import collections
+    import tracemalloc
+    snap = tracemalloc.take_snapshot()
+    cur, peak = tracemalloc.get_traced_memory()
+    logging.info(f"[mem-profile] tracemalloc peak={peak / 1e9:.2f} GB  resident-now={cur / 1e9:.2f} GB")
+    by_file: collections.Counter = collections.Counter()
+    for st in snap.statistics("lineno"):
+        by_file[os.path.basename(st.traceback[0].filename)] += st.size
+    logging.info("[mem-profile] top modules (resident at integration point):")
+    for fn_, sz in by_file.most_common(8):
+        logging.info(f"[mem-profile]   {sz / 1e9:6.3f} GB  {fn_}")
+    logging.info("[mem-profile] top 15 allocation sites:")
+    for st in snap.statistics("lineno")[:15]:
+        fr = st.traceback[0]
+        logging.info(f"[mem-profile]   {st.size / 1e9:6.3f} GB  {os.path.basename(fr.filename)}:{fr.lineno}")
+    tracemalloc.stop()
+
+
 def cmd_longitudinal(args: argparse.Namespace) -> int:
     """Run longitudinal analysis across multiple samples."""
     setup_logging(args.log_level)
+
+    _mem_profile = getattr(args, "mem_profile", False)
+    if _mem_profile:
+        import tracemalloc
+        tracemalloc.start(25)
 
     # Import here to avoid pysam requirement for other commands
     import importlib.util
@@ -177,6 +202,9 @@ def cmd_longitudinal(args: argparse.Namespace) -> int:
         all_results[mag_name] = results
         if integrator:
             all_integrators.append(integrator)
+
+    if _mem_profile:
+        _report_mem_profile()
 
     # ---- Window-level tables (the deliverables) ----
     # lineages.tsv comes back from here too:
@@ -313,6 +341,13 @@ def _add_phasing_args(p) -> None:
         help="Reads two haplotypes must share to link a NON-overlapping window pair. "
              "Consensus cannot gate those, so this is the whole evidence bar.",
     )
+    p.add_argument(
+        "--link-shared-read-frac", type=float, default=_D.link_shared_read_frac,
+        help="Coverage-invariant add-on to --link-min-shared-reads: a NON-overlapping link "
+             "also needs shared reads >= this fraction of each haplotype's continuing "
+             "reads. Scales the bar with depth so high coverage stops over-merging. "
+             "0.0 = off (default); ~0.25 is a good starting value.",
+    )
 
 
 # Flags that only mean something with MANY samples: the cross-sample merge, the
@@ -336,6 +371,11 @@ def _add_longitudinal_args(p) -> None:
         "--window-batch-factor", type=int, default=_D.window_batch_factor,
         help="Windows are dispatched to the worker pool in batches of workers * this. "
              "Lower it to cut peak memory on variant-dense contigs.",
+    )
+    p.add_argument(
+        "--mem-profile", action="store_true",
+        help="Trace peak memory with tracemalloc and log the top allocation sites at the "
+             "integration point. Diagnostic only; adds tracing overhead.",
     )
 
 
