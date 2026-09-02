@@ -1,13 +1,7 @@
 #!/usr/bin/env python3
-"""
-Comprehensive test suite for haplotyper pipeline.
+"""Unit, integration, and regression tests for the core haplotyper pipeline.
 
-Includes:
-- Unit tests for individual components
-- Integration tests for full pipeline
-- Regression tests for known behaviors
-
-Run with: pytest tests/ or python -m pytest tests/
+Run with: pytest tests/
 """
 
 import unittest
@@ -638,8 +632,8 @@ class TestAssignReads(unittest.TestCase):
     """Test PostProcessor.assign_reads directly."""
 
     def setUp(self):
-        # assign_reads is always on: step-3 links on the reads a window assigned;
-        # these tests exercise the function itself, so they opt in explicitly.
+        # assign_reads always runs: cross-window linking joins haplotypes on the reads
+        # a window assigned. These tests exercise the function directly.
         self.config = HaplotyperConfig()
         self.post = PostProcessor(self.config)
         self.reads = [
@@ -842,14 +836,9 @@ class TestResultsToDataframe(unittest.TestCase):
 
 
 class TestMeanWeightIsPooledOverReads(unittest.TestCase):
-    """REGRESSION (N3): `mean_weight` is the only abundance `strainphase run` emits.
-
-    It was an UNWEIGHTED mean of the per-window conditional abundances, which weights a
-    5-read window like a 40-read one - the estimator this codebase documents at length
-    as the wrong one (it is what produced the sawtooth). And a window whose EM collapsed
-    to junk contributed a 0.0, so a window that made NO measurement dragged the track
-    down by a third; `longitudinal._window_conditional_abundance` returns None on that
-    exact pi vector by design.
+    """`mean_weight`, the only abundance `strainphase run` emits, pools per-window
+    conditional abundances weighted by the reads that measured each window. A
+    junk-collapsed window measured nothing and is excluded, not counted as a zero.
     """
 
     def _wr(self, pi, n_reads, n_junk, track_id="T1"):
@@ -882,20 +871,17 @@ class TestMeanWeightIsPooledOverReads(unittest.TestCase):
         self.assertAlmostEqual(rec["mean_weight"], (0.9 * 40 + 0.6 * 5) / 45, places=9)
 
     def test_a_track_no_window_measured_is_nan_not_zero(self):
-        """Absent evidence is not evidence of absence: a consumer can drop a NaN but
-        cannot recover a fabricated zero."""
+        """A track no window could measure is NaN, not zero: a consumer can drop a NaN
+        but cannot recover a fabricated zero."""
         collapsed = self._wr([0.0, 0.0, 1.0], n_reads=12, n_junk=12)
         rec = results_to_dataframe({"ctg1": [collapsed]})[0]
         self.assertTrue(np.isnan(rec["mean_weight"]))
 
 
 class TestSplitReadBreakMarkers(unittest.TestCase):
-    """REGRESSION (R1-14 + R1-15): the CONT back-fill and the BRK anchor.
-
-    Both fabricate data when they get it wrong, and both are silent. A CONT written at a
-    position inside a read's OWN unaligned gap is a call the read does not support; a BRK
-    written over a called variant destroys the read's real allele there while
-    ``site_type`` still says "snv".
+    """The CONT back-fill and the BRK anchor, the two ways ``_merge_split_reads`` can
+    fabricate a call. A CONT must not be written inside a read's own unaligned gap,
+    where the read supports nothing, and a BRK must not overwrite a called variant.
     """
 
     def _seg(self, name, rs, re_, alleles):
@@ -907,10 +893,9 @@ class TestSplitReadBreakMarkers(unittest.TestCase):
     def test_cont_is_not_written_inside_a_reads_own_unaligned_gap(self):
         from strainphase.core import CONTINUOUS, _merge_split_reads
 
-        # X is itself split, over a WIDER gap than Y. An outer-span test writes "no
-        # break here" at Y's breakpoint, which sits inside X's own missing stretch - so
-        # two molecules carrying the same event with ragged breakpoints disagree at a
-        # fabricated site and the read graph drops the edge between them.
+        # X is split over a wider gap than Y. Y's breakpoint sits inside X's own missing
+        # stretch, so a naive outer-span test would write CONT there for X - a call X
+        # does not support.
         merged, breaks = _merge_split_reads([
             self._seg("X", 1000, 5000, {1100: "A"}),
             self._seg("X", 8000, 15000, {9000: "G"}),
@@ -954,13 +939,9 @@ class TestSplitReadBreakMarkers(unittest.TestCase):
 
 
 class TestGammaRowsAlwaysSumToOne(unittest.TestCase):
-    """REGRESSION (R1-23): a prune that coincides with the convergence break.
-
-    Pruning a component rewrites gamma's columns; when the prune happens on the same
-    iteration the loop terminates, the surviving rows were never renormalised and any
-    read whose whole mass sat on the pruned component came out ALL ZERO. Every
-    downstream consumer reads gamma as a posterior - junk counts, read assignment, the
-    abundance denominator - and `validate()` raises on it.
+    """Gamma rows stay normalised even when a component is pruned on the same iteration
+    the EM loop exits. A read whose mass sat entirely on the pruned component must not
+    come out all-zero, since every consumer reads gamma as a posterior.
     """
 
     def test_no_gamma_row_is_all_zero_after_a_terminating_prune(self):

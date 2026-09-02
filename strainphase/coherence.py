@@ -1,27 +1,15 @@
 #!/usr/bin/env python3
 """Abundance-coherence checking and the over-merge QC gate.
 
-**Scope, which is the whole point of this module: SINGLE TIMEPOINT ONLY.**
+Single timepoint only. A genome cannot hold two frequencies at one locus at one
+time, so two windows merged into one entity within one sample must agree on
+abundance to within sampling error; applied across timepoints this would reject
+real dynamics, so it never compares different samples.
 
-A genome cannot hold two different frequencies at one locus at one time, so two windows
-merged into the same entity *within one sample* must agree on abundance to within
-sampling error. This is a *window-merging* check. It is never a cross-timepoint
-comparison - real biology changes between timepoints, so applying it across time would
-reject true dynamics.
-
-Two design rules that are easy to get wrong:
-
-1. **Test the RAW COUNTS, never the derived ``abundance``.** ``abundance`` is
-   ``pi_k / (1 - pi_junk)``, already quantised onto unit fractions by low denominators.
-   Fisher's exact test on ``[[k1, n1-k1], [k2, n2-k2]]`` with ``k`` = supporting reads and
-   ``n`` = non-junk reads uses the evidence directly.
-
-2. **Use a likelihood test, not a fixed threshold.** At a median of ~12 reads two windows
-   at the *same* true frequency routinely differ by 0.3 or more from sampling alone. A
-   fixed cutoff would reject real merges at low coverage and accept fake ones at high
-   coverage; a test self-tightens as depth grows. (Comparator precedent uses the same
-   shape: Floria's Poisson coverage-compatibility test, Strainy's depth-ratio link
-   deletion - both likelihood tests, neither a distance.)
+The test is Fisher's exact on ``[[k1, n1-k1], [k2, n2-k2]]`` over the raw counts
+(``k`` = supporting reads, ``n`` = non-junk reads), not the derived ``abundance``.
+A likelihood test rather than a fixed cutoff so it self-tightens as depth grows.
+See docs/design/coherence.md.
 """
 
 from __future__ import annotations
@@ -54,17 +42,11 @@ def abundance_coherent(
 ) -> CoherenceResult:
     """Are these ``(supporting_reads, non_junk_reads)`` pairs mutually compatible?
 
-    ``counts`` are the per-window raw counts for ONE entity in ONE sample. Windows below
-    ``min_reads_for_coherence`` are excluded from the test rather than failing it - at
-    very low depth the test has no power and would wave everything through, so including
-    them would dilute the result.
-
-    Returns coherent=True unless MORE than half of the tested pairs are incoherent - at
-    exactly half it still merges. The tolerance is the point: a single unlucky pair
-    should not veto a merge, and one outlier among m windows produces m-1 incoherent
-    pairs out of m(m-1)/2, i.e. exactly half at m=4. Excluding the half case would make
-    a lone outlier veto at four windows and not at five, which is a threshold artefact
-    rather than a rule.
+    ``counts`` are per-window raw counts for one entity in one sample. Windows below
+    ``min_reads_for_coherence`` are excluded, not failed: at low depth the test has no
+    power. Coherent unless more than half the tested pairs are incoherent; at exactly
+    half it still merges, so a single unlucky pair cannot veto a merge. See
+    docs/design/coherence.md.
     """
     usable = [(k, n) for k, n in counts if n >= config.min_reads_for_coherence]
     if len(usable) < 2:
@@ -91,8 +73,7 @@ def abundance_coherent(
 
 @dataclass
 class QCFlags:
-    """Per-entity over-merge detector. Not a fix - a detector, so that over-merge cannot
-    pass silently whatever the linking algorithm does."""
+    """Per-entity over-merge detector. It flags over-merge for QC; it does not repair it."""
 
     entity_id: str
     too_many_per_cell: bool  # G1
@@ -114,17 +95,15 @@ def qc_flags(
 ) -> QCFlags:
     """Run the three over-merge gates on one entity.
 
-    ``members`` are dicts carrying at least ``sample``, ``window_start``, ``reads`` and
+    ``members`` are dicts with at least ``sample``, ``window_start``, ``reads`` and
     ``total_reads``.
 
-    G1  more than 2 members in a single (sample, window) cell - a genome cannot be in
-        three states at one locus at one time.
+    G1  more than 2 members in one (sample, window) cell - a genome cannot be in three
+        states at one locus at one time.
     G2  co-timepoint abundance incoherence (see ``abundance_coherent``), single
         timepoint only.
-    G3  occupancy shape. A real entity traces a DIAGONAL: it occupies roughly its full
-        window set at each timepoint, walking along the contig. An over-merged one fills
-        a HORIZONTAL band - many windows piled up across timepoints without any single
-        timepoint holding them all.
+    G3  occupancy shape: a real entity traces a diagonal, an over-merged one fills a
+        horizontal band. See docs/design/coherence.md.
     """
     cells: dict[tuple[str, int], int] = {}
     for m in members:

@@ -1,11 +1,6 @@
 #!/usr/bin/env python3
-"""
-Tests for strainphase.longitudinal module.
-
-Covers:
-- LongitudinalIntegrator.build_anchor_panel_for_key
-- LongitudinalIntegrator.count_timepoints_for_haplotype
-- LongitudinalIntegrator.rescue_window_result (basic)
+"""Tests for cross-timepoint integration: anchor panels, timepoint counting, rescue,
+and the shape of the published longitudinal tables.
 """
 
 import unittest
@@ -171,14 +166,10 @@ class TestCountTimepointsForHaplotype(unittest.TestCase):
 
 
 class TestRescueBelowTheJunkFloor(unittest.TestCase):
-    """REGRESSION (R1-16): a rescue is funded ENTIRELY out of junk's weight.
-
-    Below `_MIN_JUNK_WEIGHT` there is nothing to fund one with, and proceeding anyway is
-    strictly harmful: the rescued weight is scaled to 0.0, junk is INFLATED up to the
-    floor, and every original haplotype is scaled down to make room for a haplotype
-    contributing nothing - while the statistic said `was_rescued=True` with a weight it
-    never moved. The posterior read count does not imply the weight is there: a handful
-    of reads can sit above gamma 0.5 on a pi_junk of 0.002.
+    """A rescue is funded out of junk's weight, so below ``_MIN_JUNK_WEIGHT`` there is
+    nothing to fund one with and the window is left untouched. A posterior read count
+    does not imply the weight is there: reads can sit above gamma 0.5 on a pi_junk of
+    0.002.
     """
 
     def _window(self, pi_junk):
@@ -233,13 +224,10 @@ class TestRescueBelowTheJunkFloor(unittest.TestCase):
 
 
 class TestPublishedAbundancesSumToOne(unittest.TestCase):
-    """REGRESSION (R1-3): every haplotype holding pi weight gets a row.
-
-    `abundance` is pi_k / (1 - pi_junk), which sums to 1 over all k by construction. A
-    haplotype with no CONFIDENT read (supporting_reads counts gamma >= 0.90, and nothing
-    prunes on read support) was skipped, so the published abundances summed to less than
-    1 with no residual column and no log line - a reader could not tell mass was missing.
-    Two strains agreeing on all but a couple of markers at ~10x depth do exactly that.
+    """Every haplotype holding pi weight gets a published row, so the abundances
+    (pi_k / (1 - pi_junk)) sum to 1. A haplotype with no confident read still holds
+    weight and must not be dropped, which is what two near-identical strains at ~10x
+    depth produce.
     """
 
     def test_a_haplotype_with_no_confident_read_still_gets_a_row(self):
@@ -272,12 +260,10 @@ class TestPublishedAbundancesSumToOne(unittest.TestCase):
 
 
 class TestRelinkDoesNotDuplicateMismatchRows(unittest.TestCase):
-    """REGRESSION (R1-20): re-linking a sample's windows re-derives its mismatch rows.
-
-    The rescue pass calls `link_windows` a second time on the SAME WindowResult objects.
-    Appending to `link_mismatches` instead of resetting it doubled every row, byte for
-    byte - and those rows are also step 3's veto set, so the duplication is not confined
-    to a diagnostics file.
+    """The rescue pass calls ``link_windows`` a second time on the same WindowResult
+    objects, so ``link_mismatches`` must be reset, not appended to. Those rows also feed
+    the cross-sample merge's cannot-link set, so a duplicate is not confined to
+    diagnostics.
     """
 
     def test_link_mismatches_are_reset_not_appended(self):

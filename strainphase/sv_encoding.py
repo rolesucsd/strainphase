@@ -1,15 +1,12 @@
 #!/usr/bin/env python3
-"""
-Structural-variant input for strainphase: the SV SIDECAR format.
+"""Structural-variant input for strainphase: the SV sidecar format.
 
-strainphase's SV interface is ONE documented, caller-agnostic format — the
-sidecar TSV. strainphase consumes it via ``load_sv_sidecar_for_contig``; how you
-produce it is up to you. Caller-specific readers (e.g. Sniffles2) live in the
-PIPELINE, not here — the package stays tool-agnostic. Any caller (Sniffles,
-cuteSV, SVIM, hand-made) is fine as long as the output conforms to the format
-below; a reference Sniffles adapter ships in the pipeline as
-``scripts/sniffles_to_sidecar.py`` and imports ``SVRecord`` / ``write_sidecar``
-from here so this spec stays authoritative.
+strainphase reads structural variants through one caller-agnostic format, the
+sidecar TSV, via ``load_sv_sidecar_for_contig``. Any caller (Sniffles, cuteSV,
+SVIM, hand-made) is fine as long as its output conforms to the format below;
+caller-specific readers live in the pipeline, not the package. The pipeline's
+``scripts/sniffles_to_sidecar.py`` imports ``SVRecord`` / ``write_sidecar`` from
+here so this spec stays authoritative.
 
 SIDECAR FORMAT (tab-separated, one row per event per sample)
 ------------------------------------------------------------
@@ -17,39 +14,25 @@ SIDECAR FORMAT (tab-separated, one row per event per sample)
 
   contig         reference contig name (must match the phasing BAM/reference)
   pos            1-based breakpoint anchor
-  event_id       UNIQUE, cross-sample-STABLE label for the event = the phasing
-                 allele. Two reads cluster into one lineage iff they carry the
-                 SAME event_id, so the SAME real event MUST carry the SAME id (and
-                 the SAME pos) in every sample. Distinct events MUST differ.
-  svtype         INS/DEL/DUP/INV/BND (kept for interpretation; NOT the allele)
+  event_id       The phasing allele: unique and cross-sample-stable. Two reads
+                 cluster into one lineage iff they carry the same event_id, so one
+                 real event must carry the same id and pos in every sample, and
+                 distinct events must differ.
+  svtype         INS/DEL/DUP/INV/BND (kept for interpretation, not the allele)
   svlen          event length (0 for BND)
   af, dr, dv     allele freq, ref-support, variant-support (metadata)
-  support_reads  comma-separated read names that carry the event; MUST match the
+  support_reads  comma-separated read names that carry the event; must match the
                  BAM query names. This is what makes a read "present" at the site.
 
-Encoding rationale: the allele is the event ID (never a generic INS/DEL token),
-so a locus with two distinct events is a genuinely multi-allelic site and
-different structural changes never falsely merge. A read that spans the anchor
-reference-like votes the matched base ("absent"); one that doesn't span → no-call.
+The allele is the event id, so a locus with two distinct events is a genuine
+multi-allelic site and different structural changes never falsely merge. Encoding
+rationale and the two tools' fuller reasoning: docs/design/sv_encoding.md.
 
-TOOLS (all operate on the standard sidecar; only --sniffles is caller-specific)
--------------------------------------------------------------------------------
-  reconcile  Harmonize breakpoint DRIFT: cluster events within +/-pos_tol with
-             concordant type/length into one canonical (id, pos), so one real
+TOOLS (both operate on the standard sidecar; producing sidecars is the pipeline's job)
+  reconcile  Harmonize breakpoint DRIFT into one canonical (id, pos), so one real
              event isn't split into several alleles across samples. Never merges
-             two events from the same sample. Run this BEFORE phasing.
+             two events from the same sample. Run BEFORE phasing.
   verify     Assert each event_id maps to a single (contig, pos) across sidecars.
-             reconcile makes this hold for the drift it merges, but it does NOT
-             rewrite an id that already sits at two loci further apart than the
-             phasing pad — laundering that input would hide it from verify — so
-             verify still reports genuinely malformed sidecars afterwards, and
-             reconcile itself fails when it has to leave one behind.
-
-CLI (both operate on the standard sidecar; producing sidecars is the pipeline's job)
-------------------------------------------------------------------------------------
-    python -m strainphase.sv_encoding reconcile --sidecars *.tsv --out-dir recon/ \
-        [--samples S1 S2 ...] [--pos-tol 50] [--len-tol 0.25]
-    python -m strainphase.sv_encoding verify --sidecars recon/*.tsv [--out ok]
 """
 
 from __future__ import annotations
@@ -148,17 +131,10 @@ def load_sv_sidecar_for_contig(
 ) -> tuple[list[int], dict[int, str], dict[int, str], dict[int, dict[str, set[str]]]]:
     """Load SV pseudo-sites for one contig, ready to merge into the variant set.
 
-    Returns
-    -------
-    sv_pos
-        Sorted, de-duplicated list of anchor positions.
-    sv_ref_alleles
-        Placeholder REF base per position (``"N"``).
-    sv_site_type
-        Per-position type marker, always ``"sv"``.
-    sv_support
-        Per-position map ``{event_id: {read_name, ...}}``. Multiple events at one
-        anchor are preserved (multi-allelic site).
+    Returns ``(sv_pos, sv_ref_alleles, sv_site_type, sv_support)``: sorted unique
+    anchor positions; per-position placeholder REF ``"N"``; per-position type
+    marker ``"sv"``; and ``{pos: {event_id: {read_name, ...}}}``, which preserves
+    multiple events at one anchor as a multi-allelic site.
     """
     grouped = _load_sidecar_grouped(path)
     recs = grouped.get(contig_id, [])
@@ -177,16 +153,13 @@ def load_sv_sidecar_for_contig(
 
 
 def check_event_consistency(sidecar_paths: list[str]) -> list[str]:
-    """Verification #2: each event ID must map to exactly ONE (contig, pos)
-    across all sidecars, else the same event won't cluster into one lineage
-    across timepoints. Returns a list of human-readable violation messages
-    (empty if consistent).
+    """Check that each event id maps to exactly one (contig, pos) across all
+    sidecars; otherwise the same event will not cluster into one lineage across
+    timepoints. Returns human-readable violation messages (empty if consistent).
 
-    This backs the ``verify`` subcommand, and reconcile runs it over what it just
-    wrote — reconcile leaves an already-spread id alone rather than relocating it,
-    so it can no longer promise its own output is consistent and has to check.
-    Nothing calls it automatically at phasing time: the phasing core takes one
-    sidecar per sample and cannot see the cross-sample invariant this asserts."""
+    Backs ``verify``; reconcile also runs it over its own output. Not called at
+    phasing time, which sees one sidecar per sample. See docs/design/sv_encoding.md.
+    """
     loci_by_event: dict[str, set[tuple[str, int]]] = {}
     for path in sidecar_paths:
         for contig, recs in _load_sidecar_grouped(path).items():
@@ -201,22 +174,17 @@ def check_event_consistency(sidecar_paths: list[str]) -> list[str]:
 
 
 # ------------------------------------------------------------- reconciliation -#
-# Allele identity == event-ID identity, so breakpoint drift (one real event
-# called with slightly different anchors / IDs across samples) makes strainphase
-# see several alleles and under-cluster. reconcile harmonizes drifted events
-# into one canonical (id, pos) BEFORE phasing. It operates on the standard
-# sidecar format alone — caller-agnostic.
+# Allele identity == event-id identity, so breakpoint drift (one real event with
+# slightly different anchors/ids across samples) makes strainphase under-cluster.
+# reconcile harmonizes drifted events into one canonical (id, pos) BEFORE phasing.
 
 
 def _svtypes_concordant(t1: str, l1: int, t2: str, l2: int, len_tol_frac: float) -> bool:
     """Same SV type, and (for length-bearing types) concordant SVLEN.
 
-    Lengths are compared on MAGNITUDE. The sidecar spec calls the column an event
-    length, but it is routinely filled from VCF INFO/SVLEN, which is negative for
-    a DEL by convention — and the two conventions can even be mixed across a
-    cohort assembled from different callers. Scaling the tolerance by the signed
-    maximum would floor it at max(l1, l2, 1) == 1 for any negative pair, i.e. a
-    +/-1 bp tolerance on a 1 kb deletion, silently refusing every merge.
+    Lengths are compared on MAGNITUDE: SVLEN is negative for a DEL by convention,
+    and comparing signed values would silently refuse every merge involving a
+    negative length. See docs/design/sv_encoding.md.
     """
     if t1 != t2:
         return False
@@ -227,21 +195,15 @@ def _svtypes_concordant(t1: str, l1: int, t2: str, l2: int, len_tol_frac: float)
 
 
 # A reconciled cluster's total position span is capped at this many bp. It MUST
-# stay <= core._SV_ANCHOR_PAD (the phasing span-bracket tolerance): with the cap,
-# the canonical (median) anchor is within max_span of every member, so a read
-# that bracketed a member still brackets the canonical anchor — reconcile only
-# DECLINES to merge when the cap would be exceeded; it NEVER drops a read. The
-# cap is applied to every cluster, singletons included: one event id already
-# carrying two distant positions is malformed input, and moving it to the median
-# would push the anchor out of its own supporting reads' brackets just the same.
+# stay <= core._SV_ANCHOR_PAD (the phasing span-bracket tolerance) so the canonical
+# median anchor stays within a member's supporting-read brackets. reconcile only
+# DECLINES to merge when the cap would be exceeded; it NEVER drops a read. Applied
+# to singletons too. See docs/design/sv_encoding.md.
 _RECONCILE_MAX_SPAN = 50
 
-# An event is identified by (contig, event_id), never by the id alone. The id is
-# the phasing allele and the spec requires it to be globally unique, but a sidecar
-# that reuses one on a second contig must not be able to damage well-formed data
-# on the first: with id-only keys the reused id imports the other contig's samples
-# (vetoing a legitimate merge as if it were a multi-allelic site) and its other
-# contig's positions (dragging the canonical anchor arbitrarily far away).
+# An event is identified by (contig, event_id), never by the id alone: a sidecar
+# that reuses an id on a second contig must not corrupt well-formed data on the
+# first. See docs/design/sv_encoding.md.
 EventKey = tuple[str, str]
 
 
@@ -250,13 +212,10 @@ def _resolve_samples(
 ) -> list[tuple[str, str]]:
     """Pair each sidecar with the SAMPLE it came from, de-duplicating repeats.
 
-    Sample identity is what the same-sample merge veto is built on, so it cannot
-    be the file BASENAME: per-sample directories (S1/sv.tsv, S2/sv.tsv) then look
-    like one sample and every legitimate cross-sample merge is refused, logged as
-    the documented multi-allelic protection. The absolute path is the safe
-    default; ``samples`` overrides it for the one case a path cannot express —
-    a single sample split across several sidecars, which the default would treat
-    as several samples and so fail OPEN, collapsing a real multi-allelic site.
+    Sample identity backs the same-sample merge veto, so it defaults to the
+    absolute path, not the basename. ``samples`` overrides it for the one case a
+    path cannot express: one sample split across several sidecars. See
+    docs/design/sv_encoding.md.
     """
     if samples is not None and len(samples) != len(sidecar_paths):
         raise ValueError(
@@ -287,22 +246,15 @@ def reconcile_events(
     """Cluster drifted events across sidecars into a canonical (id, pos).
 
     Two events reconcile iff: same contig, |Δpos| <= pos_tol, same SVTYPE, and
-    concordant SVLEN. A merge is DECLINED (events kept separate) when it would:
-      - collapse two events that co-occur in the SAME sample (a real
-        multi-allelic site), or
-      - grow the cluster's total position span beyond ``max_span``.
-    The span cap makes reconciliation SAFE-BY-CONSTRUCTION: the canonical anchor
-    (median) then sits within max_span (<= the phasing pad) of every member, so
-    canonicalizing a member's position never pushes it outside a supporting
-    read's span bracket. Reconcile therefore only ever *declines to merge* — it
-    never drops a read. Events it declines to merge simply stay distinct alleles.
+    concordant SVLEN. A merge is DECLINED (events kept separate) when it would
+    collapse two events in the SAME sample (a real multi-allelic site) or grow the
+    cluster's span beyond ``max_span``. reconcile only ever declines to merge; it
+    never drops a read, and declined events stay distinct alleles.
 
-    The same cap is applied to the finished cluster, so it also covers the one
-    case no merge decision can see: an id that ALREADY carries positions further
-    apart than the cap in the raw sidecars. There reconcile declines to move
-    anything (``canonical_pos`` is None, meaning "leave each record where it is")
-    rather than relocating to a median that brackets nothing — silently
-    relocating it would also launder the violation past a later ``verify``.
+    The same cap is applied to the finished cluster, covering an id that ALREADY
+    arrives spread wider than the cap: there reconcile leaves every record in place
+    (``canonical_pos`` is None) rather than relocating to a median that brackets
+    nothing, so ``verify`` still sees the violation. See docs/design/sv_encoding.md.
 
     ``samples`` optionally names the sample each sidecar belongs to; without it,
     one sidecar is one sample (see ``_resolve_samples``).
@@ -373,11 +325,8 @@ def reconcile_events(
             if _svtypes_concordant(ti, li, rows[j][2], rows[j][3], len_tol_frac):
                 union((ci, ei), (cj, ej))
             elif find((ci, ei)) != find((cj, ej)):
-                # A neighbour close enough to be a drifted call of the same event,
-                # kept apart on type/length. Counted so the run log distinguishes
-                # "nothing was near enough to merge" from "everything near enough
-                # disagreed" — a cohort with mixed SVLEN conventions looks like the
-                # former and reads as a clean run.
+                # A near neighbour kept apart on type/length; counted so the log can
+                # tell "nothing near enough" from "near enough but disagreed".
                 declined["type"] += 1
 
     clusters: dict[EventKey, list[EventKey]] = {}
@@ -389,9 +338,8 @@ def reconcile_events(
     for members in clusters.values():
         all_pos = [p for e in members for p in pos_of[e]]
         if max(all_pos) - min(all_pos) > max_span:
-            # Only reachable for a cluster union() never grew — an id that arrives
-            # already spread across more than the pad. Leave every record exactly
-            # as it is so verify still sees it.
+            # An id that arrives already spread wider than the cap: leave every
+            # record in place so verify still sees it.
             declined["relocate"] += 1
             for e in members:
                 mapping[e] = (e[1], None)
@@ -418,11 +366,9 @@ def reconcile_events(
 def _reconciled_output_paths(sidecar_paths: list[str], out_dir: str) -> list[str]:
     """One distinct output path per input sidecar, under out_dir.
 
-    Naming by basename alone collides the moment sidecars live in per-sample
-    directories (S1/sv.tsv, S2/sv.tsv): every sample would be written to one file
-    and only the last would survive, while the caller got one path back per input.
-    Mirror the parent directory in that case, which also keeps the reconciled tree
-    matching a ``recon/{sample}/sv.tsv`` template.
+    Basenames alone collide when sidecars live in per-sample directories
+    (S1/sv.tsv, S2/sv.tsv), so mirror the parent directory in that case. See
+    docs/design/sv_encoding.md.
     """
     names = [os.path.basename(p) for p in sidecar_paths]
     if len(set(names)) == len(names):

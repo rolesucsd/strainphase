@@ -1,21 +1,13 @@
 #!/usr/bin/env python3
-"""Linking scenarios drawn from observed runs, scored on FRAGMENTATION vs ERROR.
+"""Linking scenarios reduced from observed runs, each paired with the correct answer.
 
-Every scenario here is a reduction of something measured on real data, with the
-CORRECT answer written down. They are not all expected to pass: the point is to
-score a candidate rule on both axes at once, because every change we have tried so
-far moved one at the expense of the other.
+Every scenario is a reduction of something measured on real data. Two axes matter,
+and a change that fixes one often worsens the other:
 
     fragmentation   the answer is split into more pieces than the truth has
     error           things the truth keeps apart are merged
 
-Run the benchmark table with:
-
-    pytest tests/test_linking_scenarios.py -s -k report
-
-The individual tests assert the CORRECT behaviour. Ones the current code fails are
-marked ``xfail(strict=False)`` so the suite stays green while still recording the
-gap - remove the marker when a change fixes one, and it becomes a regression test.
+These are the scenario definitions used to build and check candidate linking rules.
 """
 from __future__ import annotations
 
@@ -99,8 +91,8 @@ def s_one_track_spanning_many_windows():
 
 
 def s_oversplit_strain_rejoined():
-    """The contested over-split: one strain appears as TWO groups at a window, both
-    continuing into one group. Reciprocity sees a tie and links neither. They are one
+    """The contested over-split: one strain appears as two groups at a window, both
+    continuing into one group. The linker sees a tie and links neither. They are one
     strain and belong in one lineage."""
     groups = [
         _grp("A1", 1, [_hap("S1", STRAIN_A, wsid="TA", reads=65, read_key="X")]),
@@ -134,7 +126,7 @@ SCENARIOS = {
 
 
 # --------------------------------------------------------------------------- #
-# STEP 2 scenarios - where the fusion actually originates
+# Cross-sample scenarios - where the fusion actually originates
 # --------------------------------------------------------------------------- #
 def _w2(sample, cons):
     return WindowHaplotype(

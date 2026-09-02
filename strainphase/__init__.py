@@ -1,16 +1,15 @@
-"""
-Strainphase: Hybrid graph-probabilistic haplotype reconstruction for PacBio HiFi metagenomic data.
+"""Strainphase: strain-resolved haplotype phasing for PacBio HiFi metagenomes.
 
-This package reconstructs distinct bacterial haplotypes (strain-specific SNV patterns)
-from mixed metagenomic reads using a hybrid approach combining graph-based initialization
-with probabilistic EM refinement.
+Reads that share alleles are clustered into candidate haplotypes within
+overlapping genomic windows, refined by a quality-weighted EM model, and linked
+across windows and timepoints into contig-spanning lineages.
 
-Example usage:
+Python:
     >>> from strainphase import HaplotyperConfig, process_contig
     >>> config = HaplotyperConfig(window_size=20000, identity_distance=0.02)
     >>> results = process_contig(bam, vcf, contig_id, contig_length, config)
 
-CLI usage:
+CLI:
     $ strainphase run --bam sample.bam --vcf variants.vcf --contig ctg1 --length 50000
     $ strainphase longitudinal --samples T1,T2,T3 --bams mapping/{sample}.bam ...
     $ strainphase sv reconcile ...
