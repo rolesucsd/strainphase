@@ -1,0 +1,32 @@
+{
+  "name": "strainphase-demo",
+  "derived_from": {
+    "dataset": "div0050_k2.cov60.seed0",
+    "fingerprint": "dfbb293e316266d4",
+    "spbench_version": "1.0.0"
+  },
+  "region": {
+    "source_contig": "contig_1",
+    "start": 1000000,
+    "end": 1100000,
+    "contig": "demo_contig_1",
+    "length": 100000
+  },
+  "samples": [
+    "T1",
+    "T2",
+    "T3",
+    "T4",
+    "T5",
+    "T6"
+  ],
+  "strains": [
+    "strain1",
+    "strain2"
+  ],
+  "archetypes": {
+    "strain1": "sweep_winner",
+    "strain2": "sweep_loser"
+  },
+  "coverage": 60.0
+}
