@@ -9,6 +9,8 @@
 include LICENSE
 include README.md
 recursive-include tests *.py *.txt *.md
+# Regression fixtures: without these the tests in the sdist cannot run.
+recursive-include tests/data *.tsv.gz
 
 # Gitignored working directories. Present in a source tree on disk, never in a
 # release.

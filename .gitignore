@@ -44,12 +44,12 @@ dist/
 # of it can execute yet. Kept out of the tree rather than shipped broken.
 /benchmark/
 
-# Generated data
-data/
-tmp/
-tmp2/
-results/
-strains/
+# Generated data. Root-anchored on purpose: a bare `data/` also hides tests/data/.
+/data/
+/tmp/
+/tmp2/
+/results/
+/strains/
 
 # Conda environments
 .conda/
