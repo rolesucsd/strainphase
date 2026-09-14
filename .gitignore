@@ -57,3 +57,6 @@ strains/
 # Local scripts
 submit_bcf_to_vcf_array.sh
 run_bcf_to_vcf_array.sh
+
+# Demo run output (the demo data itself IS tracked; its output is not)
+demo/output/

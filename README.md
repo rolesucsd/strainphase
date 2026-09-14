@@ -28,6 +28,20 @@ pip install -e .
 
 ## Quick Start
 
+### Demo dataset
+
+A small demo dataset is bundled in [`demo/`](demo/) so the tool can be run immediately
+without supplying data. It is six timepoints of two strains sweeping past each other
+over a 100 kb contig, and it runs in under a minute:
+
+```bash
+bash demo/run_demo.sh
+```
+
+This phases all six timepoints and prints the recovered trajectories beside the
+bundled ground truth. See [`demo/README.md`](demo/README.md) for what the dataset
+contains and what the output should look like.
+
 ### Command Line Interface
 
 ```bash

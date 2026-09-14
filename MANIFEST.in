@@ -18,6 +18,10 @@ prune benchmarks
 prune validation
 prune docs
 
+# The demo dataset (~24 MB of BAMs) lives in the repo so it can be cloned and run,
+# but it has no business inside a release tarball that PyPI hosts and bioconda rebuilds.
+prune demo
+
 # Build and tool droppings.
 prune .github
 global-exclude *.py[cod] __pycache__/* .DS_Store
