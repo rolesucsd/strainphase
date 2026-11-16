@@ -19,10 +19,6 @@ from strainphase.window_groups import WindowGroup
 
 __all__ = ["Lineage", "PooledAbundance"]
 
-# Empty read-set sentinel for a group with no recorded reads. Not currently referenced
-# elsewhere in this module.
-_NO_READS: frozenset = frozenset()
-
 
 @dataclass
 class PooledAbundance:

@@ -4,9 +4,9 @@
 strainphase reads structural variants through one caller-agnostic format, the
 sidecar TSV, via ``load_sv_sidecar_for_contig``. Any caller (Sniffles, cuteSV,
 SVIM, hand-made) is fine as long as its output conforms to the format below;
-caller-specific readers live in the pipeline, not the package. The pipeline's
-``scripts/sniffles_to_sidecar.py`` imports ``SVRecord`` / ``write_sidecar`` from
-here so this spec stays authoritative.
+caller-specific readers live outside the package. The repository's
+``scripts/sniffles_to_sidecar.py`` is the Sniffles2 one; it imports ``SVRecord`` /
+``write_sidecar`` from here so this spec stays authoritative.
 
 SIDECAR FORMAT (tab-separated, one row per event per sample)
 ------------------------------------------------------------
@@ -28,7 +28,7 @@ The allele is the event id, so a locus with two distinct events is a genuine
 multi-allelic site and different structural changes never falsely merge. Encoding
 rationale and the two tools' fuller reasoning: docs/design/sv_encoding.md.
 
-TOOLS (both operate on the standard sidecar; producing sidecars is the pipeline's job)
+TOOLS (both operate on the standard sidecar; producing sidecars is the adapter's job)
   reconcile  Harmonize breakpoint DRIFT into one canonical (id, pos), so one real
              event isn't split into several alleles across samples. Never merges
              two events from the same sample. Run BEFORE phasing.
@@ -507,7 +507,8 @@ def run_sv(argv=None) -> int:
         return _verify_main(argv[1:])
     sys.stderr.write(
         "usage: strainphase sv {reconcile,verify} ...\n"
-        "The package consumes the sidecar TSV format; produce sidecars with your "
-        "own adapter (e.g. the pipeline's sniffles_to_sidecar.py).\n"
+        "The package consumes the sidecar TSV format; produce sidecars with "
+        "scripts/sniffles_to_sidecar.py from the repository (Sniffles2) or your own "
+        "adapter.\n"
     )
     return 2

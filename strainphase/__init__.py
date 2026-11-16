@@ -10,7 +10,7 @@ Python:
     >>> results = process_contig(bam, vcf, contig_id, contig_length, config)
 
 CLI:
-    $ strainphase run --bam sample.bam --vcf variants.vcf --contig ctg1 --length 50000
+    $ strainphase run --bam sample.bam --vcf variants.vcf.gz --contig ctg1 --length 50000
     $ strainphase longitudinal --samples T1,T2,T3 --bams mapping/{sample}.bam ...
     $ strainphase sv reconcile ...
     $ strainphase test

@@ -46,6 +46,7 @@ contains and what the output should look like.
 
 ```bash
 # Process single contig
+# The BAM must be sorted and indexed; the VCF bgzip-compressed and tabix-indexed.
 strainphase run \
     --bam sample.sorted.bam \
     --vcf clair3/pileup.vcf.gz \
@@ -89,7 +90,8 @@ results = process_contig(
 |---------|-------------|
 | `strainphase run` | Process a single contig |
 | `strainphase longitudinal` | Multi-sample longitudinal analysis |
-| `strainphase test` | Run unit test suite |
+| `strainphase sv` | Structural-variant sidecar tools (`reconcile`, `verify`) |
+| `strainphase test` | Run the unit test suite (source checkout only) |
 | `strainphase version` | Show version |
 
 ### `strainphase run`
@@ -99,7 +101,7 @@ strainphase run --bam FILE --vcf FILE --contig ID --length INT [OPTIONS]
 
 Required:
   --bam FILE          Input BAM file (sorted, indexed)
-  --vcf FILE          Input VCF file (Clair3 format)
+  --vcf FILE          Input VCF file (Clair3 format; bgzip-compressed, tabix-indexed)
   --contig ID         Contig ID to process
   --length INT        Contig length in bp
 
@@ -107,7 +109,7 @@ Options:
   --sample ID         Sample identifier
   --output FILE       Output TSV file [default: haplotypes.tsv]
   --window-size INT   Analysis window size [default: 20000]
-  --max-reads INT     Max reads per window [default: 300]
+  --max-reads INT     Max reads per window [default: 500]
   --min-mapq INT      Minimum MAPQ [default: 20]
   --identity-distance FLT  Max mismatch RATE at which two things are one entity [default: 0.02]
   --seed INT          Random seed for reproducibility
@@ -129,8 +131,10 @@ Required:
 Options:
   --mags LIST              Comma-separated MAG names [default: all]
   --contig-filter F        File listing allowed contigs
+  --sv-sidecars TPL        SV sidecar TSV template with {sample}; co-phases structural variants
+  -j, --workers INT        Worker processes for window processing [default: 1]
   --window-size INT        Window size [default: 20000]
-  --max-reads INT          Max reads per window [default: 300]
+  --max-reads INT          Max reads per window [default: 500]
   --min-anchor-weight FLT  Minimum weight for anchor panel [default: 0.15]
   --rescued-min-weight FLT Minimum weight after rescue [default: 0.02]
 ```
@@ -152,19 +156,67 @@ Options:
 
 ## Output Format
 
-### haplotypes.tsv / lineages.tsv
+### `strainphase run` → `haplotypes.tsv`
+
+One row per track (a haplotype linked across windows) on the contig.
 
 | Column | Description |
 |--------|-------------|
 | `contig` | Contig ID |
-| `sample` | Sample/timepoint ID |
+| `sample` | Sample ID |
 | `track_id` | Linked haplotype track identifier |
-| `lineage_id` | Cross-sample lineage cluster |
-| `span_start` | Track start position |
-| `span_end` | Track end position |
-| `n_snvs` | Number of SNVs in consensus |
+| `span_start`, `span_end`, `span_bp` | Track extent |
+| `n_windows` | Windows the track covers |
+| `n_snvs` | Number of sites in the consensus |
 | `mean_weight` | Read-weighted abundance pooled over the track's windows; `NaN` where no window could measure one |
-| `consensus` | SNV profile (pos:base pairs) |
+| `total_supporting_reads` | Reads confidently assigned to the track |
+| `mean_confidence` | Mean assignment confidence |
+| `consensus` | Allele profile, `pos:allele` pairs separated by `\|` |
+
+### `strainphase longitudinal` → `--output-dir`
+
+| File | One row per |
+|------|-------------|
+| `lineages.tsv` | (lineage, sample): the main output |
+| `haplotypes.tsv` | window-haplotype, with its consensus |
+| `windows_within_sample.tsv` | within-sample track |
+| `windows_across_samples.tsv` | per-window group of samples judged one entity |
+
+Diagnostics are written to `tmp/` beside them.
+
+`lineages.tsv`:
+
+| Column | Description |
+|--------|-------------|
+| `lineage_id` | Lineage identifier |
+| `mag`, `contig`, `sample` | MAG, contig and sample/timepoint |
+| `n_windows_lineage`, `n_samples_lineage` | Windows and samples the lineage covers in total |
+| `window_start`, `window_end` | Lineage window extent |
+| `marker_start`, `marker_end`, `marker_span_bp` | First and last marker position, and the distance between them |
+| `n_windows` | Windows this sample contributes |
+| `abundance` | Reads assigned / non-junk reads, pooled over the lineage's windows in this sample |
+| `abundance_all_reads` | The same over all reads, junk included |
+| `reads`, `total_reads`, `junk_reads` | The counts behind both abundances |
+| `window_group_ids` | Per-window groups this sample contributes to |
+| `haplotype_ids` | Window-haplotype IDs behind the row (join key to `haplotypes.tsv`) |
+
+An `abundance` of 0 with non-zero `total_reads` is a measured zero. A (lineage, sample)
+pair with no row was not measured there.
+
+## Structural variants
+
+`--sv-sidecars` co-phases structural variants with SNVs and indels. Each sample needs a
+sidecar TSV listing its SV events and the reads supporting them; the format is
+documented at the top of `strainphase/sv_encoding.py`. For Sniffles2 calls made with
+`--output-rnames`, `scripts/sniffles_to_sidecar.py` in this repository writes one:
+
+```bash
+python scripts/sniffles_to_sidecar.py --sniffles T1.sv.vcf.gz --out-sidecar sv/T1.tsv
+strainphase sv reconcile --sidecars sv/*.tsv --out-dir sv_reconciled/
+```
+
+`reconcile` gives one event the same ID and position in every sample; run it before
+phasing.
 
 ## Algorithm Overview
 

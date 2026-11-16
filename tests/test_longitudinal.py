@@ -252,7 +252,7 @@ class TestPublishedAbundancesSumToOne(unittest.TestCase):
         config = HaplotyperConfig(window_size=20000, min_entity_overlap_bp=0,
                                   min_cosupported_span_frac=0.0)
         rows = build_window_tables("/tmp/unused", {"MAG1": {"t0": {"c1": [wr]}}},
-                                   config, sample_order=["t0"])[0]
+                                   config)[0]
 
         self.assertEqual(len(rows), 2, "a haplotype with pi weight must be published")
         self.assertAlmostEqual(sum(r["abundance"] for r in rows), 1.0, places=9)

@@ -131,7 +131,7 @@ def _run(tmp_path, bams, vcfs, config, tag):
         config=config,
         output_dir=out,
     )
-    tables = build_window_tables(out, {"MAG1": results}, config, sample_order=SAMPLES)
+    tables = build_window_tables(out, {"MAG1": results}, config)
     return out, results, tables
 
 
@@ -264,7 +264,8 @@ def _run_cli(tmp_path, monkeypatch, extra):
     import strainphase.cli as cli
     import strainphase.longitudinal as L
 
-    for name in ("a.bam", "b.bam", "v.vcf.gz", "ref.fa"):
+    for name in ("a.bam", "a.bam.bai", "b.bam", "b.bam.bai", "v.vcf.gz", "v.vcf.gz.tbi",
+                 "ref.fa", "ref.fa.fai"):
         (tmp_path / name).write_text("")
 
     seen = {}

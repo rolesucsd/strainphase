@@ -223,3 +223,42 @@ def test_gap_filling_abundance_test_uses_the_step1_threshold():
         "the gap-filling test must respond to --abundance-coherence-alpha, the same "
         "knob step 1's eliminator reads"
     )
+
+
+def _two_tracks_apart(share_a, share_b, n_windows_a, n_windows_b):
+    """One sample, two multi-window tracks beyond step 1's reach, bridged by a second
+    sample so there is an edge to gate. Every window holds 100 phased reads."""
+    markers = frozenset({100, 290000})
+    step = 10000
+    haps = []
+    for i in range(n_windows_a):
+        haps.append(WindowHaplotype(
+            sample="s1", contig="c", window_start=1 + i * step,
+            window_end=20001 + i * step, haplotype_id=f"a{i}", consensus={100: "A"},
+            reads=share_a, total_reads=100, within_sample_id="TA"))
+    for i in range(n_windows_b):
+        haps.append(WindowHaplotype(
+            sample="s1", contig="c", window_start=200001 + i * step,
+            window_end=220001 + i * step, haplotype_id=f"b{i}",
+            consensus={290000: "A"}, reads=share_b, total_reads=100,
+            within_sample_id="TB"))
+    haps.append(WindowHaplotype(
+        sample="s2", contig="c", window_start=1, window_end=20001, haplotype_id="x0",
+        consensus={100: "A"}, reads=50, total_reads=100, within_sample_id="TX"))
+    haps.append(WindowHaplotype(
+        sample="s2", contig="c", window_start=280001, window_end=300001,
+        haplotype_id="x1", consensus={290000: "A"}, reads=50, total_reads=100,
+        within_sample_id="TX"))
+    return build_lineages_from_tracks(haps, DEFAULT_CONFIG, markers=markers)
+
+
+def test_gap_abundance_test_does_not_depend_on_track_length():
+    """Two fragments of one strain at the same share must merge however many windows
+    each spans. Supporting reads summed over a track against one window's depth made a
+    long track look more abundant than a short one at an identical share."""
+    assert len(_two_tracks_apart(30, 30, n_windows_a=5, n_windows_b=1)) == 1
+
+
+def test_gap_abundance_test_refuses_different_shares_on_long_tracks():
+    """30% and 60% in one sample are two entities, also when both tracks are long."""
+    assert len(_two_tracks_apart(30, 60, n_windows_a=4, n_windows_b=4)) > 1

@@ -62,8 +62,8 @@ which is expected. The two full-length lineages recover the sweep to a mean abso
 error of about 0.04:
 
 ```
-demo_contig_1_LIN000000  ->  strain2   MAE = 0.042
-demo_contig_1_LIN000001  ->  strain1   MAE = 0.044
+demo_contig_1_LIN000000  ->  strain1   MAE = 0.043
+demo_contig_1_LIN000001  ->  strain2   MAE = 0.042
 ```
 
 Exact numbers may shift slightly between releases as the method changes;
@@ -76,8 +76,8 @@ non-zero `total_reads` is a **measured** zero: reads were present at that locus 
 none supported the lineage. A (lineage, sample) pair with **no row at all** was not
 measured there — the window did not meet the depth floor, or nothing phased. The two
 are different, and only the first is evidence of absence. The check script prints the
-measured zeros in this dataset; T1 is the interesting case, where `LIN000001` has
-`abundance=0.0` against `total_reads=304`.
+measured zeros in this dataset; T5 is the interesting case, where `LIN000001` has
+`abundance=0.0` against `total_reads=911`.
 
 ## Provenance
 

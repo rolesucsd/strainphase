@@ -9,7 +9,7 @@ Two tracks merge when they agree byte-for-byte at every identity marker they bot
 call, over at least ``track_merge_min_shared_markers`` shared markers. Exact
 agreement, rather than a mismatch rate, keeps a handful of real differences from
 being diluted by thousands of identical sites at high coverage. The default of one
-shared marker makes this a permissive first pass; later passes split.
+shared marker makes this a permissive merge.
 
 A refusal recorded in step 1 — two tracks whose haplotypes disagreed at a called
 allele — carries over as a cannot-link and is never merged.
@@ -138,8 +138,6 @@ def build_lineages_from_tracks(
     # per-track facts the gates below need
     span = {k: (min(m.window_start for m in v), max(m.window_start for m in v))
             for k, v in tracks.items()}
-    reads = {k: sum(m.reads for m in v) for k, v in tracks.items()}
-    total = {k: max((m.total_reads for m in v), default=0) for k, v in tracks.items()}
     step_bp = config.window_size // 2
 
     comp: dict = {k: k for k in keys}
@@ -174,13 +172,19 @@ def build_lineages_from_tracks(
                 # so its abundance verdict does not exist and is taken now, on the same
                 # config step 1 reads (--abundance-coherence-alpha,
                 # --min-reads-for-coherence), so a pair is not judged differently by
-                # distance alone.
+                # distance alone. The counts are the two windows that face each other
+                # across the gap, one from each track: the same per-window (k, n) step 1
+                # compares. Summing over a track would count each read once per
+                # overlapping window and give a k that no single window's n matches.
                 lo_a, hi_a = span[other]
                 lo_b, hi_b = span[k]
                 gap = max(lo_b - hi_a, lo_a - hi_b)
-                if gap > step_bp and total[k] and total[other]:
-                    if not abundance_coherent(
-                        [(reads[other], total[other]), (reads[k], total[k])], config
+                if gap > step_bp:
+                    left, right = (other, k) if lo_b > hi_a else (k, other)
+                    near_l, near_r = tracks[left][-1], tracks[right][0]
+                    if near_l.total_reads and near_r.total_reads and not abundance_coherent(
+                        [(near_l.reads, near_l.total_reads),
+                         (near_r.reads, near_r.total_reads)], config
                     ).coherent:
                         return False
         return True

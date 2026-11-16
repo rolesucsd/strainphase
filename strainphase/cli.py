@@ -32,12 +32,42 @@ def setup_logging(level: str = "INFO") -> None:
     )
 
 
+def _input_errors(bam: str, vcf: str) -> list[str]:
+    """What is wrong with one sample's BAM and VCF, in words; empty when usable.
+
+    Both are read by region, so both need an index, and a VCF can only be indexed
+    once it is bgzip-compressed. Checked up front because pysam reports a missing
+    index as "fetch requires an index" from deep inside the first window.
+    """
+    errors = []
+    if not os.path.exists(bam):
+        errors.append(f"BAM not found: {bam}")
+    elif not any(os.path.exists(p) for p in (bam + ".bai", bam[:-4] + ".bai", bam + ".csi")):
+        errors.append(f"BAM is not indexed: {bam}. Run: samtools index {bam}")
+    if not os.path.exists(vcf):
+        errors.append(f"VCF not found: {vcf}")
+    elif not vcf.endswith((".gz", ".bgz", ".bcf")):
+        errors.append(
+            f"VCF must be bgzip-compressed and indexed: {vcf}. "
+            f"Run: bgzip {vcf} && tabix -p vcf {vcf}.gz"
+        )
+    elif not any(os.path.exists(vcf + ext) for ext in (".tbi", ".csi")):
+        errors.append(f"VCF is not indexed: {vcf}. Run: tabix -p vcf {vcf}")
+    return errors
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     """Run haplotyper on a single contig."""
     from strainphase import process_contig, results_to_dataframe
     from strainphase.core import config_from_args
 
     setup_logging(args.log_level)
+
+    errors = _input_errors(args.bam, args.vcf)
+    if errors:
+        for e in errors:
+            logging.error(e)
+        return 1
 
     config = config_from_args(args)
 
@@ -142,17 +172,21 @@ def cmd_longitudinal(args: argparse.Namespace) -> int:
         )
         return 1
 
-    # Verify files exist
+    # Verify every input before any phasing starts
+    errors = []
     for sample in samples:
-        if not os.path.exists(bam_paths[sample]):
-            logging.error(f"BAM not found: {bam_paths[sample]}")
-            return 1
-        if not os.path.exists(vcf_paths[sample]):
-            logging.error(f"VCF not found: {vcf_paths[sample]}")
-            return 1
+        errors += _input_errors(bam_paths[sample], vcf_paths[sample])
         if sv_sidecar_paths and not os.path.exists(sv_sidecar_paths[sample]):
-            logging.error(f"SV sidecar not found: {sv_sidecar_paths[sample]}")
-            return 1
+            errors.append(f"SV sidecar not found: {sv_sidecar_paths[sample]}")
+    if not os.path.exists(args.reference + ".fai"):
+        errors.append(
+            f"Reference is not indexed: {args.reference}. "
+            f"Run: samtools faidx {args.reference}"
+        )
+    if errors:
+        for e in errors:
+            logging.error(e)
+        return 1
 
     # Load contig filter if provided
     allowed_contigs = None
@@ -181,11 +215,10 @@ def cmd_longitudinal(args: argparse.Namespace) -> int:
 
     # Process each MAG
     all_results = {}
-    all_integrators = []
     for mag_name, mag_contigs in mags.items():
         logging.info(f"Processing MAG {mag_name}")
 
-        results, integrator = process_mag_longitudinal(
+        results, _ = process_mag_longitudinal(
             mag_name=mag_name,
             mag_contigs=mag_contigs,
             samples=samples,
@@ -199,8 +232,6 @@ def cmd_longitudinal(args: argparse.Namespace) -> int:
             output_dir=args.output_dir,
         )
         all_results[mag_name] = results
-        if integrator:
-            all_integrators.append(integrator)
 
     if _mem_profile:
         _report_mem_profile()
@@ -208,25 +239,18 @@ def cmd_longitudinal(args: argparse.Namespace) -> int:
     # ---- Window-level tables (the deliverables) ----
     # lineages.tsv comes back from here too: the cross-sample track merge that
     # produces the lineages runs inside build_window_tables.
-    (hap_rows, within_rows, across_rows, edge_rows, mismatch_rows,
-     edge_counts, lineage_rows) = build_window_tables(
-        args.output_dir, all_results, config, sample_order=samples
+    hap_rows, within_rows, across_rows, mismatch_rows, lineage_rows = build_window_tables(
+        args.output_dir, all_results, config
     )
     write_window_tables(
-        hap_rows, within_rows, across_rows, edge_rows, args.output_dir, mismatch_rows,
-        lineage_rows
+        hap_rows, within_rows, across_rows, args.output_dir, mismatch_rows, lineage_rows
     )
 
     n_within = len({(r["sample"], r["contig"], r["within_sample_id"]) for r in within_rows})
-    n_mismatch = edge_counts.get("failed_mismatch", 0)
-    n_noev = sum(1 for e in edge_rows if e["reason"] == "failed_no_evidence")
     logging.info(
         f"DONE: {len(hap_rows)} window-haplotypes | {n_within} within-sample entities | "
-        f"{len(across_rows)} across-sample window groups | comparisons: "
-        f"{len(edge_rows) - n_mismatch - n_noev} linked, {n_noev} no-evidence, "
-        f"{n_mismatch} mismatch"
+        f"{len(across_rows)} across-sample window groups | {len(lineage_rows)} lineage rows"
     )
-
 
     return 0
 
@@ -239,16 +263,24 @@ def cmd_test(args: argparse.Namespace) -> int:
     print(f"STRAINPHASE v{__version__} - TEST SUITE")
     print(f"{'=' * 60}\n")
 
-    try:
-        import subprocess
+    # The tests live beside the package in a source checkout and are not installed
+    # with it, so find them from this file rather than from the working directory.
+    import importlib.util
+    import subprocess
 
-        cmd = ["python", "-m", "pytest", "tests/", "-v" if args.verbose else "-q"]
-        result = subprocess.run(cmd, capture_output=False)
-        return result.returncode
-    except Exception as e:
-        logging.error(f"Could not run tests: {e}")
-        logging.info("Try running: pip install strainphase[dev] && pytest tests/")
+    tests_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tests")
+    if not os.path.isdir(tests_dir):
+        logging.error(
+            "The test suite is not part of an installed strainphase. Clone "
+            "https://github.com/rolesucsd/strainphase and run: "
+            "pip install -e '.[dev]' && strainphase test"
+        )
         return 1
+    if importlib.util.find_spec("pytest") is None:
+        logging.error("pytest is not installed. Run: pip install 'strainphase[dev]'")
+        return 1
+    cmd = [sys.executable, "-m", "pytest", tests_dir, "-v" if args.verbose else "-q"]
+    return subprocess.run(cmd).returncode
 
 
 def cmd_version(args: argparse.Namespace) -> int:
@@ -272,7 +304,7 @@ def _add_phasing_args(p) -> None:
     )
     p.add_argument(
         "--af-range", type=float, nargs=2, metavar=("LOW", "HIGH"), default=None,
-        help="Only load VCF sites whose alt-allele frequency falls in [LOW, HIGH). "
+        help="Only load VCF sites whose alt-allele frequency falls in [LOW, HIGH]. "
              "Off by default, which loads every site that clears --min-depth-site.",
     )
     p.add_argument(
@@ -391,7 +423,7 @@ def main(argv: list | None = None) -> int:
         epilog="""
 Examples:
     # Process single contig
-    strainphase run --bam sample.bam --vcf variants.vcf --contig ctg1 --length 50000
+    strainphase run --bam sample.bam --vcf variants.vcf.gz --contig ctg1 --length 50000
 
     # Longitudinal analysis
     strainphase longitudinal --samples T1,T2,T3 \\

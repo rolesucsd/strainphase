@@ -9,6 +9,7 @@
 include LICENSE
 include README.md
 recursive-include tests *.py *.txt *.md
+recursive-include scripts *.py
 # Regression fixtures: without these the tests in the sdist cannot run.
 recursive-include tests/data *.tsv.gz
 

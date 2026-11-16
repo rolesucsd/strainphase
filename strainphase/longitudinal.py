@@ -15,7 +15,7 @@ import logging
 import os
 import pickle
 import shutil
-from collections import Counter, defaultdict
+from collections import defaultdict
 
 import pysam  # noqa: F401
 
@@ -305,31 +305,29 @@ def process_mag_longitudinal(
         all_results[sample_id] = {}
 
         for contig_id, contig_length in mag_contigs.items():
-            try:
-                results = process_contig(
-                    bam_path=bam_paths[sample_id],
-                    vcf_path=vcf_paths[sample_id],
-                    contig_id=contig_id,
-                    contig_length=contig_length,
-                    config=config,
-                    sample_id=sample_id,
-                    pool=worker_pool,
-                    sv_sidecar_path=(
-                        sv_sidecar_paths.get(sample_id) if sv_sidecar_paths else None
-                    ),
-                )
+            # No per-contig error handling: a contig that fails here would be missing
+            # from every output table with nothing but a log line to say so.
+            results = process_contig(
+                bam_path=bam_paths[sample_id],
+                vcf_path=vcf_paths[sample_id],
+                contig_id=contig_id,
+                contig_length=contig_length,
+                config=config,
+                sample_id=sample_id,
+                pool=worker_pool,
+                sv_sidecar_path=(
+                    sv_sidecar_paths.get(sample_id) if sv_sidecar_paths else None
+                ),
+            )
 
-                if results:
-                    all_results[sample_id][contig_id] = results
-                    n_haps = sum(len(wr.haplotypes) for wr in results)
-                    track_ids = {h.track_id for wr in results for h in wr.haplotypes if h.track_id}
-                    logging.debug(
-                        f"    {contig_id}: {len(results)} windows, {n_haps} haplotypes, "
-                        f"{len(track_ids)} tracks"
-                    )
-            except Exception as e:
-                logging.warning(f"    Error on contig {contig_id} in {sample_id}: {e}")
-                continue
+            if results:
+                all_results[sample_id][contig_id] = results
+                n_haps = sum(len(wr.haplotypes) for wr in results)
+                track_ids = {h.track_id for wr in results for h in wr.haplotypes if h.track_id}
+                logging.debug(
+                    f"    {contig_id}: {len(results)} windows, {n_haps} haplotypes, "
+                    f"{len(track_ids)} tracks"
+                )
 
         # Park this sample's reads + gamma on disk before starting the next one.
         spill.offload(sample_id, all_results[sample_id])
@@ -391,8 +389,8 @@ def process_mag_longitudinal(
                     for wr in originals:
                         _detach_reads(wr)
                     # These share that Window, so already hold the stand-ins; only their flag
-                    # must agree. NOT offload_heavy(), which would clear `assignments` - the one
-                    # place --keep-read-assignments output survives the rescue pass.
+                    # must agree. NOT offload_heavy(), which would clear `assignments`, the
+                    # per-read rows build_window_tables writes to tmp/.
                     for wr in all_results[sample_id].get(contig_id, ()):
                         wr.heavy_offloaded = True
                     spill.discard(sample_id, contig_id)
@@ -436,7 +434,7 @@ def _read_counts(wr) -> tuple[int, int]:
     returned because the denominator choice matters (junk lets a poorly-resolving window
     pull the estimate down rather than renormalise it away).
     """
-    n = getattr(wr, "n_reads_examined", len(wr.window.reads))
+    n = wr.n_reads_examined
     if wr.gamma is None or wr.gamma.size == 0:
         return n, 0
     junk = int((wr.gamma[:, wr.gamma.shape[1] - 1] >= 0.5).sum())
@@ -511,16 +509,13 @@ def build_window_tables(
     output_dir: str,
     all_results: dict[str, dict[str, dict[str, list[WindowResult]]]],
     config: HaplotyperConfig,
-    sample_order: list[str] | None = None,
-) -> tuple[
-    list[dict], list[dict], list[dict], list[dict], list[dict], dict[str, int], list[dict]
-]:
+) -> tuple[list[dict], list[dict], list[dict], list[dict], list[dict]]:
     """Build the window-level tables and the lineages, plus the recorded mismatches.
 
-    Returns ``(haplotypes, windows_within_sample, windows_across_samples, edges,
-    within_mismatches, edge_counts, lineages)``. ``within_mismatches`` doubles as the merge's
-    cannot-link set, carrying the same haplotype ids as the haplotype rows; ``edges`` is empty
-    under the merged pipeline. Per-table field semantics: docs/design/longitudinal.md.
+    Returns ``(haplotypes, windows_within_sample, windows_across_samples,
+    within_mismatches, lineages)``. ``within_mismatches`` doubles as the merge's
+    cannot-link set, carrying the same haplotype ids as the haplotype rows. Per-table
+    field semantics: docs/design/longitudinal.md.
     """
     haplotype_rows: list[dict] = []
     within_rows: list[dict] = []
@@ -579,13 +574,12 @@ def build_window_tables(
 
                 for wr in window_results:
                     site_type_all.update(wr.window.site_type)
-                    n_reads_w = getattr(wr, "n_reads_examined", len(wr.window.reads))
+                    n_reads_w = wr.n_reads_examined
                     junk_col = wr.gamma.shape[1] - 1
                     n_junk_w = int((wr.gamma[:, junk_col] >= 0.5).sum())
                     nonjunk = n_reads_w - n_junk_w
 
                     # Read ids per within-window haplotype index, for the threading prototype.
-                    # Built only when that linker is on, so a normal run neither builds nor keeps it.
                     reads_by_hidx: dict[int, set] = {}
                     for a in getattr(wr, "assignments", None) or []:
                         # best_hap, not hap_id: the argmax even below assign_confidence_threshold.
@@ -756,8 +750,6 @@ def build_window_tables(
     # is one clustering on byte-for-byte identity over the shared markers (see track_merge).
     lineage_rows: list[dict] = []
     groups: list = []
-    edges: list = []
-    edge_counts: Counter = Counter()
     # Step 1's refusals become cannot-link between the tracks holding those haplotypes (an allele
     # disagreement or an incompatible within-sample share both mean not-one-strain); never merged.
     hap_track: dict[str, tuple[str, str]] = {
@@ -812,43 +804,22 @@ def build_window_tables(
             }
         )
 
-    # `edges` is empty under the merged pipeline; the cross-sample comparison log the
-    # old two-pass design produced is no longer generated.
-    edge_rows = [
-        {
-            "contig": e.contig,
-            "window_start": e.window_start,
-            "sample_a": e.sample_a,
-            "sample_b": e.sample_b,
-            "haplotype_a": e.haplotype_a,
-            "haplotype_b": e.haplotype_b,
-            "reason": e.reason,
-            "rate": e.rate,
-            "n_shared": e.n_shared,
-            "n_diff": e.n_diff,
-        }
-        for e in edges
-    ]
-
-    return (haplotype_rows, within_rows, across_rows, edge_rows,
-            within_mismatch_rows, edge_counts, lineage_rows)
+    return haplotype_rows, within_rows, across_rows, within_mismatch_rows, lineage_rows
 
 
 def write_window_tables(
     haplotype_rows: list[dict],
     within_rows: list[dict],
     across_rows: list[dict],
-    edge_rows: list[dict],
     output_dir: str,
     within_mismatch_rows: list[dict] | None = None,
     lineage_rows: list[dict] | None = None,
 ) -> dict[str, str]:
-    """Write the window-level tables, plus the two mismatch tables.
+    """Write the window-level tables, plus the within-sample mismatch table.
 
     A link not made for lack of shared markers is a measurement hole and is not reported; a
     link not made because the alleles disagree is a finding (a candidate recombination
-    breakpoint, the negative the merge treats as absolute) and is written. The within-sample
-    mismatches carry these; the across-sample table is empty under the merged pipeline.
+    breakpoint, the negative the merge treats as absolute) and is written.
     """
     import csv as _csv
 
@@ -857,17 +828,15 @@ def write_window_tables(
     os.makedirs(tmp_dir, exist_ok=True)
     written: dict[str, str] = {}
 
-    # The full comparison log is not written (almost all failed_no_evidence; sizes in docs).
     # Deliverables go in output_dir; diagnostics in output_dir/tmp beside the run, so they
-    # are findable, cleanable and cannot collide between concurrent runs. The mismatch tables
-    # are diagnostics carrying the cannot-link constraints, not a deliverable.
+    # are findable, cleanable and cannot collide between concurrent runs. The mismatch table
+    # is a diagnostic carrying the cannot-link constraints, not a deliverable.
     tables = [
         ("haplotypes.tsv", haplotype_rows, output_dir),
         ("windows_within_sample.tsv", within_rows, output_dir),
         ("windows_across_samples.tsv", across_rows, output_dir),
         ("lineages.tsv", lineage_rows or [], output_dir),
         ("mismatches_within_sample.tsv", within_mismatch_rows or [], tmp_dir),
-        ("mismatches_across_samples.tsv", edge_rows, tmp_dir),
     ]
     for name, rows, dest in tables:
         path = os.path.join(dest, name)
