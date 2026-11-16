@@ -15,12 +15,11 @@ import os
 import numpy as np
 import pytest
 
-from strainphase.coherence import abundance_coherent, qc_flags
+from strainphase.coherence import abundance_coherent
 from strainphase.core import (
     HaplotyperConfig,
     Read,
     compare_consensus,
-    unique_best_matches,
     variable_marker_positions,
 )
 from strainphase.longitudinal import _window_conditional_abundance
@@ -148,18 +147,6 @@ def test_cosupported_span_fraction_gate():
 
 
 # --------------------------------------------------------------------------- #
-# unique_best_matches
-# --------------------------------------------------------------------------- #
-
-
-def test_tie_contributes_no_edge():
-    """A tied best match is ambiguous and yields no edge, which bounds entity size."""
-    assert unique_best_matches({0: [(0.0, 1)]}) == {0: 1}
-    assert unique_best_matches({0: [(0.0, 1), (0.0, 2)]}) == {}
-    assert unique_best_matches({0: [(0.0, 1), (0.5, 2)]}) == {0: 1}
-
-
-# --------------------------------------------------------------------------- #
 # Window-haplotype fixture
 # --------------------------------------------------------------------------- #
 
@@ -212,37 +199,6 @@ def test_sampling_noise_alone_does_not_reject():
     """At ~12 reads two windows at the SAME true frequency routinely differ by 0.3+, so
     a fixed threshold would reject real merges. A likelihood test must not."""
     assert abundance_coherent([(6, 12), (9, 12)]).coherent
-
-
-# --------------------------------------------------------------------------- #
-# QC gate
-# --------------------------------------------------------------------------- #
-
-
-def test_qc_flags_detect_too_many_members_per_cell():
-    members = [
-        {"sample": "t0", "window_start": 1, "reads": 10, "total_reads": 40}
-        for _ in range(3)
-    ]
-    assert qc_flags("E1", members).too_many_per_cell
-
-
-def test_qc_flags_clean_entity_passes():
-    members = [
-        {"sample": f"t{i}", "window_start": 1, "reads": 20, "total_reads": 40}
-        for i in range(6)
-    ]
-    assert not qc_flags("E1", members).failed
-
-
-def test_qc_flags_detect_horizontal_occupancy():
-    """An over-merged entity piles many windows across timepoints without any single
-    timepoint holding them all."""
-    members = [
-        {"sample": f"t{i}", "window_start": i * 10000, "reads": 20, "total_reads": 40}
-        for i in range(9)
-    ]
-    assert qc_flags("E1", members).horizontal_occupancy
 
 
 # --------------------------------------------------------------------------- #
@@ -639,14 +595,14 @@ def test_a_run_writes_lineages_tsv_and_puts_diagnostics_in_tmp(tmp_path):
     all_results = {"MAG1": {s: {"c1": [wr(1, s, {3000: "T"}), wr(10001, s, {25000: "T"})]}
                             for s in ("t0", "t1", "t2")}}
     out = str(tmp_path / "run")
-    rows = build_window_tables(out, all_results, _lcfg(), sample_order=["t0", "t1", "t2"])
-    write_window_tables(rows[0], rows[1], rows[2], rows[3], out, rows[4], rows[6])
+    rows = build_window_tables(out, all_results, _lcfg())
+    write_window_tables(rows[0], rows[1], rows[2], out, rows[3], rows[4])
 
     assert os.path.exists(os.path.join(out, "lineages.tsv")), "the deliverable must exist"
     for name in ("haplotypes.tsv", "windows_within_sample.tsv",
                  "windows_across_samples.tsv"):
         assert os.path.exists(os.path.join(out, name))
-    for name in ("mismatches_within_sample.tsv", "mismatches_across_samples.tsv"):
+    for name in ("mismatches_within_sample.tsv",):
         assert os.path.exists(os.path.join(out, "tmp", name)), f"{name} belongs in tmp/"
         assert not os.path.exists(os.path.join(out, name)), f"{name} must NOT be a deliverable"
 

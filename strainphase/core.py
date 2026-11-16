@@ -93,7 +93,8 @@ class HaplotyperConfig:
     min_mapq: int = 20
     min_base_quality: int = 20
     default_base_quality: int = 20
-    # Cap per window; reads above this are uniformly subsampled with the config seed.
+    # Cap per window; above it reads are kept by a seeded hash of the read id, so
+    # overlapping windows keep the same molecules.
     max_reads_per_window: int = 500
     # A read must physically cover at least this many bp of a window to count in it, so a
     # 1 bp clip does not enter n_reads_examined / junk / the abundance denominator as a full span.
@@ -295,11 +296,6 @@ class HaplotyperConfig:
         # EM iterations
         if self.em_max_iter < 1:
             raise ValueError(f"em_max_iter must be >= 1, got {self.em_max_iter}")
-
-    def get_rng(self) -> np.random.Generator:
-        """Get a reproducible random number generator."""
-        return np.random.default_rng(self.random_seed)
-
 
 DEFAULT_CONFIG = HaplotyperConfig()
 
@@ -1103,8 +1099,7 @@ def load_snvs(
     returned tables, so handing back the cached objects would leak one sample's SV anchors
     into the next under a shared union VCF. History: docs/design/core.md.
     """
-    key = (vcf_path, contig_id, sample_name, config.min_depth_site, config.af_range,
-           config.process_indels if hasattr(config, "process_indels") else None)
+    key = (vcf_path, contig_id, sample_name, config.min_depth_site, config.af_range)
     hit = _SNV_CACHE.get(key)
     if hit is not None:
         return _copy_snv_tables(hit)
@@ -1307,7 +1302,7 @@ def _load_snvs_uncached(
             stats["multiallelic_records"] += 1
 
         # Decompose EVERY allele into atomic primitives via the one shared helper. All
-        # mutation types and all (>2) alleles are ALWAYS kept; nothing here can turn that off.
+        # mutation types and all (>2) alleles are ALWAYS kept; --af-range is the only gate.
         for alt_idx, alt in enumerate(alts):
             # The AF band is a PER-ALLELE gate: applied here, not once per record, so it
             # rejects only the allele outside the band, not the record's other alleles.
@@ -3240,23 +3235,6 @@ def compare_consensus(
     return GateResult(True, "linked", rate, n_shared, n_diff)
 
 
-def unique_best_matches(
-    matches: dict[int, list[tuple[float, int]]],
-) -> dict[int, int]:
-    """Keep only unambiguous best matches; a tie contributes nothing.
-
-    Uniqueness on both sides makes a connected component a path, not a hub, bounding an
-    entity's size structurally rather than by tuning.
-    """
-    unique: dict[int, int] = {}
-    for idx, options in matches.items():
-        options.sort(key=lambda x: x[0])
-        best_dist = options[0][0]
-        if len([o for o in options if o[0] == best_dist]) == 1:
-            unique[idx] = options[0][1]
-    return unique
-
-
 def link_windows(
     results: list[WindowResult], config: HaplotyperConfig = DEFAULT_CONFIG
 ) -> list[WindowResult]:
@@ -3624,7 +3602,7 @@ def process_contig(
     are merged in as pseudo-sites and co-phased with SNVs; the "present" allele is the unique
     event ID (a locus with two events is multi-allelic). ``None`` reproduces SNV/indel-only behavior.
     """
-    # 1) Load SNVs (and indels, if enabled) for this contig from the VCF.
+    # 1) Load SNVs and indels for this contig from the VCF.
     (
         snv_pos, ref_alleles, depth, af, site_type, site_kinds, del_span, ins_len
     ) = load_snvs(vcf_path, contig_id, vcf_sample_name, config)
@@ -3782,35 +3760,6 @@ def make_worker_pool(n_workers: int, config: HaplotyperConfig) -> Pool:
     return Pool(n_workers, initializer=_init_worker, initargs=(config,))
 
 
-def process_mag_longitudinal(*args, **kwargs):
-    """Backwards-compatible wrapper; canonical impl is
-    strainphase.longitudinal.process_mag_longitudinal.
-    """
-    # Import lazily to avoid circular imports (`strainphase.longitudinal` imports `core`).
-    from strainphase.longitudinal import process_mag_longitudinal as _impl
-
-    # Legacy signature: process_mag_longitudinal(samples: {sid: (bam, vcf)}, mag_contigs, config).
-    # Canonical: process_mag_longitudinal(mag_name, mag_contigs, samples, bam_paths, vcf_paths, config).
-    if (
-        len(args) >= 2
-        and isinstance(args[0], dict)
-        and isinstance(args[1], dict)
-        and "samples" not in kwargs
-    ):
-        samples_dict: dict[str, tuple[str, str]] = args[0]
-        mag_contigs: dict[str, int] = args[1]
-        config: HaplotyperConfig = (
-            args[2] if len(args) >= 3 else kwargs.get("config", DEFAULT_CONFIG)
-        )
-
-        sample_ids = list(samples_dict.keys())
-        bam_paths = {sid: samples_dict[sid][0] for sid in sample_ids}
-        vcf_paths = {sid: samples_dict[sid][1] for sid in sample_ids}
-        return _impl(None, mag_contigs, sample_ids, bam_paths, vcf_paths, config)
-
-    return _impl(*args, **kwargs)
-
-
 # =============================================================================
 # RESULTS EXPORT
 # =============================================================================
@@ -3866,9 +3815,7 @@ def results_to_dataframe(results: dict[str, list[WindowResult]]) -> list[dict]:
                 wa = max(0.0, min(1.0, float(pi_vec[_k]) / denom))
                 junk_col = _wr.gamma.shape[1] - 1
                 n_junk = int((_wr.gamma[:, junk_col] >= 0.5).sum())
-                n_nonjunk = max(
-                    getattr(_wr, "n_reads_examined", len(_wr.window.reads)) - n_junk, 0
-                )
+                n_nonjunk = max(_wr.n_reads_examined - n_junk, 0)
                 window_abundances.append(wa)
                 window_read_weights.append(n_nonjunk)
 
