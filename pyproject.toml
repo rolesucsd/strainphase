@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "strainphase"
-version = "0.1.0rc1"
+version = "0.1.0"
 description = "Hybrid graph-probabilistic haplotype reconstruction for PacBio HiFi metagenomic data"
 readme = "README.md"
 license = {text = "BSD-3-Clause"}
@@ -71,7 +71,7 @@ where = ["."]
 # archive/ and benchmark/ are gitignored working directories, but a source tree
 # on disk still has them and archive/benchmarks/ contains an __init__.py, so
 # setuptools would otherwise pick it up and ship it inside the wheel.
-exclude = ["tests*", "docs*", "archive*", "benchmark*"]
+exclude = ["tests*", "docs*", "archive*", "benchmark*", "scripts*", "demo*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -16,7 +16,6 @@ unit-test fixture, not a benchmark read simulator.
 import os
 import sys
 from dataclasses import dataclass, field
-from pathlib import Path
 
 import numpy as np
 
@@ -50,12 +49,6 @@ class SimulationScenario:
 
     # For tracking sweeps
     sweep_events: list[dict] = field(default_factory=list)
-
-    def total_snvs(self) -> int:
-        return len(self.snv_positions)
-
-    def n_true_haplotypes(self) -> int:
-        return len(self.true_haplotypes)
 
 
 class SyntheticDataGenerator:
@@ -489,63 +482,5 @@ def create_test_scenarios() -> dict[str, SimulationScenario]:
         n_timepoints=6,
         include_sweep=True,
     )
-
-    return scenarios
-
-
-def _fasta_total_length(path: Path) -> int:
-    """Compute total sequence length for a FASTA file."""
-    total = 0
-    with open(path) as handle:
-        for line in handle:
-            if line.startswith(">"):
-                continue
-            total += len(line.strip())
-    return total
-
-
-def create_reference_scenarios(
-    reference_dir: str,
-    n_references: int = 10,
-    seed: int = 42,
-    min_lineages: int = 2,
-    max_lineages: int = 20,
-    snv_density_per_kb: float = 2.0,
-    n_timepoints: int = 5,
-) -> dict[str, SimulationScenario]:
-    """
-    Create synthetic scenarios from reference genomes on disk.
-
-    Uses reference lengths to scale SNV counts and assigns 2-20 lineages.
-    """
-    rng = np.random.default_rng(seed)
-    ref_path = Path(reference_dir)
-    fasta_files = sorted(
-        list(ref_path.glob("*.fa")) + list(ref_path.glob("*.fasta")) + list(ref_path.glob("*.fna"))
-    )
-    if not fasta_files:
-        raise ValueError(f"No FASTA files found in {reference_dir}")
-
-    n_pick = min(n_references, len(fasta_files))
-    selected = list(rng.choice(fasta_files, size=n_pick, replace=False))
-
-    gen = SyntheticDataGenerator(seed=seed)
-    scenarios: dict[str, SimulationScenario] = {}
-
-    for fasta_path in selected:
-        mag_name = fasta_path.stem
-        total_len = _fasta_total_length(fasta_path)
-        n_haplotypes = int(rng.integers(min_lineages, max_lineages + 1))
-        n_snvs = max(20, int((total_len / 1000.0) * snv_density_per_kb))
-        include_sweep = n_haplotypes >= 2 and rng.random() < 0.6
-
-        scenarios[mag_name] = gen.create_scenario(
-            name=mag_name,
-            contig_length=total_len,
-            n_snvs=n_snvs,
-            n_haplotypes=n_haplotypes,
-            n_timepoints=n_timepoints,
-            include_sweep=include_sweep,
-        )
 
     return scenarios
