@@ -449,6 +449,7 @@ class Haplotype:
     supporting_reads: int = 0
     confidence: float = 0.0  # Mean gamma over confident reads for this haplotype.
     track_id: str | None = None  # Assigned after window linking
+    rescued_from: str | None = None  # Donor timepoint, when cross-timepoint rescue created it
 
     def distance_to(
         self, other: Haplotype, positions: list[int], max_mismatches: int | None = None
@@ -674,22 +675,6 @@ class RescueStatistic:
     n_shared_with_anchor: int
     n_mismatched_with_anchor: int
     reason: str = ""  # Debug reason for rescue outcome
-
-
-@dataclass
-class RescuedReadInfo:
-    """Per-read information for rescue events."""
-
-    read_name: str
-    sample: str  # Timepoint where rescue occurred
-    contig: str
-    window_start: int
-    window_end: int
-    donor_timepoint: str  # Timepoint that provided the anchor haplotype
-    n_snps_agree: int  # read vs rescued haplotype
-    n_snps_disagree: int
-    n_snps_total: int  # agree + disagree
-    rescued_haplotype_weight: float
 
 
 # =============================================================================
@@ -2258,7 +2243,6 @@ class LongitudinalIntegrator:
     def __init__(self, config: HaplotyperConfig = DEFAULT_CONFIG):
         self.config = config
         self.rescue_statistics: list[RescueStatistic] = []
-        self.rescued_reads: list[RescuedReadInfo] = []
 
     def build_anchor_panel_for_key(
         self,
@@ -2280,20 +2264,6 @@ class LongitudinalIntegrator:
                     anchor_samples.append(sample_id)
 
         return anchor_haps, anchor_samples
-
-    def count_timepoints_for_haplotype(
-        self, hap: Haplotype, sample_results: dict[str, WindowResult], positions: list[int]
-    ) -> int:
-        """Count timepoints where this haplotype appears."""
-        count = 0
-        for _sample_id, wr in sample_results.items():
-            for other_hap in wr.haplotypes:
-                dist, _, n_shared = hap.distance_to(other_hap, positions)
-                if n_shared >= self.config.min_shared_for_rescue:
-                    if dist <= self.config.identity_distance:
-                        count += 1
-                        break
-        return count
 
     def rescue_window_result(
         self,
@@ -2486,16 +2456,17 @@ class LongitudinalIntegrator:
                         self.config.rescued_min_weight,
                     )
 
+                    donor_timepoint = anchor_samples[anchor_idx]
                     new_hap = Haplotype(
                         consensus=new_consensus,
                         weight=rescued_weight,
                         supporting_reads=n_matching_junk,
                         confidence=0.8,
                         track_id=None,
+                        rescued_from=donor_timepoint,
                     )
                     new_haplotypes.append(new_hap)
 
-                    donor_timepoint = anchor_samples[anchor_idx]
                     new_hap_stat_idx.append(len(self.rescue_statistics))
                     self.rescue_statistics.append(
                         RescueStatistic(
@@ -2515,24 +2486,6 @@ class LongitudinalIntegrator:
                         )
                     )
                     rescued_any = True
-
-                    for read_idx, n_agree, n_disagree, n_total in matching_read_info:
-                        read = reads[read_idx]
-                        read_name = getattr(read, "name", f"read_{read_idx}")
-                        self.rescued_reads.append(
-                            RescuedReadInfo(
-                                read_name=read_name,
-                                sample=current_sample,
-                                contig=window.contig,
-                                window_start=window.start,
-                                window_end=window.end,
-                                donor_timepoint=donor_timepoint,
-                                n_snps_agree=n_agree,
-                                n_snps_disagree=n_disagree,
-                                n_snps_total=n_total,
-                                rescued_haplotype_weight=rescued_weight,
-                            )
-                        )
 
                     logging.debug(
                         f"    Rescued haplotype from {donor_timepoint}: "
@@ -2734,115 +2687,6 @@ class LongitudinalIntegrator:
                 rescued_results[sample_id].append(rescued_wr)
 
         return dict(rescued_results)
-
-    def write_rescue_statistics(self, output_path: str) -> str:
-        """Write rescue_statistics.tsv with details of rescue events."""
-        import csv
-
-        n_rescued = sum(1 for s in self.rescue_statistics if s.was_rescued)
-        logging.info(
-            f"Writing rescue_statistics.tsv: {len(self.rescue_statistics)} records "
-            f"({n_rescued} rescued)"
-        )
-
-        fieldnames = [
-            "sample",
-            "rescued_timepoint",
-            "contig",
-            "window_start",
-            "track_id",
-            "was_rescued",
-            "original_weight",
-            "rescued_weight",
-            "donor_timepoint",
-            "anchor_distance",
-            "n_shared_with_anchor",
-            "n_mismatched_with_anchor",
-            "reason",
-        ]
-
-        with open(output_path, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames, delimiter="\t")
-            writer.writeheader()
-
-            for stat in self.rescue_statistics:
-                writer.writerow(
-                    {
-                        "sample": stat.sample,
-                        "rescued_timepoint": stat.rescued_timepoint,
-                        "contig": stat.contig,
-                        "window_start": stat.window_start,
-                        "track_id": stat.track_id,
-                        "was_rescued": stat.was_rescued,
-                        "original_weight": f"{stat.original_weight:.6f}",
-                        "rescued_weight": f"{stat.rescued_weight:.6f}",
-                        "donor_timepoint": stat.donor_timepoint,
-                        "anchor_distance": (
-                            f"{stat.anchor_distance:.6f}" if stat.anchor_distance >= 0 else "NA"
-                        ),
-                        "n_shared_with_anchor": stat.n_shared_with_anchor,
-                        "n_mismatched_with_anchor": stat.n_mismatched_with_anchor,
-                        "reason": stat.reason,
-                    }
-                )
-
-        return output_path
-
-    def write_rescued_reads(self, output_path: str) -> str:
-        """Write rescued_reads.tsv with per-read details of rescue events."""
-        import csv
-
-        logging.info(
-            f"Writing rescued_reads.tsv: {len(self.rescued_reads)} reads"
-        )
-
-        fieldnames = [
-            "read_name",
-            "sample",
-            "contig",
-            "window_start",
-            "window_end",
-            "donor_timepoint",
-            "n_snps_agree",
-            "n_snps_disagree",
-            "n_snps_total",
-            "agreement_rate",
-            "rescued_haplotype_weight",
-        ]
-
-        with open(output_path, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames, delimiter="\t")
-            writer.writeheader()
-
-            for read_info in self.rescued_reads:
-                agreement_rate = (
-                    read_info.n_snps_agree / read_info.n_snps_total
-                    if read_info.n_snps_total > 0
-                    else 0.0
-                )
-                writer.writerow(
-                    {
-                        "read_name": read_info.read_name,
-                        "sample": read_info.sample,
-                        "contig": read_info.contig,
-                        "window_start": read_info.window_start,
-                        "window_end": read_info.window_end,
-                        "donor_timepoint": read_info.donor_timepoint,
-                        "n_snps_agree": read_info.n_snps_agree,
-                        "n_snps_disagree": read_info.n_snps_disagree,
-                        "n_snps_total": read_info.n_snps_total,
-                        "agreement_rate": f"{agreement_rate:.4f}",
-                        "rescued_haplotype_weight": f"{read_info.rescued_haplotype_weight:.6f}",
-                    }
-                )
-
-        return output_path
-
-
-# =============================================================================
-# MAIN PIPELINE
-# =============================================================================
-
 
 def process_window(
     window: Window, config: HaplotyperConfig = DEFAULT_CONFIG, n_timepoints_seen: int = 1

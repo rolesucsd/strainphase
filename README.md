@@ -7,16 +7,41 @@
 
 ## Overview
 
-Strainphase phases strain-resolved haplotypes from PacBio HiFi metagenomes. It
-divides each genome into overlapping windows and, within each window, clusters
-reads that share alleles into candidate haplotypes, refines them with a
-quality-weighted expectation–maximization model, and links haplotypes across
-windows and timepoints into contig-spanning lineages. Indels and structural
-variants are phased as alleles rather than discarded, and low-abundance
-haplotypes below single-timepoint detection are recovered from the other
-timepoints. It resolves intra-strain lineages differing by less than 0.5%.
+Strainphase reconstructs strain-resolved haplotypes from longitudinal PacBio HiFi
+metagenomes. It divides each reference contig into fixed overlapping windows,
+builds a read-similarity graph per window, refines candidate haplotypes with a
+base-quality-weighted expectation–maximization (EM) model that includes an
+explicit outlier component, and integrates information across timepoints to link
+haplotypes into contig-spanning lineages.
+
+Key capabilities:
+
+- **Multi-variant phasing:** Phases SNVs, length-specific indels, multi-allelic
+  sites, and structural variants (DEL, INS, INV, DUP, BND) jointly as alleles,
+  enabling haplotype separation even among near-identical strains (≥99.9% ANI)
+  where SNVs alone are sparse.
+- **High purity in multi-strain mixtures:** Scales cleanly from two to six
+  coexisting strains (91% and 79% of all informative reads placed into pure
+  haplotypes in 4- and 6-strain benchmarks, with 0 substantial false splits on
+  monoclonal controls).
+- **Targeted longitudinal rescue:** Recovers transiently rare strains (≤1×
+  coverage) using high-abundance haplotypes from other timepoints as anchors,
+  without inflating false positives at higher depth.
+- **Longitudinal SV-to-haplotype tracking:** Directly phases structural variants
+  onto point-mutation backbones across multi-year time series, distinguishing
+  within-strain structural plasticity (such as phase-variable inversions) from
+  diverged strain-linked deletions and insertions.
+- **Practical compute:** Runs in ~4.5–5.7 min and 2.5–2.8 GB peak RAM per
+  10-timepoint species on standard CPUs (competitive with Rust-based per-sample
+  phasers and >25–160× faster than assembly-graph phasing).
 
 ## Installation
+
+```bash
+pip install strainphase
+```
+
+Or install from source:
 
 ```bash
 git clone https://github.com/rolesucsd/strainphase.git

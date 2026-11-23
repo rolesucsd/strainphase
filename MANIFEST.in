@@ -27,5 +27,11 @@ prune demo
 
 # Build and tool droppings.
 prune .github
+prune .claude
+prune .pytest_cache
+prune .ruff_cache
+prune build
+prune dist
 global-exclude *.py[cod] __pycache__/* .DS_Store
 exclude .pre-commit-config.yaml
+exclude .coverage
